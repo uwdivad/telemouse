@@ -1,0 +1,5 @@
+/target
+/recordings/*
+!/recordings/demo-session.jsonl
+/.idea/
+/.playwright-mcp/

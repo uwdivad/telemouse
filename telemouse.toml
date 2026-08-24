@@ -1,0 +1,44 @@
+# telemouse configuration — all fields optional, defaults shown/commented.
+
+# Your mouse's real CPI (a.k.a. DPI). Used by consumers to derive physical cm.
+mouse_cpi = 1600.0
+
+[batch]
+window_ms = 25
+max_events = 448
+ring_capacity = 65536
+
+[udp]
+enabled = true
+addr = "127.0.0.1:7878"
+
+[kafka]
+# Off by default so capture works with no broker running. UDP + local
+# recording always work; Kafka failures never stall capture either way.
+enabled = false
+brokers = ["127.0.0.1:9092"]
+
+[recording]
+enabled = true
+dir = "recordings"
+
+[viz]
+http_addr = "127.0.0.1:7879"
+
+# Per-game aim conversion: degrees = counts * sens * coeff.
+# Key = lowercase process name.
+[games."cs2.exe"]
+sens = 1.0
+yaw_coeff = 0.022
+pitch_coeff = 0.022
+
+# Call of Duty via the CoD HQ launcher (MW2/MW3/Warzone). MW2019 standalone
+# was "modernwarfare.exe" — copy this block under that key if you play it.
+# Modern CoD is 0.0066 deg/count at sens 1 (a third of Source's 0.022, hence
+# the "CS sens x 3.33" folk conversion). The coefficients are plain config —
+# adjust them here if your setup warrants it; with legacy ADS (no separate
+# ADS multiplier) one coefficient covers the whole session.
+[games."cod.exe"]
+sens = 12.5          # set to your in-game sensitivity
+yaw_coeff = 0.0066
+pitch_coeff = 0.0066

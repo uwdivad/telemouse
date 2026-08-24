@@ -1,0 +1,36 @@
+[package]
+name = "telemouse-viz"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "telemouse-viz"
+path = "src/main.rs"
+
+[dependencies]
+telemouse-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Explicit features, not "full": this process is one UDP socket, one HTTP
+# listener and a couple of WebSockets — it has no use for process/signal/io-std
+# machinery, and the runtime is pinned to 2 workers in main.rs.
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "fs",
+    "io-util",
+    "time",
+    "sync",
+] }
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+serde_json.workspace = true
+serde.workspace = true
+clap.workspace = true
+tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
