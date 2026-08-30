@@ -10,11 +10,18 @@
 //! children and then calls [`post_quit`].
 //!
 //! Every failure is a `warn!` and a headless server, never a panic. The
-//! window state lives on this thread's stack and is reached from the window
-//! procedure through `GWLP_USERDATA`, the same idiom as the capture crate.
-//! Handlers take a raw pointer and read fields as they go rather than holding
-//! a `&mut` across Win32 calls, because several of those (`ShowWindow`,
-//! `SetWindowTextW`, `TrackPopupMenu`, …) re-enter the window procedure.
+//! window state is a heap allocation owned by [`run`] as a raw pointer and
+//! reached from the window procedure through `GWLP_USERDATA`, the same idiom
+//! as the capture crate. Nothing ever holds a `&mut UiState`: handlers take
+//! the raw pointer and read fields as they go, because several Win32 calls
+//! (`ShowWindow`, `SetWindowTextW`, `TrackPopupMenu`, …) re-enter the window
+//! procedure, which would alias any reference held across them.
+//!
+//! Menu choices come back as the return value of `TrackPopupMenu`
+//! (`TPM_RETURNCMD`), not as `WM_COMMAND`. A `WM_COMMAND` can be posted to
+//! this window by any process on the desktop (`FindWindowW` + `PostMessageW`)
+//! and would otherwise start a capture or exit the panel; the return value
+//! cannot be forged. Scripts drive the panel through the HTTP API instead.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -44,8 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow, PostMessageW, PostQuitMessage,
     PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SendMessageW,
     SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
     WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
     WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     WS_VSCROLL,
@@ -251,7 +259,10 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         let icons = [make_icon(IconState::Idle), make_icon(IconState::CaptureRunning)];
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
 
-        let mut state = UiState {
+        // From here on the state is reached only through `ptr` — never
+        // through a `&mut` — because `tray_add`, `ShowWindow` and `refresh`
+        // all re-enter `wndproc`, which reaches it through the same pointer.
+        let ptr: *mut UiState = Box::into_raw(Box::new(UiState {
             link,
             hwnd,
             edit,
@@ -264,21 +275,20 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             visible: true,
             exiting: false,
             swallow_up: false,
-        };
-        let ptr: *mut UiState = &mut state;
+        }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
 
-        state.tooltip = model::tooltip(&state.link.state.borrow());
+        (*ptr).tooltip = model::tooltip(&(*ptr).link.state.borrow());
         tray_add(ptr);
-        if !state.tray_added {
+        if !(*ptr).tray_added {
             warn!("tray icon unavailable; closing the window will exit the panel");
         }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-        state.link.visible.store(true, Ordering::Relaxed);
-        state.link.poke.notify_one();
+        (*ptr).link.visible.store(true, Ordering::Relaxed);
+        (*ptr).link.poke.notify_one();
         refresh(ptr);
-        info!(tray = state.tray_added, "gui running; double-click the tray icon to show the window");
+        info!(tray = (*ptr).tray_added, "gui running; double-click the tray icon to show the window");
 
         let mut msg = MSG::default();
         loop {
@@ -298,6 +308,9 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         teardown(ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let _ = DestroyWindow(hwnd);
+        // Nothing can reach the state any more: GWLP_USERDATA is cleared and
+        // the window is gone.
+        drop(Box::from_raw(ptr));
         info!("gui stopped");
     }
     Ok(())
@@ -492,10 +505,27 @@ unsafe fn show_menu(s: *mut UiState) {
         let _ = GetCursorPos(&mut pt);
         // Without this the menu does not close when the user clicks away.
         let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, None, hwnd, None);
+        // TPM_RETURNCMD: the chosen id is the return value (0 = dismissed)
+        // and no WM_COMMAND is sent, so a command can only ever come from
+        // this menu. Grayed items cannot be chosen, which is the `enabled`
+        // check.
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
         // ...and without this the next click on the icon is swallowed.
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
+        if let Ok(id) = u16::try_from(chosen.0)
+            && id != 0
+        {
+            command(s, id);
+        }
     }
 }
 
@@ -608,12 +638,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
-            // Menu commands come with a zero lParam; EN_* notifications from
-            // the EDIT carry its HWND and are ignored.
-            WM_COMMAND if lparam.0 == 0 && hiword(wparam.0) == 0 => {
-                command(s, loword(wparam.0) as u16);
-                LRESULT(0)
-            }
+            // No WM_COMMAND arm on purpose: menu choices arrive as the
+            // return value of TrackPopupMenu (see `show_menu`), so a
+            // WM_COMMAND posted from outside falls through to DefWindowProc.
             WM_APP_QUIT | WM_DESTROY => {
                 if (*s).tray_added {
                     let data = tray_data(s);

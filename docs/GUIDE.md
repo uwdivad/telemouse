@@ -1432,7 +1432,10 @@ a terminal it leaves it alone, so logs stay in view.
 target\debug`: window + grey icon; right-click → *Start capture* → green
 within a second and the web page agrees; *Stop capture* → grey, "exited:
 Ctrl-Break" in the log tail; close → hidden, icon click → back; *Exit* →
-children stopped, icon gone. Menu ids are plain `WM_COMMAND`s, so the whole
-loop can be driven from PowerShell (`FindWindow('TelemouseCtlWindow',
-'telemouse-ctl')`, then `PostMessage(h, 0x111, 1002, 0)` for start,
-`1003` stop, `1007` exit).
+children stopped, icon gone. Menu choices are the return value of
+`TrackPopupMenu` (`TPM_RETURNCMD`), not `WM_COMMAND`s — a posted
+`WM_COMMAND` from another process is ignored, since it could otherwise start
+a capture or exit the panel. To script the same loop, use the HTTP API the
+page uses (`Invoke-RestMethod -Method Post -Headers @{'X-Telemouse-Ctl'='1'}
+http://127.0.0.1:7880/api/components/capture/start`, then `/stop`) and watch
+the icon follow; `WM_CLOSE` (0x10) posted to the window still hides it.

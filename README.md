@@ -290,6 +290,7 @@ telemouse-ctl.exe serve --no-gui                     # headless: web page only (
 telemouse-ctl.exe serve --http 127.0.0.1:7899        # panel on another port
 telemouse-ctl.exe serve --bin-dir D:\telemouse\bin   # binaries somewhere else
 telemouse-ctl.exe serve --config C:\path\telemouse.toml
+telemouse-ctl.exe serve --log-dir D:\telemouse\logs  # ctl.log + <component>.log somewhere else
 $env:RUST_LOG = 'info,telemouse_ctl=debug'; telemouse-ctl.exe   # snapshot cadence, tray events
 ```
 
