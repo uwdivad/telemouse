@@ -23,6 +23,11 @@ no in-game overlay.
 
 ## Quick start
 
+Prebuilt binaries: each [GitHub release](https://github.com/uwdivad/telemouse/releases)
+ships `telemouse-vX.Y.Z-windows-x86_64.zip` (the four executables,
+`telemouse.toml`, docs) with a SHA-256 alongside. Unzip, edit
+`telemouse.toml`, run `telemouse-ctl.exe`. From source:
+
 ```powershell
 # 0. One-time: check your environment (QPC clock, monitors, UDP, Kafka reachability)
 cargo run -p telemouse-capture -- doctor
@@ -376,7 +381,7 @@ in the browser alongside lag-behind-live and render FPS. `seq_no` gaps
 ## Development
 
 ```powershell
-cargo test --workspace              # 368 tests; no mouse, admin, Kafka, or browser needed
+cargo test --workspace              # 407 tests; no mouse, admin, Kafka, or browser needed
 cargo bench -p telemouse-analyze    # criterion benches over the loader + hot math
 cargo bench -p telemouse-core       # wire encode/decode, batcher
 # numbers, method and what is left on the table: docs/BENCHMARKS.md
@@ -386,6 +391,19 @@ cargo build --profile profiling     # release speed + debug symbols for flamegra
 Append `?profile=1` to the viz URL for an in-page frame-time breakdown.
 The August 2026 performance/observability audit and its resolutions are
 documented in [docs/AUDIT-2026-08.md](docs/AUDIT-2026-08.md).
+
+**Releasing.** CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on
+every push. A release is a tag: bump `version` in the root `Cargo.toml`, add
+a `## [X.Y.Z]` section to `CHANGELOG.md`, commit, then
+
+```powershell
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin master vX.Y.Z
+```
+
+`release.yml` refuses a tag that does not match the Cargo version, builds and
+tests in release mode, zips the binaries with the config and docs, and publishes
+a GitHub Release whose notes are that changelog section.
 
 Win32 code is isolated behind `#[cfg(windows)]`; all metric math, batching,
 clock mapping and wire logic is pure and unit-tested (flick detection is tested

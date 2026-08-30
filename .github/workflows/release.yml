@@ -1,0 +1,70 @@
+name: release
+
+# Pushing a `v*` tag builds the four binaries in release mode on Windows,
+# packages them with the sample config and docs, and attaches the zip to a
+# GitHub Release for that tag. Release notes are the matching section of
+# CHANGELOG.md.
+#
+#   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "tag v$tag but [workspace.package] version = $ver" }
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "telemouse-${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $name
+          Copy-Item telemouse.toml, README.md, CHANGELOG.md $name
+          Copy-Item docs -Destination "$name/docs" -Recurse
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          Get-FileHash "$name.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $name.zip" } | Set-Content "$name.zip.sha256"
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($ver))\]").LineNumber
+          if (-not $start) { throw "CHANGELOG.md has no '## [$ver]' section" }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end = ($rest | Select-String -Pattern '^## \[').LineNumber
+          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          $body | Set-Content notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: telemouse ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            telemouse-${{ github.ref_name }}-windows-x86_64.zip
+            telemouse-${{ github.ref_name }}-windows-x86_64.zip.sha256
