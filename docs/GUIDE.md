@@ -1300,7 +1300,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, and the message loop. See §19.5. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` keeps a `sysinfo::System` between scans so CPU % is per interval, refreshes only cpu/memory/cmd/exe (no per-process user lookup — that cost seconds), and serves `scan_cached(ttl)` from a 4 s cache because a full table walk was ~5% of a core when polled every poll; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a 400-line `LogRing` per component, `try_wait` reaping, and the two-stage stop. |
-| `server.rs` | axum router, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config. |
+| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config. |
 | `index.html` | Self-contained page: polls `/api/state` + `/api/sessions` every 2 s (10 s while the tab is hidden), re-renders only when something structural changed and patches the live numbers otherwise, two-click kill (no modal dialogs). |
 
 ### 19.2 The API
@@ -1316,8 +1316,13 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 Every `POST` without `X-Telemouse-Ctl: 1` is a 403. A browser only adds a
 custom header to a cross-origin request after a CORS preflight, which this
 server never answers, so a stray web page cannot reach the panel via
-`localhost`. That plus the loopback bind is the whole security model — the
-panel is a local tool that can terminate processes, and is documented as such.
+`localhost`. DNS rebinding would make such a page same-origin, so every
+request (GET included — `/api/state` returns child command lines and logs) is
+also refused with 403 unless its `Host` is an IP literal, `localhost`, or
+`*.localhost` (`telemouse_core::localhost`, shared with viz, which applies the
+same rule and an `Origin` check on `/ws`). That plus the loopback bind is the
+whole security model — the panel is a local tool that can terminate processes,
+and is documented as such.
 
 ### 19.3 How a stop works
 

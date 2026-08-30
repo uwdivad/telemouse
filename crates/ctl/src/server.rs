@@ -5,16 +5,25 @@
 //! a CORS preflight — which this server never answers — so a web page the user
 //! happens to have open cannot stop the capture agent or kill a process by
 //! poking `localhost`.
+//!
+//! That guard assumes the attacker's page is cross-origin. DNS rebinding makes
+//! it same-origin: a name the attacker controls re-resolves to `127.0.0.1`,
+//! and the page may then set any header it likes. The `Host` header still
+//! carries the attacker's name, so every request — GET included, `/api/state`
+//! returns child command lines and logs — is refused unless `Host` names this
+//! machine (see [`telemouse_core::localhost`]).
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
+use telemouse_core::localhost::host_is_trusted;
 use tracing::{info, warn};
 
 use crate::manager::{Manager, StartError, StartRequest, StopError};
@@ -65,7 +74,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/components/{id}/start", post(api_start))
         .route("/api/components/{id}/stop", post(api_stop))
         .route("/api/processes/{pid}/kill", post(api_kill))
+        .layer(middleware::from_fn(require_local_host))
         .with_state(state)
+}
+
+/// Refuse any request whose `Host` is a DNS name other than `localhost`: that
+/// is what a DNS-rebinding page looks like from here. IP literals always pass.
+async fn require_local_host(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !host_is_trusted(host) {
+        warn!(host, path = %req.uri().path(), "refusing request with a non-local Host header");
+        return error(StatusCode::FORBIDDEN, "host not allowed");
+    }
+    next.run(req).await
 }
 
 async fn index(State(st): State<AppState>) -> Response {
@@ -239,7 +264,10 @@ mod tests {
         guarded: bool,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value, String) {
-        let mut req = Request::builder().method(method).uri(uri);
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:7880");
         if guarded {
             req = req.header(GUARD_HEADER, "1");
         }
@@ -306,6 +334,34 @@ mod tests {
             assert!(p["pid"].is_number());
             assert!(p["kind"].is_string());
         }
+    }
+
+    /// A DNS-rebound page is same-origin and can set the guard header; the
+    /// `Host` it sends is the only thing that gives it away.
+    #[tokio::test]
+    async fn rebound_host_names_are_refused_even_with_the_guard_header() {
+        for (uri, method) in [
+            ("/", Method::GET),
+            ("/api/state", Method::GET),
+            ("/api/components/capture/stop", Method::POST),
+            ("/api/processes/1/kill", Method::POST),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, "evil.com")
+                .header(GUARD_HEADER, "1")
+                .body(Body::empty())
+                .unwrap();
+            let res = router(state()).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        let req = Request::builder()
+            .uri("/healthz")
+            .header(header::HOST, "localhost:7880")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router(state()).oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

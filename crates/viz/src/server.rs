@@ -1,18 +1,27 @@
 //! HTTP + WebSocket surface: the embedded page, the replay REST endpoints, and
 //! the `/ws` live fan-out.
+//!
+//! There is no authentication: this is a local tool. What it does defend
+//! against is the browser itself being used against it — a web page the user
+//! happens to have open reading the live stream or the recordings. Every
+//! request must carry a `Host` naming this machine (so a DNS-rebound name is
+//! refused), and a WebSocket upgrade must come from a local `Origin` or from
+//! no browser at all. See [`telemouse_core::localhost`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use telemouse_core::config::ObsConfig;
+use telemouse_core::localhost::{host_is_trusted, origin_is_trusted};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
@@ -73,7 +82,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/sessions", get(api_sessions))
         .route("/api/session/{id}", get(api_session))
+        .layer(middleware::from_fn(require_local_host))
         .with_state(state)
+}
+
+/// Refuse any request whose `Host` is a DNS name other than `localhost`: that
+/// is what a DNS-rebinding page looks like from here. IP literals always pass
+/// so a deliberate LAN bind keeps working.
+async fn require_local_host(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !host_is_trusted(host) {
+        warn!(host, path = %req.uri().path(), "refusing request with a non-local Host header");
+        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+    next.run(req).await
 }
 
 /// The bridge's own health, in the same shape the page receives once a second
@@ -161,8 +187,30 @@ async fn api_session(State(st): State<AppState>, Path(id): Path<String>) -> Resp
     (headers, Body::from_stream(ReaderStream::new(file))).into_response()
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| client_loop(socket, st))
+/// WebSocket upgrades are exempt from CORS, so a page anywhere on the web
+/// could otherwise open this socket and read every mouse delta. A browser
+/// always sends `Origin` on an upgrade; a non-browser client (a script, a
+/// second bridge) sends none and is let through.
+///
+/// The extractor is taken as a `Result` so the origin is judged before any
+/// handshake validation: a foreign page gets 403, never a hint about what a
+/// well-formed upgrade would look like.
+async fn ws_upgrade(
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    headers: HeaderMap,
+    State(st): State<AppState>,
+) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or("");
+        if !origin_is_trusted(origin) {
+            warn!(origin, "refusing websocket from a non-local origin");
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
+    match ws {
+        Ok(ws) => ws.on_upgrade(move |socket| client_loop(socket, st)),
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
 /// One shared `Utf8Bytes` frame becomes one WebSocket text frame per client.
@@ -287,14 +335,76 @@ mod tests {
     }
 
     async fn get(state: AppState, uri: &str) -> (StatusCode, HeaderMap, String) {
+        get_with(state, uri, &[("host", "127.0.0.1:7879")]).await
+    }
+
+    async fn get_with(
+        state: AppState,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::builder().uri(uri);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
         let res = router(state)
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = res.status();
         let headers = res.headers().clone();
         let body = to_bytes(res.into_body(), 64 * 1024 * 1024).await.unwrap();
         (status, headers, String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn rebound_host_names_are_refused_everywhere() {
+        let st = state_with(PathBuf::from("recordings"));
+        for uri in ["/", "/healthz", "/api/stats", "/api/sessions", "/api/session/x", "/ws"] {
+            let (status, _, _) = get_with(st.clone(), uri, &[("host", "evil.com:7879")]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+        // A missing Host (HTTP/1.0 client) is not a browser and not a rebinding.
+        let (status, _, _) = get_with(st.clone(), "/healthz", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        for host in ["localhost:7879", "127.0.0.1", "[::1]:7879", "192.168.1.20:7879"] {
+            let (status, _, _) = get_with(st.clone(), "/healthz", &[("host", host)]).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+        }
+    }
+
+    /// The `/ws` route is reached through `require_local_host` and then the
+    /// Origin check; both must answer before any upgrade handshake happens.
+    #[tokio::test]
+    async fn websocket_refuses_foreign_origins() {
+        let st = state_with(PathBuf::from("recordings"));
+        let ws_headers = |origin: Option<&'static str>| {
+            let mut h = vec![
+                ("host", "127.0.0.1:7879"),
+                ("connection", "upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ];
+            if let Some(o) = origin {
+                h.push(("origin", o));
+            }
+            h
+        };
+        let (status, _, body) = get_with(st.clone(), "/ws", &ws_headers(Some("http://evil.com"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "origin not allowed");
+        let (status, _, _) = get_with(st.clone(), "/ws", &ws_headers(Some("null"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Same-machine browser, and a non-browser client with no Origin at all,
+        // both get past the origin check and into the handshake. `oneshot`
+        // carries no upgradable connection, so the handshake itself answers
+        // 426 — which is the extractor speaking, not the origin check.
+        for origin in [Some("http://127.0.0.1:7879"), Some("http://localhost:7879"), None] {
+            let (status, _, body) = get_with(st.clone(), "/ws", &ws_headers(origin)).await;
+            assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{origin:?}");
+            assert_ne!(body, "origin not allowed");
+        }
     }
 
     #[tokio::test]

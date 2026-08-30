@@ -106,6 +106,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let http_addr: SocketAddr = http_addr_s
         .parse()
         .with_context(|| format!("invalid --http address {http_addr_s:?}"))?;
+    if !http_addr.ip().is_loopback() {
+        // There is no authentication on the page, the stream, or the recordings.
+        warn!(%http_addr, "viz is listening on a non-loopback address; anyone who can reach it can watch the live stream and download every recording");
+    }
 
     let hub = Arc::new(Hub::new());
 

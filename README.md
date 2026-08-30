@@ -213,7 +213,12 @@ Binaries are looked up next to `telemouse-ctl` itself (so `cargo build
 `--bin-dir` points elsewhere. The API is plain JSON (`GET /api/state`,
 `POST /api/components/{id}/start|stop`, `POST /api/processes/{pid}/kill`);
 mutating calls must carry an `X-Telemouse-Ctl: 1` header, which keeps a random
-web page open in the same browser from reaching the panel through `localhost`.
+web page open in the same browser from reaching the panel through `localhost`,
+and every request must carry a `Host` naming this machine (an IP literal or
+`localhost`), which defeats DNS rebinding. `telemouse-viz` applies the same
+`Host` rule and additionally refuses WebSocket upgrades from a non-local
+`Origin`, so a web page cannot read the live stream. Neither server has any
+authentication beyond that: keep both on loopback unless you mean otherwise.
 The panel refuses to kill any process the scan would not list, and never
 accepts arbitrary command-line arguments — only the flags shown on the cards.
 

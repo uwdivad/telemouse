@@ -14,6 +14,7 @@ pub mod batcher;
 pub mod clock;
 pub mod config;
 pub mod event;
+pub mod localhost;
 pub mod session;
 pub mod units;
 pub mod wire;
