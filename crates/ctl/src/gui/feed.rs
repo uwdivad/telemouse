@@ -102,7 +102,12 @@ pub async fn run_publisher(
             recording_enabled: rec.enabled,
             recording_dir: rec.dir,
         };
-        debug!(visible = vis, poked, processes = snap.processes.len(), "gui snapshot");
+        debug!(
+            visible = vis,
+            poked,
+            processes = snap.processes.len(),
+            "gui snapshot"
+        );
         if tx.send(Arc::new(snap)).is_err() {
             debug!("gui snapshot receiver gone; publisher exiting");
             return;
@@ -115,9 +120,16 @@ pub async fn run_publisher(
 /// card's switch, resolved by the manager. The outcome is logged and shows
 /// up in the next snapshot.
 pub fn start(link: &GuiLink, id: &'static str, save: Option<bool>) {
-    let (m, s, poke) = (link.manager.clone(), link.scanner.clone(), link.poke.clone());
+    let (m, s, poke) = (
+        link.manager.clone(),
+        link.scanner.clone(),
+        link.poke.clone(),
+    );
     link.handle.spawn(async move {
-        let req = StartRequest { save, ..Default::default() };
+        let req = StartRequest {
+            save,
+            ..Default::default()
+        };
         match m.start(id, &req).await {
             Ok(pid) => info!(component = id, pid, save = ?save, "started from the tray"),
             Err(e) => warn!(component = id, error = %e, "tray start refused"),
@@ -129,7 +141,11 @@ pub fn start(link: &GuiLink, id: &'static str, save: Option<bool>) {
 
 /// Graceful stop (Ctrl-Break, then terminate after the grace period).
 pub fn stop(link: &GuiLink, id: &'static str) {
-    let (m, s, poke) = (link.manager.clone(), link.scanner.clone(), link.poke.clone());
+    let (m, s, poke) = (
+        link.manager.clone(),
+        link.scanner.clone(),
+        link.poke.clone(),
+    );
     link.handle.spawn(async move {
         match m.stop(id, false).await {
             Ok(outcome) => info!(component = id, ?outcome, "stopped from the tray"),
@@ -183,7 +199,12 @@ mod tests {
                 w.fetch_add(1, Ordering::Relaxed);
             }),
         ));
-        Rig { rx, poke, wakes, task }
+        Rig {
+            rx,
+            poke,
+            wakes,
+            task,
+        }
     }
 
     async fn next(rx: &mut watch::Receiver<Arc<Snapshot>>) -> Arc<Snapshot> {
@@ -216,10 +237,16 @@ mod tests {
         let t0 = std::time::Instant::now();
         r.poke.notify_one();
         let s = next(&mut r.rx).await;
-        assert!(t0.elapsed() < Duration::from_secs(2), "poke must not wait for the cadence");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "poke must not wait for the cadence"
+        );
         assert_eq!(s.components.len(), crate::manager::COMPONENTS.len());
         assert!(s.processes.is_empty(), "no process scan while hidden");
-        assert!(s.components.iter().all(|c| c.log.is_empty()), "no log lines while hidden");
+        assert!(
+            s.components.iter().all(|c| c.log.is_empty()),
+            "no log lines while hidden"
+        );
         r.task.abort();
     }
 
@@ -250,9 +277,13 @@ mod tests {
         // No binaries: the start fails at spawn, the stop finds nothing running;
         // both must still poke so the UI refreshes.
         start(&link, "capture", Some(false));
-        tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), poke.notified())
+            .await
+            .unwrap();
         stop(&link, "viz");
-        tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), poke.notified())
+            .await
+            .unwrap();
         assert!(link.manager.snapshot(1).await.iter().all(|c| !c.running));
     }
 }

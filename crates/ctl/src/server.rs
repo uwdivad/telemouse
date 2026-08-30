@@ -112,10 +112,11 @@ fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, axum::Json(json!({ "error": msg.to_string() }))).into_response()
 }
 
-fn guard(headers: &HeaderMap) -> Result<(), Response> {
+/// The refusal to send back, if the request lacks the guard header.
+fn guard(headers: &HeaderMap) -> Option<Response> {
     match headers.get(GUARD_HEADER) {
-        Some(v) if v == "1" => Ok(()),
-        _ => Err(error(
+        Some(v) if v == "1" => None,
+        _ => Some(error(
             StatusCode::FORBIDDEN,
             format!("mutating requests must carry the {GUARD_HEADER}: 1 header"),
         )),
@@ -153,7 +154,7 @@ async fn api_start(
     headers: HeaderMap,
     body: Option<axum::Json<StartRequest>>,
 ) -> Response {
-    if let Err(r) = guard(&headers) {
+    if let Some(r) = guard(&headers) {
         return r;
     }
     let req = body.map(|b| b.0).unwrap_or_default();
@@ -190,7 +191,7 @@ async fn api_stop(
     headers: HeaderMap,
     body: Option<axum::Json<StopBody>>,
 ) -> Response {
-    if let Err(r) = guard(&headers) {
+    if let Some(r) = guard(&headers) {
         return r;
     }
     let force = body.map(|b| b.0.force).unwrap_or(false);
@@ -199,13 +200,19 @@ async fn api_stop(
             st.scanner.invalidate();
             axum::Json(json!({ "ok": true, "outcome": outcome })).into_response()
         }
-        Err(StopError::UnknownComponent) => error(StatusCode::NOT_FOUND, StopError::UnknownComponent),
+        Err(StopError::UnknownComponent) => {
+            error(StatusCode::NOT_FOUND, StopError::UnknownComponent)
+        }
         Err(StopError::NotRunning) => error(StatusCode::CONFLICT, StopError::NotRunning),
     }
 }
 
-async fn api_kill(State(st): State<AppState>, Path(pid): Path<u32>, headers: HeaderMap) -> Response {
-    if let Err(r) = guard(&headers) {
+async fn api_kill(
+    State(st): State<AppState>,
+    Path(pid): Path<u32>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(r) = guard(&headers) {
         return r;
     }
     let scanner = st.scanner.clone();
@@ -296,8 +303,17 @@ mod tests {
         assert!(html.contains("<html"));
         assert!(!html.contains(CONFIG_PLACEHOLDER));
         assert!(html.contains("\"viz_http\":\"127.0.0.1:7879\""));
-        for forbidden in ["src=\"http", "href=\"http", "//cdn.", "unpkg.com", "jsdelivr"] {
-            assert!(!INDEX_HTML.contains(forbidden), "external asset: {forbidden}");
+        for forbidden in [
+            "src=\"http",
+            "href=\"http",
+            "//cdn.",
+            "unpkg.com",
+            "jsdelivr",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(forbidden),
+                "external asset: {forbidden}"
+            );
         }
         assert_eq!(INDEX_HTML.matches(CONFIG_PLACEHOLDER).count(), 1);
         // The page must send the guard header, or nothing it does will work.
@@ -326,8 +342,20 @@ mod tests {
         assert_eq!(cap["kind"], "service");
         assert_eq!(cap["running"], false);
         assert_eq!(cap["bin_found"], false);
-        assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--no-kafka"));
-        assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--record"));
+        assert!(
+            cap["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["flag"] == "--no-kafka")
+        );
+        assert!(
+            cap["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["flag"] == "--record")
+        );
         assert_eq!(cap["saving"], false);
         assert_eq!(cap["exits"], 0);
         assert_eq!(cap["unexpected_exits"], 0);
@@ -366,7 +394,10 @@ mod tests {
             .header(header::HOST, "localhost:7880")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(router(state()).oneshot(req).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            router(state()).oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -378,7 +409,12 @@ mod tests {
         ] {
             let (status, v, _) = call(state(), Method::POST, uri, false, None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
-            assert!(v["error"].as_str().unwrap().contains("X-Telemouse-Ctl".to_lowercase().as_str()));
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("X-Telemouse-Ctl".to_lowercase().as_str())
+            );
         }
         // GETs are open: the page has to load before it can send anything.
         let (status, _, _) = call(state(), Method::GET, "/api/sessions", false, None).await;
@@ -415,7 +451,14 @@ mod tests {
     #[tokio::test]
     async fn start_and_stop_map_manager_errors_to_statuses() {
         let st = state();
-        let (s, _, _) = call(st.clone(), Method::POST, "/api/components/nope/start", true, None).await;
+        let (s, _, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/components/nope/start",
+            true,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         let (s, v, _) = call(
             st.clone(),
@@ -437,11 +480,25 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         // Binary directory is empty: the spawn itself fails.
-        let (s, v, _) = call(st.clone(), Method::POST, "/api/components/viz/start", true, None).await;
+        let (s, v, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/components/viz/start",
+            true,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(v["error"].as_str().unwrap().contains("could not start"));
 
-        let (s, _, _) = call(st.clone(), Method::POST, "/api/components/viz/stop", true, None).await;
+        let (s, _, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/components/viz/stop",
+            true,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
         let (s, _, _) = call(st, Method::POST, "/api/components/nope/stop", true, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -451,15 +508,39 @@ mod tests {
     async fn kill_refuses_self_unrelated_and_unknown_pids() {
         let st = state();
         let me = std::process::id();
-        let (s, v, _) = call(st.clone(), Method::POST, &format!("/api/processes/{me}/kill"), true, None).await;
+        let (s, v, _) = call(
+            st.clone(),
+            Method::POST,
+            &format!("/api/processes/{me}/kill"),
+            true,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert!(v["error"].as_str().unwrap().contains("itself"));
 
         let system_pid = if cfg!(windows) { 4 } else { 1 };
-        let (s, _, _) = call(st.clone(), Method::POST, &format!("/api/processes/{system_pid}/kill"), true, None).await;
-        assert!(matches!(s, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{s}");
+        let (s, _, _) = call(
+            st.clone(),
+            Method::POST,
+            &format!("/api/processes/{system_pid}/kill"),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(s, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+            "{s}"
+        );
 
-        let (s, _, _) = call(st, Method::POST, "/api/processes/4294967200/kill", true, None).await;
+        let (s, _, _) = call(
+            st,
+            Method::POST,
+            "/api/processes/4294967200/kill",
+            true,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 

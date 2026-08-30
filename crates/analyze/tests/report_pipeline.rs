@@ -162,11 +162,7 @@ fn full_pipeline_over_a_written_recording() {
         r.segments.iter().map(|s| s.flicks).sum::<usize>(),
         r.flicks.count
     );
-    assert!(
-        r.per_second
-            .iter()
-            .any(|s| s.marker_label == "round-start")
-    );
+    assert!(r.per_second.iter().any(|s| s.marker_label == "round-start"));
 
     // --- render -----------------------------------------------------------
     let text = r.render();

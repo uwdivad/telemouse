@@ -239,7 +239,11 @@ pub fn path_efficiency_in(p: &Prepared, a: usize, b: usize) -> (f64, f64) {
         sum_path += path;
     }
     (
-        if sum_path > 0.0 { sum_net / sum_path } else { 0.0 },
+        if sum_path > 0.0 {
+            sum_net / sum_path
+        } else {
+            0.0
+        },
         stats::median(&effs).unwrap_or(0.0),
     )
 }
@@ -342,7 +346,8 @@ mod tests {
             (k.accel_cm_per_s2.median - p.counts_to_cm(k.accel_counts_per_s2.median)).abs() < 1e-6
         );
         assert!(
-            (k.accel_deg_per_s2.median - k.accel_counts_per_s2.median * FIXTURE_DEG_PER_COUNT).abs()
+            (k.accel_deg_per_s2.median - k.accel_counts_per_s2.median * FIXTURE_DEG_PER_COUNT)
+                .abs()
                 < 1e-6
         );
 

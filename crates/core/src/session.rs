@@ -90,7 +90,11 @@ mod tests {
         let mut games = BTreeMap::new();
         games.insert(
             "cs2.exe".to_string(),
-            GameSens { sens: 1.1, yaw_coeff: 0.022, pitch_coeff: 0.022 },
+            GameSens {
+                sens: 1.1,
+                yaw_coeff: 0.022,
+                pitch_coeff: 0.022,
+            },
         );
         SessionConfig {
             session_id: "s-1".into(),
@@ -105,7 +109,12 @@ mod tests {
             mouse_cpi: 1600.0,
             devices: vec![r"\\?\HID#VID_1532&PID_0099".into()],
             games,
-            monitors: vec![MonitorInfo { width: 2560, height: 1440, refresh_hz: Some(240), primary: true }],
+            monitors: vec![MonitorInfo {
+                width: 2560,
+                height: 1440,
+                refresh_hz: Some(240),
+                primary: true,
+            }],
             capture_version: "0.1.0".into(),
             coalesce_ms: 2,
         }

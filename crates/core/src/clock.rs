@@ -57,7 +57,7 @@ mod tests {
 
     fn anchor() -> QpcAnchor {
         QpcAnchor {
-            qpc: 5_000_000_000,          // 500s of uptime
+            qpc: 5_000_000_000,            // 500s of uptime
             utc_us: 1_756_000_000_000_000, // some 2025-era UTC µs
             qpc_freq: FREQ,
         }
@@ -99,10 +99,7 @@ mod tests {
             qpc_freq: FREQ,
         };
         let one_hour = FREQ * 3600;
-        assert_eq!(
-            a.qpc_to_utc_us(a.qpc + one_hour),
-            a.utc_us + 3_600_000_000
-        );
+        assert_eq!(a.qpc_to_utc_us(a.qpc + one_hour), a.utc_us + 3_600_000_000);
     }
 
     #[test]
@@ -111,9 +108,24 @@ mod tests {
         // Sign spread, values straddling multiples of 10, and range extremes
         // (qpc = 0 and qpc = u64::MAX both stay in-range around the anchor).
         let dticks: [i128; 21] = [
-            0, 1, -1, 3, -3, 9, -9, 10, -10, 11, -11, 19, -19, 20, -20,
-            999_999_999_999, -4_999_999_999,
-            -(anchor().qpc as i128),              // qpc = 0
+            0,
+            1,
+            -1,
+            3,
+            -3,
+            9,
+            -9,
+            10,
+            -10,
+            11,
+            -11,
+            19,
+            -19,
+            20,
+            -20,
+            999_999_999_999,
+            -4_999_999_999,
+            -(anchor().qpc as i128),                 // qpc = 0
             u64::MAX as i128 - anchor().qpc as i128, // qpc = u64::MAX
             u64::MAX as i128 / 2,
             -(anchor().qpc as i128) + 7,

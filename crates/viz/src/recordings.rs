@@ -248,7 +248,11 @@ mod tests {
         );
         write(tmp.path(), "s.jsonl", &body);
         let list = list_recordings(tmp.path());
-        assert_eq!(list[0].started_utc_us, Some(1756000000000500), "anchor.utc_us wins over started_utc_us");
+        assert_eq!(
+            list[0].started_utc_us,
+            Some(1756000000000500),
+            "anchor.utc_us wins over started_utc_us"
+        );
         assert_eq!(list[0].ended_utc_us, Some(1756000009000000));
     }
 
@@ -276,13 +280,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "junk.jsonl", "not json\n{\"type\":\"other\"}\n");
         write(tmp.path(), "empty.jsonl", "");
-        assert_eq!(probe_time_range(&tmp.path().join("junk.jsonl")), (None, None));
-        assert_eq!(probe_time_range(&tmp.path().join("empty.jsonl")), (None, None));
+        assert_eq!(
+            probe_time_range(&tmp.path().join("junk.jsonl")),
+            (None, None)
+        );
+        assert_eq!(
+            probe_time_range(&tmp.path().join("empty.jsonl")),
+            (None, None)
+        );
     }
 
     #[test]
     fn bundled_demo_recording_reports_its_time_range() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent()).unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap();
         let Some(path) = resolve_recording(&repo_root.join("recordings"), "demo-session") else {
             return;
         };
@@ -317,9 +330,9 @@ mod tests {
             "C:\\Windows\\win.ini",
             r"\\server\share\x",
             "demo/../demo",
-            "demo.jsonl",  // extension is added by us, not supplied
-            "demo:$DATA",  // NTFS alternate data stream
-            "demo ",       // trailing space
+            "demo.jsonl", // extension is added by us, not supplied
+            "demo:$DATA", // NTFS alternate data stream
+            "demo ",      // trailing space
             ".hidden",
             "",
         ] {

@@ -480,7 +480,10 @@ mod tests {
     #[test]
     fn run_residual_matches_a_dense_boxcar() {
         let mut b = StreamBuilder::new();
-        b.move_ms(30, 7, 0).idle_ms(900).move_ms(40, -3, 2).idle_ms(600);
+        b.move_ms(30, 7, 0)
+            .idle_ms(900)
+            .move_ms(40, -3, 2)
+            .idle_ms(600);
         let p = prep(b.into_events());
         let half = p.params.tremor_baseline_ms / 2;
         let dense_vx = p.grid.dense(|r, j| r.vx[j]);

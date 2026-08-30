@@ -674,7 +674,9 @@ mod tests {
             "s-test.jsonl",
             &[
                 Envelope::Session(cfg.clone()).to_json().unwrap(),
-                batch_env(&cfg, 0, Some("cs2.exe"), 0, vec![e]).to_json().unwrap(),
+                batch_env(&cfg, 0, Some("cs2.exe"), 0, vec![e])
+                    .to_json()
+                    .unwrap(),
                 // A pre-device-tracking line, written by hand.
                 format!(
                     r#"{{"type":"batch","session_id":"s-test","seq_no":1,"ts_anchor_us":{},"pointer_locked":true,"screen_w":1,"screen_h":1,"drops_since_last":0,"events":[{{"ts_qpc":{},"dx":1,"dy":1,"buttons":0,"wheel":0}}]}}"#,

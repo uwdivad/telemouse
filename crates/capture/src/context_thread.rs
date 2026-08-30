@@ -428,11 +428,7 @@ mod tests {
         assert_eq!(changes.len(), 3, "{changes:?}");
         assert!(changes.iter().any(|c| c.starts_with("mouse_cpi: 1600")));
         assert!(changes.iter().any(|c| c.contains("udp.addr")));
-        assert!(
-            changes
-                .iter()
-                .any(|c| c == "kafka.enabled: false -> true")
-        );
+        assert!(changes.iter().any(|c| c == "kafka.enabled: false -> true"));
     }
 
     #[test]

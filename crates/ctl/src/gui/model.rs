@@ -101,7 +101,12 @@ pub fn focus_component(components: &[ComponentState]) -> Option<&ComponentState>
 }
 
 fn hms_utc(unix_s: u64) -> String {
-    format!("{:02}:{:02}:{:02}", (unix_s / 3600) % 24, (unix_s / 60) % 60, unix_s % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        (unix_s / 3600) % 24,
+        (unix_s / 60) % 60,
+        unix_s % 60
+    )
 }
 
 /// The whole body of the status window. CRLF line endings: a Win32 `EDIT`
@@ -110,7 +115,10 @@ fn hms_utc(unix_s: u64) -> String {
 pub fn render_text(s: &Snapshot) -> String {
     let now = s.now_unix_s;
     let mut out: Vec<String> = Vec::with_capacity(64);
-    out.push(format!("COMPONENTS                                              refreshed {} UTC", hms_utc(now)));
+    out.push(format!(
+        "COMPONENTS                                              refreshed {} UTC",
+        hms_utc(now)
+    ));
     for c in &s.components {
         let state = if c.running {
             "running"
@@ -119,7 +127,10 @@ pub fn render_text(s: &Snapshot) -> String {
         } else {
             "not built"
         };
-        let pid = c.pid.map(|p| format!("pid {p}")).unwrap_or_else(|| "-".into());
+        let pid = c
+            .pid
+            .map(|p| format!("pid {p}"))
+            .unwrap_or_else(|| "-".into());
         let up = match (c.running, c.since_unix_s) {
             (true, Some(since)) => format!("up {}", format_uptime(now, since)),
             _ => "-".into(),
@@ -132,7 +143,10 @@ pub fn render_text(s: &Snapshot) -> String {
             Kind::Service => "service",
             Kind::Task => "task",
         };
-        out.push(format!("{:<17} {:<8} {:<10} {:<11} {:<12} {:<18} {}", c.label, kind, state, pid, up, last, c.summary));
+        out.push(format!(
+            "{:<17} {:<8} {:<10} {:<11} {:<12} {:<18} {}",
+            c.label, kind, state, pid, up, last, c.summary
+        ));
     }
     out.push(String::new());
     let cap = component(s, "capture");
@@ -146,17 +160,26 @@ pub fn render_text(s: &Snapshot) -> String {
         Some(c) if c.running => "; capture is NOT saving".to_string(),
         _ => String::new(),
     };
-    out.push(format!("SAVE DATA           default {default} (telemouse.toml [recording] enabled){now_line}"));
+    out.push(format!(
+        "{:<20}default {default} (telemouse.toml [recording] enabled){now_line}",
+        "SAVE DATA"
+    ));
     out.push(String::new());
     out.push("RELATED PROCESSES".into());
     if s.processes.is_empty() {
         out.push("  (none)".into());
     } else {
-        out.push(format!("{:>7}  {:<8} {:<24} {:>6} {:>9}", "PID", "KIND", "NAME", "CPU%", "MEM MB"));
+        out.push(format!(
+            "{:>7}  {:<8} {:<24} {:>6} {:>9}",
+            "PID", "KIND", "NAME", "CPU%", "MEM MB"
+        ));
         for p in &s.processes {
             let kind = format!("{:?}", p.kind).to_ascii_lowercase();
             let me = if p.is_self { "  (this panel)" } else { "" };
-            out.push(format!("{:>7}  {:<8} {:<24} {:>6.1} {:>9.1}{}", p.pid, kind, p.name, p.cpu_pct, p.mem_mb, me));
+            out.push(format!(
+                "{:>7}  {:<8} {:<24} {:>6.1} {:>9.1}{}",
+                p.pid, kind, p.name, p.cpu_pct, p.mem_mb, me
+            ));
         }
     }
     out.push(String::new());
@@ -195,12 +218,21 @@ pub enum MenuEntry {
 }
 
 fn item(id: u16, label: &str, enabled: bool) -> MenuEntry {
-    MenuEntry::Item(MenuItem { id, label: label.into(), enabled })
+    MenuEntry::Item(MenuItem {
+        id,
+        label: label.into(),
+        enabled,
+    })
 }
 
 /// Start is offered when the binary exists and nothing is running; stop when
 /// it is running. One of the two per service, never both.
-fn service_items(c: Option<&ComponentState>, label: &str, start_id: u16, stop_id: u16) -> MenuEntry {
+fn service_items(
+    c: Option<&ComponentState>,
+    label: &str,
+    start_id: u16,
+    stop_id: u16,
+) -> MenuEntry {
     match c {
         Some(c) if c.running => item(stop_id, &format!("Stop {label}"), true),
         Some(c) => item(start_id, &format!("Start {label}"), c.bin_found),
@@ -215,13 +247,21 @@ fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
     match component(s, "capture") {
         Some(c) if c.running => vec![item(
             MENU_STOP_CAPTURE,
-            if c.saving { "Stop capture (saving data)" } else { "Stop capture (not saving)" },
+            if c.saving {
+                "Stop capture (saving data)"
+            } else {
+                "Stop capture (not saving)"
+            },
             true,
         )],
         c => {
             let ok = c.is_some_and(|c| c.bin_found);
             vec![
-                item(MENU_START_CAPTURE, &format!("Start capture (save data → {})", s.recording_dir), ok),
+                item(
+                    MENU_START_CAPTURE,
+                    &format!("Start capture (save data → {})", s.recording_dir),
+                    ok,
+                ),
                 item(MENU_START_CAPTURE_NOSAVE, "Start capture (don't save)", ok),
             ]
         }
@@ -230,12 +270,25 @@ fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
 
 pub fn menu(s: &Snapshot, window_visible: bool) -> Vec<MenuEntry> {
     let mut v = vec![
-        item(MENU_TOGGLE_WINDOW, if window_visible { "Hide window" } else { "Show window" }, true),
+        item(
+            MENU_TOGGLE_WINDOW,
+            if window_visible {
+                "Hide window"
+            } else {
+                "Show window"
+            },
+            true,
+        ),
         MenuEntry::Separator,
     ];
     v.extend(capture_items(s));
     v.extend([
-        service_items(component(s, "viz"), "viz server", MENU_START_VIZ, MENU_STOP_VIZ),
+        service_items(
+            component(s, "viz"),
+            "viz server",
+            MENU_START_VIZ,
+            MENU_STOP_VIZ,
+        ),
         MenuEntry::Separator,
         item(MENU_OPEN_PANEL, "Open web panel", true),
         MenuEntry::Separator,
@@ -309,7 +362,13 @@ mod tests {
     use crate::manager::{ExitInfo, Flag};
     use crate::procs::{ProcInfo, ProcKind};
 
-    fn comp(id: &'static str, label: &'static str, kind: Kind, running: bool, bin_found: bool) -> ComponentState {
+    fn comp(
+        id: &'static str,
+        label: &'static str,
+        kind: Kind,
+        running: bool,
+        bin_found: bool,
+    ) -> ComponentState {
         ComponentState {
             id,
             label,
@@ -338,7 +397,13 @@ mod tests {
             recording_dir: "recordings".into(),
             now_unix_s: 1_000_000 + 3661,
             components: vec![
-                comp("capture", "Capture agent", Kind::Service, capture_running, true),
+                comp(
+                    "capture",
+                    "Capture agent",
+                    Kind::Service,
+                    capture_running,
+                    true,
+                ),
                 comp("viz", "Viz server", Kind::Service, viz_running, true),
                 comp("doctor", "Doctor", Kind::Task, false, false),
             ],
@@ -376,11 +441,17 @@ mod tests {
     #[test]
     fn tooltip_names_both_services_and_is_bounded() {
         let t = tooltip(&snap(true, false));
-        assert_eq!(t, "telemouse-ctl — capture: running 1:01:01 (saving), viz: stopped");
+        assert_eq!(
+            t,
+            "telemouse-ctl — capture: running 1:01:01 (saving), viz: stopped"
+        );
         let mut nosave = snap(true, false);
         nosave.components[0].saving = false;
         assert!(tooltip(&nosave).contains("(not saving)"));
-        assert!(!tooltip(&snap(false, false)).contains("saving"), "no note while stopped");
+        assert!(
+            !tooltip(&snap(false, false)).contains("saving"),
+            "no note while stopped"
+        );
         assert!(tooltip(&Snapshot::default()).contains("capture: ?"));
         let mut long = snap(false, false);
         long.components[0].running = true;
@@ -400,8 +471,8 @@ mod tests {
         assert_eq!(focus_component(&s.components).unwrap().id, "viz");
         let mut s = snap(false, false);
         assert!(focus_component(&s.components).is_none(), "nothing ever ran");
-        s.components[2].last_exit = Some(ExitInfo { code: Some(0), at_unix_s: 500 });
-        s.components[1].last_exit = Some(ExitInfo { code: Some(1), at_unix_s: 900 });
+        s.components[2].last_exit = Some(ExitInfo::new(Some(0), 500));
+        s.components[1].last_exit = Some(ExitInfo::new(Some(1), 900));
         assert_eq!(focus_component(&s.components).unwrap().id, "viz");
     }
 
@@ -409,7 +480,10 @@ mod tests {
     fn text_has_crlf_only_and_every_section() {
         let text = render_text(&snap(true, false));
         assert!(text.ends_with("\r\n"));
-        assert!(!text.replace("\r\n", "").contains('\n'), "bare LF would vanish in an EDIT");
+        assert!(
+            !text.replace("\r\n", "").contains('\n'),
+            "bare LF would vanish in an EDIT"
+        );
         assert!(text.contains("COMPONENTS"));
         assert!(text.contains("Capture agent"));
         assert!(text.contains("running"));
@@ -424,7 +498,10 @@ mod tests {
         let t = render_text(&off);
         assert!(t.contains("default off"));
         assert!(t.contains("capture is NOT saving"));
-        assert!(!render_text(&snap(false, false)).contains("capture is"), "no live note while stopped");
+        assert!(
+            !render_text(&snap(false, false)).contains("capture is"),
+            "no live note while stopped"
+        );
         assert!(text.contains("RELATED PROCESSES"));
         assert!(text.contains("telemouse-ctl.exe"));
         assert!(text.contains("(this panel)"));
@@ -448,7 +525,10 @@ mod tests {
         };
         let m = ids(&menu(&snap(true, false), true));
         assert!(m.contains(&(MENU_STOP_CAPTURE, true)));
-        assert!(!m.iter().any(|(id, _)| *id == MENU_START_CAPTURE || *id == MENU_START_CAPTURE_NOSAVE));
+        assert!(
+            !m.iter()
+                .any(|(id, _)| *id == MENU_START_CAPTURE || *id == MENU_START_CAPTURE_NOSAVE)
+        );
         let labels: Vec<String> = menu(&snap(true, false), true)
             .into_iter()
             .filter_map(|e| match e {
@@ -456,7 +536,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(labels.iter().any(|l| l == "Stop capture (saving data)"), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l == "Stop capture (saving data)"),
+            "{labels:?}"
+        );
         let both = ids(&menu(&snap(false, false), true));
         assert!(both.contains(&(MENU_START_CAPTURE, true)));
         assert!(both.contains(&(MENU_START_CAPTURE_NOSAVE, true)));
@@ -468,7 +551,10 @@ mod tests {
         let mut s = snap(false, false);
         s.components[0].bin_found = false;
         let m = ids(&menu(&s, false));
-        assert!(m.contains(&(MENU_START_CAPTURE, false)), "missing binary greys start");
+        assert!(
+            m.contains(&(MENU_START_CAPTURE, false)),
+            "missing binary greys start"
+        );
         assert!(m.contains(&(MENU_START_CAPTURE_NOSAVE, false)));
         assert!(m.contains(&(MENU_START_VIZ, true)));
         assert!(ids(&menu(&Snapshot::default(), false)).contains(&(MENU_START_CAPTURE, false)));
@@ -479,7 +565,10 @@ mod tests {
         };
         assert_eq!(label(true), "Hide window");
         assert_eq!(label(false), "Show window");
-        let all: Vec<u16> = ids(&menu(&snap(false, false), true)).into_iter().map(|(i, _)| i).collect();
+        let all: Vec<u16> = ids(&menu(&snap(false, false), true))
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         let mut dedup = all.clone();
         dedup.sort_unstable();
         dedup.dedup();
@@ -488,10 +577,22 @@ mod tests {
 
     #[test]
     fn panel_url_replaces_an_unspecified_bind_address() {
-        assert_eq!(panel_url("127.0.0.1:7880".parse().unwrap()), "http://127.0.0.1:7880/");
-        assert_eq!(panel_url("0.0.0.0:7880".parse().unwrap()), "http://127.0.0.1:7880/");
-        assert_eq!(panel_url("[::]:9000".parse().unwrap()), "http://127.0.0.1:9000/");
-        assert_eq!(panel_url("192.168.1.5:7880".parse().unwrap()), "http://192.168.1.5:7880/");
+        assert_eq!(
+            panel_url("127.0.0.1:7880".parse().unwrap()),
+            "http://127.0.0.1:7880/"
+        );
+        assert_eq!(
+            panel_url("0.0.0.0:7880".parse().unwrap()),
+            "http://127.0.0.1:7880/"
+        );
+        assert_eq!(
+            panel_url("[::]:9000".parse().unwrap()),
+            "http://127.0.0.1:9000/"
+        );
+        assert_eq!(
+            panel_url("192.168.1.5:7880".parse().unwrap()),
+            "http://192.168.1.5:7880/"
+        );
     }
 
     #[test]
@@ -506,7 +607,11 @@ mod tests {
                 assert_eq!(centre >> 24, 0xFF, "centre is opaque");
                 assert_eq!(px.bgra[0], 0, "corner is transparent");
                 assert_eq!(px.mask[0] & 0x80, 0x80, "corner is masked out");
-                assert_eq!(px.mask[(n / 2) * IconPixels::mask_stride(size) + (n / 2) / 8] & (0x80 >> ((n / 2) % 8)), 0);
+                assert_eq!(
+                    px.mask[(n / 2) * IconPixels::mask_stride(size) + (n / 2) / 8]
+                        & (0x80 >> ((n / 2) % 8)),
+                    0
+                );
                 // The ring is darker than the fill.
                 // Second pixel of the middle row: inside the disc, on the ring.
                 let edge = px.bgra[(n / 2) * n + 1];
@@ -516,6 +621,9 @@ mod tests {
         }
         assert_eq!(IconPixels::mask_stride(16), 2);
         assert_eq!(IconPixels::mask_stride(20), 4);
-        assert_ne!(icon_bitmap(IconState::Idle, 16).bgra, icon_bitmap(IconState::CaptureRunning, 16).bgra);
+        assert_ne!(
+            icon_bitmap(IconState::Idle, 16).bgra,
+            icon_bitmap(IconState::CaptureRunning, 16).bgra
+        );
     }
 }

@@ -196,7 +196,8 @@ impl Hub {
                 // `accepted.text` already is the shared frame — caching and
                 // broadcasting it are refcount bumps, not copies.
                 if accepted.is_session {
-                    *self.session.lock().unwrap() = Some(accepted.text.clone());
+                    *self.session.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(accepted.text.clone());
                 }
                 // Err just means "no subscribers right now" — still counted as
                 // forwarded work done; the session cache above is what matters
@@ -220,7 +221,10 @@ impl Hub {
 
     /// The cached `session` envelope JSON, if one has been seen.
     pub fn cached_session(&self) -> Option<Frame> {
-        self.session.lock().unwrap().clone()
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Subscribe a new client: the catch-up frames it should get first, plus a
@@ -229,7 +233,9 @@ impl Hub {
     /// missing one, so we read the cache while holding the lock and subscribe
     /// inside it.
     pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {
-        let guard = self.session.lock().unwrap();
+        // A poisoned lock (a client task panicked mid-publish) must not turn
+        // every later reconnect into a 500: the cached value is still whole.
+        let guard = self.session.lock().unwrap_or_else(|p| p.into_inner());
         let rx = self.tx.subscribe();
         let frames = frames_on_connect(guard.as_ref());
         drop(guard);

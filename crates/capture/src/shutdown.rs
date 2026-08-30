@@ -89,7 +89,10 @@ mod tests {
         let s = Shutdown::new();
         let start = Instant::now();
         assert!(!s.wait_timeout(Duration::from_millis(40)));
-        assert!(start.elapsed() >= Duration::from_millis(30), "returned too early");
+        assert!(
+            start.elapsed() >= Duration::from_millis(30),
+            "returned too early"
+        );
     }
 
     #[test]
@@ -104,7 +107,11 @@ mod tests {
         };
         let start = Instant::now();
         assert!(s.wait_timeout(Duration::from_secs(30)));
-        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
         setter.join().unwrap();
     }
 
@@ -121,7 +128,11 @@ mod tests {
         let start = Instant::now();
         // Returns false: woken, but shutdown was never requested.
         assert!(!s.wait_timeout(Duration::from_secs(30)));
-        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
         assert!(!s.is_set());
         notifier.join().unwrap();
     }

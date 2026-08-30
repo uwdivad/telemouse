@@ -174,8 +174,7 @@ pub fn to_csv(rows: &[SecondRow]) -> String {
     String::from_utf8(buf).expect("ASCII/UTF-8 output")
 }
 
-const FLICK_HEADER: &str =
-    "index,t_start_s,t_ballistic_end_s,t_end_s,duration_ms,amplitude_deg,amplitude_counts,\
+const FLICK_HEADER: &str = "index,t_start_s,t_ballistic_end_s,t_end_s,duration_ms,amplitude_deg,amplitude_counts,\
 peak_velocity_deg_s,peak_velocity_counts_s,overshoot_ratio,correction_deg,settle_ms,\
 time_to_click_ms,direction_deg,corrections\n";
 

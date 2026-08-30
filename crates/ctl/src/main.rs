@@ -54,12 +54,17 @@ fn init_tracing(log_dir: &std::path::Path) {
         .init();
     match file {
         Ok(_) => info!(path = %log_dir.join("ctl.log").display(), "logging to file"),
-        Err(e) => warn!(dir = %log_dir.display(), error = %e, "cannot open log file; logging to stderr only"),
+        Err(e) => {
+            warn!(dir = %log_dir.display(), error = %e, "cannot open log file; logging to stderr only")
+        }
     }
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "telemouse-ctl", about = "Control panel: start, stop and inspect telemouse processes")]
+#[command(
+    name = "telemouse-ctl",
+    about = "Control panel: start, stop and inspect telemouse processes"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -106,10 +111,11 @@ async fn main() -> Result<()> {
     // The config decides where logs go, so it is read before the subscriber
     // exists; its own failure is reported right after.
     let cfg = AppConfig::load_or_default(&args.config);
-    let log_dir = args
-        .log_dir
-        .clone()
-        .unwrap_or_else(|| cfg.as_ref().map(|c| c.ctl.log_dir.clone()).unwrap_or_else(|_| PathBuf::from("logs")));
+    let log_dir = args.log_dir.clone().unwrap_or_else(|| {
+        cfg.as_ref()
+            .map(|c| c.ctl.log_dir.clone())
+            .unwrap_or_else(|_| PathBuf::from("logs"))
+    });
     init_tracing(&log_dir);
     let cfg = match cfg {
         Ok(c) => c,
@@ -254,7 +260,10 @@ mod tests {
         assert_eq!(a.http.as_deref(), Some("127.0.0.1:9001"));
         assert_eq!(a.bin_dir, Some(PathBuf::from("target/release")));
         assert!(!a.no_gui, "the gui is on by default");
-        assert!(a.log_dir.is_none(), "log dir comes from the config by default");
+        assert!(
+            a.log_dir.is_none(),
+            "log dir comes from the config by default"
+        );
     }
 
     #[test]

@@ -118,11 +118,13 @@ impl KafkaSink {
                 // Keep the client alive for as long as the forwarder runs.
                 let _client = client;
                 runtime.block_on(async move {
-                    let forwarder =
-                        tokio::spawn(forward(rx, producers, Arc::clone(&worker_stats)));
+                    let forwarder = tokio::spawn(forward(rx, producers, Arc::clone(&worker_stats)));
                     // Resolves (with Err) the moment the sink is dropped.
                     let _ = shutdown_rx.await;
-                    if tokio::time::timeout(DRAIN_TIMEOUT, forwarder).await.is_err() {
+                    if tokio::time::timeout(DRAIN_TIMEOUT, forwarder)
+                        .await
+                        .is_err()
+                    {
                         let abandoned = worker_stats.kafka_queued.load(Ordering::Relaxed);
                         worker_stats
                             .kafka_abandoned

@@ -33,7 +33,11 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_CONFIG: &str = "telemouse.toml";
 
 #[derive(Debug, Parser)]
-#[command(name = "telemouse", version, about = "Raw mouse telemetry capture agent")]
+#[command(
+    name = "telemouse",
+    version,
+    about = "Raw mouse telemetry capture agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -140,8 +144,7 @@ struct AliveGuard {
 #[cfg(windows)]
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        self.flag
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
         // Wake the main thread so it notices immediately.
         self.shutdown.notify();
     }
@@ -323,11 +326,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     };
 
     let t3 = {
-        let (ctx, stats, shutdown) = (
-            Arc::clone(&ctx),
-            Arc::clone(&stats),
-            Arc::clone(&shutdown),
-        );
+        let (ctx, stats, shutdown) = (Arc::clone(&ctx), Arc::clone(&stats), Arc::clone(&shutdown));
         let ctx_args = ContextArgs {
             session_id: session_id.clone(),
             anchor,
@@ -486,9 +485,7 @@ fn cmd_doctor(args: DoctorArgs) -> Result<()> {
             "  monitor[{i}]     : {}x{}{}{}",
             m.width,
             m.height,
-            m.refresh_hz
-                .map(|r| format!(" @{r}Hz"))
-                .unwrap_or_default(),
+            m.refresh_hz.map(|r| format!(" @{r}Hz")).unwrap_or_default(),
             if m.primary { " (primary)" } else { "" }
         );
     }
@@ -632,7 +629,10 @@ mod tests {
         };
         assert!(args.record && !args.no_record);
         apply_cli(&mut off, &args);
-        assert!(off.recording.enabled, "--record overrides recording.enabled = false");
+        assert!(
+            off.recording.enabled,
+            "--record overrides recording.enabled = false"
+        );
         assert!(Cli::try_parse_from(["telemouse", "run", "--record", "--no-record"]).is_err());
     }
 }

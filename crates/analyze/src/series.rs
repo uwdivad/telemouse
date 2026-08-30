@@ -917,18 +917,8 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
         }
         r.vxs = sg_run(&sg, &r.vx, r.start, n, params.sg_half, dt);
         r.vys = sg_run(&sg, &r.vy, r.start, n, params.sg_half, dt);
-        r.speed_raw = r
-            .vx
-            .iter()
-            .zip(&r.vy)
-            .map(|(x, y)| x.hypot(*y))
-            .collect();
-        r.speed = r
-            .vxs
-            .iter()
-            .zip(&r.vys)
-            .map(|(x, y)| x.hypot(*y))
-            .collect();
+        r.speed_raw = r.vx.iter().zip(&r.vy).map(|(x, y)| x.hypot(*y)).collect();
+        r.speed = r.vxs.iter().zip(&r.vys).map(|(x, y)| x.hypot(*y)).collect();
         r.last_move = last_move_table(&r.speed, params.still_speed);
         r.prev_last_move = prev_last_move;
         if let Some(&v) = r.last_move.last()

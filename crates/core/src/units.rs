@@ -42,7 +42,11 @@ mod tests {
     #[test]
     fn cs2_yaw_example_from_plan() {
         // deg = counts × sens × 0.022
-        let g = GameSens { sens: 2.0, yaw_coeff: 0.022, pitch_coeff: 0.022 };
+        let g = GameSens {
+            sens: 2.0,
+            yaw_coeff: 0.022,
+            pitch_coeff: 0.022,
+        };
         assert!((counts_to_yaw_deg(100.0, &g) - 4.4).abs() < 1e-12);
     }
 

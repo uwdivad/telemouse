@@ -31,9 +31,9 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ANSI_FIXED_FONT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateBitmap, CreateFontW,
-    DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject, HBRUSH,
-    HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
+    ANSI_FIXED_FONT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateBitmap,
+    CreateFontW, DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject,
+    HBRUSH, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -44,19 +44,17 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
-    LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SendMessageW,
-    SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-    WS_VSCROLL,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW,
+    IDI_APPLICATION, LoadCursorW, LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
+    SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -153,7 +151,10 @@ fn hide_console_if_owned() {
     // SAFETY: the buffer is a plain array; the call reports how many fit.
     let n = unsafe { GetConsoleProcessList(&mut pids) };
     if n != 1 {
-        debug!(attached = n, "console shared with a shell; leaving it visible");
+        debug!(
+            attached = n,
+            "console shared with a shell; leaving it visible"
+        );
         return;
     }
     // SAFETY: no arguments; a null HWND means no console.
@@ -165,7 +166,9 @@ fn hide_console_if_owned() {
     unsafe {
         let _ = ShowWindow(console, SW_HIDE);
     }
-    info!("console window hidden (this process owns it); run from a terminal or with --no-gui to keep it");
+    info!(
+        "console window hidden (this process owns it); run from a terminal or with --no-gui to keep it"
+    );
 }
 
 /// The UI thread body. Returns when [`post_quit`] / [`post_thread_quit`]
@@ -251,12 +254,24 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
                 (FIXED_PITCH.0 | FF_MODERN.0) as u32,
                 w!("Consolas"),
             );
-            if f.is_invalid() { HFONT(GetStockObject(ANSI_FIXED_FONT).0) } else { f }
+            if f.is_invalid() {
+                HFONT(GetStockObject(ANSI_FIXED_FONT).0)
+            } else {
+                f
+            }
         };
-        SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
         SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(1 << 20)), None);
 
-        let icons = [make_icon(IconState::Idle), make_icon(IconState::CaptureRunning)];
+        let icons = [
+            make_icon(IconState::Idle),
+            make_icon(IconState::CaptureRunning),
+        ];
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
 
         // From here on the state is reached only through `ptr` — never
@@ -288,7 +303,10 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         (*ptr).link.visible.store(true, Ordering::Relaxed);
         (*ptr).link.poke.notify_one();
         refresh(ptr);
-        info!(tray = (*ptr).tray_added, "gui running; double-click the tray icon to show the window");
+        info!(
+            tray = (*ptr).tray_added,
+            "gui running; double-click the tray icon to show the window"
+        );
 
         let mut msg = MSG::default();
         loop {
@@ -342,8 +360,20 @@ unsafe fn make_icon(state: IconState) -> HICON {
     // SAFETY: the pixel buffers outlive the CreateBitmap calls, which copy;
     // both bitmaps are deleted after the icon is made from them.
     unsafe {
-        let color = CreateBitmap(ICON_SIZE as i32, ICON_SIZE as i32, 1, 32, Some(px.bgra.as_ptr() as *const c_void));
-        let mask = CreateBitmap(ICON_SIZE as i32, ICON_SIZE as i32, 1, 1, Some(px.mask.as_ptr() as *const c_void));
+        let color = CreateBitmap(
+            ICON_SIZE as i32,
+            ICON_SIZE as i32,
+            1,
+            32,
+            Some(px.bgra.as_ptr() as *const c_void),
+        );
+        let mask = CreateBitmap(
+            ICON_SIZE as i32,
+            ICON_SIZE as i32,
+            1,
+            1,
+            Some(px.mask.as_ptr() as *const c_void),
+        );
         let icon = if color.is_invalid() || mask.is_invalid() {
             None
         } else {
@@ -384,7 +414,11 @@ unsafe fn tray_data(s: *mut UiState) -> NOTIFYICONDATAW {
             hIcon: (*s).icons[(*s).icon_state.index()],
             ..Default::default()
         };
-        let tip: Vec<u16> = (*s).tooltip.encode_utf16().take(d.szTip.len() - 1).collect();
+        let tip: Vec<u16> = (*s)
+            .tooltip
+            .encode_utf16()
+            .take(d.szTip.len() - 1)
+            .collect();
         d.szTip[..tip.len()].copy_from_slice(&tip);
         d
     }
@@ -463,7 +497,11 @@ unsafe fn refresh(s: *mut UiState) {
             set_text(edit, &model::render_text(&snap));
         }
         let icon = model::icon_state(&snap);
-        let tip = if (*s).exiting { "telemouse-ctl — stopping…".to_string() } else { model::tooltip(&snap) };
+        let tip = if (*s).exiting {
+            "telemouse-ctl — stopping…".to_string()
+        } else {
+            model::tooltip(&snap)
+        };
         if icon != (*s).icon_state || tip != (*s).tooltip {
             if icon != (*s).icon_state {
                 info!(?icon, "tray icon state");
@@ -492,7 +530,11 @@ unsafe fn show_menu(s: *mut UiState) {
             let r = match e {
                 MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
                 MenuEntry::Item(i) => {
-                    let flags = if i.enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
+                    let flags = if i.enabled {
+                        MF_STRING
+                    } else {
+                        MF_STRING | MF_GRAYED
+                    };
                     let label = wide(&i.label);
                     AppendMenuW(menu, flags, i.id as usize, PCWSTR(label.as_ptr()))
                 }
@@ -551,7 +593,14 @@ unsafe fn open_panel(s: *mut UiState) {
     // SAFETY: `s` is live; the wide URL outlives the call.
     unsafe {
         let url = wide(&(*s).link.panel_url);
-        let r = ShellExecuteW(None, w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        let r = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
         if r.0 as usize > 32 {
             info!(url = %(*s).link.panel_url, "opened the web panel");
         } else {
@@ -596,7 +645,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         match msg {
             WM_SIZE => {
                 let edit = (*s).edit;
-                let _ = MoveWindow(edit, 0, 0, loword(lparam.0 as usize) as i32, hiword(lparam.0 as usize) as i32, true);
+                let _ = MoveWindow(
+                    edit,
+                    0,
+                    0,
+                    loword(lparam.0 as usize) as i32,
+                    hiword(lparam.0 as usize) as i32,
+                    true,
+                );
                 LRESULT(0)
             }
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE && (*s).tray_added => {

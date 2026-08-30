@@ -478,9 +478,15 @@ mod tests {
             batch_meta(2, Some("cs2.exe"), true, 40),
         ];
         let q = analyze(loaded_with_batches(evs, batches));
-        assert!((q.locked_fraction - 0.8).abs() < 1e-9, "{}", q.locked_fraction);
         assert!(
-            q.warnings().iter().any(|w| w.contains("pointer was locked")),
+            (q.locked_fraction - 0.8).abs() < 1e-9,
+            "{}",
+            q.locked_fraction
+        );
+        assert!(
+            q.warnings()
+                .iter()
+                .any(|w| w.contains("pointer was locked")),
             "{:?}",
             q.warnings()
         );

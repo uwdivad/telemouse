@@ -178,8 +178,7 @@ pub fn detect(p: &Prepared) -> Vec<Flick> {
                 peak_velocity_deg_s: p.peak_aim_speed(start, ballistic_end),
                 peak_velocity_counts_s: g.peak_speed(start, ballistic_end),
                 overshoot_ratio: correction_counts / amplitude_counts,
-                correction_deg: (correction_counts * ux * kx)
-                    .hypot(correction_counts * uy * ky),
+                correction_deg: (correction_counts * ux * kx).hypot(correction_counts * uy * ky),
                 settle_ms: (settle_at.saturating_sub(ballistic_end)) as f64 * dt_ms,
                 time_to_click_ms,
                 direction_deg: ady.atan2(adx).to_degrees(),
@@ -491,12 +490,16 @@ mod tests {
             b.move_ms(20, 50, 0).idle_ms(10);
             if i % 3 != 2 {
                 // Most flicks are followed by a click inside the window...
-                b.button(buttons::LEFT_DOWN).idle_ms(20).button(buttons::LEFT_UP);
+                b.button(buttons::LEFT_DOWN)
+                    .idle_ms(20)
+                    .button(buttons::LEFT_UP);
             }
             // ...and a stray click far from any flick lands in the rest gap.
             b.idle_ms(200);
             if i % 4 == 1 {
-                b.button(buttons::LEFT_DOWN).idle_ms(10).button(buttons::LEFT_UP);
+                b.button(buttons::LEFT_DOWN)
+                    .idle_ms(10)
+                    .button(buttons::LEFT_UP);
             }
             b.idle_ms(400);
         }

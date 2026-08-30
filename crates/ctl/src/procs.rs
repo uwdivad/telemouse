@@ -209,7 +209,8 @@ impl Scanner {
             }
         }
         let fresh = self.scan();
-        *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), fresh.clone()));
+        *self.last.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((Instant::now(), fresh.clone()));
         fresh
     }
 
@@ -341,7 +342,9 @@ pub struct Details {
 
 #[cfg(windows)]
 mod sys {
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+    use windows::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
     use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, UNICODE_STRING};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -404,7 +407,15 @@ mod sys {
     unsafe fn command_line(h: HANDLE) -> String {
         let mut len = 0u32;
         // SAFETY: a size probe with a null buffer; the API reports the length.
-        let _ = unsafe { NtQueryInformationProcess(h, ProcessCommandLineInformation, std::ptr::null_mut(), 0, &mut len) };
+        let _ = unsafe {
+            NtQueryInformationProcess(
+                h,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut len,
+            )
+        };
         if len == 0 || len > 1 << 20 {
             return String::new();
         }
@@ -444,12 +455,18 @@ mod sys {
 
             let mut path = [0u16; 1024];
             let mut n = path.len() as u32;
-            if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut n).is_ok() {
+            if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut n)
+                .is_ok()
+            {
                 d.exe = Some(String::from_utf16_lossy(&path[..n as usize]));
             }
 
-            let (mut created, mut exited, mut kernel, mut user) =
-                (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
             if GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user).is_ok() {
                 d.cpu_100ns = ft(kernel).saturating_add(ft(user));
                 d.started_unix_s = ft(created).saturating_sub(FILETIME_UNIX_DIFF) / 10_000_000;
@@ -545,7 +562,9 @@ mod sys {
 
     pub fn exists(pid: u32) -> bool {
         let target = Pid::from_u32(pid);
-        table(ProcessesToUpdate::Some(&[target])).process(target).is_some()
+        table(ProcessesToUpdate::Some(&[target]))
+            .process(target)
+            .is_some()
     }
 
     pub fn terminate(pid: u32) -> bool {
@@ -564,10 +583,16 @@ mod tests {
         assert_eq!(classify("telemouse.exe", ""), Some(ProcKind::Capture));
         assert_eq!(classify("telemouse", ""), Some(ProcKind::Capture));
         assert_eq!(classify("TELEMOUSE-VIZ.EXE", ""), Some(ProcKind::Viz));
-        assert_eq!(classify("telemouse-analyze.exe", ""), Some(ProcKind::Analyze));
+        assert_eq!(
+            classify("telemouse-analyze.exe", ""),
+            Some(ProcKind::Analyze)
+        );
         assert_eq!(classify("telemouse-ctl.exe", ""), Some(ProcKind::Ctl));
         // A test binary or a future tool: listed, as "other".
-        assert_eq!(classify("telemouse_ctl-1a2b3c.exe", ""), Some(ProcKind::Other));
+        assert_eq!(
+            classify("telemouse_ctl-1a2b3c.exe", ""),
+            Some(ProcKind::Other)
+        );
     }
 
     #[test]
@@ -585,7 +610,10 @@ mod tests {
         for (name, cmd) in [
             ("explorer.exe", ""),
             ("cs2.exe", "cs2.exe -novid"),
-            ("rustrover64.exe", "C:\\RustRover\\bin\\rustrover64.exe C:\\telemouse"),
+            (
+                "rustrover64.exe",
+                "C:\\RustRover\\bin\\rustrover64.exe C:\\telemouse",
+            ),
             ("code.exe", "code telemouse"),
             ("notelemouse.exe", ""),
         ] {
@@ -597,7 +625,13 @@ mod tests {
     fn the_name_prefilter_admits_everything_classify_can_accept() {
         // Anything classify() might say yes to must pass the prefilter, or
         // the scan would never query it.
-        for name in ["telemouse.exe", "TELEMOUSE-VIZ.EXE", "telemouse_ctl-1a2b.exe", "cargo.exe", "cargo"] {
+        for name in [
+            "telemouse.exe",
+            "TELEMOUSE-VIZ.EXE",
+            "telemouse_ctl-1a2b.exe",
+            "cargo.exe",
+            "cargo",
+        ] {
             assert!(name_is_candidate(name), "{name}");
         }
         for name in ["explorer.exe", "cs2.exe", "notelemouse.exe", "System"] {
@@ -608,12 +642,19 @@ mod tests {
     #[test]
     fn cpu_pct_is_a_rate_over_the_previous_interval() {
         assert_eq!(cpu_pct(None, 5_000_000), 0.0, "first sighting");
-        assert_eq!(cpu_pct(Some((Duration::ZERO, 0)), 5_000_000), 0.0, "no interval");
+        assert_eq!(
+            cpu_pct(Some((Duration::ZERO, 0)), 5_000_000),
+            0.0,
+            "no interval"
+        );
         // 250 ms of CPU over a 1 s interval = 25% of one core.
         let pct = cpu_pct(Some((Duration::from_secs(1), 10_000_000)), 12_500_000);
         assert!((pct - 25.0).abs() < 1e-3, "{pct}");
         // A counter that went backwards (PID recycled) is 0, not negative.
-        assert_eq!(cpu_pct(Some((Duration::from_secs(1), 9_000_000)), 1_000), 0.0);
+        assert_eq!(
+            cpu_pct(Some((Duration::from_secs(1), 9_000_000)), 1_000),
+            0.0
+        );
     }
 
     #[test]
@@ -638,7 +679,11 @@ mod tests {
         assert!(me.mem_mb > 0.0, "working set should be known: {me:?}");
         assert!(me.started_unix_s > 1_600_000_000, "{}", me.started_unix_s);
         assert!(me.exe.as_deref().is_some_and(|e| !e.is_empty()));
-        assert!(me.cmd.to_ascii_lowercase().contains("telemouse"), "{:?}", me.cmd);
+        assert!(
+            me.cmd.to_ascii_lowercase().contains("telemouse"),
+            "{:?}",
+            me.cmd
+        );
         assert_eq!(me.cpu_pct, 0.0, "no rate on the first scan");
         // The second scan reports a rate over the interval, never negative.
         let again = s.scan();
@@ -653,7 +698,10 @@ mod tests {
         let b = s.scan_cached(Duration::from_secs(60));
         assert_eq!(a, b, "a cached scan is returned verbatim");
         assert!(s.last.lock().unwrap().is_some());
-        assert!(s.known.lock().unwrap().is_some(), "the enumeration is remembered too");
+        assert!(
+            s.known.lock().unwrap().is_some(),
+            "the enumeration is remembered too"
+        );
         // A refused kill still drops both caches: the state was touched.
         let _ = s.kill(u32::MAX - 7);
         assert!(s.last.lock().unwrap().is_none());
@@ -711,11 +759,18 @@ mod tests {
             let _ = s.scan();
         }
         let per_scan = t0.elapsed() / 20;
-        assert!(per_scan < Duration::from_millis(5), "details-only scan took {per_scan:?}");
+        assert!(
+            per_scan < Duration::from_millis(5),
+            "details-only scan took {per_scan:?}"
+        );
         let t0 = Instant::now();
         s.invalidate();
         let _ = s.scan();
-        assert!(t0.elapsed() < Duration::from_millis(200), "enumeration took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "enumeration took {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
@@ -723,7 +778,11 @@ mod tests {
         // Spawn a child, let the scanner see it, end it, and check the next
         // scan (inside ENUMERATE_EVERY, so details-only) drops it.
         let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-            .args(if cfg!(windows) { ["/C", "ping -n 30 127.0.0.1 > NUL"] } else { ["-c", "sleep 30"] })
+            .args(if cfg!(windows) {
+                ["/C", "ping -n 30 127.0.0.1 > NUL"]
+            } else {
+                ["-c", "sleep 30"]
+            })
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn a child");

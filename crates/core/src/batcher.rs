@@ -94,7 +94,11 @@ mod tests {
     use super::*;
 
     fn ev(ts_qpc: u64) -> RawEvent {
-        RawEvent { ts_qpc, dx: 1, ..Default::default() }
+        RawEvent {
+            ts_qpc,
+            dx: 1,
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -213,7 +213,12 @@ mod tests {
         b.drops_since_last = 3;
         b.abs_frames_since_last = 1;
         b.events = vec![
-            RawEvent { ts_qpc: 100, dx: 3, dy: -1, ..Default::default() },
+            RawEvent {
+                ts_qpc: 100,
+                dx: 3,
+                dy: -1,
+                ..Default::default()
+            },
             RawEvent {
                 ts_qpc: 110,
                 dx: 0,
@@ -283,12 +288,22 @@ mod tests {
         let general = |s: &str| -> Envelope { serde_json::from_str(s).unwrap() };
         let mut b = batch();
         b.game = Some("cs2.exe".into());
-        b.events.push(RawEvent { ts_qpc: 5, dx: -2, dy: 9, buttons: 1, ..Default::default() });
+        b.events.push(RawEvent {
+            ts_qpc: 5,
+            dx: -2,
+            dy: 9,
+            buttons: 1,
+            ..Default::default()
+        });
         let cfg = SessionConfig {
             session_id: "s-1".into(),
             started_utc_us: 1,
             qpc_freq: 10_000_000,
-            anchor: crate::QpcAnchor { qpc: 1, utc_us: 1, qpc_freq: 10_000_000 },
+            anchor: crate::QpcAnchor {
+                qpc: 1,
+                utc_us: 1,
+                qpc_freq: 10_000_000,
+            },
             anchor_uncertainty_us: Some(3),
             mouse_cpi: 1600.0,
             devices: vec!["mouse".into()],
@@ -304,9 +319,16 @@ mod tests {
             ts_utc_us: 10,
             label: "round".into(),
         };
-        for e in [Envelope::Batch(b), Envelope::Session(cfg), Envelope::Marker(m)] {
+        for e in [
+            Envelope::Batch(b),
+            Envelope::Session(cfg),
+            Envelope::Marker(m),
+        ] {
             let s = e.to_json().unwrap();
-            assert!(fast_tag(&s).is_some(), "own output must hit the fast path: {s}");
+            assert!(
+                fast_tag(&s).is_some(),
+                "own output must hit the fast path: {s}"
+            );
             assert_eq!(Envelope::from_json(&s).unwrap(), e);
             assert_eq!(Envelope::from_json(&s).unwrap(), general(&s));
 
@@ -315,7 +337,9 @@ mod tests {
             let mut keys: Vec<_> = v.as_object().unwrap().iter().collect();
             keys.reverse();
             let reordered = serde_json::Value::Object(
-                keys.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                keys.into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             )
             .to_string();
             assert!(fast_tag(&reordered).is_none() || reordered.starts_with("{\"type\""));

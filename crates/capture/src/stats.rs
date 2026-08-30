@@ -298,7 +298,11 @@ pub fn compute_report(
     elapsed_secs: f64,
     idle_for_s: u64,
 ) -> ReportFields {
-    let secs = if elapsed_secs > 0.0 { elapsed_secs } else { 1.0 };
+    let secs = if elapsed_secs > 0.0 {
+        elapsed_secs
+    } else {
+        1.0
+    };
     let events_delta = now.events.saturating_sub(prev.events);
     let batches_delta = now.batches.saturating_sub(prev.batches);
     let first = now.ship_latency_first.since(&prev.ship_latency_first);
@@ -443,7 +447,10 @@ mod tests {
         let window = second.since(&first);
         assert_eq!(window.total(), 1);
         // Only the 10ms sample is in the window.
-        assert_eq!(window.percentile_us(0.5), bucket_upper_us(bucket_of(10_000)));
+        assert_eq!(
+            window.percentile_us(0.5),
+            bucket_upper_us(bucket_of(10_000))
+        );
     }
 
     #[test]

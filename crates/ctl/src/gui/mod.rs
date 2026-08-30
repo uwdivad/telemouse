@@ -109,7 +109,11 @@ pub fn spawn(deps: GuiDeps) -> Option<GuiHandle> {
                 }
             });
         match thread {
-            Ok(thread) => Some(GuiHandle { thread, hwnd, thread_id }),
+            Ok(thread) => Some(GuiHandle {
+                thread,
+                hwnd,
+                thread_id,
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "could not start the gui thread");
                 None

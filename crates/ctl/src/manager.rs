@@ -79,6 +79,9 @@ pub struct Component {
 }
 
 /// The panel's catalogue. Order is display order.
+// rustfmt would spread every `Flag` over four lines; one row per flag reads
+// as the table it is.
+#[rustfmt::skip]
 pub const COMPONENTS: &[Component] = &[
     Component {
         id: "capture",
@@ -88,11 +91,11 @@ pub const COMPONENTS: &[Component] = &[
         base_args: &["run"],
         kind: Kind::Service,
         flags: &[
-            Flag { flag: "--print", help: "log a one-line summary for every batch" },
-            Flag { flag: "--no-kafka", help: "disable the Kafka sink" },
-            Flag { flag: "--no-udp", help: "disable the localhost UDP sink (live viz)" },
+            Flag { flag: "--print",     help: "log a one-line summary for every batch" },
+            Flag { flag: "--no-kafka",  help: "disable the Kafka sink" },
+            Flag { flag: "--no-udp",    help: "disable the localhost UDP sink (live viz)" },
             Flag { flag: "--no-record", help: "do not save the JSONL recording, whatever telemouse.toml says" },
-            Flag { flag: "--record", help: "save the JSONL recording, whatever telemouse.toml says" },
+            Flag { flag: "--record",    help: "save the JSONL recording, whatever telemouse.toml says" },
         ],
         takes_session: false,
         passes_config: true,
@@ -137,7 +140,10 @@ pub const COMPONENTS: &[Component] = &[
         bin: "telemouse-analyze",
         base_args: &["report"],
         kind: Kind::Task,
-        flags: &[Flag { flag: "--timing", help: "print the per-phase timing table" }],
+        flags: &[Flag {
+            flag: "--timing",
+            help: "print the per-phase timing table",
+        }],
         takes_session: true,
         passes_config: false,
     },
@@ -159,11 +165,29 @@ pub struct StartRequest {
     pub save: Option<bool>,
 }
 
+/// How a Windows process reports "left on Ctrl-Break / Ctrl-C": the exit
+/// code is `STATUS_CONTROL_C_EXIT`, which is what a gracefully stopped
+/// service shows.
+pub const STATUS_CONTROL_C_EXIT: i32 = -1073741510; // 0xC000013A
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExitInfo {
     /// `None` when killed by a signal (Unix) — on Windows always a code.
     pub code: Option<i32>,
     pub at_unix_s: u64,
+    /// `code == STATUS_CONTROL_C_EXIT`, decided here so the page does not
+    /// carry the number.
+    pub ctrl_break: bool,
+}
+
+impl ExitInfo {
+    pub fn new(code: Option<i32>, at_unix_s: u64) -> Self {
+        Self {
+            code,
+            at_unix_s,
+            ctrl_break: code == Some(STATUS_CONTROL_C_EXIT),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,7 +332,10 @@ impl LogSink {
         {
             warn!(error = %e, "component log file write failed; further failures are not reported");
         }
-        self.ring.lock().unwrap_or_else(|p| p.into_inner()).push(line);
+        self.ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(line);
     }
 
     fn tail(&self, n: usize) -> Vec<String> {
@@ -373,8 +400,11 @@ impl Slot {
         };
         match child.try_wait() {
             Ok(Some(status)) => {
-                let exit = ExitInfo { code: status.code(), at_unix_s: now_unix() };
-                let uptime_s = self.since.map(|s| exit.at_unix_s.saturating_sub(s)).unwrap_or(0);
+                let exit = ExitInfo::new(status.code(), now_unix());
+                let uptime_s = self
+                    .since
+                    .map(|s| exit.at_unix_s.saturating_sub(s))
+                    .unwrap_or(0);
                 let expected = self.stopping || (c.kind == Kind::Task && exit.code == Some(0));
                 self.exits += 1;
                 if expected {
@@ -391,7 +421,8 @@ impl Slot {
                         "exited without being stopped"
                     );
                 }
-                self.log.push(format!("--- exited: {} ---", describe_exit(exit)));
+                self.log
+                    .push(format!("--- exited: {} ---", describe_exit(exit)));
                 self.last_exit = Some(exit);
                 self.clear();
                 true
@@ -415,8 +446,7 @@ impl Slot {
 
 pub(crate) fn describe_exit(e: ExitInfo) -> String {
     match e.code {
-        // STATUS_CONTROL_C_EXIT: how a Windows process reports "left on Ctrl-Break".
-        Some(-1073741510) => "Ctrl-Break".into(),
+        _ if e.ctrl_break => "Ctrl-Break".into(),
         Some(c) => format!("code {c}"),
         None => "signal".into(),
     }
@@ -482,7 +512,10 @@ impl Manager {
             let found = p.is_file();
             return (p, found);
         }
-        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(Path::to_path_buf))
+        {
             let p = dir.join(&file);
             if p.is_file() {
                 return (p, true);
@@ -575,7 +608,9 @@ impl Manager {
         let mut args: Vec<String> = c.base_args.iter().map(|s| s.to_string()).collect();
         if c.takes_session {
             let name = req.session.as_deref().ok_or(StartError::SessionRequired)?;
-            let p = self.validate_session(name).map_err(StartError::BadSession)?;
+            let p = self
+                .validate_session(name)
+                .map_err(StartError::BadSession)?;
             args.push(p.display().to_string());
         }
         if c.passes_config {
@@ -623,12 +658,15 @@ impl Manager {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            StartError::Spawn(format!("{} {}: {e}", bin.display(), args.join(" ")))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| StartError::Spawn(format!("{} {}: {e}", bin.display(), args.join(" "))))?;
         let pid = child.id().unwrap_or(0);
-        slot.log
-            .push(format!("--- started pid {pid}: {} {} ---", bin.display(), args.join(" ")));
+        slot.log.push(format!(
+            "--- started pid {pid}: {} {} ---",
+            bin.display(),
+            args.join(" ")
+        ));
         if let Some(out) = child.stdout.take() {
             tokio::spawn(pump(out, slot.log.clone()));
         }
@@ -669,7 +707,12 @@ impl Manager {
                     return Ok(StopOutcome::Graceful);
                 }
             }
-            warn!(component = c.id, pid, grace_s = self.cfg.grace.as_secs(), "did not stop in time; terminating");
+            warn!(
+                component = c.id,
+                pid,
+                grace_s = self.cfg.grace.as_secs(),
+                "did not stop in time; terminating"
+            );
         }
 
         let mut slots = self.slots.lock().await;
@@ -748,7 +791,10 @@ mod tests {
         #[cfg(not(windows))]
         base_args: &["-c", "echo hello from child; sleep 60"],
         kind: Kind::Service,
-        flags: &[Flag { flag: "--ok", help: "allowed" }],
+        flags: &[Flag {
+            flag: "--ok",
+            help: "allowed",
+        }],
         takes_session: false,
         passes_config: false,
     };
@@ -808,7 +854,11 @@ mod tests {
             if !s.running {
                 return s;
             }
-            assert!(tokio::time::Instant::now() < deadline, "{id} still running: {:?}", s.log);
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{id} still running: {:?}",
+                s.log
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -852,7 +902,10 @@ mod tests {
             if text.contains("about to fail") && text.contains("--- exited: code 3 ---") {
                 break text;
             }
-            assert!(tokio::time::Instant::now() < deadline, "log file incomplete: {text:?}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "log file incomplete: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(text.starts_with("--- started pid"));
@@ -869,7 +922,10 @@ mod tests {
         let mut f = open_log(&dir, "x").unwrap();
         writeln!(f, "fresh").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
-        assert_eq!(std::fs::metadata(dir.join("x.log.1")).unwrap().len(), LOG_ROTATE_BYTES + 1);
+        assert_eq!(
+            std::fs::metadata(dir.join("x.log.1")).unwrap().len(),
+            LOG_ROTATE_BYTES + 1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -885,13 +941,27 @@ mod tests {
         assert_eq!(recording_flags(true, false), s(&["--no-record"]));
         assert_eq!(recording_flags(false, true), s(&["--record"]));
         let m = manager(Path::new("."));
-        assert_eq!(m.recording(), RecordingInfo { enabled: true, dir: ".".into() });
+        assert_eq!(
+            m.recording(),
+            RecordingInfo {
+                enabled: true,
+                dir: ".".into()
+            }
+        );
     }
 
     #[tokio::test]
     async fn snapshot_reports_the_arguments_of_a_run() {
         let m = manager(Path::new("."));
-        m.start("sleeper", &StartRequest { flags: vec!["--ok".into()], ..Default::default() }).await.unwrap();
+        m.start(
+            "sleeper",
+            &StartRequest {
+                flags: vec!["--ok".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let st = m.snapshot(1).await;
         let s = st.iter().find(|s| s.id == "sleeper").unwrap();
         assert_eq!(s.args.last().map(String::as_str), Some("--ok"));
@@ -920,7 +990,9 @@ mod tests {
         assert!(s.log[0].starts_with("--- started pid"));
 
         assert_eq!(
-            m.start("sleeper", &StartRequest::default()).await.unwrap_err(),
+            m.start("sleeper", &StartRequest::default())
+                .await
+                .unwrap_err(),
             StartError::AlreadyRunning
         );
 
@@ -932,7 +1004,11 @@ mod tests {
             if s.log.iter().any(|l| l.contains("hello from child")) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "no output captured: {:?}", s.log);
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no output captured: {:?}",
+                s.log
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -944,7 +1020,10 @@ mod tests {
         assert!(s.pid.is_none());
         assert!(s.last_exit.is_some());
         assert!(s.log.iter().any(|l| l.starts_with("--- exited:")));
-        assert_eq!(m.stop("sleeper", true).await.unwrap_err(), StopError::NotRunning);
+        assert_eq!(
+            m.stop("sleeper", true).await.unwrap_err(),
+            StopError::NotRunning
+        );
     }
 
     #[tokio::test]
@@ -955,7 +1034,10 @@ mod tests {
         // Whether the Ctrl-Break is honoured or the grace period runs out,
         // the child is gone afterwards and it took no longer than grace+slack.
         let outcome = m.stop("sleeper", false).await.unwrap();
-        assert!(matches!(outcome, StopOutcome::Graceful | StopOutcome::Terminated));
+        assert!(matches!(
+            outcome,
+            StopOutcome::Graceful | StopOutcome::Terminated
+        ));
         assert!(t0.elapsed() < Duration::from_secs(4));
         let st = m.snapshot(5).await;
         assert!(!st.iter().find(|s| s.id == "sleeper").unwrap().running);
@@ -975,26 +1057,65 @@ mod tests {
         let m = manager(&dir);
 
         let ok = m
-            .arguments(&SLEEPER, &StartRequest { flags: vec!["--ok".into(), "--ok".into()], ..Default::default() })
+            .arguments(
+                &SLEEPER,
+                &StartRequest {
+                    flags: vec!["--ok".into(), "--ok".into()],
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(ok.last(), Some(&"--ok".to_string()));
-        assert_eq!(ok.iter().filter(|a| *a == "--ok").count(), 1, "flags are deduplicated");
+        assert_eq!(
+            ok.iter().filter(|a| *a == "--ok").count(),
+            1,
+            "flags are deduplicated"
+        );
 
         assert_eq!(
-            m.arguments(&SLEEPER, &StartRequest { flags: vec!["--evil".into()], ..Default::default() })
-                .unwrap_err(),
+            m.arguments(
+                &SLEEPER,
+                &StartRequest {
+                    flags: vec!["--evil".into()],
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
             StartError::FlagNotAllowed("--evil".into())
         );
         assert_eq!(
-            m.arguments(&REPORTER, &StartRequest::default()).unwrap_err(),
+            m.arguments(&REPORTER, &StartRequest::default())
+                .unwrap_err(),
             StartError::SessionRequired
         );
-        for bad in ["../x.jsonl", "sub/x.jsonl", "sub\\x.jsonl", "notes.txt", "missing.jsonl", ""] {
-            let r = m.arguments(&REPORTER, &StartRequest { session: Some(bad.into()), ..Default::default() });
-            assert!(matches!(r, Err(StartError::BadSession(_))), "{bad:?} → {r:?}");
+        for bad in [
+            "../x.jsonl",
+            "sub/x.jsonl",
+            "sub\\x.jsonl",
+            "notes.txt",
+            "missing.jsonl",
+            "",
+        ] {
+            let r = m.arguments(
+                &REPORTER,
+                &StartRequest {
+                    session: Some(bad.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(r, Err(StartError::BadSession(_))),
+                "{bad:?} → {r:?}"
+            );
         }
         let ok = m
-            .arguments(&REPORTER, &StartRequest { session: Some("s-1.jsonl".into()), ..Default::default() })
+            .arguments(
+                &REPORTER,
+                &StartRequest {
+                    session: Some("s-1.jsonl".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(ok[0], "report");
         assert!(ok[1].ends_with("s-1.jsonl"));
@@ -1010,30 +1131,74 @@ mod tests {
         let has = |args: &[String], f: &str| args.iter().any(|a| a == f);
 
         let on = Manager::new(std::slice::from_ref(capture), config(Path::new(".")));
-        let a = on.arguments(capture, &StartRequest { save: Some(false), ..Default::default() }).unwrap();
+        let a = on
+            .arguments(
+                capture,
+                &StartRequest {
+                    save: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(has(&a, "--no-record") && !has(&a, "--record"));
-        let a = on.arguments(capture, &StartRequest { save: Some(true), ..Default::default() }).unwrap();
-        assert!(!has(&a, "--no-record") && !has(&a, "--record"), "agrees with the default: no flag");
+        let a = on
+            .arguments(
+                capture,
+                &StartRequest {
+                    save: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            !has(&a, "--no-record") && !has(&a, "--record"),
+            "agrees with the default: no flag"
+        );
         let a = on.arguments(capture, &StartRequest::default()).unwrap();
         assert!(!has(&a, "--no-record") && !has(&a, "--record"));
 
         let off = Manager::new(
             std::slice::from_ref(capture),
-            ManagerConfig { recording_enabled: false, ..config(Path::new(".")) },
+            ManagerConfig {
+                recording_enabled: false,
+                ..config(Path::new("."))
+            },
         );
-        let a = off.arguments(capture, &StartRequest { save: Some(true), ..Default::default() }).unwrap();
+        let a = off
+            .arguments(
+                capture,
+                &StartRequest {
+                    save: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(has(&a, "--record") && !has(&a, "--no-record"));
         assert!(recording_saves(false, &a));
 
         // A raw flag and the switch that says the same thing do not double up.
         let a = on
-            .arguments(capture, &StartRequest { flags: vec!["--no-record".into()], save: Some(false), ..Default::default() })
+            .arguments(
+                capture,
+                &StartRequest {
+                    flags: vec!["--no-record".into()],
+                    save: Some(false),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(a.iter().filter(|x| *x == "--no-record").count(), 1);
 
         // Components without the switch refuse it like any other flag.
         assert_eq!(
-            on.arguments(&SLEEPER, &StartRequest { save: Some(false), ..Default::default() }).unwrap_err(),
+            on.arguments(
+                &SLEEPER,
+                &StartRequest {
+                    save: Some(false),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
             StartError::FlagNotAllowed("--no-record".into())
         );
     }
@@ -1045,13 +1210,22 @@ mod tests {
             m.start("nope", &StartRequest::default()).await.unwrap_err(),
             StartError::UnknownComponent
         );
-        assert_eq!(m.stop("nope", true).await.unwrap_err(), StopError::UnknownComponent);
+        assert_eq!(
+            m.stop("nope", true).await.unwrap_err(),
+            StopError::UnknownComponent
+        );
 
         let dir = tmpdir("missing");
         std::fs::write(dir.join("s.jsonl"), "{}\n").unwrap();
         let m = manager(&dir);
         let r = m
-            .start("rep", &StartRequest { session: Some("s.jsonl".into()), ..Default::default() })
+            .start(
+                "rep",
+                &StartRequest {
+                    session: Some("s.jsonl".into()),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(matches!(r, Err(StartError::Spawn(_))), "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1065,7 +1239,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         std::fs::write(dir.join("new.jsonl"), "{}\n").unwrap();
         let m = manager(&dir);
-        assert_eq!(m.list_sessions(), vec!["new.jsonl".to_string(), "old.jsonl".to_string()]);
+        assert_eq!(
+            m.list_sessions(),
+            vec!["new.jsonl".to_string(), "old.jsonl".to_string()]
+        );
         assert!(manager(&dir.join("absent")).list_sessions().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1075,10 +1252,16 @@ mod tests {
         let dir = tmpdir("bin");
         let m = Manager::new(
             &[SLEEPER],
-            ManagerConfig { bin_dir: Some(dir.clone()), ..config(Path::new(".")) },
+            ManagerConfig {
+                bin_dir: Some(dir.clone()),
+                ..config(Path::new("."))
+            },
         );
         let (p, found) = m.resolve_bin("telemouse-viz");
-        assert_eq!(p, dir.join(format!("telemouse-viz{}", std::env::consts::EXE_SUFFIX)));
+        assert_eq!(
+            p,
+            dir.join(format!("telemouse-viz{}", std::env::consts::EXE_SUFFIX))
+        );
         assert!(!found);
         std::fs::write(&p, "").unwrap();
         assert!(m.resolve_bin("telemouse-viz").1);
@@ -1092,7 +1275,13 @@ mod tests {
             r.push(i.to_string());
         }
         assert_eq!(r.lines.len(), LOG_CAPACITY);
-        assert_eq!(r.tail(2), vec![(LOG_CAPACITY + 8).to_string(), (LOG_CAPACITY + 9).to_string()]);
+        assert_eq!(
+            r.tail(2),
+            vec![
+                (LOG_CAPACITY + 8).to_string(),
+                (LOG_CAPACITY + 9).to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1102,7 +1291,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), COMPONENTS.len());
         for c in COMPONENTS {
-            assert!(crate::procs::classify(c.bin, "").is_some(), "{} is not a telemouse binary", c.bin);
+            assert!(
+                crate::procs::classify(c.bin, "").is_some(),
+                "{} is not a telemouse binary",
+                c.bin
+            );
         }
     }
 }

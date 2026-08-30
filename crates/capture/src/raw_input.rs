@@ -231,7 +231,8 @@ impl DrainStamper {
     /// and is being read at `now`.
     #[inline]
     pub fn stamp(&self, wake: u64, now: u64, i: usize) -> u64 {
-        wake.saturating_add(self.step.saturating_mul(i as u64)).min(now.max(wake))
+        wake.saturating_add(self.step.saturating_mul(i as u64))
+            .min(now.max(wake))
     }
 
     /// Timestamp for the `i`th of `n` reports drained on the cadence timer,
@@ -731,7 +732,10 @@ mod win {
                 Err(e) => tracing::warn!(error = %e, vk = hotkey.vk, "marker hotkey unavailable"),
             }
 
-            tracing::info!(coalesce_ms = coalesce.as_millis() as u64, "raw input capture running");
+            tracing::info!(
+                coalesce_ms = coalesce.as_millis() as u64,
+                "raw input capture running"
+            );
             // One process-lifetime timer for the coalescing window; the whole
             // drain path stays allocation-free.
             let coalesce_timer = if coalesce.is_zero() {
@@ -775,7 +779,12 @@ mod win {
                     // Block until anything is queued. MWMO_INPUTAVAILABLE
                     // makes this return for messages that were already
                     // waiting, not only ones posted after the previous peek.
-                    let r = MsgWaitForMultipleObjectsEx(None, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    let r = MsgWaitForMultipleObjectsEx(
+                        None,
+                        INFINITE,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE,
+                    );
                     if r == WAIT_FAILED {
                         let e = windows::core::Error::from_thread();
                         tracing::error!(error = %e, "MsgWaitForMultipleObjectsEx failed; stopping capture");
@@ -795,7 +804,8 @@ mod win {
                             // display change) is handled after the drain, at
                             // most one window late.
                             let due = -((coalesce.as_nanos() / 100) as i64);
-                            if SetWaitableTimer(timer, &due, cadence_ms, None, None, false).is_ok() {
+                            if SetWaitableTimer(timer, &due, cadence_ms, None, None, false).is_ok()
+                            {
                                 waited = WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
                                 if !waited {
                                     let e = windows::core::Error::from_thread();
@@ -886,7 +896,15 @@ mod tests {
         );
         // Even with buttons attached: the deltas are not HID counts.
         assert_eq!(
-            decode_mouse(MOUSE_MOVE_ABSOLUTE | 0x02, buttons::LEFT_DOWN, 0, 1, 1, 1, 2),
+            decode_mouse(
+                MOUSE_MOVE_ABSOLUTE | 0x02,
+                buttons::LEFT_DOWN,
+                0,
+                1,
+                1,
+                1,
+                2
+            ),
             Decoded::Absolute
         );
     }
@@ -1096,7 +1114,11 @@ mod tests {
             s.finish(wake, 3);
             wake += 3 * MS;
         }
-        assert!((s.step() as i64 - MS as i64).abs() <= MS as i64 / 20, "step {}", s.step());
+        assert!(
+            (s.step() as i64 - MS as i64).abs() <= MS as i64 / 20,
+            "step {}",
+            s.step()
+        );
 
         // An 8kHz mouse: 24 reports per 3ms drain → 125µs spacing.
         let mut s = DrainStamper::new(MS, 3 * MS, 20 * MS);

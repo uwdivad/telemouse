@@ -122,8 +122,7 @@ mod win {
         let h = HANDLE(handle as *mut core::ffi::c_void);
         let mut chars = 0u32;
         // First call with a null buffer asks for the required length.
-        let probe =
-            unsafe { GetRawInputDeviceInfoW(Some(h), RIDI_DEVICENAME, None, &mut chars) };
+        let probe = unsafe { GetRawInputDeviceInfoW(Some(h), RIDI_DEVICENAME, None, &mut chars) };
         if probe == u32::MAX || chars == 0 || chars > 4096 {
             return None;
         }

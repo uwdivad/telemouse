@@ -1338,7 +1338,7 @@ then calls `Child::kill` (TerminateProcess). If the panel has no console
 A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
 "exited on Ctrl-Break", not as a failure.
 
-### 19.4 Tests (`cargo test -p telemouse-ctl`, 42 tests)
+### 19.4 Tests (`cargo test -p telemouse-ctl`, 51 tests)
 
 - `gui::model`: icon follows capture only; uptime formatting; tooltip names
   both services and stays under the `szTip` bound; the log focus prefers a

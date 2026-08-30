@@ -26,7 +26,9 @@ impl UdpSink {
             .connect(addr)
             .with_context(|| format!("connect udp socket to {addr}"))?;
         // Never let a full socket buffer stall the shipping thread.
-        socket.set_nonblocking(true).context("set udp nonblocking")?;
+        socket
+            .set_nonblocking(true)
+            .context("set udp nonblocking")?;
         Ok(Self {
             socket,
             addr: addr.to_string(),

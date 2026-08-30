@@ -37,7 +37,10 @@ const PUSH_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_EVERY_PUSHES: u32 = 5;
 
 #[derive(Parser, Debug)]
-#[command(name = "telemouse-viz", about = "Live mouse-telemetry visualization and replay server")]
+#[command(
+    name = "telemouse-viz",
+    about = "Live mouse-telemetry visualization and replay server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -75,7 +78,9 @@ struct ServeArgs {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -150,7 +155,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "telemouse-viz serving; dashboard http://{http_addr}/ — OBS browser source http://{http_addr}/obs"
     );
 
-    axum::serve(listener, app).await.context("http server failed")?;
+    axum::serve(listener, app)
+        .await
+        .context("http server failed")?;
     Ok(())
 }
 
@@ -168,7 +175,10 @@ struct NoDelayListener {
 
 impl NoDelayListener {
     fn new(inner: tokio::net::TcpListener) -> Self {
-        Self { inner, warned: false }
+        Self {
+            inner,
+            warned: false,
+        }
     }
 }
 
@@ -313,6 +323,9 @@ mod tests {
         let _client = client.unwrap();
         let (stream, peer) = accepted;
         assert_eq!(peer.ip(), addr.ip());
-        assert!(stream.nodelay().unwrap(), "accepted stream must have TCP_NODELAY");
+        assert!(
+            stream.nodelay().unwrap(),
+            "accepted stream must have TCP_NODELAY"
+        );
     }
 }

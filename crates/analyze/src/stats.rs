@@ -244,7 +244,9 @@ mod tests {
             seed ^= seed << 17;
             (seed % 10_000) as f64 * 0.125
         };
-        for n in [1usize, 2, 3, 4, 5, 7, 10, 11, 99, 100, 101, 1000, 1001, 4097] {
+        for n in [
+            1usize, 2, 3, 4, 5, 7, 10, 11, 99, 100, 101, 1000, 1001, 4097,
+        ] {
             let mut xs: Vec<f64> = (0..n).map(|_| next()).collect();
             if n > 5 {
                 xs[2] = f64::NAN;
@@ -256,18 +258,27 @@ mod tests {
             // Order statistics are exact; mean/stddev are summed in a
             // different order and may differ by rounding.
             assert_eq!(via_sort.n, via_select.n, "n={n}");
-            assert_eq!(via_sort.median.to_bits(), via_select.median.to_bits(), "n={n}");
+            assert_eq!(
+                via_sort.median.to_bits(),
+                via_select.median.to_bits(),
+                "n={n}"
+            );
             assert_eq!(via_sort.p90.to_bits(), via_select.p90.to_bits(), "n={n}");
             assert_eq!(via_sort.p99.to_bits(), via_select.p99.to_bits(), "n={n}");
             assert_eq!(via_sort.max.to_bits(), via_select.max.to_bits(), "n={n}");
             assert!((via_sort.mean - via_select.mean).abs() <= 1e-9 * via_sort.mean.abs().max(1.0));
-            assert!((via_sort.stddev - via_select.stddev).abs() <= 1e-9 * via_sort.stddev.abs().max(1.0));
+            assert!(
+                (via_sort.stddev - via_select.stddev).abs()
+                    <= 1e-9 * via_sort.stddev.abs().max(1.0)
+            );
         }
     }
 
     #[test]
     fn scaled_summary_matches_summary_of_scaled_sample() {
-        let xs: Vec<f64> = (0..1000).map(|i| ((i * 7919) % 1000) as f64 * 0.37 + 1.5).collect();
+        let xs: Vec<f64> = (0..1000)
+            .map(|i| ((i * 7919) % 1000) as f64 * 0.37 + 1.5)
+            .collect();
         let k = 2.54 / 1600.0;
         let direct = Summary::of(&xs.iter().map(|x| x * k).collect::<Vec<_>>());
         let scaled = Summary::of(&xs).scaled(k);

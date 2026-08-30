@@ -106,7 +106,14 @@ impl SavGol {
     /// the general loop were costing on multi-million-cell sessions. Both
     /// loops accumulate taps in the same order, so the result is bit-identical
     /// to the general loop applied everywhere (the tests check this).
-    fn apply_with(&self, table: &[Vec<f64>], half: usize, y: &[f64], scale: f64, out: &mut Vec<f64>) {
+    fn apply_with(
+        &self,
+        table: &[Vec<f64>],
+        half: usize,
+        y: &[f64],
+        scale: f64,
+        out: &mut Vec<f64>,
+    ) {
         let n = y.len();
         let width = 2 * half + 1;
         let last_start = n - width;
@@ -268,7 +275,9 @@ mod tests {
         };
         let mut seed = 12345u64;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) % 2000) as f64 - 1000.0
         };
         let mut out = Vec::new();

@@ -96,7 +96,9 @@ fn bench_load(c: &mut Criterion) {
         g.bench_with_input(
             BenchmarkId::new(format!("{} events", evs.len()), cells),
             &path,
-            |b, path| b.iter(|| black_box(load::load_session(black_box(path)).unwrap().events.len())),
+            |b, path| {
+                b.iter(|| black_box(load::load_session(black_box(path)).unwrap().events.len()))
+            },
         );
     }
     g.finish();

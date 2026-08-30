@@ -151,9 +151,7 @@ mod tests {
         // Never emits a control character that could corrupt a terminal.
         let all_bytes: Vec<u8> = (0u8..=255).collect();
         assert!(
-            payload_prefix(&all_bytes)
-                .chars()
-                .all(|c| !c.is_control()),
+            payload_prefix(&all_bytes).chars().all(|c| !c.is_control()),
             "log line must stay printable"
         );
     }

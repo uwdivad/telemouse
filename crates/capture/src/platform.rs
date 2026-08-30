@@ -23,8 +23,8 @@ mod imp {
     use telemouse_core::session::MonitorInfo;
     use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, HDC, HMONITOR,
-        MONITORINFO, MONITORINFOEXW, GetMonitorInfoW,
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW,
+        GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     use windows::Win32::System::Threading::{
@@ -160,7 +160,10 @@ mod imp {
             ..Default::default()
         };
         let ok = unsafe {
-            GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO)
+            GetMonitorInfoW(
+                hmonitor,
+                &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+            )
         };
         if ok.as_bool() {
             let r = info.monitorInfo.rcMonitor;
@@ -351,7 +354,10 @@ mod tests {
             Some("cs2.exe")
         );
         assert_eq!(basename_lower("/usr/bin/Foo").as_deref(), Some("foo"));
-        assert_eq!(basename_lower("notepad.exe").as_deref(), Some("notepad.exe"));
+        assert_eq!(
+            basename_lower("notepad.exe").as_deref(),
+            Some("notepad.exe")
+        );
         assert_eq!(basename_lower(r"C:\dir\"), None);
         assert_eq!(basename_lower(""), None);
     }

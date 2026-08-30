@@ -22,10 +22,7 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
     #[error("invalid config: {field}: {reason}")]
-    Invalid {
-        field: &'static str,
-        reason: String,
-    },
+    Invalid { field: &'static str, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -207,19 +204,28 @@ impl Default for BatchConfig {
 
 impl Default for UdpConfig {
     fn default() -> Self {
-        Self { enabled: true, addr: "127.0.0.1:7878".into() }
+        Self {
+            enabled: true,
+            addr: "127.0.0.1:7878".into(),
+        }
     }
 }
 
 impl Default for KafkaConfig {
     fn default() -> Self {
-        Self { enabled: false, brokers: vec!["127.0.0.1:9092".into()] }
+        Self {
+            enabled: false,
+            brokers: vec!["127.0.0.1:9092".into()],
+        }
     }
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
-        Self { enabled: true, dir: PathBuf::from("recordings") }
+        Self {
+            enabled: true,
+            dir: PathBuf::from("recordings"),
+        }
     }
 }
 
@@ -261,7 +267,10 @@ impl ObsConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
-            ConfigError::Invalid { field, reason: reason.into() }
+            ConfigError::Invalid {
+                field,
+                reason: reason.into(),
+            }
         }
         if !OBS_LAYOUTS.contains(&self.layout.as_str()) {
             return Err(invalid(
@@ -272,7 +281,10 @@ impl ObsConfig {
         if !Self::background_is_valid(&self.background) {
             return Err(invalid(
                 "viz.obs.background",
-                format!("{:?}: expected \"transparent\" or a #rrggbb / #rrggbbaa colour", self.background),
+                format!(
+                    "{:?}: expected \"transparent\" or a #rrggbb / #rrggbbaa colour",
+                    self.background
+                ),
             ));
         }
         for item in &self.hud {
@@ -286,7 +298,11 @@ impl ObsConfig {
         if !OBS_HUD_POSITIONS.contains(&self.hud_position.as_str()) {
             return Err(invalid(
                 "viz.obs.hud_position",
-                format!("{:?} is not one of {}", self.hud_position, OBS_HUD_POSITIONS.join(", ")),
+                format!(
+                    "{:?} is not one of {}",
+                    self.hud_position,
+                    OBS_HUD_POSITIONS.join(", ")
+                ),
             ));
         }
         if !(self.scale.is_finite() && (0.5..=4.0).contains(&self.scale)) {
@@ -320,10 +336,16 @@ impl AppConfig {
     /// pipeline. Called by [`Self::load`]; defaults always pass.
     pub fn validate(&self) -> Result<(), ConfigError> {
         fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
-            ConfigError::Invalid { field, reason: reason.into() }
+            ConfigError::Invalid {
+                field,
+                reason: reason.into(),
+            }
         }
         if !(self.mouse_cpi.is_finite() && self.mouse_cpi > 0.0) {
-            return Err(invalid("mouse_cpi", format!("must be a positive number, got {}", self.mouse_cpi)));
+            return Err(invalid(
+                "mouse_cpi",
+                format!("must be a positive number, got {}", self.mouse_cpi),
+            ));
         }
         if self.batch.window_ms == 0 {
             return Err(invalid("batch.window_ms", "must be at least 1ms"));
@@ -334,11 +356,17 @@ impl AppConfig {
         if self.batch.max_events > crate::wire::MAX_EVENTS_PER_BATCH {
             return Err(invalid(
                 "batch.max_events",
-                format!("exceeds the UDP datagram budget of {}", crate::wire::MAX_EVENTS_PER_BATCH),
+                format!(
+                    "exceeds the UDP datagram budget of {}",
+                    crate::wire::MAX_EVENTS_PER_BATCH
+                ),
             ));
         }
         if self.batch.ring_capacity < self.batch.max_events {
-            return Err(invalid("batch.ring_capacity", "must be at least batch.max_events"));
+            return Err(invalid(
+                "batch.ring_capacity",
+                "must be at least batch.max_events",
+            ));
         }
         if self.batch.coalesce_ms > MAX_COALESCE_MS {
             return Err(invalid(
@@ -347,7 +375,10 @@ impl AppConfig {
             ));
         }
         if self.kafka.enabled && self.kafka.brokers.is_empty() {
-            return Err(invalid("kafka.brokers", "kafka is enabled but no brokers are listed"));
+            return Err(invalid(
+                "kafka.brokers",
+                "kafka is enabled but no brokers are listed",
+            ));
         }
         self.viz.obs.validate()?;
         if self.ctl.stop_grace_secs > MAX_STOP_GRACE_SECS {
@@ -416,7 +447,13 @@ mod tests {
 
         let mut bad = AppConfig::default();
         bad.ctl.stop_grace_secs = MAX_STOP_GRACE_SECS + 1;
-        assert!(matches!(bad.validate(), Err(ConfigError::Invalid { field: "ctl.stop_grace_secs", .. })));
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::Invalid {
+                field: "ctl.stop_grace_secs",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -497,7 +534,10 @@ mod tests {
             ("batch.window_ms", "[batch]\nwindow_ms = 0"),
             ("batch.max_events", "[batch]\nmax_events = 0"),
             ("batch.max_events", "[batch]\nmax_events = 4096"),
-            ("batch.ring_capacity", "[batch]\nmax_events = 448\nring_capacity = 16"),
+            (
+                "batch.ring_capacity",
+                "[batch]\nmax_events = 448\nring_capacity = 16",
+            ),
             ("batch.coalesce_ms", "[batch]\ncoalesce_ms = 11"),
             ("kafka.brokers", "[kafka]\nenabled = true\nbrokers = []"),
             ("games", "[games.\"a.exe\"]\nsens = -2.0"),
@@ -505,7 +545,10 @@ mod tests {
             ("viz.obs.background", "[viz.obs]\nbackground = \"blue\""),
             ("viz.obs.background", "[viz.obs]\nbackground = \"#12345\""),
             ("viz.obs.hud", "[viz.obs]\nhud = [\"speed\", \"wpm\"]"),
-            ("viz.obs.hud_position", "[viz.obs]\nhud_position = \"middle\""),
+            (
+                "viz.obs.hud_position",
+                "[viz.obs]\nhud_position = \"middle\"",
+            ),
             ("viz.obs.scale", "[viz.obs]\nscale = 0.1"),
             ("viz.obs.trail_secs", "[viz.obs]\ntrail_secs = 60"),
             ("viz.obs.buffer_ms", "[viz.obs]\nbuffer_ms = 5"),

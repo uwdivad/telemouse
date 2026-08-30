@@ -242,7 +242,7 @@ impl Stats {
     pub fn roll_latency(&self) -> LatencySnapshot {
         let done = self.latency.take();
         if done.samples > 0 {
-            *self.last_latency.lock().unwrap() = done;
+            *self.last_latency.lock().unwrap_or_else(|p| p.into_inner()) = done;
         }
         done
     }
@@ -251,7 +251,7 @@ impl Stats {
     /// in-progress one before the first roll (so a page opened in the first
     /// few seconds still sees numbers).
     pub fn latency_snapshot(&self) -> LatencySnapshot {
-        let last = *self.last_latency.lock().unwrap();
+        let last = *self.last_latency.lock().unwrap_or_else(|p| p.into_inner());
         if last.samples > 0 {
             last
         } else {
@@ -507,7 +507,9 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "missing {key} in /api/stats payload");
         }
-        for key in ["samples", "p50_us", "p99_us", "max_us", "mean_us", "negative"] {
+        for key in [
+            "samples", "p50_us", "p99_us", "max_us", "mean_us", "negative",
+        ] {
             assert!(v["latency"].get(key).is_some(), "missing latency.{key}");
         }
     }

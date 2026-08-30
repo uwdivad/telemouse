@@ -72,7 +72,9 @@ impl Sink for JsonlSink {
         self.writer
             .write_all(payload.as_bytes())
             .context("write recording line")?;
-        self.writer.write_all(b"\n").context("write recording line")?;
+        self.writer
+            .write_all(b"\n")
+            .context("write recording line")?;
         self.flush_if_due(false)
     }
 

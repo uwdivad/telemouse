@@ -218,7 +218,11 @@ impl ShipperCore {
     /// `None` when empty. The caller serializes a [`BatchView`] over
     /// [`Self::events`] and then calls [`Self::finish_batch`]; nothing on that
     /// path clones a `String` or surrenders the event `Vec`.
-    pub fn next_batch_meta(&mut self, drops_total: u32, abs_frames_total: u32) -> Option<BatchMeta> {
+    pub fn next_batch_meta(
+        &mut self,
+        drops_total: u32,
+        abs_frames_total: u32,
+    ) -> Option<BatchMeta> {
         let first = self.batcher.first_qpc()?;
         let seq_no = self.batch_seq;
         self.batch_seq += 1;
@@ -465,8 +469,7 @@ pub fn run(
                     let idle_timeout = next_park_timeout(idle_probe_expired, true);
                     let parked_at = Instant::now();
                     std::thread::park_timeout(idle_timeout);
-                    idle_probe_expired =
-                        parked_at.elapsed() >= idle_timeout && consumer.is_empty();
+                    idle_probe_expired = parked_at.elapsed() >= idle_timeout && consumer.is_empty();
                 } else {
                     idle_probe_expired = false;
                 }
@@ -557,7 +560,14 @@ fn flush(
     if let Err(e) = enc.encode(&view) {
         tracing::error!(error = %format!("{e:#}"), "could not serialize envelope");
     } else {
-        deliver(sinks, stats, limiter, view.topic(), view.key(), enc.payload());
+        deliver(
+            sinks,
+            stats,
+            limiter,
+            view.topic(),
+            view.key(),
+            enc.payload(),
+        );
     }
     core.finish_batch();
 }
@@ -650,9 +660,7 @@ mod tests {
         for chunk in 0..4 {
             core.push(ev(anchor().qpc + chunk, 1));
             core.push(ev(anchor().qpc + chunk, 1));
-            let b = core
-                .build_batch(&ctx(), totals.next().unwrap(), 0)
-                .unwrap();
+            let b = core.build_batch(&ctx(), totals.next().unwrap(), 0).unwrap();
             seen.push(b.drops_since_last);
         }
         assert_eq!(seen, vec![0, 3, 0, 7]);
@@ -796,7 +804,10 @@ mod tests {
         // ...and the next one past it reports the backlog.
         assert_eq!(l.allow("udp", t0 + WARN_INTERVAL), Some(5));
         // The counter resets after being reported.
-        assert_eq!(l.allow("udp", t0 + WARN_INTERVAL + Duration::from_secs(1)), None);
+        assert_eq!(
+            l.allow("udp", t0 + WARN_INTERVAL + Duration::from_secs(1)),
+            None
+        );
         assert_eq!(l.allow("udp", t0 + WARN_INTERVAL * 2), Some(1));
     }
 

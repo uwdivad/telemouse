@@ -107,8 +107,19 @@ mod tests {
             drops_since_last: 0,
             abs_frames_since_last: 0,
             events: vec![
-                RawEvent { ts_qpc: 100, dx: 3, dy: -1, ..Default::default() },
-                RawEvent { ts_qpc: 110, dx: -1, dy: 2, buttons: buttons::LEFT_DOWN, ..Default::default() },
+                RawEvent {
+                    ts_qpc: 100,
+                    dx: 3,
+                    dy: -1,
+                    ..Default::default()
+                },
+                RawEvent {
+                    ts_qpc: 110,
+                    dx: -1,
+                    dy: 2,
+                    buttons: buttons::LEFT_DOWN,
+                    ..Default::default()
+                },
             ],
         }
     }

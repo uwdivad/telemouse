@@ -837,7 +837,9 @@ impl Report {
             return;
         }
         section(o, "Between markers");
-        o.push_str("   #   from(s)     to(s)   flicks   overshoot   tremor   path eff   clicks/m\n");
+        o.push_str(
+            "   #   from(s)     to(s)   flicks   overshoot   tremor   path eff   clicks/m\n",
+        );
         for s in &self.segments {
             o.push_str(&format!(
                 "  {:>3}  {:>8.1}  {:>8.1}  {:>7}  {:>10.3}  {:>7.0}  {:>9.3}  {:>9.1}\n",

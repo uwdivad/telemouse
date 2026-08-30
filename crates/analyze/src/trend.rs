@@ -121,10 +121,7 @@ pub fn report_for(
         }
     }
     let loaded = crate::load::load_session(recording)?;
-    Ok((
-        crate::report::build(loaded, params),
-        CacheOutcome::Missing,
-    ))
+    Ok((crate::report::build(loaded, params), CacheOutcome::Missing))
 }
 
 /// One session's line in the longitudinal table.
@@ -284,8 +281,16 @@ pub fn render(rows: &[TrendRow]) -> String {
     let extra: Vec<&str> = rows[0].extra.iter().map(|(k, _)| k.as_str()).collect();
     o.push_str(&format!(
         "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9} {:>9} {:>8} {:>8}",
-        "SESSION", "STARTED (UTC)", "DURATION", "EVENTS", "DROPS", "FLICKS", "OVERSHOOT",
-        "SETTLE ms", "TREMOR", "PATH EFF"
+        "SESSION",
+        "STARTED (UTC)",
+        "DURATION",
+        "EVENTS",
+        "DROPS",
+        "FLICKS",
+        "OVERSHOOT",
+        "SETTLE ms",
+        "TREMOR",
+        "PATH EFF"
     ));
     for k in &extra {
         o.push_str(&format!(" {k:>14}"));
@@ -514,7 +519,12 @@ mod tests {
         assert!(rows[0].extra[1].1.unwrap() > 0.0);
         assert!(rows[0].extra[2].1.is_none());
         let csv = to_csv(&rows);
-        assert!(csv.lines().next().unwrap().contains("micro.band_ratio_8_12"));
+        assert!(
+            csv.lines()
+                .next()
+                .unwrap()
+                .contains("micro.band_ratio_8_12")
+        );
     }
 
     #[test]

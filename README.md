@@ -305,7 +305,7 @@ $env:RUST_LOG = 'info,telemouse_ctl=debug'; telemouse-ctl.exe   # snapshot caden
   the `TaskbarCreated` message; give it a second.
 - Console window hidden and you want it: run from a terminal, or `--no-gui`.
 
-**Tests**: `cargo test -p telemouse-ctl` (42 tests; the child-process tests
+**Tests**: `cargo test -p telemouse-ctl` (51 tests; the child-process tests
 take about a minute) or `cargo test -p telemouse-ctl gui::` for just the GUI
 logic, which runs anywhere in well under a second.
 

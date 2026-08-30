@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection};
+use axum::extract::ws::{
+    Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection,
+};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -292,7 +294,10 @@ mod tests {
 
     /// The injected config object literal, parsed back out of the page.
     fn injected_config(html: &str) -> serde_json::Value {
-        let start = html.find("window.TELEMOUSE_CONFIG = {").expect("config script") + "window.TELEMOUSE_CONFIG = ".len();
+        let start = html
+            .find("window.TELEMOUSE_CONFIG = {")
+            .expect("config script")
+            + "window.TELEMOUSE_CONFIG = ".len();
         let end = html[start..].find("};").expect("literal end") + start + 1;
         serde_json::from_str(&html[start..end]).expect("injected config is valid JSON")
     }
@@ -304,7 +309,12 @@ mod tests {
         let (s2, h2, obs) = get(st, "/obs").await;
         assert_eq!(s1, StatusCode::OK);
         assert_eq!(s2, StatusCode::OK);
-        assert!(h2[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+        assert!(
+            h2[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
         assert!(!dash.contains(CONFIG_PLACEHOLDER));
         assert!(!obs.contains(CONFIG_PLACEHOLDER));
 
@@ -360,14 +370,26 @@ mod tests {
     #[tokio::test]
     async fn rebound_host_names_are_refused_everywhere() {
         let st = state_with(PathBuf::from("recordings"));
-        for uri in ["/", "/healthz", "/api/stats", "/api/sessions", "/api/session/x", "/ws"] {
+        for uri in [
+            "/",
+            "/healthz",
+            "/api/stats",
+            "/api/sessions",
+            "/api/session/x",
+            "/ws",
+        ] {
             let (status, _, _) = get_with(st.clone(), uri, &[("host", "evil.com:7879")]).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
         }
         // A missing Host (HTTP/1.0 client) is not a browser and not a rebinding.
         let (status, _, _) = get_with(st.clone(), "/healthz", &[]).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        for host in ["localhost:7879", "127.0.0.1", "[::1]:7879", "192.168.1.20:7879"] {
+        for host in [
+            "localhost:7879",
+            "127.0.0.1",
+            "[::1]:7879",
+            "192.168.1.20:7879",
+        ] {
             let (status, _, _) = get_with(st.clone(), "/healthz", &[("host", host)]).await;
             assert_eq!(status, StatusCode::OK, "{host}");
         }
@@ -391,7 +413,8 @@ mod tests {
             }
             h
         };
-        let (status, _, body) = get_with(st.clone(), "/ws", &ws_headers(Some("http://evil.com"))).await;
+        let (status, _, body) =
+            get_with(st.clone(), "/ws", &ws_headers(Some("http://evil.com"))).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, "origin not allowed");
         let (status, _, _) = get_with(st.clone(), "/ws", &ws_headers(Some("null"))).await;
@@ -400,7 +423,11 @@ mod tests {
         // both get past the origin check and into the handshake. `oneshot`
         // carries no upgradable connection, so the handshake itself answers
         // 426 — which is the extractor speaking, not the origin check.
-        for origin in [Some("http://127.0.0.1:7879"), Some("http://localhost:7879"), None] {
+        for origin in [
+            Some("http://127.0.0.1:7879"),
+            Some("http://localhost:7879"),
+            None,
+        ] {
             let (status, _, body) = get_with(st.clone(), "/ws", &ws_headers(origin)).await;
             assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{origin:?}");
             assert_ne!(body, "origin not allowed");
@@ -478,7 +505,13 @@ mod tests {
         assert!(INDEX_HTML.contains("<html"));
         assert!(INDEX_HTML.len() > 10_000, "page looks truncated");
         // No external assets: nothing may be fetched from another origin.
-        for forbidden in ["src=\"http", "href=\"http", "//cdn.", "unpkg.com", "jsdelivr"] {
+        for forbidden in [
+            "src=\"http",
+            "href=\"http",
+            "//cdn.",
+            "unpkg.com",
+            "jsdelivr",
+        ] {
             assert!(
                 !INDEX_HTML.contains(forbidden),
                 "page references external asset: {forbidden}"
