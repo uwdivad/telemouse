@@ -46,6 +46,9 @@ http_addr = "127.0.0.1:7880"
 # bin_dir = "target/release"
 # A graceful stop sends Ctrl-Break and waits this long before terminating.
 stop_grace_secs = 5
+# ctl.log (the panel's own log; its console is hidden when started from
+# Explorer) and one <component>.log per launched component go here.
+log_dir = "logs"
 
 # OBS browser source: add http://127.0.0.1:7879/obs as a Browser source.
 # These are the defaults; any of them can be overridden per source with URL

@@ -6,3 +6,4 @@
 # separate target dirs used for benching (docs/BENCHMARKS.md) and criterion output
 /target-bench*
 crates/*/target-bench/
+/logs/

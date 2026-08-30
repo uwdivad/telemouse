@@ -13,8 +13,11 @@
 //! send the event from), it is terminated.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,23 @@ use tracing::{info, warn};
 
 /// Lines of child output kept per component (across restarts).
 const LOG_CAPACITY: usize = 400;
+
+/// A log file this large at startup is rotated to `<name>.1` (the previous
+/// `.1` is dropped). One panel session of chatty children is well under this.
+const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open `<dir>/<name>.log` for appending, rotating it first if it has grown
+/// past [`LOG_ROTATE_BYTES`]. Creates the directory.
+pub fn open_log(dir: &Path, name: &str) -> std::io::Result<File> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{name}.log"));
+    if let Ok(md) = std::fs::metadata(&path)
+        && md.len() > LOG_ROTATE_BYTES
+    {
+        let _ = std::fs::rename(&path, dir.join(format!("{name}.log.1")));
+    }
+    File::options().create(true).append(true).open(path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +174,11 @@ pub struct ComponentState {
     pub pid: Option<u32>,
     pub since_unix_s: Option<u64>,
     pub last_exit: Option<ExitInfo>,
+    /// Exits seen since the panel started.
+    pub exits: u32,
+    /// Of those, the ones nobody asked for: a service that died without a
+    /// stop, or a task that finished with a non-zero code.
+    pub unexpected_exits: u32,
     /// Arguments of the current (or last) run, after the base arguments.
     pub args: Vec<String>,
     /// Capture only: is this run writing a JSONL recording? False for
@@ -239,7 +264,7 @@ pub enum StopOutcome {
     Terminated,
 }
 
-/// Bounded, shared line buffer for one component's output.
+/// Bounded line buffer for one component's output.
 #[derive(Default)]
 pub struct LogRing {
     lines: VecDeque<String>,
@@ -257,13 +282,61 @@ impl LogRing {
     }
 }
 
+/// Where one component's output goes: the ring the page and tray read, and
+/// — when a log directory is configured — `<log_dir>/<id>.log`, so what a
+/// child printed survives the panel being restarted.
+#[derive(Default)]
+pub struct LogSink {
+    ring: Mutex<LogRing>,
+    file: Mutex<Option<File>>,
+    /// A failed write is reported once, not once per line.
+    write_failed: AtomicBool,
+}
+
+impl LogSink {
+    fn push(&self, line: String) {
+        if let Some(f) = self.file.lock().unwrap_or_else(|p| p.into_inner()).as_mut()
+            && let Err(e) = writeln!(f, "{line}")
+            && !self.write_failed.swap(true, Ordering::Relaxed)
+        {
+            warn!(error = %e, "component log file write failed; further failures are not reported");
+        }
+        self.ring.lock().unwrap_or_else(|p| p.into_inner()).push(line);
+    }
+
+    fn tail(&self, n: usize) -> Vec<String> {
+        self.ring.lock().unwrap_or_else(|p| p.into_inner()).tail(n)
+    }
+
+    /// Attach the file on first use. Opening lazily means an unwritable log
+    /// directory costs a warning at the first start, not a refusal to serve.
+    fn ensure_file(&self, dir: &Path, id: &str) {
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        if file.is_some() {
+            return;
+        }
+        match open_log(dir, id) {
+            Ok(f) => *file = Some(f),
+            Err(e) => {
+                if !self.write_failed.swap(true, Ordering::Relaxed) {
+                    warn!(component = id, dir = %dir.display(), error = %e, "cannot open component log file; output is kept in memory only");
+                }
+            }
+        }
+    }
+}
+
 struct Slot {
     child: Option<Child>,
     pid: Option<u32>,
     since: Option<u64>,
     last_exit: Option<ExitInfo>,
+    /// Set by `stop`: the next exit was asked for.
+    stopping: bool,
+    exits: u32,
+    unexpected_exits: u32,
     args: Vec<String>,
-    log: Arc<Mutex<LogRing>>,
+    log: Arc<LogSink>,
 }
 
 impl Slot {
@@ -273,38 +346,63 @@ impl Slot {
             pid: None,
             since: None,
             last_exit: None,
+            stopping: false,
+            exits: 0,
+            unexpected_exits: 0,
             args: Vec::new(),
-            log: Arc::new(Mutex::new(LogRing::default())),
+            log: Arc::new(LogSink::default()),
         }
     }
 
     /// Record an exit if the child has one; returns whether it is gone.
-    fn reap(&mut self) -> bool {
+    ///
+    /// An exit nobody asked for is the one event an operator most needs to
+    /// hear about and the one the page cannot show if it is not open, so it
+    /// is a `warn!` with everything needed to go and look: which component,
+    /// what it was running, how long it lasted, and how it ended.
+    fn reap(&mut self, c: &Component) -> bool {
         let Some(child) = self.child.as_mut() else {
             return true;
         };
         match child.try_wait() {
             Ok(Some(status)) => {
                 let exit = ExitInfo { code: status.code(), at_unix_s: now_unix() };
-                self.log
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(format!("--- exited: {} ---", describe_exit(exit)));
+                let uptime_s = self.since.map(|s| exit.at_unix_s.saturating_sub(s)).unwrap_or(0);
+                let expected = self.stopping || (c.kind == Kind::Task && exit.code == Some(0));
+                self.exits += 1;
+                if expected {
+                    info!(component = c.id, pid = self.pid, exit = %describe_exit(exit), uptime_s, "exited");
+                } else {
+                    self.unexpected_exits += 1;
+                    warn!(
+                        component = c.id,
+                        pid = self.pid,
+                        exit = %describe_exit(exit),
+                        uptime_s,
+                        args = %self.args.join(" "),
+                        unexpected_exits = self.unexpected_exits,
+                        "exited without being stopped"
+                    );
+                }
+                self.log.push(format!("--- exited: {} ---", describe_exit(exit)));
                 self.last_exit = Some(exit);
-                self.child = None;
-                self.pid = None;
-                self.since = None;
+                self.clear();
                 true
             }
             Ok(None) => false,
             Err(e) => {
-                warn!(error = %e, "try_wait failed; treating child as gone");
-                self.child = None;
-                self.pid = None;
-                self.since = None;
+                warn!(component = c.id, pid = self.pid, error = %e, "try_wait failed; treating child as gone");
+                self.clear();
                 true
             }
         }
+    }
+
+    fn clear(&mut self) {
+        self.child = None;
+        self.pid = None;
+        self.since = None;
+        self.stopping = false;
     }
 }
 
@@ -324,42 +422,43 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Everything a [`Manager`] needs to know about its surroundings.
+#[derive(Debug, Clone)]
+pub struct ManagerConfig {
+    /// Where the binaries are; `None` = next to this executable, then `PATH`.
+    pub bin_dir: Option<PathBuf>,
+    /// The `telemouse.toml` handed to every child that takes one.
+    pub config_path: PathBuf,
+    pub recordings_dir: PathBuf,
+    /// `recording.enabled` from that config.
+    pub recording_enabled: bool,
+    /// How long a graceful stop may take before the child is terminated.
+    pub grace: Duration,
+    /// Where child output is also written, one `<id>.log` per component.
+    /// `None` keeps it in memory only.
+    pub log_dir: Option<PathBuf>,
+}
+
 pub struct Manager {
     components: Vec<Component>,
-    bin_dir: Option<PathBuf>,
-    config_path: PathBuf,
-    recordings_dir: PathBuf,
-    /// `recording.enabled` from the config every child is launched with.
-    recording_enabled: bool,
-    grace: Duration,
+    cfg: ManagerConfig,
     slots: tokio::sync::Mutex<HashMap<&'static str, Slot>>,
 }
 
 impl Manager {
-    pub fn new(
-        components: &[Component],
-        bin_dir: Option<PathBuf>,
-        config_path: PathBuf,
-        recordings_dir: PathBuf,
-        recording_enabled: bool,
-        grace: Duration,
-    ) -> Self {
+    pub fn new(components: &[Component], cfg: ManagerConfig) -> Self {
         let slots = components.iter().map(|c| (c.id, Slot::new())).collect();
         Self {
             components: components.to_vec(),
-            bin_dir,
-            config_path,
-            recordings_dir,
-            recording_enabled,
-            grace,
+            cfg,
             slots: tokio::sync::Mutex::new(slots),
         }
     }
 
     pub fn recording(&self) -> RecordingInfo {
         RecordingInfo {
-            enabled: self.recording_enabled,
-            dir: self.recordings_dir.display().to_string(),
+            enabled: self.cfg.recording_enabled,
+            dir: self.cfg.recordings_dir.display().to_string(),
         }
     }
 
@@ -371,7 +470,7 @@ impl Manager {
     /// next to this executable, else bare name (PATH lookup).
     pub fn resolve_bin(&self, bin: &str) -> (PathBuf, bool) {
         let file = format!("{bin}{}", std::env::consts::EXE_SUFFIX);
-        if let Some(dir) = &self.bin_dir {
+        if let Some(dir) = &self.cfg.bin_dir {
             let p = dir.join(&file);
             let found = p.is_file();
             return (p, found);
@@ -394,7 +493,7 @@ impl Manager {
         if !name.ends_with(".jsonl") {
             return Err("must be a .jsonl recording".into());
         }
-        let p = self.recordings_dir.join(name);
+        let p = self.cfg.recordings_dir.join(name);
         if !p.is_file() {
             return Err(format!("no such recording: {name}"));
         }
@@ -403,7 +502,7 @@ impl Manager {
 
     /// `*.jsonl` files in the recordings directory, newest first.
     pub fn list_sessions(&self) -> Vec<String> {
-        let Ok(rd) = std::fs::read_dir(&self.recordings_dir) else {
+        let Ok(rd) = std::fs::read_dir(&self.cfg.recordings_dir) else {
             return Vec::new();
         };
         let mut v: Vec<(SystemTime, String)> = rd
@@ -425,8 +524,8 @@ impl Manager {
     /// an unwatched panel still records exits.
     pub async fn reap(&self) {
         let mut slots = self.slots.lock().await;
-        for s in slots.values_mut() {
-            s.reap();
+        for c in &self.components {
+            slots.get_mut(c.id).expect("slot per component").reap(c);
         }
     }
 
@@ -436,7 +535,7 @@ impl Manager {
             .iter()
             .map(|c| {
                 let s = slots.get_mut(c.id).expect("slot per component");
-                s.reap();
+                s.reap(c);
                 let (bin_path, bin_found) = self.resolve_bin(c.bin);
                 ComponentState {
                     id: c.id,
@@ -452,11 +551,13 @@ impl Manager {
                     pid: s.pid,
                     since_unix_s: s.since,
                     last_exit: s.last_exit,
+                    exits: s.exits,
+                    unexpected_exits: s.unexpected_exits,
                     args: s.args.clone(),
                     saving: s.child.is_some()
                         && c.id == "capture"
-                        && recording_saves(self.recording_enabled, &s.args),
-                    log: s.log.lock().unwrap_or_else(|p| p.into_inner()).tail(log_lines),
+                        && recording_saves(self.cfg.recording_enabled, &s.args),
+                    log: s.log.tail(log_lines),
                 }
             })
             .collect()
@@ -472,7 +573,7 @@ impl Manager {
         }
         if c.passes_config {
             args.push("--config".into());
-            args.push(self.config_path.display().to_string());
+            args.push(self.cfg.config_path.display().to_string());
         }
         for f in &req.flags {
             if !c.flags.iter().any(|a| a.flag == f) {
@@ -492,8 +593,11 @@ impl Manager {
 
         let mut slots = self.slots.lock().await;
         let slot = slots.get_mut(c.id).expect("slot per component");
-        if !slot.reap() {
+        if !slot.reap(c) {
             return Err(StartError::AlreadyRunning);
+        }
+        if let Some(dir) = &self.cfg.log_dir {
+            slot.log.ensure_file(dir, c.id);
         }
 
         let mut cmd = Command::new(&bin);
@@ -509,10 +613,8 @@ impl Manager {
             StartError::Spawn(format!("{} {}: {e}", bin.display(), args.join(" ")))
         })?;
         let pid = child.id().unwrap_or(0);
-        {
-            let mut log = slot.log.lock().unwrap_or_else(|p| p.into_inner());
-            log.push(format!("--- started pid {pid}: {} {} ---", bin.display(), args.join(" ")));
-        }
+        slot.log
+            .push(format!("--- started pid {pid}: {} {} ---", bin.display(), args.join(" ")));
         if let Some(out) = child.stdout.take() {
             tokio::spawn(pump(out, slot.log.clone()));
         }
@@ -534,33 +636,36 @@ impl Manager {
         let pid = {
             let mut slots = self.slots.lock().await;
             let slot = slots.get_mut(c.id).expect("slot per component");
-            if slot.reap() {
+            if slot.reap(c) {
                 return Err(StopError::NotRunning);
             }
-            slot.pid.unwrap_or(0)
+            slot.stopping = true;
+            slot.pid
         };
 
-        if !force && send_ctrl_break(pid) {
-            let deadline = tokio::time::Instant::now() + self.grace;
+        // A pid of 0 would address the whole console group — this panel
+        // included — so a child whose pid was never known is only terminated.
+        if !force && pid.is_some_and(send_ctrl_break) {
+            let deadline = tokio::time::Instant::now() + self.cfg.grace;
             while tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let mut slots = self.slots.lock().await;
-                if slots.get_mut(c.id).expect("slot per component").reap() {
+                if slots.get_mut(c.id).expect("slot per component").reap(c) {
                     info!(component = c.id, pid, "stopped gracefully");
                     return Ok(StopOutcome::Graceful);
                 }
             }
-            warn!(component = c.id, pid, grace_s = self.grace.as_secs(), "did not stop in time; terminating");
+            warn!(component = c.id, pid, grace_s = self.cfg.grace.as_secs(), "did not stop in time; terminating");
         }
 
         let mut slots = self.slots.lock().await;
         let slot = slots.get_mut(c.id).expect("slot per component");
-        if let Some(child) = slot.child.as_mut() {
-            if let Err(e) = child.kill().await {
-                warn!(component = c.id, pid, error = %e, "kill failed");
-            }
+        if let Some(child) = slot.child.as_mut()
+            && let Err(e) = child.kill().await
+        {
+            warn!(component = c.id, pid, error = %e, "kill failed");
         }
-        slot.reap();
+        slot.reap(c);
         info!(component = c.id, pid, "terminated");
         Ok(StopOutcome::Terminated)
     }
@@ -575,10 +680,10 @@ impl Manager {
 }
 
 /// Copy one child stream, line by line, into its component's log.
-async fn pump<R: AsyncRead + Unpin>(r: R, log: Arc<Mutex<LogRing>>) {
+async fn pump<R: AsyncRead + Unpin>(r: R, log: Arc<LogSink>) {
     let mut lines = BufReader::new(r).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        log.lock().unwrap_or_else(|p| p.into_inner()).push(line);
+        log.push(line);
     }
 }
 
@@ -646,15 +751,112 @@ mod tests {
         passes_config: false,
     };
 
+    /// A task that fails: exits 3 without being asked to.
+    const FAILER: Component = Component {
+        id: "failer",
+        label: "Failer",
+        summary: "test task that exits 3",
+        #[cfg(windows)]
+        bin: "cmd",
+        #[cfg(not(windows))]
+        bin: "sh",
+        #[cfg(windows)]
+        base_args: &["/C", "echo about to fail && exit 3"],
+        #[cfg(not(windows))]
+        base_args: &["-c", "echo about to fail; exit 3"],
+        kind: Kind::Task,
+        flags: &[],
+        takes_session: false,
+        passes_config: false,
+    };
+
+    fn config(dir: &Path) -> ManagerConfig {
+        ManagerConfig {
+            bin_dir: None,
+            config_path: PathBuf::from("telemouse.toml"),
+            recordings_dir: dir.to_path_buf(),
+            recording_enabled: true,
+            grace: Duration::from_secs(2),
+            log_dir: None,
+        }
+    }
+
     fn manager(dir: &Path) -> Manager {
-        Manager::new(
-            &[SLEEPER, REPORTER],
-            None,
-            PathBuf::from("telemouse.toml"),
-            dir.to_path_buf(),
-            true,
-            Duration::from_secs(2),
-        )
+        Manager::new(&[SLEEPER, REPORTER, FAILER], config(dir))
+    }
+
+    /// Poll until the component is no longer running (or the deadline).
+    async fn wait_exit(m: &Manager, id: &str) -> ComponentState {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = m.snapshot(50).await;
+            let s = st.into_iter().find(|s| s.id == id).unwrap();
+            if !s.running {
+                return s;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{id} still running: {:?}", s.log);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exits_are_counted_and_classified() {
+        let m = manager(Path::new("."));
+        // A task that fails on its own: unexpected.
+        m.start("failer", &StartRequest::default()).await.unwrap();
+        let s = wait_exit(&m, "failer").await;
+        assert_eq!(s.last_exit.map(|e| e.code), Some(Some(3)));
+        assert_eq!((s.exits, s.unexpected_exits), (1, 1));
+        assert!(s.log.iter().any(|l| l.contains("about to fail")));
+
+        // A service that is stopped: expected, whatever the exit code.
+        m.start("sleeper", &StartRequest::default()).await.unwrap();
+        m.stop("sleeper", true).await.unwrap();
+        let s = wait_exit(&m, "sleeper").await;
+        assert_eq!((s.exits, s.unexpected_exits), (1, 0));
+
+        // Counts accumulate across runs and `stopping` does not leak into
+        // the next run.
+        m.start("failer", &StartRequest::default()).await.unwrap();
+        let s = wait_exit(&m, "failer").await;
+        assert_eq!((s.exits, s.unexpected_exits), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn child_output_is_also_written_to_a_log_file() {
+        let dir = tmpdir("logs");
+        let mut cfg = config(Path::new("."));
+        cfg.log_dir = Some(dir.join("nested"));
+        let m = Manager::new(&[FAILER], cfg);
+        m.start("failer", &StartRequest::default()).await.unwrap();
+        wait_exit(&m, "failer").await;
+        // The pumps finish a beat after try_wait sees the exit.
+        let path = dir.join("nested").join("failer.log");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains("about to fail") && text.contains("--- exited: code 3 ---") {
+                break text;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "log file incomplete: {text:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(text.starts_with("--- started pid"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_log_rotates_a_large_file() {
+        let dir = tmpdir("rotate");
+        let path = dir.join("x.log");
+        let f = File::create(&path).unwrap();
+        f.set_len(LOG_ROTATE_BYTES + 1).unwrap();
+        drop(f);
+        let mut f = open_log(&dir, "x").unwrap();
+        writeln!(f, "fresh").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        assert_eq!(std::fs::metadata(dir.join("x.log.1")).unwrap().len(), LOG_ROTATE_BYTES + 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -822,11 +1024,7 @@ mod tests {
         let dir = tmpdir("bin");
         let m = Manager::new(
             &[SLEEPER],
-            Some(dir.clone()),
-            PathBuf::from("telemouse.toml"),
-            PathBuf::from("."),
-            true,
-            Duration::from_secs(1),
+            ManagerConfig { bin_dir: Some(dir.clone()), ..config(Path::new(".")) },
         );
         let (p, found) = m.resolve_bin("telemouse-viz");
         assert_eq!(p, dir.join(format!("telemouse-viz{}", std::env::consts::EXE_SUFFIX)));

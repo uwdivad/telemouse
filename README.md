@@ -71,6 +71,7 @@ dir = "recordings"            # per-session JSONL files
 [ctl]
 http_addr = "127.0.0.1:7880"  # control panel; keep it on loopback — it can kill processes
 stop_grace_secs = 5           # Ctrl-Break → wait this long → terminate
+log_dir = "logs"              # ctl.log + one <component>.log per launched component
 
 # Aim-space conversion, per game: degrees = counts * sens * coeff.
 # Key = lowercase process name of the game (matched automatically).
@@ -241,7 +242,7 @@ a game is running.
 2. Start the panel — any of these:
 
    ```powershell
-   target\release\telemouse-ctl.exe                          # from a terminal: logs stay in the console
+   target\release\telemouse-ctl.exe                          # from a terminal: logs go to the console and logs\ctl.log
    cargo run -p telemouse-ctl -- serve --bin-dir target\debug   # debug build, pointed at the debug binaries
    ```
 
@@ -249,7 +250,10 @@ a game is running.
    that way the panel is the only process on its console, so it hides the
    console window and you get just the GUI. (The console itself stays —
    the graceful stop is a `CTRL_BREAK`, which needs one — so don't be
-   surprised to see it in Task Manager.)
+   surprised to see it in Task Manager.) The panel's own log is in
+   `logs\ctl.log`, and everything a launched component printed is in
+   `logs\<component>.log` — that is where to look when something died
+   while you weren't watching.
 
 3. What appears:
    - a window titled **telemouse-ctl**: a monospace readout of every

@@ -24,12 +24,39 @@ use telemouse_core::config::AppConfig;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::manager::Manager;
+use crate::manager::{Manager, ManagerConfig};
 use crate::procs::Scanner;
 use crate::server::{AppState, PageConfig};
 
 /// How often exited children are reaped when nobody is looking at the page.
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// stderr plus `<log_dir>/ctl.log`. Started from Explorer the panel hides
+/// its console, so without the file its own warnings — a child that died,
+/// a request refused — would be written into a window nobody can see.
+fn init_tracing(log_dir: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let file = manager::open_log(log_dir, "ctl");
+    let file_layer = file.as_ref().ok().map(|f| {
+        f.try_clone().ok().map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(f))
+        })
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(file_layer.flatten())
+        .init();
+    match file {
+        Ok(_) => info!(path = %log_dir.join("ctl.log").display(), "logging to file"),
+        Err(e) => warn!(dir = %log_dir.display(), error = %e, "cannot open log file; logging to stderr only"),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "telemouse-ctl", about = "Control panel: start, stop and inspect telemouse processes")]
@@ -60,14 +87,14 @@ struct ServeArgs {
     /// is always headless elsewhere).
     #[arg(long)]
     no_gui: bool,
+    /// Override `ctl.log_dir`: where `ctl.log` and one `<component>.log` per
+    /// launched component are written.
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
-
     let cli = Cli::parse();
     let args = match cli.command {
         Some(Command::Serve(a)) => a,
@@ -76,18 +103,25 @@ async fn main() -> Result<()> {
             ..Default::default()
         },
     };
-    serve(args).await
-}
-
-async fn serve(args: ServeArgs) -> Result<()> {
-    let cfg = match AppConfig::load_or_default(&args.config) {
+    // The config decides where logs go, so it is read before the subscriber
+    // exists; its own failure is reported right after.
+    let cfg = AppConfig::load_or_default(&args.config);
+    let log_dir = args
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| cfg.as_ref().map(|c| c.ctl.log_dir.clone()).unwrap_or_else(|_| PathBuf::from("logs")));
+    init_tracing(&log_dir);
+    let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, path = %args.config.display(), "config unreadable; using defaults");
             AppConfig::default()
         }
     };
+    serve(args, cfg, log_dir).await
+}
 
+async fn serve(args: ServeArgs, cfg: AppConfig, log_dir: PathBuf) -> Result<()> {
     let http_addr_s = args.http.unwrap_or(cfg.ctl.http_addr);
     let http_addr: SocketAddr = http_addr_s
         .parse()
@@ -100,11 +134,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let manager = Arc::new(Manager::new(
         manager::COMPONENTS,
-        bin_dir.clone(),
-        args.config.clone(),
-        cfg.recording.dir.clone(),
-        cfg.recording.enabled,
-        Duration::from_secs(cfg.ctl.stop_grace_secs),
+        ManagerConfig {
+            bin_dir: bin_dir.clone(),
+            config_path: args.config.clone(),
+            recordings_dir: cfg.recording.dir.clone(),
+            recording_enabled: cfg.recording.enabled,
+            grace: Duration::from_secs(cfg.ctl.stop_grace_secs),
+            log_dir: Some(log_dir.clone()),
+        },
     ));
     let state = AppState {
         manager: manager.clone(),
@@ -140,6 +177,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         http = %http_addr,
         config = %args.config.display(),
         bin_dir = %bin_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "(next to telemouse-ctl, then PATH)".into()),
+        logs = %log_dir.display(),
         "telemouse-ctl serving; control panel http://{http_addr}/"
     );
 
@@ -216,6 +254,16 @@ mod tests {
         assert_eq!(a.http.as_deref(), Some("127.0.0.1:9001"));
         assert_eq!(a.bin_dir, Some(PathBuf::from("target/release")));
         assert!(!a.no_gui, "the gui is on by default");
+        assert!(a.log_dir.is_none(), "log dir comes from the config by default");
+    }
+
+    #[test]
+    fn log_dir_flag_parses() {
+        let cli = Cli::parse_from(["telemouse-ctl", "serve", "--log-dir", "D:/tm/logs"]);
+        let Some(Command::Serve(a)) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(a.log_dir, Some(PathBuf::from("D:/tm/logs")));
     }
 
     #[test]

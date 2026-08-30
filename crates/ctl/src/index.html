@@ -216,7 +216,7 @@ function render() {
 function renderCards() {
   const host = $("cards");
   const key = JSON.stringify([
-    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.saving, c.last_exit, c.log.length, c.log[c.log.length - 1]]),
+    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.saving, c.last_exit, c.unexpected_exits, c.log.length, c.log[c.log.length - 1]]),
     sessions, [...busy], [...openLogs], state.recording,
   ]);
   if (key === cardsKey) {
@@ -241,6 +241,9 @@ function renderCards() {
     const exit = c.last_exit;
     const exitText = exit ? ("exited " + (exit.code === -1073741510 ? "on Ctrl-Break" : exit.code === null ? "by signal" : "code " + exit.code) + " at " + clock(exit.at_unix_s)) : "";
     const exitCls = exit && exit.code !== 0 && exit.code !== -1073741510 ? "bad" : "";
+    // Exits nobody asked for, since the panel started: a crash loop shows
+    // here even when every individual exit scrolled out of the log.
+    const crashText = c.unexpected_exits ? `<span class="bad" title="exits without a stop since the panel started (${c.exits} exits in all)">unexpected exits: ${c.unexpected_exits}</span>` : "";
 
     // The recording switch is one checkbox, not two raw flags: it defaults
     // to telemouse.toml and only sends --record / --no-record when it disagrees.
@@ -272,7 +275,7 @@ function renderCards() {
         <span class="pill ${run ? "on" : ""}"><span class="dot"></span><span data-uptime="${c.id}">${run ? "running · pid " + c.pid + " · " + ago(c.since_unix_s) : (c.kind === "task" ? "idle" : "stopped")}</span></span>${saveNow}
       </div>
       <div class="sum">${esc(c.summary)}</div>
-      <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}</div>
+      <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}${crashText}</div>
       ${flags || saveCtl ? `<div class="opts">${saveCtl}${flags}</div>` : ""}
       <div class="row">${sessionSel}${buttons}</div>
       <details ${openLogs.has(c.id) ? "open" : ""} data-log="${c.id}"><summary>output (${c.log.length} lines)</summary><pre class="log">${esc(c.log.join("\n")) || "—"}</pre></details>

@@ -126,6 +126,10 @@ pub struct CtlConfig {
     /// How long a graceful stop (Ctrl-Break) may take before the child is
     /// terminated outright.
     pub stop_grace_secs: u64,
+    /// Where the panel writes `ctl.log` (its own log — the console is hidden
+    /// when started from Explorer) and one `<component>.log` per launched
+    /// component (what the child printed, kept across panel restarts).
+    pub log_dir: PathBuf,
 }
 
 impl Default for CtlConfig {
@@ -134,6 +138,7 @@ impl Default for CtlConfig {
             http_addr: "127.0.0.1:7880".into(),
             bin_dir: None,
             stop_grace_secs: 5,
+            log_dir: PathBuf::from("logs"),
         }
     }
 }
@@ -397,14 +402,16 @@ mod tests {
         assert_eq!(c.ctl.http_addr, "127.0.0.1:7880");
         assert_eq!(c.ctl.bin_dir, None);
         assert_eq!(c.ctl.stop_grace_secs, 5);
+        assert_eq!(c.ctl.log_dir, Path::new("logs"));
 
         let c: AppConfig = toml::from_str(
-            "[ctl]\nhttp_addr = \"127.0.0.1:9000\"\nbin_dir = \"target/release\"\nstop_grace_secs = 2\n",
+            "[ctl]\nhttp_addr = \"127.0.0.1:9000\"\nbin_dir = \"target/release\"\nstop_grace_secs = 2\nlog_dir = \"var/log\"\n",
         )
         .unwrap();
         assert_eq!(c.ctl.http_addr, "127.0.0.1:9000");
         assert_eq!(c.ctl.bin_dir.as_deref(), Some(Path::new("target/release")));
         assert_eq!(c.ctl.stop_grace_secs, 2);
+        assert_eq!(c.ctl.log_dir, Path::new("var/log"));
         c.validate().unwrap();
 
         let mut bad = AppConfig::default();

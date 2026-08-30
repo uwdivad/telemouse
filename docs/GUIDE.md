@@ -956,6 +956,7 @@ http_addr = "127.0.0.1:7879"
 http_addr = "127.0.0.1:7880"  # control panel; loopback — it can kill processes
 # bin_dir = "target/release"  # where the binaries are; default: next to telemouse-ctl, then PATH
 stop_grace_secs = 5           # Ctrl-Break → wait → terminate (0–60)
+log_dir = "logs"              # ctl.log + <component>.log per launched component; rotated at 8 MB
 
 [viz.obs]                     # defaults for /obs; every one overridable by URL param
 layout = "split"              # split | stack | desk | aim
@@ -1293,13 +1294,13 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 
 | File | Owns |
 |---|---|
-| `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui`), config load, 2-worker tokio runtime, the 500 ms reaper, Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Warns if bound to a non-loopback address. |
+| `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Warns if bound to a non-loopback address. |
 | `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
 | `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink`, `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop` actions. |
 | `gui/model.rs` | Pure: `render_text` (the window body, CRLF, fixed columns), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
 | `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, and the message loop. See §19.5. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` keeps a `sysinfo::System` between scans so CPU % is per interval, refreshes only cpu/memory/cmd/exe (no per-process user lookup — that cost seconds), and serves `scan_cached(ttl)` from a 4 s cache because a full table walk was ~5% of a core when polled every poll; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
-| `manager.rs` | The component catalogue (`COMPONENTS`), `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a 400-line `LogRing` per component, `try_wait` reaping, and the two-stage stop. |
+| `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
 | `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config. |
 | `index.html` | Self-contained page: polls `/api/state` + `/api/sessions` every 2 s (10 s while the tab is hidden), re-renders only when something structural changed and patches the live numbers otherwise, two-click kill (no modal dialogs). |
 
@@ -1307,7 +1308,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 
 | Route | Effect |
 |---|---|
-| `GET /api/state` | `{ self_pid, now_unix_s, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `recording` is the config default; each component carries its run's `args` and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
+| `GET /api/state` | `{ self_pid, now_unix_s, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `recording` is the config default; each component carries its run's `args`, `exits` / `unexpected_exits` since the panel started (a service that died without a stop, or a task that finished non-zero), and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
 | `GET /api/sessions` | `*.jsonl` names in `recording.dir`, newest first (the report picker). |
 | `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl" }`. 404 unknown, 409 already running, 400 disallowed flag / bad session, 500 spawn failure (binary missing). |
 | `POST /api/components/{id}/stop` | body `{ force?: bool }` → `{ outcome: "graceful" \| "terminated" }`. 409 if not running. |

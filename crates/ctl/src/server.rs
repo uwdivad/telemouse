@@ -241,13 +241,16 @@ mod tests {
         AppState {
             manager: Arc::new(Manager::new(
                 crate::manager::COMPONENTS,
-                // An empty directory: every binary is "not found", so start
-                // can only fail at spawn — never launch a real agent in tests.
-                Some(std::env::temp_dir().join("telemouse-ctl-no-bins")),
-                PathBuf::from("telemouse.toml"),
-                PathBuf::from("recordings"),
-                true,
-                Duration::from_secs(1),
+                crate::manager::ManagerConfig {
+                    // An empty directory: every binary is "not found", so start
+                    // can only fail at spawn — never launch a real agent in tests.
+                    bin_dir: Some(std::env::temp_dir().join("telemouse-ctl-no-bins")),
+                    config_path: PathBuf::from("telemouse.toml"),
+                    recordings_dir: PathBuf::from("recordings"),
+                    recording_enabled: true,
+                    grace: Duration::from_secs(1),
+                    log_dir: None,
+                },
             )),
             scanner: Arc::new(Scanner::new()),
             page: Arc::new(render_page(&PageConfig {
@@ -326,6 +329,8 @@ mod tests {
         assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--no-kafka"));
         assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--record"));
         assert_eq!(cap["saving"], false);
+        assert_eq!(cap["exits"], 0);
+        assert_eq!(cap["unexpected_exits"], 0);
         assert!(cap["args"].is_array());
         assert_eq!(v["recording"]["enabled"], true);
         assert_eq!(v["recording"]["dir"], "recordings");

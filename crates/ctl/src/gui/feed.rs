@@ -149,11 +149,14 @@ mod tests {
     fn manager() -> Arc<Manager> {
         Arc::new(Manager::new(
             crate::manager::COMPONENTS,
-            Some(std::env::temp_dir().join("telemouse-ctl-gui-no-bins")),
-            PathBuf::from("telemouse.toml"),
-            PathBuf::from("recordings"),
-            true,
-            Duration::from_secs(1),
+            crate::manager::ManagerConfig {
+                bin_dir: Some(std::env::temp_dir().join("telemouse-ctl-gui-no-bins")),
+                config_path: PathBuf::from("telemouse.toml"),
+                recordings_dir: PathBuf::from("recordings"),
+                recording_enabled: true,
+                grace: Duration::from_secs(1),
+                log_dir: None,
+            },
         ))
     }
 

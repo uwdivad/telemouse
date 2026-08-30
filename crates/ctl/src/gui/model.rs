@@ -329,6 +329,8 @@ mod tests {
             pid: running.then_some(4242),
             since_unix_s: running.then_some(1_000_000),
             last_exit: None,
+            exits: 0,
+            unexpected_exits: 0,
             args: Vec::new(),
             saving: running && id == "capture",
             log: vec!["line one".into(), "line two".into()],
