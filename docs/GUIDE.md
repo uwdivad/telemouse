@@ -1310,7 +1310,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 |---|---|
 | `GET /api/state` | `{ self_pid, now_unix_s, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `recording` is the config default; each component carries its run's `args`, `exits` / `unexpected_exits` since the panel started (a service that died without a stop, or a task that finished non-zero), and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
 | `GET /api/sessions` | `*.jsonl` names in `recording.dir`, newest first (the report picker). |
-| `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl" }`. 404 unknown, 409 already running, 400 disallowed flag / bad session, 500 spawn failure (binary missing). |
+| `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl", save?: bool }`. `save` is the capture card's switch: the server turns it into `--record` / `--no-record` against its own `recording.enabled` (`recording_flags`), so the page and the tray never derive the flag themselves; omitted = the config default. 404 unknown, 409 already running, 400 disallowed flag / bad session (including `save` on a component without the switch), 500 spawn failure (binary missing). |
 | `POST /api/components/{id}/stop` | body `{ force?: bool }` → `{ outcome: "graceful" \| "terminated" }`. 409 if not running. |
 | `POST /api/processes/{pid}/kill` | 403 for this panel or an unrelated process, 404 unknown, 500 if the OS refuses. |
 

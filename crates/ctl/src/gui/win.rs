@@ -566,12 +566,10 @@ unsafe fn command(s: *mut UiState, id: u16) {
         match id {
             model::MENU_TOGGLE_WINDOW => set_visible(s, !(*s).visible),
             model::MENU_START_CAPTURE | model::MENU_START_CAPTURE_NOSAVE => {
-                let save = id == model::MENU_START_CAPTURE;
-                let flags = model::start_flags(&(*s).link.state.borrow(), save);
-                feed::start(&(*s).link, "capture", flags)
+                feed::start(&(*s).link, "capture", Some(id == model::MENU_START_CAPTURE))
             }
             model::MENU_STOP_CAPTURE => feed::stop(&(*s).link, "capture"),
-            model::MENU_START_VIZ => feed::start(&(*s).link, "viz", Vec::new()),
+            model::MENU_START_VIZ => feed::start(&(*s).link, "viz", None),
             model::MENU_STOP_VIZ => feed::stop(&(*s).link, "viz"),
             model::MENU_OPEN_PANEL => open_panel(s),
             model::MENU_EXIT => request_exit(s),

@@ -111,14 +111,15 @@ pub async fn run_publisher(
     }
 }
 
-/// Start a component with the given flags (the tray's quick action). The
-/// outcome is logged and shows up in the next snapshot.
-pub fn start(link: &GuiLink, id: &'static str, flags: Vec<String>) {
+/// Start a component (the tray's quick action); `save` is the capture
+/// card's switch, resolved by the manager. The outcome is logged and shows
+/// up in the next snapshot.
+pub fn start(link: &GuiLink, id: &'static str, save: Option<bool>) {
     let (m, s, poke) = (link.manager.clone(), link.scanner.clone(), link.poke.clone());
     link.handle.spawn(async move {
-        let req = StartRequest { flags, session: None };
+        let req = StartRequest { save, ..Default::default() };
         match m.start(id, &req).await {
-            Ok(pid) => info!(component = id, pid, flags = ?req.flags, "started from the tray"),
+            Ok(pid) => info!(component = id, pid, save = ?save, "started from the tray"),
             Err(e) => warn!(component = id, error = %e, "tray start refused"),
         }
         s.invalidate();
@@ -248,7 +249,7 @@ mod tests {
         };
         // No binaries: the start fails at spawn, the stop finds nothing running;
         // both must still poke so the UI refreshes.
-        start(&link, "capture", vec!["--no-record".into()]);
+        start(&link, "capture", Some(false));
         tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();
         stop(&link, "viz");
         tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();

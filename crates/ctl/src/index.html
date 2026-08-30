@@ -179,6 +179,10 @@ function startComponent(c) {
   const ch = chosen[c.id] || {};
   const body = { flags: [...(ch.flags || [])] };
   if (c.takes_session) body.session = ch.session || (sessions[0] || null);
+  // The save switch is sent as a boolean and turned into --record /
+  // --no-record by the server against the config it holds now, not the
+  // one this page loaded with. Untouched = null = the config default.
+  if (ch.save === true || ch.save === false) body.save = ch.save;
   return act(c.id, async () => {
     const r = await api("POST", "/api/components/" + c.id + "/start", body);
     toast(c.label + " started (pid " + r.pid + ")", "ok");
@@ -345,11 +349,7 @@ document.addEventListener("change", (e) => {
     const ch = chosen[t.dataset.c];
     if (t.checked) ch.flags.add(t.dataset.flag); else ch.flags.delete(t.dataset.flag);
   } else if (t.dataset.save) {
-    const ch = chosen[t.dataset.save];
-    ch.save = t.checked;
-    ch.flags.delete("--record"); ch.flags.delete("--no-record");
-    if (ch.save && !state.recording.enabled) ch.flags.add("--record");
-    if (!ch.save && state.recording.enabled) ch.flags.add("--no-record");
+    chosen[t.dataset.save].save = t.checked;
   } else if (t.dataset.session) {
     chosen[t.dataset.session].session = t.value;
   }

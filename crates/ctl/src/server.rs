@@ -385,6 +385,33 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// `save` is accepted for capture (and fails only at spawn, since the
+    /// test bin dir is empty) and refused as a disallowed flag elsewhere.
+    #[tokio::test]
+    async fn save_switch_is_a_request_field() {
+        let st = state();
+        let (s, v, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/components/capture/start",
+            true,
+            Some(serde_json::json!({ "save": false })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("--no-record"), "{v}");
+        let (s, v, _) = call(
+            st,
+            Method::POST,
+            "/api/components/viz/start",
+            true,
+            Some(serde_json::json!({ "save": false })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("--no-record"), "{v}");
+    }
+
     #[tokio::test]
     async fn start_and_stop_map_manager_errors_to_statuses() {
         let st = state();

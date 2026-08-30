@@ -191,7 +191,7 @@ shows no toasts (markers still flash the panels).
 - **Components** — a card each for the capture agent, the viz server, `doctor`,
   `analyze trend` and `analyze report`. *Start* launches the binary with the
   panel's own `--config`; the capture card has a **save data** switch (it
-  defaults to `[recording] enabled` in `telemouse.toml` and sends
+  defaults to `[recording] enabled` in `telemouse.toml`; the panel adds
   `--record` / `--no-record` only when you flip it the other way), shows
   *saving → recordings/* or *not saving* while the agent runs, and exposes
   `--print` / `--no-kafka` / `--no-udp` as checkboxes; the report card has a

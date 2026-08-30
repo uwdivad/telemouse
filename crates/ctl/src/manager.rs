@@ -150,6 +150,13 @@ pub struct StartRequest {
     /// File name (not path) of a recording in the recordings directory.
     #[serde(default)]
     pub session: Option<String>,
+    /// Capture only: save a recording this run? `None` = whatever
+    /// `recording.enabled` says. The panel turns this into `--record` /
+    /// `--no-record` itself (see [`recording_flags`]) so the page and the
+    /// tray cannot disagree with it, or with a config that changed since
+    /// the page loaded.
+    #[serde(default)]
+    pub save: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -575,7 +582,14 @@ impl Manager {
             args.push("--config".into());
             args.push(self.cfg.config_path.display().to_string());
         }
-        for f in &req.flags {
+        // `save` becomes a flag here and then goes through the same allow-list
+        // as any other, so a component without the recording switch refuses it
+        // the way it refuses the raw flag.
+        let save_flags = req
+            .save
+            .map(|save| recording_flags(self.cfg.recording_enabled, save))
+            .unwrap_or_default();
+        for f in req.flags.iter().chain(&save_flags) {
             if !c.flags.iter().any(|a| a.flag == f) {
                 return Err(StartError::FlagNotAllowed(f.clone()));
             }
@@ -877,7 +891,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reports_the_arguments_of_a_run() {
         let m = manager(Path::new("."));
-        m.start("sleeper", &StartRequest { flags: vec!["--ok".into()], session: None }).await.unwrap();
+        m.start("sleeper", &StartRequest { flags: vec!["--ok".into()], ..Default::default() }).await.unwrap();
         let st = m.snapshot(1).await;
         let s = st.iter().find(|s| s.id == "sleeper").unwrap();
         assert_eq!(s.args.last().map(String::as_str), Some("--ok"));
@@ -961,13 +975,13 @@ mod tests {
         let m = manager(&dir);
 
         let ok = m
-            .arguments(&SLEEPER, &StartRequest { flags: vec!["--ok".into(), "--ok".into()], session: None })
+            .arguments(&SLEEPER, &StartRequest { flags: vec!["--ok".into(), "--ok".into()], ..Default::default() })
             .unwrap();
         assert_eq!(ok.last(), Some(&"--ok".to_string()));
         assert_eq!(ok.iter().filter(|a| *a == "--ok").count(), 1, "flags are deduplicated");
 
         assert_eq!(
-            m.arguments(&SLEEPER, &StartRequest { flags: vec!["--evil".into()], session: None })
+            m.arguments(&SLEEPER, &StartRequest { flags: vec!["--evil".into()], ..Default::default() })
                 .unwrap_err(),
             StartError::FlagNotAllowed("--evil".into())
         );
@@ -976,15 +990,52 @@ mod tests {
             StartError::SessionRequired
         );
         for bad in ["../x.jsonl", "sub/x.jsonl", "sub\\x.jsonl", "notes.txt", "missing.jsonl", ""] {
-            let r = m.arguments(&REPORTER, &StartRequest { flags: vec![], session: Some(bad.into()) });
+            let r = m.arguments(&REPORTER, &StartRequest { session: Some(bad.into()), ..Default::default() });
             assert!(matches!(r, Err(StartError::BadSession(_))), "{bad:?} → {r:?}");
         }
         let ok = m
-            .arguments(&REPORTER, &StartRequest { flags: vec![], session: Some("s-1.jsonl".into()) })
+            .arguments(&REPORTER, &StartRequest { session: Some("s-1.jsonl".into()), ..Default::default() })
             .unwrap();
         assert_eq!(ok[0], "report");
         assert!(ok[1].ends_with("s-1.jsonl"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The save switch is resolved against the config the panel holds, not
+    /// whatever the page believed when it loaded.
+    #[test]
+    fn save_is_resolved_server_side() {
+        let capture = &COMPONENTS[0];
+        assert_eq!(capture.id, "capture");
+        let has = |args: &[String], f: &str| args.iter().any(|a| a == f);
+
+        let on = Manager::new(std::slice::from_ref(capture), config(Path::new(".")));
+        let a = on.arguments(capture, &StartRequest { save: Some(false), ..Default::default() }).unwrap();
+        assert!(has(&a, "--no-record") && !has(&a, "--record"));
+        let a = on.arguments(capture, &StartRequest { save: Some(true), ..Default::default() }).unwrap();
+        assert!(!has(&a, "--no-record") && !has(&a, "--record"), "agrees with the default: no flag");
+        let a = on.arguments(capture, &StartRequest::default()).unwrap();
+        assert!(!has(&a, "--no-record") && !has(&a, "--record"));
+
+        let off = Manager::new(
+            std::slice::from_ref(capture),
+            ManagerConfig { recording_enabled: false, ..config(Path::new(".")) },
+        );
+        let a = off.arguments(capture, &StartRequest { save: Some(true), ..Default::default() }).unwrap();
+        assert!(has(&a, "--record") && !has(&a, "--no-record"));
+        assert!(recording_saves(false, &a));
+
+        // A raw flag and the switch that says the same thing do not double up.
+        let a = on
+            .arguments(capture, &StartRequest { flags: vec!["--no-record".into()], save: Some(false), ..Default::default() })
+            .unwrap();
+        assert_eq!(a.iter().filter(|x| *x == "--no-record").count(), 1);
+
+        // Components without the switch refuse it like any other flag.
+        assert_eq!(
+            on.arguments(&SLEEPER, &StartRequest { save: Some(false), ..Default::default() }).unwrap_err(),
+            StartError::FlagNotAllowed("--no-record".into())
+        );
     }
 
     #[tokio::test]
@@ -1000,7 +1051,7 @@ mod tests {
         std::fs::write(dir.join("s.jsonl"), "{}\n").unwrap();
         let m = manager(&dir);
         let r = m
-            .start("rep", &StartRequest { flags: vec![], session: Some("s.jsonl".into()) })
+            .start("rep", &StartRequest { session: Some("s.jsonl".into()), ..Default::default() })
             .await;
         assert!(matches!(r, Err(StartError::Spawn(_))), "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);

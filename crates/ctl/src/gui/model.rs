@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 
 use crate::gui::feed::Snapshot;
-use crate::manager::{ComponentState, Kind, describe_exit, recording_flags};
+use crate::manager::{ComponentState, Kind, describe_exit};
 
 /// `NOTIFYICONDATAW.szTip` is 128 UTF-16 units including the terminator.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
@@ -80,11 +80,6 @@ pub fn tooltip(s: &Snapshot) -> String {
         service_status(component(s, "viz"), s.now_unix_s),
     );
     text.chars().take(TOOLTIP_MAX_CHARS).collect()
-}
-
-/// Flags for a tray-started capture run that should (not) save data.
-pub fn start_flags(s: &Snapshot, save: bool) -> Vec<String> {
-    recording_flags(s.recording_enabled, save)
 }
 
 /// Whose log tail the window shows: the running capture agent, else the
@@ -438,17 +433,6 @@ mod tests {
         let empty = render_text(&Snapshot::default());
         assert!(empty.contains("(none)"));
         assert!(empty.contains("nothing has run yet"));
-    }
-
-    #[test]
-    fn start_flags_only_override_a_disagreeing_default() {
-        let on = snap(false, false);
-        assert!(start_flags(&on, true).is_empty());
-        assert_eq!(start_flags(&on, false), vec!["--no-record".to_string()]);
-        let mut off = snap(false, false);
-        off.recording_enabled = false;
-        assert_eq!(start_flags(&off, true), vec!["--record".to_string()]);
-        assert!(start_flags(&off, false).is_empty());
     }
 
     #[test]
