@@ -15,7 +15,7 @@ use std::hint::black_box;
 
 use telemouse_analyze::savgol::SavGol;
 use telemouse_analyze::series::{Params, prepare};
-use telemouse_analyze::{flicks, micro, testutil};
+use telemouse_analyze::{flicks, load, micro, testutil};
 
 /// The two session sizes every bench runs at.
 const SIZES: [usize; 2] = [1_000_000, 10_000_000];
@@ -79,8 +79,32 @@ fn bench_flick_detect(c: &mut Criterion) {
     g.finish();
 }
 
+/// The JSONL loader over a synthetic recording of the same shape, batched at
+/// the capture agent's steady state (25 events per batch at 1kHz). The file
+/// is written once per size into a temp dir; the bench times only
+/// `load_session` (parse + flatten + intern), with the file in page cache.
+fn bench_load(c: &mut Criterion) {
+    let mut g = c.benchmark_group("load_session");
+    g.sample_size(10);
+    let dir = tempfile::tempdir().expect("tempdir");
+    for cells in SIZES {
+        let cfg = testutil::session_cfg();
+        let evs = testutil::bench_events(cells);
+        let path = testutil::write_session(dir.path(), &cfg, Some("cs2.exe"), &evs, &[], 25);
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        g.throughput(Throughput::Bytes(bytes));
+        g.bench_with_input(
+            BenchmarkId::new(format!("{} events", evs.len()), cells),
+            &path,
+            |b, path| b.iter(|| black_box(load::load_session(black_box(path)).unwrap().events.len())),
+        );
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    bench_load,
     bench_prepare,
     bench_savgol,
     bench_welch,

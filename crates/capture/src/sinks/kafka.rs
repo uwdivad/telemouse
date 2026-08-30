@@ -28,7 +28,6 @@ use rskafka::client::producer::aggregator::RecordAggregator;
 use rskafka::client::producer::{BatchProducer, BatchProducerBuilder};
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
-use telemouse_core::Envelope;
 use telemouse_core::wire::{TOPIC_EVENTS, TOPIC_MARKERS, TOPIC_SESSIONS};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio::sync::oneshot;
@@ -51,22 +50,23 @@ const TOPICS: [&str; 3] = [TOPIC_EVENTS, TOPIC_SESSIONS, TOPIC_MARKERS];
 
 type Producers = HashMap<&'static str, Arc<BatchProducer<RecordAggregator>>>;
 
-/// One already-serialized envelope on its way to Kafka. Carrying `Arc<str>`
-/// keeps the shipping thread's reusable buffer out of the picture without
-/// deep-cloning the whole typed envelope per batch.
-#[derive(Debug, Clone)]
+/// One already-serialized envelope on its way to Kafka. Owning plain `Vec<u8>`
+/// buffers means one copy out of the shipping thread's reusable buffer at job
+/// creation; `produce` then *moves* them into the `Record` rather than copying
+/// again.
+#[derive(Debug)]
 pub struct KafkaJob {
     pub topic: &'static str,
-    pub key: Arc<str>,
-    pub payload: Arc<str>,
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 impl KafkaJob {
-    pub fn new(env: &Envelope, payload: &str) -> Self {
+    pub fn new(topic: &'static str, key: &str, payload: &str) -> Self {
         Self {
-            topic: env.topic(),
-            key: Arc::from(env.key()),
-            payload: Arc::from(payload),
+            topic,
+            key: key.as_bytes().to_vec(),
+            payload: payload.as_bytes().to_vec(),
         }
     }
 }
@@ -169,9 +169,10 @@ async fn forward(mut rx: Receiver<KafkaJob>, producers: Producers, stats: Arc<St
         let producers = Arc::clone(&producers);
         let stats = Arc::clone(&stats);
         inflight.spawn(async move {
-            if let Err(e) = produce(&producers, &job).await {
+            let topic = job.topic;
+            if let Err(e) = produce(&producers, job).await {
                 stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(error = %format!("{e:#}"), topic = job.topic, "kafka produce failed");
+                tracing::warn!(error = %format!("{e:#}"), topic, "kafka produce failed");
             }
             stats.kafka_queued.fetch_sub(1, Ordering::Relaxed);
         });
@@ -212,20 +213,24 @@ async fn open_producers(client: &Client) -> Result<Producers> {
     Ok(map)
 }
 
-async fn produce(producers: &Producers, job: &KafkaJob) -> Result<()> {
+async fn produce(producers: &Producers, job: KafkaJob) -> Result<()> {
+    let topic = job.topic;
     let producer = producers
-        .get(job.topic)
-        .with_context(|| format!("no producer for {}", job.topic))?;
+        .get(topic)
+        .with_context(|| format!("no producer for {topic}"))?;
+    // One clock read per produce call, taken before the record is assembled.
+    let timestamp = chrono::Utc::now();
+    // The job's buffers move straight into the record: no third copy.
     let record = Record {
-        key: Some(job.key.as_bytes().to_vec()),
-        value: Some(job.payload.as_bytes().to_vec()),
+        key: Some(job.key),
+        value: Some(job.payload),
         headers: Default::default(),
-        timestamp: chrono::Utc::now(),
+        timestamp,
     };
     producer
         .produce(record)
         .await
-        .with_context(|| format!("produce to {}", job.topic))?;
+        .with_context(|| format!("produce to {topic}"))?;
     Ok(())
 }
 
@@ -234,11 +239,11 @@ impl Sink for KafkaSink {
         "kafka"
     }
 
-    fn send(&mut self, env: &Envelope, payload: &str) -> Result<()> {
+    fn send(&mut self, topic: &'static str, key: &str, payload: &str) -> Result<()> {
         let Some(tx) = self.tx.as_ref() else {
             anyhow::bail!("kafka forwarder is shut down");
         };
-        match tx.try_send(KafkaJob::new(env, payload)) {
+        match tx.try_send(KafkaJob::new(topic, key, payload)) {
             Ok(()) => {
                 self.stats.kafka_queued.fetch_add(1, Ordering::Relaxed);
                 if self.dropping {
@@ -282,6 +287,8 @@ impl Drop for KafkaSink {
 
 #[cfg(test)]
 mod tests {
+    use telemouse_core::Envelope;
+
     use super::*;
 
     fn marker(label: &str) -> Envelope {
@@ -313,9 +320,9 @@ mod tests {
     fn jobs_carry_the_routing_the_forwarder_needs() {
         let env = marker("hotkey");
         let payload = env.to_json().unwrap();
-        let job = KafkaJob::new(&env, &payload);
+        let job = KafkaJob::new(env.topic(), env.key(), &payload);
         assert_eq!(job.topic, TOPIC_MARKERS);
-        assert_eq!(&*job.key, "s-1");
-        assert_eq!(&*job.payload, payload);
+        assert_eq!(job.key, b"s-1");
+        assert_eq!(job.payload, payload.as_bytes());
     }
 }

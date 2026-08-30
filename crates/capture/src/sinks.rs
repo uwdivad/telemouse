@@ -14,7 +14,6 @@ pub mod kafka;
 pub mod udp;
 
 use anyhow::{Context, Result};
-use telemouse_core::Envelope;
 
 pub use jsonl::JsonlSink;
 pub use kafka::KafkaSink;
@@ -23,9 +22,11 @@ pub use udp::UdpSink;
 pub trait Sink: Send {
     /// Stable short name, also the key used by [`crate::stats::Stats`].
     fn name(&self) -> &'static str;
-    /// Deliver one envelope. `payload` is `env` already serialized as JSON —
-    /// sinks that ship JSON must use it rather than re-serializing.
-    fn send(&mut self, env: &Envelope, payload: &str) -> Result<()>;
+    /// Deliver one envelope, already serialized as `payload` — sinks that ship
+    /// JSON must use it rather than re-serializing. `topic` and `key` carry
+    /// the routing (`Envelope::topic()`/`key()` or the `EnvelopeView`
+    /// equivalents), so the per-batch path never needs an owned `Envelope`.
+    fn send(&mut self, topic: &'static str, key: &str, payload: &str) -> Result<()>;
     /// Periodic housekeeping (flushes). Called roughly once per second.
     fn tick(&mut self) -> Result<()> {
         Ok(())
@@ -36,7 +37,7 @@ pub trait Sink: Send {
 /// allocation on the shipping path.
 #[derive(Debug, Default)]
 pub struct EnvelopeEncoder {
-    buf: Vec<u8>,
+    buf: String,
 }
 
 impl EnvelopeEncoder {
@@ -44,25 +45,44 @@ impl EnvelopeEncoder {
         Self {
             // Comfortably above a full 448-event batch, so the buffer stops
             // growing after the first flush.
-            buf: Vec::with_capacity(64 * 1024),
+            buf: String::with_capacity(64 * 1024),
         }
     }
 
     /// Encode `env` into the reused buffer. Read it back with [`Self::payload`]
     /// — split in two so the payload can be borrowed while the sinks are
-    /// borrowed mutably.
-    pub fn encode(&mut self, env: &Envelope) -> Result<()> {
-        self.buf.clear();
-        serde_json::to_writer(&mut self.buf, env).context("serialize envelope")?;
-        // serde_json only ever writes UTF-8; check once here so `payload` is
-        // infallible on the shipping path.
-        std::str::from_utf8(&self.buf).context("serialized envelope is not utf-8")?;
-        Ok(())
+    /// borrowed mutably. Takes anything serializable so the owned [`Envelope`]
+    /// and the borrowing `EnvelopeView` share one path.
+    pub fn encode<T: serde::Serialize>(&mut self, env: &T) -> Result<()> {
+        // Serialize into the buffer's bytes, then validate UTF-8 exactly once
+        // on the way back into the `String` — `payload` is then a free borrow,
+        // not a second O(n) scan per flush.
+        let mut bytes = std::mem::take(&mut self.buf).into_bytes();
+        bytes.clear();
+        let serialized = serde_json::to_writer(&mut bytes, env).context("serialize envelope");
+        if serialized.is_err() {
+            // Never leave a half-written payload readable.
+            bytes.clear();
+        }
+        match String::from_utf8(bytes) {
+            Ok(s) => {
+                self.buf = s;
+                serialized
+            }
+            // serde_json only ever writes UTF-8, so this is a bug; keep the
+            // (emptied) buffer usable either way.
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                bytes.clear();
+                self.buf = String::from_utf8(bytes).expect("an empty buffer is valid utf-8");
+                serialized.and(Err(anyhow::anyhow!("serialized envelope is not utf-8")))
+            }
+        }
     }
 
     /// The JSON written by the last successful [`Self::encode`].
     pub fn payload(&self) -> &str {
-        std::str::from_utf8(&self.buf).unwrap_or("")
+        &self.buf
     }
 
     /// Capacity of the reusable buffer, for tests.
@@ -79,10 +99,15 @@ pub struct SinkFailure {
 }
 
 /// Deliver one envelope to every sink, collecting (not propagating) failures.
-pub fn fan_out(sinks: &mut [Box<dyn Sink>], env: &Envelope, payload: &str) -> Vec<SinkFailure> {
+pub fn fan_out(
+    sinks: &mut [Box<dyn Sink>],
+    topic: &'static str,
+    key: &str,
+    payload: &str,
+) -> Vec<SinkFailure> {
     let mut failures = Vec::new();
     for sink in sinks.iter_mut() {
-        if let Err(e) = sink.send(env, payload) {
+        if let Err(e) = sink.send(topic, key, payload) {
             failures.push(SinkFailure {
                 sink: sink.name(),
                 error: format!("{e:#}"),
@@ -110,9 +135,13 @@ pub fn tick_all(sinks: &mut [Box<dyn Sink>]) -> Vec<SinkFailure> {
 pub(crate) mod mock {
     use std::sync::{Arc, Mutex};
 
+    use telemouse_core::Envelope;
+
     use super::*;
 
-    /// Records everything it receives.
+    /// Records everything it receives. `received` holds the typed envelopes
+    /// parsed back from the JSON payloads (the trait no longer hands sinks a
+    /// typed envelope); payloads that do not parse are still counted.
     #[derive(Clone, Default)]
     pub struct RecordingSink {
         pub name: &'static str,
@@ -132,7 +161,7 @@ pub(crate) mod mock {
         }
 
         pub fn count(&self) -> usize {
-            self.received.lock().unwrap().len()
+            self.payloads.lock().unwrap().len()
         }
     }
 
@@ -140,8 +169,10 @@ pub(crate) mod mock {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn send(&mut self, env: &Envelope, payload: &str) -> Result<()> {
-            self.received.lock().unwrap().push(env.clone());
+        fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
+            if let Ok(env) = Envelope::from_json(payload) {
+                self.received.lock().unwrap().push(env);
+            }
             self.payloads.lock().unwrap().push(payload.to_string());
             Ok(())
         }
@@ -170,7 +201,7 @@ pub(crate) mod mock {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn send(&mut self, _env: &Envelope, _payload: &str) -> Result<()> {
+        fn send(&mut self, _topic: &'static str, _key: &str, _payload: &str) -> Result<()> {
             *self.calls.lock().unwrap() += 1;
             Err(anyhow::anyhow!("boom"))
         }
@@ -217,7 +248,8 @@ mod tests {
             Box::new(last.clone()),
         ];
 
-        let failures = fan_out(&mut sinks, &env(), "{}");
+        let e = env();
+        let failures = fan_out(&mut sinks, e.topic(), e.key(), "{}");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].sink, "kafka");
         assert!(failures[0].error.contains("boom"));
@@ -234,7 +266,8 @@ mod tests {
             Box::new(FailingSink::new("udp")),
         ];
         let stats = Stats::default();
-        for f in fan_out(&mut sinks, &env(), "{}") {
+        let e = env();
+        for f in fan_out(&mut sinks, e.topic(), e.key(), "{}") {
             stats.count_sink_error(f.sink);
         }
         let snap = stats.snapshot();
@@ -286,7 +319,7 @@ mod tests {
         let e = env();
         enc.encode(&e).unwrap();
         let payload = enc.payload().to_string();
-        fan_out(&mut sinks, &e, &payload);
+        fan_out(&mut sinks, e.topic(), e.key(), &payload);
         assert_eq!(*a.payloads.lock().unwrap(), *b.payloads.lock().unwrap());
         assert_eq!(a.payloads.lock().unwrap()[0], payload);
     }

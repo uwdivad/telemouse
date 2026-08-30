@@ -4,9 +4,21 @@
 mouse_cpi = 1600.0
 
 [batch]
-window_ms = 25
+# Batch window: the live-viz latency floor and the batches/s every hop pays
+# for (~150us of kernel CPU per batch across capture, bridge and each
+# browser). 50 = 20 batches/s. 25 halves live latency for double that cost;
+# recordings and analysis are the same either way.
+window_ms = 50
 max_events = 448
 ring_capacity = 65536
+# Raw-input reads are batched: the capture thread wakes on the first report
+# of a burst, then drains the queue every (coalesce_ms + 1) ms on a timer for
+# as long as reports keep coming. Being woken by the queue costs Windows
+# ~25-30us of kernel CPU per wake, so at 1kHz: 2 = ~0.45% of a core, 8 =
+# ~0.22%. Only a burst's first report has an observed arrival; the rest are
+# spaced by the estimated report interval (exact to about this many ms).
+# 0 = one read per report, exact stamps, ~2.8% of a core. Max 10.
+coalesce_ms = 8
 
 [udp]
 enabled = true
@@ -24,6 +36,31 @@ dir = "recordings"
 
 [viz]
 http_addr = "127.0.0.1:7879"
+
+# Control panel (telemouse-ctl): start/stop the components above, run the
+# tools, see and kill telemouse processes. It can terminate processes, so
+# keep it on loopback.
+[ctl]
+http_addr = "127.0.0.1:7880"
+# Where the telemouse binaries are. Unset = next to telemouse-ctl, then PATH.
+# bin_dir = "target/release"
+# A graceful stop sends Ctrl-Break and waits this long before terminating.
+stop_grace_secs = 5
+
+# OBS browser source: add http://127.0.0.1:7879/obs as a Browser source.
+# These are the defaults; any of them can be overridden per source with URL
+# query parameters, e.g. /obs?layout=aim&hud=speed,aim&scale=1.5&bg=0e131c80
+[viz.obs]
+layout = "split"            # split | stack | desk | aim
+background = "transparent"  # or "#rrggbb" / "#rrggbbaa"
+hud = ["speed", "aim", "cpm"]  # also: eps, dist, aimdist, clicks, game, latency; [] hides it
+hud_position = "bottom-left"
+scale = 1.0                 # stroke/marker/HUD size multiplier for small sources
+trail_secs = 3.0
+buffer_ms = 55
+grid = true
+legend = false
+labels = false
 
 # Per-game aim conversion: degrees = counts * sens * coeff.
 # Key = lowercase process name.

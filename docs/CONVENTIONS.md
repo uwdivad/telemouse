@@ -11,6 +11,7 @@ the repo root.
 | `telemouse-capture` (bin `telemouse`) | `crates/capture` | Win32 raw-input capture agent, sinks (UDP, Kafka, JSONL recording). |
 | `telemouse-viz` | `crates/viz` | UDP→WebSocket bridge, embedded browser viz (live + replay). |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions. |
+| `telemouse-ctl` | `crates/ctl` | Control panel: launches/stops the binaries above (fixed argument allow-lists), lists and kills telemouse processes. |
 
 Each workstream edits **only its own crate**. Root `Cargo.toml` already lists
 all members and shared `[workspace.dependencies]`; add crate-local deps with

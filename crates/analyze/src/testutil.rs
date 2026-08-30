@@ -60,6 +60,7 @@ pub fn session_cfg() -> SessionConfig {
             primary: true,
         }],
         capture_version: "test".into(),
+        coalesce_ms: 0,
     }
 }
 

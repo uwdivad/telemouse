@@ -23,7 +23,16 @@ impl QpcAnchor {
     /// internally so tick→µs scaling cannot overflow for any realistic uptime.
     pub fn qpc_to_utc_us(&self, qpc: u64) -> i64 {
         let dticks = qpc as i128 - self.qpc as i128;
-        let dus = dticks * 1_000_000 / self.qpc_freq as i128;
+        // Fast path for the ubiquitous 10 MHz QPC frequency: the product is
+        // exact in i128, so `dticks * 1_000_000 / 10_000_000` and `dticks / 10`
+        // are the same truncating division — bit-identical for negative deltas
+        // too, since i128 division truncates toward zero in both forms. The
+        // parity test below checks this across the sign and range spread.
+        let dus = if self.qpc_freq == 10_000_000 {
+            dticks / 10
+        } else {
+            dticks * 1_000_000 / self.qpc_freq as i128
+        };
         (self.utc_us as i128 + dus) as i64
     }
 
@@ -94,6 +103,47 @@ mod tests {
             a.qpc_to_utc_us(a.qpc + one_hour),
             a.utc_us + 3_600_000_000
         );
+    }
+
+    #[test]
+    fn fast_path_matches_general_expression_at_10mhz() {
+        let a = anchor();
+        // Sign spread, values straddling multiples of 10, and range extremes
+        // (qpc = 0 and qpc = u64::MAX both stay in-range around the anchor).
+        let dticks: [i128; 21] = [
+            0, 1, -1, 3, -3, 9, -9, 10, -10, 11, -11, 19, -19, 20, -20,
+            999_999_999_999, -4_999_999_999,
+            -(anchor().qpc as i128),              // qpc = 0
+            u64::MAX as i128 - anchor().qpc as i128, // qpc = u64::MAX
+            u64::MAX as i128 / 2,
+            -(anchor().qpc as i128) + 7,
+        ];
+        for dt in dticks {
+            let qpc = (a.qpc as i128 + dt) as u64;
+            // The general expression, computed explicitly.
+            let expected = a.utc_us as i128 + dt * 1_000_000 / a.qpc_freq as i128;
+            assert_eq!(
+                a.qpc_to_utc_us(qpc) as i128,
+                expected,
+                "fast path diverged at dticks={dt}"
+            );
+        }
+    }
+
+    #[test]
+    fn general_path_still_serves_other_frequencies() {
+        // A 3 MHz clock (not the 10 MHz fast path): 1 tick = 1/3 µs.
+        let a = QpcAnchor {
+            qpc: 9_000_000,
+            utc_us: 1_756_000_000_000_000,
+            qpc_freq: 3_000_000,
+        };
+        assert_eq!(a.qpc_to_utc_us(a.qpc), a.utc_us);
+        assert_eq!(a.qpc_to_utc_us(a.qpc + 3_000_000), a.utc_us + 1_000_000);
+        assert_eq!(a.qpc_to_utc_us(a.qpc - 1_500_000), a.utc_us - 500_000);
+        // 4 ticks at 3MHz = 1.33µs → truncates to 1; -4 ticks → -1 (toward zero).
+        assert_eq!(a.qpc_to_utc_us(a.qpc + 4), a.utc_us + 1);
+        assert_eq!(a.qpc_to_utc_us(a.qpc - 4), a.utc_us - 1);
     }
 
     #[test]

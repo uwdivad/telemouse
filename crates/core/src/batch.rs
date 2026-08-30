@@ -42,6 +42,50 @@ impl Batch {
             .iter()
             .fold((0i64, 0i64), |(x, y), e| (x + e.dx as i64, y + e.dy as i64))
     }
+
+    /// Borrow this batch as a serialize-side [`BatchView`].
+    pub fn as_view(&self) -> BatchView<'_> {
+        BatchView {
+            session_id: &self.session_id,
+            seq_no: self.seq_no,
+            ts_anchor_us: self.ts_anchor_us,
+            game: self.game.as_deref(),
+            pointer_locked: self.pointer_locked,
+            screen_w: self.screen_w,
+            screen_h: self.screen_h,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+            drops_since_last: self.drops_since_last,
+            abs_frames_since_last: self.abs_frames_since_last,
+            events: &self.events,
+        }
+    }
+}
+
+/// Serialize-side borrowing mirror of [`Batch`], for the shipping thread's
+/// zero-realloc flush path: the batcher keeps its event `Vec`, the session id
+/// and process name stay wherever they already live, and the view serializes
+/// straight into a reused buffer. Field order and every `skip_serializing_if`
+/// match [`Batch`] exactly, so the JSON is byte-identical (the wire test
+/// enforces this). Serialize-only by design — the deserialize side keeps
+/// using the owned [`Batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BatchView<'a> {
+    pub session_id: &'a str,
+    pub seq_no: u64,
+    pub ts_anchor_us: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game: Option<&'a str>,
+    pub pointer_locked: bool,
+    pub screen_w: u32,
+    pub screen_h: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_y: Option<i32>,
+    pub drops_since_last: u32,
+    pub abs_frames_since_last: u32,
+    pub events: &'a [RawEvent],
 }
 
 #[cfg(test)]

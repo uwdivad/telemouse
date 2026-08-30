@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use telemouse_core::config::ObsConfig;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
@@ -24,16 +25,49 @@ use crate::stats::StatsPayload;
 /// page needs is inlined so the viz works on a machine with no internet.
 pub const INDEX_HTML: &str = include_str!("index.html");
 
+/// Where the server splices its config into the page. Sits inside a
+/// `<script>` object literal, so the raw file (placeholder intact) is still
+/// valid JavaScript and an unconfigured page just sees `{}`.
+const CONFIG_PLACEHOLDER: &str = "/*__TELEMOUSE_CONFIG__*/";
+
+/// The two flavours of the page, rendered once at startup: the dashboard and
+/// the OBS browser-source variant. Same HTML, different injected config.
+pub struct Pages {
+    pub index: String,
+    pub obs: String,
+}
+
+impl Pages {
+    pub fn render(obs: &ObsConfig) -> Self {
+        Self {
+            index: inject_config(INDEX_HTML, obs, false),
+            obs: inject_config(INDEX_HTML, obs, true),
+        }
+    }
+}
+
+/// Splice `{ obs_route, obs }` into the page. `<` is escaped so a config
+/// string can never close the `<script>` element it is embedded in.
+fn inject_config(html: &str, obs: &ObsConfig, obs_route: bool) -> String {
+    let cfg = serde_json::json!({ "obs_route": obs_route, "obs": obs });
+    let mut json = cfg.to_string();
+    // Object literal body: strip the outer braces and drop it into `{...}`.
+    json = json[1..json.len() - 1].replace('<', "\\u003c");
+    html.replace(CONFIG_PLACEHOLDER, &json)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub hub: Arc<Hub>,
     pub recordings_dir: PathBuf,
+    pub pages: Arc<Pages>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
+        .route("/obs", get(obs_page))
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_upgrade))
         .route("/api/stats", get(api_stats))
@@ -54,14 +88,25 @@ async fn api_stats(State(st): State<AppState>) -> impl IntoResponse {
     axum::Json(stats_payload(&st.hub))
 }
 
-async fn index() -> impl IntoResponse {
+fn html_response(body: String) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INDEX_HTML,
+        body,
     )
+        .into_response()
+}
+
+async fn index(State(st): State<AppState>) -> Response {
+    html_response(st.pages.index.clone())
+}
+
+/// The OBS browser-source page: same app, chrome hidden, `[viz.obs]`
+/// defaults applied. URL query parameters override them per source.
+async fn obs_page(State(st): State<AppState>) -> Response {
+    html_response(st.pages.obs.clone())
 }
 
 async fn healthz() -> &'static str {
@@ -120,11 +165,12 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(st): State<AppState>) -> Respons
     ws.on_upgrade(move |socket| client_loop(socket, st))
 }
 
-/// One shared `Arc<str>` becomes one WebSocket text frame per client. The hub
-/// side of the fan-out is a refcount bump; only this last hop copies, and only
-/// into the socket's own buffer.
+/// One shared `Utf8Bytes` frame becomes one WebSocket text frame per client.
+/// Every hop of the fan-out — the broadcast clone and this per-client send —
+/// is a refcount bump on the single buffer built at acceptance; nothing here
+/// copies the payload.
 fn text_frame(frame: &crate::hub::Frame) -> Message {
-    Message::Text(axum::extract::ws::Utf8Bytes::from(&**frame))
+    Message::Text(frame.clone())
 }
 
 /// One connected browser. Sends the cached `session` envelope first (so a
@@ -192,7 +238,52 @@ mod tests {
         AppState {
             hub: Arc::new(Hub::new()),
             recordings_dir: dir,
+            pages: Arc::new(Pages::render(&ObsConfig::default())),
         }
+    }
+
+    /// The injected config object literal, parsed back out of the page.
+    fn injected_config(html: &str) -> serde_json::Value {
+        let start = html.find("window.TELEMOUSE_CONFIG = {").expect("config script") + "window.TELEMOUSE_CONFIG = ".len();
+        let end = html[start..].find("};").expect("literal end") + start + 1;
+        serde_json::from_str(&html[start..end]).expect("injected config is valid JSON")
+    }
+
+    #[tokio::test]
+    async fn dashboard_and_obs_pages_share_html_but_differ_in_config() {
+        let st = state_with(PathBuf::from("recordings"));
+        let (s1, _, dash) = get(st.clone(), "/").await;
+        let (s2, h2, obs) = get(st, "/obs").await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(s2, StatusCode::OK);
+        assert!(h2[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+        assert!(!dash.contains(CONFIG_PLACEHOLDER));
+        assert!(!obs.contains(CONFIG_PLACEHOLDER));
+
+        let d = injected_config(&dash);
+        let o = injected_config(&obs);
+        assert_eq!(d["obs_route"], false);
+        assert_eq!(o["obs_route"], true);
+        // Both carry the defaults, so `?obs=1` on the dashboard works too.
+        assert_eq!(d["obs"]["layout"], "split");
+        assert_eq!(o["obs"]["hud"], serde_json::json!(["speed", "aim", "cpm"]));
+    }
+
+    #[test]
+    fn injected_config_cannot_break_out_of_the_script_tag() {
+        // Validation would reject this; the renderer must be safe regardless.
+        let cfg = ObsConfig {
+            background: "</script><script>alert(1)</script>".into(),
+            ..Default::default()
+        };
+        let html = inject_config(INDEX_HTML, &cfg, true);
+        assert!(!html.contains("</script><script>alert"));
+        assert!(html.contains("\\u003c/script>"));
+    }
+
+    #[test]
+    fn index_carries_the_config_placeholder() {
+        assert_eq!(INDEX_HTML.matches(CONFIG_PLACEHOLDER).count(), 1);
     }
 
     async fn get(state: AppState, uri: &str) -> (StatusCode, HeaderMap, String) {
@@ -287,10 +378,6 @@ mod tests {
 
     #[test]
     fn router_builds_with_a_state() {
-        let state = AppState {
-            hub: Arc::new(Hub::new()),
-            recordings_dir: PathBuf::from("recordings"),
-        };
-        let _ = router(state);
+        let _ = router(state_with(PathBuf::from("recordings")));
     }
 }

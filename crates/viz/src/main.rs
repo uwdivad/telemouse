@@ -69,7 +69,9 @@ struct ServeArgs {
 /// HTTP listener and a handful of WebSockets; the default runtime spawned a
 /// worker (and a stack, and a share of every work-stealing scan) per core to
 /// idle. Two keeps the ingest loop and a blocking-ish HTTP handler from ever
-/// queueing behind each other, and costs nothing when idle.
+/// queueing behind each other, and costs nothing when idle. (A single-thread
+/// runtime was measured at 1kHz and made no difference: the bridge's ~0.45%
+/// is socket syscalls, not scheduling.)
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -126,22 +128,66 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let state = AppState {
         hub: hub.clone(),
         recordings_dir: recordings_dir.clone(),
+        pages: Arc::new(server::Pages::render(&cfg.viz.obs)),
     };
     let app = server::router(state);
 
-    let listener = tokio::net::TcpListener::bind(http_addr)
-        .await
-        .with_context(|| format!("failed to bind http {http_addr}"))?;
+    let listener = NoDelayListener::new(
+        tokio::net::TcpListener::bind(http_addr)
+            .await
+            .with_context(|| format!("failed to bind http {http_addr}"))?,
+    );
 
     info!(
         http = %http_addr,
         udp = %udp_addr_s,
         recordings = %recordings_dir.display(),
-        "telemouse-viz serving; open http://{http_addr}/"
+        obs_layout = %cfg.viz.obs.layout,
+        "telemouse-viz serving; dashboard http://{http_addr}/ — OBS browser source http://{http_addr}/obs"
     );
 
     axum::serve(listener, app).await.context("http server failed")?;
     Ok(())
+}
+
+/// [`tokio::net::TcpListener`] wrapper that sets `TCP_NODELAY` on every
+/// accepted connection. Neither tokio, hyper, nor axum 0.8 sets it (axum 0.8
+/// removed `Serve::tcp_nodelay`), and this server's WebSocket traffic — one
+/// small frame every ~25ms, one direction — is the worst case for Nagle plus
+/// delayed ACK: each frame can sit in the kernel waiting for an ACK timer.
+/// A connection whose socket refuses the option still works (just with worse
+/// latency), so failure is a once-per-process warning, never an error.
+struct NoDelayListener {
+    inner: tokio::net::TcpListener,
+    warned: bool,
+}
+
+impl NoDelayListener {
+    fn new(inner: tokio::net::TcpListener) -> Self {
+        Self { inner, warned: false }
+    }
+}
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        // Delegate to the TcpListener impl: it owns the retry-on-accept-error
+        // loop; this wrapper only tunes the stream it hands back.
+        let (stream, addr) = axum::serve::Listener::accept(&mut self.inner).await;
+        if let Err(e) = stream.set_nodelay(true)
+            && !self.warned
+        {
+            self.warned = true;
+            warn!(error = %e, "could not set TCP_NODELAY on an accepted connection; ws frames may be delayed by Nagle");
+        }
+        (stream, addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 /// Metrics are logs here — plus, now, a push.
@@ -174,7 +220,8 @@ async fn stats_reporter(hub: Arc<Hub>) {
         // Push first: the page's readout should be live even while the log
         // stays quiet on an idle bridge.
         match serde_json::to_string(&server::stats_payload(&hub)) {
-            Ok(json) => hub.broadcast(std::sync::Arc::from(json.as_str())),
+            // `From<String>` for `Utf8Bytes` reuses the String's allocation.
+            Ok(json) => hub.broadcast(json.into()),
             Err(e) => warn!(error = %e, "could not serialize viz_stats frame"),
         }
 
@@ -247,5 +294,21 @@ mod tests {
     fn no_subcommand_defaults_to_serve() {
         let cli = Cli::parse_from(["telemouse-viz"]);
         assert!(cli.command.is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_connections_have_nodelay_set() {
+        use axum::serve::Listener as _;
+        let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inner.local_addr().unwrap();
+        let mut listener = NoDelayListener::new(inner);
+        assert_eq!(listener.local_addr().unwrap(), addr);
+
+        let (accepted, client) =
+            tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+        let _client = client.unwrap();
+        let (stream, peer) = accepted;
+        assert_eq!(peer.ip(), addr.ip());
+        assert!(stream.nodelay().unwrap(), "accepted stream must have TCP_NODELAY");
     }
 }

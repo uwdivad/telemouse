@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>telemouse — live &amp; replay</title>
+<!-- Server-injected config ([viz.obs] defaults, and whether this is the /obs
+     route). The placeholder survives when the file is opened raw, in which
+     case the page sees an empty object and behaves as the dashboard. -->
+<script>window.TELEMOUSE_CONFIG = {/*__TELEMOUSE_CONFIG__*/};</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1017'/%3E%3Cpath d='M5 25 C11 25 9 8 16 8 C23 8 21 21 27 12' fill='none' stroke='%2335d0e0' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
   :root {
@@ -90,7 +94,7 @@
 
   /* ---------- replay transport ---------- */
   .transport {
-    display: flex; align-items: center; gap: 12px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
     padding: 8px 14px; background: var(--panel-2);
     border-bottom: 1px solid var(--line); flex: none;
   }
@@ -119,6 +123,14 @@
     width: 12px; height: 20px; border-radius: 3px; background: var(--fg); border: 1px solid #000;
   }
   .time { font: 12px var(--mono); color: var(--fg); min-width: 120px; text-align: right; }
+  .wall { font: 11px var(--mono); color: var(--fg-dim); min-width: 150px; text-align: right; }
+  .wall:empty { display: none; }
+  .goto { display: flex; align-items: center; gap: 6px; flex: none; }
+  .goto input[type=datetime-local] {
+    font: 12px var(--mono); color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px;
+    color-scheme: dark;
+  }
 
   /* ---------- panels ---------- */
   .panels { flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
@@ -175,6 +187,50 @@
   .toast.out { opacity: 0; transition: opacity .4s; }
 
   @media (max-width: 900px) { .panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+
+  /* ---------- OBS browser-source mode ----------
+     No chrome, no gaps, a transparent page (OBS composites it over the game
+     capture), and a HUD instead of the stats bar. These rules come after the
+     media query on purpose: the layout is explicit here, not viewport-driven. */
+  body.obs { background: transparent; }
+  .obs .topbar, .obs .transport, .obs .stats, .obs #toasts { display: none; }
+  .obs .panels { gap: 0; background: transparent; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+  .obs .panels { position: relative; }
+  .obs .panel { background: transparent; }
+  .obs.layout-stack .panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .obs.layout-desk .panels, .obs.layout-aim .panels { grid-template-columns: 1fr; }
+  .obs.layout-desk #aimPanel, .obs.layout-aim #deskPanel { display: none; }
+  /* Dashboard single-panel view (?view=desk / ?view=aim, or the View toggle). */
+  .view-desk .panels, .view-aim .panels { grid-template-columns: 1fr; }
+  .view-desk #aimPanel, .view-aim #deskPanel { display: none; }
+  .obs:not(.labels) .panel .title, .obs:not(.labels) .panel .hint { display: none; }
+  .obs .panel .title { font-size: calc(11px * var(--s, 1)); text-shadow: 0 1px 3px #000c; }
+
+  .hud {
+    position: absolute; z-index: 5; pointer-events: none;
+    display: flex; gap: calc(14px * var(--s, 1)); padding: calc(10px * var(--s, 1)) calc(14px * var(--s, 1));
+    font-family: var(--mono);
+    /* The 10Hz textContent writes must never invalidate layout outside the
+       absolutely-positioned HUD itself. */
+    contain: layout paint style;
+  }
+  .hud.hidden { display: none; }
+  .hud.top-left { left: 0; top: 0; }
+  .hud.top-right { right: 0; top: 0; flex-direction: row-reverse; }
+  .hud.bottom-left { left: 0; bottom: 0; }
+  .hud.bottom-right { right: 0; bottom: 0; flex-direction: row-reverse; }
+  .hud .item { display: flex; flex-direction: column; min-width: calc(64px * var(--s, 1)); }
+  .hud .k {
+    font-size: calc(10px * var(--s, 1)); letter-spacing: .12em; text-transform: uppercase;
+    color: #c8d2df; opacity: .8; text-shadow: 0 1px 2px #000, 0 0 6px #000a;
+  }
+  .hud .v {
+    font-size: calc(22px * var(--s, 1)); line-height: 1.15; font-weight: 600; color: #fff;
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 2px #000, 0 0 8px #000c;
+  }
+  .hud .v small { font-size: calc(11px * var(--s, 1)); font-weight: 400; color: #c8d2df; margin-left: .2em; }
+  .hud .item.text .v { font-size: calc(15px * var(--s, 1)); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -185,6 +241,12 @@
   <div class="seg" id="modeSwitch">
     <button data-mode="live" class="on">Live</button>
     <button data-mode="replay">Replay</button>
+  </div>
+
+  <div class="seg" id="viewSwitch" title="Which panel(s) to show (?view=both|desk|aim). V cycles.">
+    <button data-view="both" class="on">Both</button>
+    <button data-view="desk">Desk</button>
+    <button data-view="aim">Aim</button>
   </div>
 
   <div class="pill" id="connPill"><span class="dot"></span><span id="connText">idle</span></div>
@@ -226,21 +288,27 @@
     <input type="range" id="scrub" min="0" max="1000" step="1" value="0">
   </div>
   <div class="time" id="timeText">0:00.00 / 0:00.00</div>
+  <div class="wall" id="wallText" title="Wall-clock time (local) of the play head"></div>
+  <label class="goto" title="Jump to a moment in the past: picks the recording that was running then and seeks to it. Also ?at=2026-08-29T21:14:03 on the URL.">
+    <input type="datetime-local" step="1" id="gotoTime">
+    <button class="btn" id="btnGoto">Go to time</button>
+  </label>
 </div>
 
 <div class="panels">
-  <div class="panel">
+  <div class="panel" id="deskPanel">
     <canvas id="deskCanvas"></canvas>
     <div class="title"><b>Desk space</b> — hand path<span class="sub" id="deskSub">grid 1 cm</span></div>
     <div class="hint" id="deskHint"></div>
     <div class="flash" id="deskFlash"></div>
   </div>
-  <div class="panel">
+  <div class="panel" id="aimPanel">
     <canvas id="aimCanvas"></canvas>
     <div class="title"><b>Aim space</b> — crosshair path<span class="sub" id="aimSub">grid 10&deg;</span></div>
     <div class="hint" id="aimHint"></div>
     <div class="flash" id="aimFlash"></div>
   </div>
+  <div class="hud hidden" id="hud"></div>
 </div>
 
 <div class="stats" id="stats">
@@ -254,7 +322,7 @@
     <div class="k">latency</div><div class="v"><span id="sLat">—</span> <small>ms</small></div></div>
   <div class="stat" id="statLag" title="How far the play head trails the newest event received (live buffer plus any backlog still draining).">
     <div class="k">lag</div><div class="v"><span id="sLag">0</span> <small>ms</small></div></div>
-  <div class="stat" id="statFps" title="Smoothed animation frame rate against an estimate of this display's refresh rate.">
+  <div class="stat" id="statFps" title="Smoothed animation frame rate against an estimate of this display's refresh rate. Drawing is capped (?fps=, default 120; 30 while this window is not focused) so the dashboard does not compete with a game for the GPU.">
     <div class="k">fps</div><div class="v"><span id="sFps">0</span> <small id="sFpsRef"></small></div></div>
   <div class="stat" id="statDrops" title="Ring-buffer drops reported by the capture agent (events it could not hand to the shipping thread).">
     <div class="k">ring drops</div><div class="v"><span id="sDrops">0</span></div></div>
@@ -305,6 +373,10 @@ const BTN = {
   X2_DOWN: 0x0100, X2_UP: 0x0200,
 };
 BTN.ANY_DOWN = BTN.LEFT_DOWN | BTN.RIGHT_DOWN | BTN.MIDDLE_DOWN | BTN.X1_DOWN | BTN.X2_DOWN;
+BTN.ANY_UP = BTN.ANY_DOWN << 1;   // every *_UP bit is its *_DOWN bit shifted left
+/* Ring colour per button: left, right, everything else. */
+const BTN_KIND = [[BTN.LEFT_DOWN, 0], [BTN.RIGHT_DOWN, 1], [BTN.MIDDLE_DOWN, 2], [BTN.X1_DOWN, 2], [BTN.X2_DOWN, 2]];
+const RING_COLORS = ["70,214,138", "124,140,255", "255,176,46"];
 
 /* Used when the session has no profile for the foreground process. */
 const FALLBACK_SENS = { sens: 1.0, yaw_coeff: 0.022, pitch_coeff: 0.022, fallback: true };
@@ -328,10 +400,115 @@ const MAX_DROP_MARKS = 4000;
 const PITCH_LIMIT = 89;      // FPS engines clamp pitch; so do we
 const PANEL_BG = "#0e131c";  // must match --panel: the canvases are opaque now
 
-const PROFILE = new URLSearchParams(location.search).get("profile") === "1";
+const QUERY = new URLSearchParams(location.search);
+const PROFILE = QUERY.get("profile") === "1";
+/* Draw-rate cap (`?fps=`). A 240Hz monitor means 240 full two-canvas
+   repaints a second, and the GPU doing that is the same GPU running the
+   game; 120 is visually identical for a trail and halves the cost. An
+   unfocused dashboard drops to FPS_BACKGROUND — a window you are not
+   looking at should cost nothing you notice. OBS composites at its own
+   rate (60 by default), so anything above that is wasted there. */
+const FPS_DEFAULT = 120, FPS_OBS_DEFAULT = 60, FPS_BACKGROUND = 30;
+const fpsQ = parseFloat(QUERY.get("fps"));
+const VIEWS = ["both", "desk", "aim"];
+const VIEW = VIEWS.indexOf(QUERY.get("view")) >= 0 ? QUERY.get("view") : "both";
 
 /* ---------- small helpers ---------- */
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+/* =====================================================================
+   OBS browser-source mode
+
+   Reached via the /obs route (server sets `obs_route`) or `?obs=1` on the
+   dashboard. Three layers, each overriding the last: built-in defaults,
+   the server's [viz.obs] table, then URL query parameters — so one toml
+   sets the house style and each OBS source can still tweak its own URL:
+
+       /obs?layout=aim&hud=speed,aim&scale=1.5&bg=0e131c80&grid=0
+
+   What it changes: the chrome (top bar, transport, stats bar, toasts) is
+   hidden; the page and panels are transparent unless `bg` says otherwise;
+   a HUD replaces the stats bar; nothing touches localStorage; and the
+   per-frame DOM work drops to one small HUD repaint at 10Hz.
+   ===================================================================== */
+
+const SERVER_CFG = (typeof window.TELEMOUSE_CONFIG === "object" && window.TELEMOUSE_CONFIG) || {};
+const OBS_MODE = QUERY.get("obs") === "1" || SERVER_CFG.obs_route === true;
+
+const HUD_ITEMS = {
+  speed:   { k: "speed",     unit: "cm/s" },
+  aim:     { k: "aim speed", unit: "°/s" },
+  cpm:     { k: "clicks/min" },
+  eps:     { k: "events/s" },
+  dist:    { k: "hand dist", unit: "m" },
+  aimdist: { k: "aim dist",  unit: "°" },
+  clicks:  { k: "clicks" },
+  game:    { k: "game", text: true },
+  latency: { k: "latency",   unit: "ms" },
+};
+
+/** "transparent" | "rrggbb" | "#rrggbbaa" | "rgb" → { css, alpha }. */
+function parseBg(s) {
+  s = String(s || "").trim().toLowerCase();
+  if (!s || s === "transparent" || s === "none") return { css: "transparent", alpha: 0 };
+  let hex = s[0] === "#" ? s.slice(1) : s;
+  if (hex.length === 3) hex = hex.replace(/./g, (c) => c + c);
+  if (!/^[0-9a-f]{6}([0-9a-f]{2})?$/.test(hex)) return { css: "transparent", alpha: 0 };
+  const r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
+  const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+  return { css: "rgba(" + r + "," + g + "," + b + "," + a.toFixed(3) + ")", alpha: a };
+}
+
+const OBS = OBS_MODE ? (() => {
+  const d = Object.assign({
+    layout: "split", background: "transparent", hud: ["speed", "aim", "cpm"],
+    hud_position: "bottom-left", scale: 1, trail_secs: 3, buffer_ms: 55,
+    grid: true, legend: false, labels: false,
+  }, SERVER_CFG.obs || {});
+  const str = (name, dflt, allowed) => {
+    const v = QUERY.get(name);
+    const pick = v === null ? dflt : v;
+    return allowed.indexOf(pick) >= 0 ? pick : allowed[0];
+  };
+  const bool = (name, dflt) => {
+    const v = QUERY.get(name);
+    return v === null ? !!dflt : !(v === "0" || v === "false" || v === "no" || v === "off");
+  };
+  const num = (name, dflt, lo, hi) => {
+    const v = QUERY.get(name);
+    const n = v === null ? +dflt : parseFloat(v);
+    return isFinite(n) ? clamp(n, lo, hi) : clamp(+dflt, lo, hi);
+  };
+  const hudRaw = QUERY.get("hud");
+  const hud = (hudRaw === null ? (Array.isArray(d.hud) ? d.hud : []) : hudRaw.split(","))
+    .map((s) => String(s).trim().toLowerCase())
+    .filter((s) => Object.prototype.hasOwnProperty.call(HUD_ITEMS, s));
+  return {
+    /* `view=desk|aim|both` (the dashboard's spelling) is accepted here too,
+       so the same URL suffix works on both routes. */
+    layout: str("layout", { desk: "desk", aim: "aim", both: "split" }[QUERY.get("view")] || d.layout,
+                ["split", "stack", "desk", "aim"]),
+    bg: parseBg(QUERY.get("bg") === null ? d.background : QUERY.get("bg")),
+    hud: hud,
+    hudPos: str("hudpos", d.hud_position, ["bottom-left", "top-left", "top-right", "bottom-right"]),
+    scale: num("scale", d.scale, 0.5, 4),
+    trail: num("trail", d.trail_secs, 0.3, 12),
+    buffer: num("buffer", d.buffer_ms, 10, 200) / 1000,
+    grid: bool("grid", d.grid),
+    legend: bool("legend", d.legend),
+    labels: bool("labels", d.labels),
+  };
+})() : null;
+
+const MAX_FPS = isFinite(fpsQ) && fpsQ > 0 ? clamp(fpsQ, 5, 400) : (OBS ? FPS_OBS_DEFAULT : FPS_DEFAULT);
+
+/* Stroke / marker size multiplier: 1 on the dashboard, `scale` in OBS mode. */
+const S = OBS ? OBS.scale : 1;
+/* Grid lines are near-invisible on a transparent page composited over dark
+   game footage, so the overlay gets a lighter, alpha-based palette. */
+const GRID = OBS && OBS.bg.alpha < 1
+  ? { line: "rgba(255,255,255,0.07)", axis: "rgba(255,255,255,0.16)", wrap: "rgba(200,140,255,0.35)" }
+  : { line: "#151c28", axis: "#25303f", wrap: "#3a2b46" };
 
 function wrapYaw(deg) {
   let d = deg % 360;
@@ -354,6 +531,20 @@ function fmtTime(s) {
   const m = Math.floor(s / 60);
   const rest = s - m * 60;
   return m + ":" + (rest < 10 ? "0" : "") + rest.toFixed(2);
+}
+
+const pad2 = (n) => (n < 10 ? "0" : "") + n;
+
+/** Local "YYYY-MM-DD HH:MM:SS" for an epoch ms — the wall-clock readout. */
+function fmtWallClock(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+         pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+
+/** The same, shaped for an <input type=datetime-local> value. */
+function toDatetimeLocal(ms) {
+  return fmtWallClock(ms).replace(" ", "T");
 }
 
 /* Rolling event counter over a fixed window, bucketed so 1kHz input costs
@@ -568,6 +759,8 @@ const engine = {
   markerCursor: 0,
   tStart: 0,
   tEnd: 0,
+  /* Seconds of events one live batch covers; floors the live buffer. */
+  batchSpan: 0,
   haveTimeline: false,
 
   /* integrator checkpoints, built at load; empty in live mode */
@@ -601,6 +794,7 @@ const engine = {
   totalCm: 0,
   totalDeg: 0,
   totalClicks: 0,
+  held: 0,            // *_DOWN bits of buttons currently pressed (steady ring at the head)
   drops: 0,
   lostBatches: 0,
   absFrames: 0,
@@ -639,9 +833,11 @@ const engine = {
     this.metas.length = 0;
     this.metaBase = 0;
     this.cursor = 0;
+    this.held = 0;
     this.markers.length = 0;
     this.markerCursor = 0;
     this.tStart = 0; this.tEnd = 0;
+    this.batchSpan = 0;
     this.haveTimeline = false;
     this.checkpoints.length = 0;
     this.cpBuilt = 0;
@@ -692,6 +888,7 @@ const engine = {
     this.resetTotals();
     this.resetIntegrators();
     this.cursor = 0;
+    this.held = 0;
     this.markerCursor = 0;
   },
 
@@ -798,14 +995,23 @@ const engine = {
       this.metas.push(meta);
 
       const cols = this.ev;
+      let tFirst = 0, tLast = 0;
       for (let i = 0; i < evs.length; i++) {
         const e = evs[i];
         const t = this.qpcToT(e.ts_qpc);
+        if (i === 0) tFirst = t;
+        tLast = t;
         /* `| 0` is doing real work here: buttons/wheel/wheel_h are omitted
            from the JSON when zero, so these are routinely undefined. */
         cols.push(t, e.dx | 0, e.dy | 0, e.buttons | 0, e.wheel | 0, e.wheel_h | 0, mi);
         this.noteTime(t);
       }
+      /* How much time one batch covers (≈ the agent's batch window while the
+         mouse is moving). The live buffer is floored at this so a longer
+         window on the agent can never turn into a stutter here; it decays
+         so a quiet feed does not pin the floor at a stale value. */
+      const span = Math.max(0, tLast - tFirst);
+      this.batchSpan = Math.max(span, this.batchSpan * 0.9);
     }
 
     if (drops > 0 || lost > 0) {
@@ -860,6 +1066,13 @@ const engine = {
 
   get duration() { return Math.max(0, this.tEnd - this.tStart); },
 
+  /** The live buffer actually applied: the user's/OBS setting, but never
+      less than one batch span plus a frame of slack — the play head must
+      not reach the end of a batch before the next one can have arrived. */
+  effectiveLiveBuffer() {
+    return Math.max(ui.liveBuffer, Math.min(0.2, this.batchSpan + 0.01));
+  },
+
   /** UTC µs the newest received event was captured at, or null if the
       session anchor is unknown. */
   newestUtcUs() {
@@ -903,6 +1116,7 @@ const engine = {
       lastYawWrapped: this.lastYawWrapped,
       lastEventT: this.lastEventT,
       totalCm: this.totalCm, totalDeg: this.totalDeg, totalClicks: this.totalClicks,
+      held: this.held,
       vrefDesk: this.vrefDesk, vrefAim: this.vrefAim,
       clickRate: this.clickRate.save(), eventRate: this.eventRate.save(),
     };
@@ -916,6 +1130,7 @@ const engine = {
     this.lastEventT = cp.lastEventT;
     this.totalCm = cp.totalCm; this.totalDeg = cp.totalDeg;
     this.totalClicks = cp.totalClicks;
+    this.held = cp.held | 0;
     this.vrefDesk = cp.vrefDesk; this.vrefAim = cp.vrefAim;
     this.clickRate.load(cp.clickRate);
     this.eventRate.load(cp.eventRate);
@@ -945,8 +1160,9 @@ const engine = {
 
   /* ---------------- play head ---------------- */
 
-  /** Live: track the newest event with a small buffer so 25ms batches are
-      spread smoothly across frames instead of landing as one jump. */
+  /** Live: track the newest event with a small buffer so batches (25–50ms
+      of events each) are spread smoothly across frames instead of landing
+      as one jump. */
   advanceLive(wallSec, dt) {
     if (!this.haveTimeline) return;
     if (!this.clockStarted) {
@@ -954,7 +1170,7 @@ const engine = {
       this.clockStarted = true;
       return;
     }
-    const target = this.tEnd - ui.liveBuffer;
+    const target = this.tEnd - this.effectiveLiveBuffer();
     const err = target - this.playT;
     if (err > 0.75) {
       /* Way behind — a stall just ended, the tab was hidden, or the stream
@@ -1114,16 +1330,22 @@ const engine = {
     }
 
     const b = ev.b[i];
-    if (b & BTN.ANY_DOWN) {
-      this.totalClicks++;
-      this.clickRate.add(et, 1);
-      if (fresh) {
-        const kind = (b & BTN.LEFT_DOWN) ? 0 : (b & BTN.RIGHT_DOWN) ? 1 : 2;
-        this.rings.push({
-          t: et, kind: kind,
-          dx: this.deskX, dy: this.deskY,
-          ax: wrapYaw(this.yawRaw), ay: this.pitch,
-        });
+    if (b & (BTN.ANY_DOWN | BTN.ANY_UP)) {
+      /* Press: one expanding ring (the click flash) plus the button joins
+         `held`, which draws a steady ring at the head until its release. */
+      this.held = (this.held | (b & BTN.ANY_DOWN)) & ~((b & BTN.ANY_UP) >> 1);
+      this.dirty = true;
+      if (b & BTN.ANY_DOWN) {
+        this.totalClicks++;
+        this.clickRate.add(et, 1);
+        if (fresh) {
+          const kind = (b & BTN.LEFT_DOWN) ? 0 : (b & BTN.RIGHT_DOWN) ? 1 : 2;
+          this.rings.push({
+            t: et, kind: kind,
+            dx: this.deskX, dy: this.deskY,
+            ax: wrapYaw(this.yawRaw), ay: this.pitch,
+          });
+        }
       }
     }
 
@@ -1178,8 +1400,12 @@ class Panel {
     /* alpha:false lets the compositor skip a blend of the whole canvas every
        frame; desynchronized lets it skip a frame of latency getting there.
        Both mean the canvas is opaque, so the background is painted, not
-       cleared. */
-    this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true });
+       cleared. The one exception is an OBS overlay with a see-through
+       background, which needs the alpha channel and pays for it. */
+    this.opaque = !(OBS && OBS.bg.alpha < 1);
+    this.bg = OBS ? OBS.bg : { css: PANEL_BG, alpha: 1 };
+    this.hidden = false;
+    this.ctx = this.canvas.getContext("2d", { alpha: !this.opaque, desynchronized: true });
     this.unit = opts.unit;             // "cm" | "deg"
     this.minHalf = opts.minHalf;       // smallest half-extent, in data units
     this.subEl = document.getElementById(opts.subId);
@@ -1196,6 +1422,9 @@ class Panel {
 
   resize() {
     const r = this.canvas.getBoundingClientRect();
+    /* A panel the layout hid (OBS `layout=desk` / `aim`) measures 0×0;
+       render() skips it entirely rather than drawing into a 1px canvas. */
+    this.hidden = r.width < 1 || r.height < 1;
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.w = Math.max(1, Math.round(r.width));
     this.h = Math.max(1, Math.round(r.height));
@@ -1246,22 +1475,33 @@ class Panel {
       : { x: wrapYaw(eng.yawRaw), y: eng.pitch };
     const vref = isDesk ? eng.vrefDesk : eng.vrefAim;
 
+    if (this.hidden) return;
     this.autoScale(head, trail);
 
     ctx.save();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    ctx.fillStyle = PANEL_BG;
-    ctx.fillRect(0, 0, this.w, this.h);
+    if (this.opaque) {
+      ctx.fillStyle = this.bg.css;
+      ctx.fillRect(0, 0, this.w, this.h);
+    } else {
+      ctx.clearRect(0, 0, this.w, this.h);
+      if (this.bg.alpha > 0) {
+        ctx.fillStyle = this.bg.css;
+        ctx.fillRect(0, 0, this.w, this.h);
+      }
+    }
 
-    this.drawGrid(ctx, isDesk);
+    if (!OBS || OBS.grid) this.drawGrid(ctx, isDesk);
     this.drawTrail(ctx, trail, eng, vref);
     this.drawRings(ctx, eng, isDesk);
+    if (eng.held) this.drawHeld(ctx, eng, head);
     this.drawHead(ctx, head);
     if (isDesk) {
       this.drawWheel(ctx, eng);
-      this.drawCursorGhost(ctx, eng);
+      /* The desktop-cursor miniature is a debugging aid, not stream content. */
+      if (!OBS) this.drawCursorGhost(ctx, eng);
     }
-    this.drawLegend(ctx, vref, isDesk);
+    if (!OBS || OBS.legend) this.drawLegend(ctx, vref, isDesk);
 
     ctx.restore();
   }
@@ -1281,7 +1521,7 @@ class Panel {
     const y1 = this.cy + halfY;
 
     ctx.beginPath();
-    ctx.strokeStyle = "#151c28";
+    ctx.strokeStyle = GRID.line;
     for (let x = x0; x <= x1; x += step) {
       if (Math.abs(x) < step * 0.001) continue;
       const px = Math.round(this.toX(x)) + 0.5;
@@ -1296,7 +1536,7 @@ class Panel {
 
     /* Origin axes: where "recenter" put you. */
     ctx.beginPath();
-    ctx.strokeStyle = "#25303f";
+    ctx.strokeStyle = GRID.axis;
     const ox = Math.round(this.toX(0)) + 0.5, oy = Math.round(this.toY(0)) + 0.5;
     ctx.moveTo(ox, 0); ctx.lineTo(ox, this.h);
     ctx.moveTo(0, oy); ctx.lineTo(this.w, oy);
@@ -1305,7 +1545,7 @@ class Panel {
     if (!isDesk) {
       /* Yaw wrap boundaries at ±180°. */
       ctx.beginPath();
-      ctx.strokeStyle = "#3a2b46";
+      ctx.strokeStyle = GRID.wrap;
       ctx.setLineDash([4, 5]);
       for (const b of [-180, 180]) {
         const px = Math.round(this.toX(b)) + 0.5;
@@ -1356,7 +1596,7 @@ class Panel {
         const fade = (ai + 1) / ALEVELS;
         ctx.globalAlpha = 0.10 + 0.85 * fade * fade;
         ctx.strokeStyle = RAMP_CSS[vi];
-        ctx.lineWidth = 1.1 + 1.5 * (vi / (VLEVELS - 1)) * fade;
+        ctx.lineWidth = (1.1 + 1.5 * (vi / (VLEVELS - 1)) * fade) * S;
         ctx.beginPath();
         for (let k = 0; k < b.length; k += 4) {
           ctx.moveTo(b[k], b[k + 1]);
@@ -1368,8 +1608,26 @@ class Panel {
     ctx.globalAlpha = 1;
   }
 
+  /** Steady ring per held button, riding on the head: the same look as a
+      click ring frozen early in its life, one size step per extra button. */
+  drawHeld(ctx, eng, head) {
+    const x = this.toX(head.x), y = this.toY(head.y);
+    let n = 0;
+    for (let i = 0; i < BTN_KIND.length; i++) {
+      if (!(eng.held & BTN_KIND[i][0])) continue;
+      const col = RING_COLORS[BTN_KIND[i][1]];
+      const rad = (13 + 6 * n) * S;
+      n++;
+      ctx.fillStyle = "rgba(" + col + ",0.22)";
+      ctx.beginPath(); ctx.arc(x, y, rad * 0.6, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "rgba(" + col + ",0.9)";
+      ctx.lineWidth = 2.2 * S;
+      ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
   drawRings(ctx, eng, isDesk) {
-    const colors = ["70,214,138", "124,140,255", "255,176,46"];
+    const colors = RING_COLORS;
     const now = eng.playT;
     for (let k = 0; k < eng.rings.n; k++) {
       const r = eng.rings.at(k);
@@ -1378,10 +1636,10 @@ class Panel {
       const f = age / RING_LIFE;
       const x = this.toX(isDesk ? r.dx : r.ax);
       const y = this.toY(isDesk ? r.dy : r.ay);
-      const rad = 4 + 34 * (1 - Math.pow(1 - f, 2.2));
+      const rad = (4 + 34 * (1 - Math.pow(1 - f, 2.2))) * S;
       const col = colors[r.kind];
       ctx.strokeStyle = "rgba(" + col + "," + (0.9 * (1 - f)).toFixed(3) + ")";
-      ctx.lineWidth = 2.2 * (1 - f) + 0.5;
+      ctx.lineWidth = (2.2 * (1 - f) + 0.5) * S;
       ctx.beginPath();
       ctx.arc(x, y, rad, 0, Math.PI * 2);
       ctx.stroke();
@@ -1397,16 +1655,16 @@ class Panel {
   drawHead(ctx, head) {
     const x = this.toX(head.x), y = this.toY(head.y);
     ctx.fillStyle = "rgba(255,255,255,0.10)";
-    ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, 9 * S, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = "#ffffff";
-    ctx.beginPath(); ctx.arc(x, y, 2.6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, 2.6 * S, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = "rgba(53,208,224,0.55)";
-    ctx.lineWidth = 1;
+    ctx.lineWidth = S;
     ctx.beginPath();
-    ctx.moveTo(x - 12, y); ctx.lineTo(x - 5, y);
-    ctx.moveTo(x + 5, y); ctx.lineTo(x + 12, y);
-    ctx.moveTo(x, y - 12); ctx.lineTo(x, y - 5);
-    ctx.moveTo(x, y + 5); ctx.lineTo(x, y + 12);
+    ctx.moveTo(x - 12 * S, y); ctx.lineTo(x - 5 * S, y);
+    ctx.moveTo(x + 5 * S, y); ctx.lineTo(x + 12 * S, y);
+    ctx.moveTo(x, y - 12 * S); ctx.lineTo(x, y - 5 * S);
+    ctx.moveTo(x, y + 5 * S); ctx.lineTo(x, y + 12 * S);
     ctx.stroke();
   }
 
@@ -1513,18 +1771,18 @@ class Panel {
   }
 
   drawLegend(ctx, vref, isDesk) {
-    const x = 12, y = this.h - 22, w = 108, h = 6;
+    const x = 12, y = this.h - 22 * S, w = 108 * S, h = 6 * S;
     for (let i = 0; i < VLEVELS; i++) {
       ctx.fillStyle = RAMP_CSS[i];
       ctx.fillRect(x + (w / VLEVELS) * i, y, w / VLEVELS + 0.6, h);
     }
-    ctx.fillStyle = "#4d5a6d";
-    ctx.font = "10px ui-monospace, monospace";
-    ctx.fillText("0", x, y + 16);
+    ctx.fillStyle = OBS ? "#c8d2df" : "#4d5a6d";
+    ctx.font = Math.round(10 * S) + "px ui-monospace, monospace";
+    ctx.fillText("0", x, y + 16 * S);
     const top = isDesk
       ? Math.round(vref) + " cm/s"
       : Math.round(vref) + "°/s";
-    ctx.fillText(top, x + w - ctx.measureText(top).width, y + 16);
+    ctx.fillText(top, x + w - ctx.measureText(top).width, y + 16 * S);
   }
 
   flash() {
@@ -1566,6 +1824,12 @@ const ui = {
   wsTimer: null,
   loadedSession: null,
   loadToken: 0,
+  sessions: [],
+  /* "go to time" targets: one waiting for the session list, one waiting
+     for a recording to finish streaming in. Wall-clock UTC µs or null. */
+  pendingUtcUs: null,
+  seekAfterLoadUtcUs: null,
+  _wallSec: null,
   liveBuffer: LIVE_BUFFER_DEFAULT,
   bridge: null,
   bridgeAt: 0,
@@ -1610,6 +1874,9 @@ const ui = {
     this.liveBuffer = clamp(seconds, 0.01, 0.2);
     $("buf").value = String(Math.round(this.liveBuffer * 1000));
     $("bufVal").textContent = Math.round(this.liveBuffer * 1000) + "ms";
+    /* An OBS source's buffer comes from its URL/config; it must not
+       overwrite the dashboard's remembered choice (same origin). */
+    if (OBS) return;
     try { localStorage.setItem(LIVE_BUFFER_KEY, String(this.liveBuffer)); } catch (e) { /* private mode */ }
   },
 
@@ -1669,15 +1936,86 @@ const ui = {
       return;
     }
     sel.innerHTML = "";
+    this.sessions = list;
     for (const s of list) {
       const o = document.createElement("option");
       o.value = s.id;
       const kb = (s.bytes / 1024).toFixed(0);
-      const when = s.modified_epoch_ms ? new Date(s.modified_epoch_ms).toLocaleString() : "";
-      o.textContent = s.id + "  (" + kb + " KB" + (when ? ", " + when : "") + ")";
+      /* Prefer the recording's own clock over the file's mtime: the id and
+         the anchor are UTC, the user thinks in local time. */
+      const startMs = s.started_utc_us != null ? s.started_utc_us / 1000 : s.modified_epoch_ms;
+      const when = startMs ? new Date(startMs).toLocaleString() : "";
+      const span = (s.started_utc_us != null && s.ended_utc_us != null)
+        ? ", " + fmtTime((s.ended_utc_us - s.started_utc_us) / 1e6).replace(/\.\d+$/, "") : "";
+      o.textContent = s.id + "  (" + (when ? when + span + ", " : "") + kb + " KB)";
       sel.appendChild(o);
     }
+    if (this.pendingUtcUs !== null) {
+      const target = this.pendingUtcUs;
+      this.pendingUtcUs = null;
+      if (this.gotoUtcUs(target)) return;
+    }
     await this.loadSession(list[0].id);
+  },
+
+  /** When a listed recording ends. A recording still being written has a
+      real end (the server reads it off the file's tail), so a missing one
+      means an envelope with no batches yet: it ends where it starts. */
+  sessionEnd(s) {
+    return s.ended_utc_us == null ? s.started_utc_us : s.ended_utc_us;
+  },
+
+  /** Which recording was running at `utcUs`: one whose span contains it
+      (1 s of slack past the last batch), else the one that ended most
+      recently before it. */
+  sessionAt(utcUs) {
+    let best = null;
+    for (const s of this.sessions || []) {
+      if (s.started_utc_us == null || s.started_utc_us > utcUs) continue;
+      if (utcUs <= this.sessionEnd(s) + 1e6) return s;
+      if (!best || this.sessionEnd(s) > this.sessionEnd(best)) best = s;
+    }
+    return best;
+  },
+
+  /** Replay the moment `utcUs`: load the recording that covers it if it is
+      not the loaded one, then seek there. Returns false (with a toast) when
+      no recording could plausibly hold it. */
+  gotoUtcUs(utcUs) {
+    if (!isFinite(utcUs)) return false;
+    const s = this.sessionAt(utcUs);
+    if (!s) {
+      this.toast("go to time", "no recording from before " + new Date(utcUs / 1000).toLocaleString(), true);
+      return false;
+    }
+    const drift = utcUs - this.sessionEnd(s);
+    if (drift > 1e6) {
+      /* Nearest we can do: the end of the last recording before that time. */
+      this.toast("go to time", "nothing recorded then — jumping to the end of " + s.id +
+                 " (" + fmtTime(drift / 1e6).replace(/\.\d+$/, "") + " earlier)");
+    }
+    $("sessionSel").value = s.id;
+    if (this.loadedSession === s.id && !engine.loading) {
+      this.seekUtcUs(utcUs);
+      return true;
+    }
+    this.seekAfterLoadUtcUs = utcUs;
+    this.loadSession(s.id);
+    return true;
+  },
+
+  /** Seek the loaded recording to wall-clock `utcUs`, clamped to its span. */
+  seekUtcUs(utcUs) {
+    if (engine.anchorUtcUs === null || !engine.haveTimeline) return;
+    const t = clamp((utcUs - engine.anchorUtcUs) / 1e6, engine.tStart, engine.tEnd);
+    engine.seek(t);
+    this.renderTransport();
+  },
+
+  /** Wall-clock UTC µs of the play head, or null before a session anchor. */
+  playheadUtcUs() {
+    if (engine.anchorUtcUs === null || !engine.haveTimeline) return null;
+    return engine.anchorUtcUs + engine.playT * 1e6;
   },
 
   /** Stream a recording in and parse it as it arrives.
@@ -1765,6 +2103,11 @@ const ui = {
     this.setConn("ok", id + " · " + engine.ev.n.toLocaleString() + " events" +
                        (bad ? " (" + bad + " bad lines)" : ""));
     this.renderNotches();
+    if (this.seekAfterLoadUtcUs !== null) {
+      const target = this.seekAfterLoadUtcUs;
+      this.seekAfterLoadUtcUs = null;
+      this.seekUtcUs(target);
+    }
     this.renderTransport();
     this.setReplayPlaying(true);
   },
@@ -1811,6 +2154,14 @@ const ui = {
     }
     $("scrubFill").style.width = (dur > 0 ? 100 * pos / dur : 0) + "%";
     $("timeText").textContent = fmtTime(pos) + " / " + fmtTime(dur);
+    /* Wall clock of the play head, refreshed once per second of timeline
+       (not per frame — it is text layout, and it only changes that often). */
+    const utc = this.playheadUtcUs();
+    const sec = utc === null ? null : Math.floor(utc / 1e6);
+    if (sec !== this._wallSec) {
+      this._wallSec = sec;
+      $("wallText").textContent = sec === null ? "" : fmtWallClock(sec * 1000);
+    }
   },
 
   jumpMarker(dir) {
@@ -1829,6 +2180,9 @@ const ui = {
   /* ---------------- notifications ---------------- */
 
   toast(label, text, bad) {
+    /* Stream overlays get the panel flash for markers and nothing for the
+       rest: a data-loss banner belongs on the dashboard, not on air. */
+    if (OBS) return;
     const el = document.createElement("div");
     el.className = "toast" + (bad ? " bad" : "");
     el.innerHTML = "<span class='lbl'>" + escapeHtml(label) + "</span> &nbsp;" + escapeHtml(text);
@@ -2048,6 +2402,82 @@ function paintBridge(now) {
 }
 
 /* =====================================================================
+   OBS HUD — the stats bar's stream-facing replacement. Built once from the
+   configured item list; repainted at 10Hz with one textContent write per
+   item, and only when the text actually changed.
+   ===================================================================== */
+
+const hud = { items: [] };
+
+function buildHud() {
+  const box = $("hud");
+  box.innerHTML = "";
+  hud.items.length = 0;
+  if (!OBS || !OBS.hud.length) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  box.classList.add(OBS.hudPos);
+  for (const key of OBS.hud) {
+    const spec = HUD_ITEMS[key];
+    const item = document.createElement("div");
+    item.className = "item" + (spec.text ? " text" : "");
+    const k = document.createElement("div");
+    k.className = "k";
+    k.textContent = spec.k;
+    const v = document.createElement("div");
+    v.className = "v";
+    const val = document.createElement("span");
+    val.textContent = "—";
+    v.appendChild(val);
+    if (spec.unit) {
+      const u = document.createElement("small");
+      u.textContent = spec.unit;
+      v.appendChild(u);
+    }
+    item.appendChild(k);
+    item.appendChild(v);
+    box.appendChild(item);
+    hud.items.push({ key: key, el: val, last: "—" });
+  }
+}
+
+/* One cached formatter for the HUD's grouped integers: bare toLocaleString()
+   constructs a fresh Intl formatter per call, and hudValue runs at 10Hz.
+   Same locale, same default options — output is identical. */
+const hudIntFmt = new Intl.NumberFormat();
+
+function hudValue(key, e) {
+  switch (key) {
+    case "speed": return e.speedCm.toFixed(e.speedCm < 100 ? 1 : 0);
+    case "aim": return hudIntFmt.format(Math.round(e.speedDeg));
+    case "cpm": return String(Math.round(e.clickRate.total(e.playT)));
+    case "eps": return hudIntFmt.format(Math.round(e.eventRate.perSecond(e.playT)));
+    case "dist": return (e.totalCm / 100).toFixed(2);
+    case "aimdist": return hudIntFmt.format(Math.round(e.totalDeg));
+    case "clicks": return hudIntFmt.format(e.totalClicks);
+    case "game": return e.game ? e.game.replace(/\.exe$/i, "") : "—";
+    case "latency": {
+      const us = ui.mode === "live" ? e.newestUtcUs() : null;
+      if (us === null) { latEma = null; return "—"; }
+      const ms = (Date.now() * 1000 - us) / 1000;
+      latEma = latEma === null ? ms : latEma + (ms - latEma) * 0.25;
+      return latEma.toFixed(1);
+    }
+  }
+  return "—";
+}
+
+function paintHud() {
+  const e = engine;
+  for (const it of hud.items) {
+    const v = hudValue(it.key, e);
+    if (v !== it.last) { it.last = v; it.el.textContent = v; }
+  }
+  /* The panel hints are only visible with labels on; paintStats normally
+     keeps them current, and this is its stand-in. */
+  if (OBS.labels) ui.refreshSensHint();
+}
+
+/* =====================================================================
    Main loop — one rAF drives ingest-consumption, drawing, and readouts.
 
    Redrawing is conditional: a still picture is still a still picture, and
@@ -2057,10 +2487,18 @@ function paintBridge(now) {
 
 let lastFrameT = 0;
 let wasAlive = false;
+let lastDrawMs = 0;
 
 function frame(msNow) {
   requestAnimationFrame(frame);
   const now = msNow / 1000;
+
+  /* Rate cap: the play head still advances every frame (cheap, and keeps
+     the data exact); only the expensive part — repainting — is skipped
+     until the cap's interval has elapsed. The half-frame slack keeps a
+     cap equal to the refresh rate from aliasing to half of it. */
+  const cap = (!OBS && !document.hasFocus()) ? Math.min(MAX_FPS, FPS_BACKGROUND) : MAX_FPS;
+  const due = msNow - lastDrawMs >= 1000 / cap - 2;
 
   const dt = lastFrameT ? now - lastFrameT : 0;
   lastFrameT = now;
@@ -2082,18 +2520,22 @@ function frame(msNow) {
      after the last trail point expires so the panels actually end up
      empty instead of holding a ghost. */
   const alive = engine.visualsAlive();
-  if (!ui.paused && (engine.dirty || alive || wasAlive)) {
+  if (due && !ui.paused && (engine.dirty || alive || wasAlive)) {
     if (PROFILE) performance.mark("dr0");
     engine.draw();
     if (PROFILE) { performance.mark("dr1"); measure("draw", "dr0", "dr1", "draw"); }
     engine.dirty = false;
+    lastDrawMs = msNow;
+    wasAlive = alive;
   }
-  wasAlive = alive;
 
   if (now - lastStatsPaint >= 0.1) {
     lastStatsPaint = now;
     if (PROFILE) performance.mark("st0");
-    paintStats(now);
+    /* OBS mode: the stats bar is display:none, so writing ~20 tiles into
+       it would be pure layout work; the HUD is the only readout. */
+    if (OBS) paintHud();
+    else paintStats(now);
     /* The transport writes layout-affecting styles; at 240Hz that was a
        style recalc per frame for a bar that changes by a pixel. Same 100ms
        cadence as the stats. */
@@ -2111,6 +2553,28 @@ function frame(msNow) {
 $("modeSwitch").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (b) ui.setMode(b.dataset.mode);
+});
+
+/** Show one panel or both. Mirrors the choice into ?view= so the URL is
+    shareable / bookmarkable; the ResizeObservers re-measure the panels. */
+let view = "both";
+function setView(v) {
+  if (VIEWS.indexOf(v) < 0) v = "both";
+  view = v;
+  document.body.classList.remove("view-desk", "view-aim");
+  if (v !== "both") document.body.classList.add("view-" + v);
+  for (const b of $("viewSwitch").children) b.classList.toggle("on", b.dataset.view === v);
+  const q = new URLSearchParams(location.search);
+  if (v === "both") q.delete("view"); else q.set("view", v);
+  const qs = q.toString();
+  history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash);
+  deskPanel.resize();
+  aimPanel.resize();
+  engine.dirty = true;
+}
+$("viewSwitch").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (b) setView(b.dataset.view);
 });
 
 $("decay").addEventListener("input", (e) => {
@@ -2140,6 +2604,19 @@ $("btnPlay").addEventListener("click", () => ui.setReplayPlaying(!ui.replayPlayi
 $("btnPrevMarker").addEventListener("click", () => ui.jumpMarker(-1));
 $("btnNextMarker").addEventListener("click", () => ui.jumpMarker(1));
 $("sessionSel").addEventListener("change", (e) => ui.loadSession(e.target.value));
+
+/* "Go to time": the picker is local time (what the user remembers); the
+   recordings are UTC µs. `new Date("YYYY-MM-DDTHH:MM:SS")` parses a bare
+   datetime-local value as local time, which is exactly the conversion needed. */
+function gotoPickedTime() {
+  const v = $("gotoTime").value;
+  if (!v) return;
+  const ms = new Date(v).getTime();
+  if (!isFinite(ms)) { ui.toast("go to time", "unreadable date/time", true); return; }
+  ui.gotoUtcUs(ms * 1000);
+}
+$("btnGoto").addEventListener("click", gotoPickedTime);
+$("gotoTime").addEventListener("keydown", (e) => { if (e.key === "Enter") { gotoPickedTime(); e.preventDefault(); } });
 $("speedSel").addEventListener("change", (e) => { ui.replaySpeed = +e.target.value; });
 
 const scrub = $("scrub");
@@ -2159,6 +2636,7 @@ window.addEventListener("keydown", (e) => {
   if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
   if (e.code === "KeyR") { engine.resetIntegrators(); e.preventDefault(); }
   else if (e.code === "Space") { togglePause(); e.preventDefault(); }
+  else if (e.code === "KeyV" && !OBS) { setView(VIEWS[(VIEWS.indexOf(view) + 1) % VIEWS.length]); e.preventDefault(); }
   else if (ui.mode === "replay" && e.code === "ArrowRight") {
     engine.seek(Math.min(engine.tEnd, engine.playT + (e.shiftKey ? 10 : 1)));
     ui.renderTransport(); e.preventDefault();
@@ -2198,23 +2676,56 @@ armDprWatch();
    from growing without bound. */
 setInterval(() => engine.trim(), 250);
 
+if (OBS) {
+  /* Body classes drive the CSS (chrome hidden, layout, labels); the panels
+     were constructed before this ran, so re-measure them once the hidden
+     one has collapsed to 0×0. */
+  document.body.classList.add("obs", "layout-" + OBS.layout);
+  if (OBS.labels) document.body.classList.add("labels");
+  document.documentElement.style.setProperty("--s", String(OBS.scale));
+  $("decay").value = String(OBS.trail);
+  buildHud();
+  deskPanel.resize();
+  aimPanel.resize();
+}
+if (!OBS && VIEW !== "both") setView(VIEW);
 engine.decay = +$("decay").value;
 $("decayVal").textContent = engine.decay.toFixed(1) + "s";
 let savedBuffer = LIVE_BUFFER_DEFAULT;
-try {
-  const v = +localStorage.getItem(LIVE_BUFFER_KEY);
-  if (isFinite(v) && v >= 0.01 && v <= 0.2) savedBuffer = v;
-} catch (e) { /* storage blocked */ }
+if (OBS) {
+  savedBuffer = OBS.buffer;
+} else {
+  try {
+    const v = +localStorage.getItem(LIVE_BUFFER_KEY);
+    if (isFinite(v) && v >= 0.01 && v <= 0.2) savedBuffer = v;
+  } catch (e) { /* storage blocked */ }
+}
 ui.setLiveBuffer(savedBuffer);
 if (PROFILE) $("statProf").classList.remove("hidden");
-ui.setConn("warn", "connecting");
-ui.connect();
+/* ?at=<local ISO datetime or epoch ms> opens straight into replay at that
+   moment — a bookmarkable "show me 21:14:03 last night" — without first
+   opening a live socket it would close a millisecond later. Not for OBS
+   sources, which are live by definition. */
+const AT = QUERY.get("at");
+let atMs = NaN;
+if (AT && !OBS) {
+  atMs = /^\d{11,}$/.test(AT) ? +AT : new Date(AT).getTime();
+  if (!isFinite(atMs)) ui.toast("?at=", "unreadable date/time: " + AT, true);
+}
+if (isFinite(atMs)) {
+  ui.pendingUtcUs = atMs * 1000;
+  $("gotoTime").value = toDatetimeLocal(atMs);
+  ui.setMode("replay");
+} else {
+  ui.setConn("warn", "connecting");
+  ui.connect();
+}
 requestAnimationFrame(frame);
 
 /* Handy from the devtools console when tuning: telemouse.engine.playT, etc. */
 window.telemouse = {
   engine: engine, ui: ui, deskPanel: deskPanel, aimPanel: aimPanel,
-  prof: prof, profiling: PROFILE,
+  prof: prof, profiling: PROFILE, obs: OBS,
 };
 </script>
 </body>

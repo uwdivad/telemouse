@@ -5,17 +5,21 @@
 //! the sinks. All of that policy lives in [`ShipperCore`], which is pure and
 //! testable; [`run`] is only the thread + timing shell around it.
 //!
-//! The loop **parks** rather than polling: T1 unparks it when the ring goes
-//! non-empty (see [`crate::raw_input::RingWaker`]), and a short park timeout —
-//! sized to whatever is left of the current batch window — guarantees the
-//! time-based flush still fires on an idle desk.
+//! The loop **parks** rather than polling: with no batch open, T1 unparks it
+//! on the first event (see [`crate::raw_input::RingWaker`]); once a batch is
+//! open it sleeps out the remainder of the batch window and drains whatever
+//! accumulated in one go. That makes the wakeup rate ~1/window rather than
+//! one per mouse report — at 1kHz the per-event wake/park cycle was most of
+//! the agent's CPU.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use telemouse_core::{Batch, Batcher, Envelope, Marker, QpcAnchor, RawEvent, SessionConfig};
+use telemouse_core::{
+    BatchView, Batcher, Envelope, EnvelopeView, Marker, QpcAnchor, RawEvent, SessionConfig,
+};
 
 use crate::context::SharedContext;
 use crate::platform;
@@ -32,8 +36,32 @@ const MIN_PARK: Duration = Duration::from_micros(500);
 /// serviced under a flood.
 const DRAIN_BUDGET: usize = 8_192;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// Park length once the loop is *confirmed* idle: only the once-a-second sink
+/// tick needs a timer then, so an idle desk costs one wakeup a second instead
+/// of forty. Reached via a two-stage descent (see [`next_park_timeout`]): the
+/// first empty-ring park is only [`MAX_PARK`], so a wake lost to the
+/// [`RingWaker`] race costs at most one batch window, never a full second.
+const IDLE_PARK: Duration = TICK_INTERVAL;
 /// A misbehaving sink warns at most this often, with a suppressed count.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Park timeout for an empty-ring park: the two-stage idle descent.
+///
+/// T1's `RingWaker` wake can, rarely, be lost to the relaxed-load race while
+/// this thread is on its way into `park` — the park timeout is the backstop.
+/// So the FIRST park after the ring goes empty is only the batch window
+/// ([`MAX_PARK`]): a lost wake costs at most one window. Only when that probe
+/// park times out with the ring *still* empty (`prev_timed_out`, judged by the
+/// caller) does the loop descend to [`IDLE_PARK`]; anything arriving — a
+/// successful wake or a non-empty ring — resets the descent. Price: one extra
+/// wakeup per descent into idle.
+pub fn next_park_timeout(prev_timed_out: bool, ring_empty: bool) -> Duration {
+    if prev_timed_out && ring_empty {
+        IDLE_PARK
+    } else {
+        MAX_PARK
+    }
+}
 
 /// A hotkey press handed over from T1 (or a note from T3). Markers are rare, so
 /// a plain channel is the right tool — the SPSC ring stays reserved for the hot
@@ -111,6 +139,16 @@ impl WarnLimiter {
     }
 }
 
+/// The per-batch header values [`ShipperCore::next_batch_meta`] hands out
+/// alongside the borrowed events when a batch is flushed.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchMeta {
+    pub seq_no: u64,
+    pub ts_anchor_us: i64,
+    pub drops_since_last: u32,
+    pub abs_frames_since_last: u32,
+}
+
 /// The shipping policy: accumulate, decide, assemble.
 pub struct ShipperCore {
     session_id: String,
@@ -121,9 +159,6 @@ pub struct ShipperCore {
     drops: DropAccountant,
     abs_frames: DropAccountant,
     window_ticks: u64,
-    /// QPC of the batch's first event, mirrored so the loop can work out how
-    /// long it may park before the window expires.
-    first_qpc: Option<u64>,
 }
 
 impl ShipperCore {
@@ -137,7 +172,6 @@ impl ShipperCore {
             drops: DropAccountant::new(),
             abs_frames: DropAccountant::new(),
             window_ticks: anchor.ms_to_ticks(window_ms),
-            first_qpc: None,
         }
     }
 
@@ -145,10 +179,11 @@ impl ShipperCore {
         self.anchor
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn push(&mut self, ev: RawEvent) {
-        if self.first_qpc.is_none() {
-            self.first_qpc = Some(ev.ts_qpc);
-        }
         self.batcher.push(ev);
     }
 
@@ -160,10 +195,16 @@ impl ShipperCore {
         self.batcher.len()
     }
 
+    /// The accumulated events, borrowed — a flushed `BatchView` serializes
+    /// straight over this slice.
+    pub fn events(&self) -> &[RawEvent] {
+        self.batcher.events()
+    }
+
     /// How long the loop may park before the current batch window expires.
     /// With nothing pending there is no deadline, so it parks the full window.
     pub fn park_hint(&self, now_qpc: u64) -> Duration {
-        let Some(first) = self.first_qpc else {
+        let Some(first) = self.batcher.first_qpc() else {
             return MAX_PARK;
         };
         let elapsed = now_qpc.saturating_sub(first);
@@ -172,36 +213,56 @@ impl ShipperCore {
         Duration::from_micros(us).clamp(MIN_PARK, MAX_PARK)
     }
 
-    /// Assemble the accumulated events into a batch. `None` when empty.
+    /// Claim the header for the accumulated batch — sequence number, anchor
+    /// timestamp and the per-batch deltas — leaving the events in place.
+    /// `None` when empty. The caller serializes a [`BatchView`] over
+    /// [`Self::events`] and then calls [`Self::finish_batch`]; nothing on that
+    /// path clones a `String` or surrenders the event `Vec`.
+    pub fn next_batch_meta(&mut self, drops_total: u32, abs_frames_total: u32) -> Option<BatchMeta> {
+        let first = self.batcher.first_qpc()?;
+        let seq_no = self.batch_seq;
+        self.batch_seq += 1;
+        Some(BatchMeta {
+            seq_no,
+            ts_anchor_us: self.anchor.qpc_to_utc_us(first),
+            drops_since_last: self.drops.delta(drops_total),
+            abs_frames_since_last: self.abs_frames.delta(abs_frames_total),
+        })
+    }
+
+    /// Done with the flushed batch: clear it, keeping the event capacity.
+    pub fn finish_batch(&mut self) {
+        self.batcher.reset();
+    }
+
+    /// Assemble the accumulated events into an owned batch. `None` when empty.
+    /// Test convenience only — the production flush path serializes a
+    /// borrowing [`BatchView`] instead (see [`flush`]).
+    #[cfg(test)]
     pub fn build_batch(
         &mut self,
         ctx: &crate::context::ContextSnapshot,
         drops_total: u32,
         abs_frames_total: u32,
-    ) -> Option<Batch> {
-        if self.batcher.is_empty() {
-            return None;
-        }
-        let events = self.batcher.take();
-        self.first_qpc = None;
-        let ts_anchor_us = self.anchor.qpc_to_utc_us(events[0].ts_qpc);
+    ) -> Option<telemouse_core::Batch> {
+        let meta = self.next_batch_meta(drops_total, abs_frames_total)?;
         let (cursor_x, cursor_y) = ctx.batch_cursor();
-        let seq_no = self.batch_seq;
-        self.batch_seq += 1;
-        Some(Batch {
+        let batch = telemouse_core::Batch {
             session_id: self.session_id.clone(),
-            seq_no,
-            ts_anchor_us,
+            seq_no: meta.seq_no,
+            ts_anchor_us: meta.ts_anchor_us,
             game: ctx.game.clone(),
             pointer_locked: ctx.pointer_locked,
             screen_w: ctx.screen_w,
             screen_h: ctx.screen_h,
             cursor_x,
             cursor_y,
-            drops_since_last: self.drops.delta(drops_total),
-            abs_frames_since_last: self.abs_frames.delta(abs_frames_total),
-            events,
-        })
+            drops_since_last: meta.drops_since_last,
+            abs_frames_since_last: meta.abs_frames_since_last,
+            events: self.batcher.events().to_vec(),
+        };
+        self.finish_batch();
+        Some(batch)
     }
 
     pub fn build_marker(&mut self, ts_qpc: u64, label: String) -> Marker {
@@ -219,15 +280,17 @@ impl ShipperCore {
 
 /// Deliver one envelope everywhere, isolating and counting sink failures.
 ///
-/// `payload` is the envelope already serialized once for the whole fan-out.
+/// `payload` is the envelope already serialized once for the whole fan-out;
+/// `topic`/`key` carry its routing.
 pub fn deliver(
     sinks: &mut [Box<dyn Sink>],
     stats: &Stats,
     limiter: &mut WarnLimiter,
-    env: &Envelope,
+    topic: &'static str,
+    key: &str,
     payload: &str,
 ) {
-    for failure in fan_out(sinks, env, payload) {
+    for failure in fan_out(sinks, topic, key, payload) {
         stats.count_sink_error(failure.sink);
         if let Some(suppressed) = limiter.allow(failure.sink, Instant::now()) {
             tracing::warn!(
@@ -240,8 +303,10 @@ pub fn deliver(
     }
 }
 
-/// Serialize then deliver. Returns false if the envelope could not be encoded
-/// at all (which is a bug, not a sink failure, so it is logged loudly).
+/// Serialize then deliver an owned envelope (sessions and markers — batches go
+/// through the borrowing view in [`flush`]). Returns false if the envelope
+/// could not be encoded at all (which is a bug, not a sink failure, so it is
+/// logged loudly).
 fn encode_and_deliver(
     enc: &mut EnvelopeEncoder,
     sinks: &mut [Box<dyn Sink>],
@@ -253,7 +318,7 @@ fn encode_and_deliver(
         tracing::error!(error = %format!("{e:#}"), "could not serialize envelope");
         return false;
     }
-    deliver(sinks, stats, limiter, env, enc.payload());
+    deliver(sinks, stats, limiter, env.topic(), env.key(), enc.payload());
     true
 }
 
@@ -304,6 +369,9 @@ pub fn run(
     );
 
     let mut last_tick = Instant::now();
+    // Two-stage idle descent: true once an empty-ring park has already timed
+    // out with the ring still empty, i.e. the loop is confirmed idle.
+    let mut idle_probe_expired = false;
     loop {
         let stopping = capture_stopped.load(Ordering::Acquire);
         stats.observe_ring_slots(consumer.slots() as u64);
@@ -378,13 +446,41 @@ pub fn run(
         }
         if drained < DRAIN_BUDGET {
             let timeout = core.park_hint(platform::qpc());
-            waker.begin_park();
-            // Re-check: T1 may have pushed between the drain above and the flag
-            // going up. Missing that check would cost one park timeout.
-            if consumer.is_empty() {
+            if core.pending() == 0 {
+                // Nothing in flight: T1 wakes us on the first event (so the
+                // batch window starts promptly), markers and shutdown wake us
+                // explicitly, and the only timed work left is the sink tick.
+                waker.begin_park();
+                // Re-check: T1 may have pushed between the drain above and the
+                // flag going up. Missing that check would cost one park timeout.
+                // A marker handed over in this tiny window rides the next
+                // wake or the tick, at worst a second late — markers are rare
+                // and every sender also calls `wake()` after sending.
+                if consumer.is_empty() {
+                    // Descend to the long idle park only once a batch-window
+                    // park has confirmed the ring is really idle: a wake lost
+                    // to the RingWaker race (see its docs) then costs at most
+                    // MAX_PARK, not IDLE_PARK, for one extra wakeup per
+                    // descent into idle.
+                    let idle_timeout = next_park_timeout(idle_probe_expired, true);
+                    let parked_at = Instant::now();
+                    std::thread::park_timeout(idle_timeout);
+                    idle_probe_expired =
+                        parked_at.elapsed() >= idle_timeout && consumer.is_empty();
+                } else {
+                    idle_probe_expired = false;
+                }
+                waker.end_park();
+            } else {
+                // A batch is open: its window is the only deadline that
+                // matters, so sleep it out and let events pile up in the ring.
+                // Waking per event here cost a syscall on T1 and a full
+                // wake→pop→park cycle on this thread for every mouse report.
+                idle_probe_expired = false;
                 std::thread::park_timeout(timeout);
             }
-            waker.end_park();
+        } else {
+            idle_probe_expired = false;
         }
     }
 
@@ -421,32 +517,61 @@ fn flush(
 ) {
     // The context is only needed here (~40×/s), never per drained event.
     let snapshot = ctx.get();
-    let Some(batch) = core.build_batch(&snapshot, stats.ring_drops(), stats.abs_frames()) else {
+    let Some(meta) = core.next_batch_meta(stats.ring_drops(), stats.abs_frames()) else {
         return;
     };
     stats.batches.fetch_add(1, Ordering::Relaxed);
-    record_latency(core.anchor(), stats, &batch);
+    record_latency(core.anchor(), stats, core.events());
     if print {
-        let (dx, dy) = batch.total_counts();
+        let (dx, dy) = total_counts(core.events());
         tracing::info!(
-            seq = batch.seq_no,
-            events = batch.events.len(),
+            seq = meta.seq_no,
+            events = core.events().len(),
             dx,
             dy,
-            drops = batch.drops_since_last,
-            abs_frames = batch.abs_frames_since_last,
-            game = batch.game.as_deref().unwrap_or("-"),
-            locked = batch.pointer_locked,
+            drops = meta.drops_since_last,
+            abs_frames = meta.abs_frames_since_last,
+            game = snapshot.game.as_deref().unwrap_or("-"),
+            locked = snapshot.pointer_locked,
             "batch"
         );
     }
-    encode_and_deliver(enc, sinks, stats, limiter, &Envelope::Batch(batch));
+    // Steady-state allocation-free: the view borrows the session id, the
+    // context snapshot and the batcher's events in place — no `String` clones,
+    // no fresh `Vec` — and serializes into the encoder's reused buffer.
+    let (cursor_x, cursor_y) = snapshot.batch_cursor();
+    let view = EnvelopeView::Batch(BatchView {
+        session_id: core.session_id(),
+        seq_no: meta.seq_no,
+        ts_anchor_us: meta.ts_anchor_us,
+        game: snapshot.game.as_deref(),
+        pointer_locked: snapshot.pointer_locked,
+        screen_w: snapshot.screen_w,
+        screen_h: snapshot.screen_h,
+        cursor_x,
+        cursor_y,
+        drops_since_last: meta.drops_since_last,
+        abs_frames_since_last: meta.abs_frames_since_last,
+        events: core.events(),
+    });
+    if let Err(e) = enc.encode(&view) {
+        tracing::error!(error = %format!("{e:#}"), "could not serialize envelope");
+    } else {
+        deliver(sinks, stats, limiter, view.topic(), view.key(), enc.payload());
+    }
+    core.finish_batch();
+}
+
+fn total_counts(events: &[RawEvent]) -> (i64, i64) {
+    events
+        .iter()
+        .fold((0i64, 0i64), |(x, y), e| (x + e.dx as i64, y + e.dy as i64))
 }
 
 /// Record how long the batch's oldest and newest events waited to be shipped.
-fn record_latency(anchor: QpcAnchor, stats: &Stats, batch: &Batch) {
+fn record_latency(anchor: QpcAnchor, stats: &Stats, events: &[RawEvent]) {
     let now = platform::qpc();
-    let (Some(first), Some(last)) = (batch.events.first(), batch.events.last()) else {
+    let (Some(first), Some(last)) = (events.first(), events.last()) else {
         return;
     };
     stats
@@ -459,6 +584,7 @@ fn record_latency(anchor: QpcAnchor, stats: &Stats, batch: &Batch) {
 
 #[cfg(test)]
 mod tests {
+    use telemouse_core::Batch;
     use telemouse_core::event::buttons;
 
     use super::*;
@@ -608,6 +734,18 @@ mod tests {
         // Taking the batch clears the deadline again.
         core.build_batch(&ctx(), 0, 0).unwrap();
         assert_eq!(core.park_hint(a.qpc + FREQ), MAX_PARK);
+    }
+
+    #[test]
+    fn the_idle_descent_takes_two_stages() {
+        // First empty-ring park after activity: only the batch window, so a
+        // wake lost to the RingWaker race costs at most one window.
+        assert_eq!(next_park_timeout(false, true), MAX_PARK);
+        // A probe that timed out with the ring still empty: confirmed idle.
+        assert_eq!(next_park_timeout(true, true), IDLE_PARK);
+        // Anything in the ring resets the descent, whatever the probe said.
+        assert_eq!(next_park_timeout(true, false), MAX_PARK);
+        assert_eq!(next_park_timeout(false, false), MAX_PARK);
     }
 
     #[test]

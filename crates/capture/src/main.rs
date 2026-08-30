@@ -3,7 +3,9 @@
 //! Three threads (see `mouse-telemetry-plan.md`):
 //!
 //! * **T1** [`raw_input`] — message-only window, `WM_INPUT` → QPC timestamp →
-//!   SPSC ring. Never blocks, never allocates after startup.
+//!   SPSC ring. Never blocks, never allocates on the per-report path (rare
+//!   exceptions: a hotkey marker allocates its label and mpsc node, and a
+//!   never-before-seen device allocates its device-table entry).
 //! * **T2** [`shipping`] — drains the ring, batches on a 25ms window, fans out
 //!   to UDP / Kafka / JSONL. Each sink fails independently.
 //! * **T3** [`context_thread`] — 250ms poll of foreground process, screen and
@@ -119,6 +121,43 @@ fn cmd_run(_args: RunArgs) -> Result<()> {
     anyhow::bail!("raw input capture requires Windows; `telemouse doctor` still works here")
 }
 
+/// Clears an alive flag when its thread exits *for any reason* — a panic
+/// unwinds through the guard, so the main loop's watchdog sees honest state
+/// instead of a zombie thread.
+#[cfg(windows)]
+struct AliveGuard {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<shutdown::Shutdown>,
+}
+
+#[cfg(windows)]
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.flag
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Wake the main thread so it notices immediately.
+        self.shutdown.notify();
+    }
+}
+
+/// Join a worker thread, logging a panic payload instead of discarding it.
+/// Returns false on a panic so the process can exit nonzero.
+#[cfg(windows)]
+fn join_loudly(name: &'static str, handle: std::thread::JoinHandle<()>) -> bool {
+    match handle.join() {
+        Ok(()) => true,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            tracing::error!(thread = name, panic = %msg, "worker thread panicked");
+            false
+        }
+    }
+}
+
 #[cfg(windows)]
 fn cmd_run(args: RunArgs) -> Result<()> {
     use std::sync::Arc;
@@ -171,6 +210,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             games: cfg.games.clone(),
             monitors: platform::monitors(),
             capture_version: env!("CARGO_PKG_VERSION").to_string(),
+            coalesce_ms: cfg.batch.coalesce_ms,
         },
     );
     tracing::info!(
@@ -179,6 +219,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         anchor_uncertainty_us,
         devices = device_table.len() - 1,
         monitors = session.monitors.len(),
+        coalesce_ms = cfg.batch.coalesce_ms,
         "session starting"
     );
 
@@ -235,6 +276,9 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     // Cleared by T1 when its message loop returns, for any reason. The main
     // loop watches it so a dead capture thread is an error, not silence.
     let capture_alive = Arc::new(AtomicBool::new(true));
+    // Same watchdog for T2: a dead shipping thread would otherwise leave a
+    // zombie agent capturing into a ring nobody drains.
+    let shipping_alive = Arc::new(AtomicBool::new(true));
     let handles = Arc::new(CaptureHandles::default());
     let waker = Arc::new(RingWaker::default());
 
@@ -253,17 +297,20 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             ctx: Arc::clone(&ctx),
             devices: device_table,
             hotkey: raw_input::Hotkey::default(),
+            coalesce: Duration::from_millis(cfg.batch.coalesce_ms),
+            qpc_freq,
         };
         let (alive, shutdown) = (Arc::clone(&capture_alive), Arc::clone(&shutdown));
         std::thread::Builder::new()
             .name("telemouse-capture".into())
             .spawn(move || {
+                let _alive = AliveGuard {
+                    flag: alive,
+                    shutdown,
+                };
                 if let Err(e) = raw_input::run(deps) {
                     tracing::error!(error = %format!("{e:#}"), "capture thread failed");
                 }
-                alive.store(false, Ordering::Release);
-                // Wake the main thread so it notices immediately.
-                shutdown.notify();
             })
             .context("spawn capture thread")?
     };
@@ -280,6 +327,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             config_path: args.config.clone(),
             config: file_cfg,
             marker_tx,
+            waker: Arc::clone(&waker),
         };
         std::thread::Builder::new()
             .name("telemouse-context".into())
@@ -289,6 +337,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     let t2 = {
         let (ctx, stats) = (Arc::clone(&ctx), Arc::clone(&stats));
+        let (alive, shutdown) = (Arc::clone(&shipping_alive), Arc::clone(&shutdown));
         let ship_args = ShippingArgs {
             session,
             window_ms: cfg.batch.window_ms,
@@ -299,7 +348,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         };
         std::thread::Builder::new()
             .name("telemouse-shipping".into())
-            .spawn(move || shipping::run(consumer, marker_rx, sinks, ctx, stats, ship_args))
+            .spawn(move || {
+                let _alive = AliveGuard {
+                    flag: alive,
+                    shutdown,
+                };
+                shipping::run(consumer, marker_rx, sinks, ctx, stats, ship_args)
+            })
             .context("spawn shipping thread")?
     };
 
@@ -322,6 +377,12 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             tracing::error!("capture thread exited; shutting down so the gap is not silent");
             break;
         }
+        if !shipping_alive.load(Ordering::Acquire) {
+            tracing::error!(
+                "shipping thread exited; shutting down so capture does not feed a ring nobody drains"
+            );
+            break;
+        }
         match deadline {
             Some(d) => shutdown.wait_until(d),
             None => shutdown.wait_timeout(Duration::from_secs(60)),
@@ -342,17 +403,20 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         tracing::warn!("capture window never came up; posting WM_QUIT to the thread");
         raw_input::post_thread_quit(thread_id);
     }
+    let mut joined_clean = true;
     if hwnd == 0 && thread_id == 0 && capture_alive.load(Ordering::Acquire) {
         // Nothing to post to and the thread claims to be running: detach rather
         // than block forever on a join that can never complete.
         tracing::error!("capture thread never published a handle; detaching it");
         drop(t1);
     } else {
-        let _ = t1.join();
+        joined_clean &= join_loudly("capture", t1);
     }
     capture_stopped.store(true, Ordering::Release);
-    let _ = t2.join();
-    let _ = t3.join();
+    // T2 may be in its idle park; do not make shutdown wait it out.
+    waker.wake();
+    joined_clean &= join_loudly("shipping", t2);
+    joined_clean &= join_loudly("context", t3);
 
     let final_stats = stats.snapshot();
     tracing::info!(
@@ -375,6 +439,9 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         capture_to_ship_us_p99 = final_stats.ship_latency_first.percentile_us(0.99),
         "session finished"
     );
+    if !joined_clean {
+        anyhow::bail!("a worker thread panicked; see the errors above");
+    }
     Ok(())
 }
 

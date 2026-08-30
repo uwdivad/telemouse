@@ -1,0 +1,57 @@
+[package]
+name = "telemouse-ctl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "telemouse-ctl"
+path = "src/main.rs"
+
+[dependencies]
+telemouse-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+# This process spawns children and polls them: `process` is the point.
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "process",
+    "signal",
+    "io-util",
+    "time",
+    "sync",
+] }
+axum = { version = "0.8.9" }
+
+# The process table is read with a Toolhelp snapshot plus per-process
+# queries for the few matching names (see procs.rs for why not sysinfo).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Wdk_System_Threading",
+    # The tray icon and status window (gui/win.rs): a plain window with one
+    # EDIT control, Shell_NotifyIcon, a popup menu, runtime-drawn icons, and
+    # hiding the console window when this process is the only one on it.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+] }
+
+# Off Windows the same three calls go through sysinfo; capture is
+# Windows-only, this just keeps `cargo test` portable.
+[target.'cfg(not(windows))'.dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

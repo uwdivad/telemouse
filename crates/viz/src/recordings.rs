@@ -5,6 +5,7 @@
 //! validation that keeps `/api/session/{id}` from serving arbitrary files can
 //! be tested directly.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -19,6 +20,79 @@ pub struct SessionEntry {
     pub path: String,
     pub bytes: u64,
     pub modified_epoch_ms: i64,
+    /// Wall-clock UTC µs of the session envelope's anchor (`anchor.utc_us`,
+    /// falling back to `started_utc_us`), or `None` if the first line is not
+    /// a session envelope. This is the zero of the page's replay timeline,
+    /// which is what lets "go to 21:14:03" become a seek offset.
+    pub started_utc_us: Option<i64>,
+    /// Wall-clock UTC µs of the last batch or marker in the file, read from
+    /// the file's tail so a 500 MB recording costs the same as a 5 KB one.
+    /// `None` if the tail holds no timestamped line.
+    pub ended_utc_us: Option<i64>,
+}
+
+/// How much of a recording's head and tail is inspected for timestamps.
+/// A session envelope (device list, sens table, monitors) is a few KB; a
+/// batch line at 448 events is ~20 KB. 64 KB covers both with room.
+const PROBE_BYTES: u64 = 64 * 1024;
+
+/// Wall-clock span `(started, ended)` of one recording, each `None` when the
+/// corresponding end of the file does not carry a usable timestamp.
+///
+/// Reads at most [`PROBE_BYTES`] from each end: the first line for the
+/// session anchor, the last timestamped line for the end. Deliberately
+/// tolerant — a truncated last line (the agent was killed mid-write) simply
+/// falls back to the previous complete line.
+pub fn probe_time_range(path: &Path) -> (Option<i64>, Option<i64>) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (None, None);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+
+    let mut head = Vec::new();
+    if f.by_ref().take(PROBE_BYTES).read_to_end(&mut head).is_err() {
+        return (None, None);
+    }
+    let first = head.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let started = serde_json::from_slice::<serde_json::Value>(first)
+        .ok()
+        .filter(|v| v["type"] == "session")
+        .and_then(|v| {
+            v["anchor"]["utc_us"]
+                .as_i64()
+                .or_else(|| v["started_utc_us"].as_i64())
+        });
+
+    let tail_start = len.saturating_sub(PROBE_BYTES);
+    let mut tail = Vec::new();
+    if tail_start > 0 {
+        if f.seek(SeekFrom::Start(tail_start)).is_err() || f.read_to_end(&mut tail).is_err() {
+            return (started, None);
+        }
+    } else {
+        tail = head;
+    }
+    let ended = tail
+        .split(|&b| b == b'\n')
+        .rev()
+        .filter(|l| !l.is_empty())
+        .find_map(line_utc_us);
+    (started, ended)
+}
+
+/// The wall-clock UTC µs a batch or marker line ends at, if it parses.
+///
+/// A batch's `ts_anchor_us` is its first event; adding the last event's QPC
+/// offset would need the session's `qpc_freq`, and a batch spans ≤ one
+/// `window_ms` (50 ms by default), which is below what "go to a time" can
+/// usefully resolve anyway.
+fn line_utc_us(line: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    match v["type"].as_str()? {
+        "batch" => v["ts_anchor_us"].as_i64(),
+        "marker" => v["ts_utc_us"].as_i64(),
+        _ => None,
+    }
 }
 
 /// True if `id` is shaped like a session id we are willing to look up.
@@ -68,11 +142,14 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
                 .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let (started_utc_us, ended_utc_us) = probe_time_range(&path);
             Some(SessionEntry {
                 id,
                 path: path.to_string_lossy().replace('\\', "/"),
                 bytes: meta.len(),
                 modified_epoch_ms,
+                started_utc_us,
+                ended_utc_us,
             })
         })
         .collect();
@@ -147,6 +224,71 @@ mod tests {
         assert!(json.contains(r#""id":"s-1""#));
         assert!(json.contains(r#""bytes":2"#));
         assert!(json.contains("modified_epoch_ms"));
+        assert!(json.contains(r#""started_utc_us":null"#));
+        assert!(json.contains(r#""ended_utc_us":null"#));
+    }
+
+    const SESSION_LINE: &str = r#"{"type":"session","session_id":"s","started_utc_us":1756000000000000,"qpc_freq":10000000,"anchor":{"qpc":5000000000,"utc_us":1756000000000500,"qpc_freq":10000000}}"#;
+
+    fn batch_line(ts_anchor_us: i64, pad: usize) -> String {
+        // `pad` bloats the line so tests can push the file past PROBE_BYTES.
+        format!(
+            r#"{{"type":"batch","session_id":"s","seq_no":1,"ts_anchor_us":{ts_anchor_us},"note":"{}","events":[]}}"#,
+            "x".repeat(pad)
+        )
+    }
+
+    #[test]
+    fn time_range_comes_from_the_anchor_and_the_last_timestamped_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{SESSION_LINE}\n{}\n{}\n{{\"type\":\"marker\",\"session_id\":\"s\",\"seq_no\":3,\"ts_qpc\":1,\"ts_utc_us\":1756000009000000,\"label\":\"m\"}}\n",
+            batch_line(1756000001000000, 0),
+            batch_line(1756000005000000, 0),
+        );
+        write(tmp.path(), "s.jsonl", &body);
+        let list = list_recordings(tmp.path());
+        assert_eq!(list[0].started_utc_us, Some(1756000000000500), "anchor.utc_us wins over started_utc_us");
+        assert_eq!(list[0].ended_utc_us, Some(1756000009000000));
+    }
+
+    #[test]
+    fn time_range_survives_a_truncated_last_line_and_a_large_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = format!("{SESSION_LINE}\n");
+        // Well past PROBE_BYTES so the head and tail windows do not overlap.
+        for i in 0..20 {
+            body.push_str(&batch_line(1756000000000000 + i * 1_000_000, 10_000));
+            body.push('\n');
+        }
+        // The agent died mid-write: no trailing newline, unparseable JSON.
+        body.push_str(r#"{"type":"batch","ts_anchor_us":1756000099"#);
+        write(tmp.path(), "s.jsonl", &body);
+        assert!(body.len() as u64 > 2 * PROBE_BYTES);
+
+        let (started, ended) = probe_time_range(&tmp.path().join("s.jsonl"));
+        assert_eq!(started, Some(1756000000000500));
+        assert_eq!(ended, Some(1756000019000000));
+    }
+
+    #[test]
+    fn time_range_is_none_for_files_without_envelopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "junk.jsonl", "not json\n{\"type\":\"other\"}\n");
+        write(tmp.path(), "empty.jsonl", "");
+        assert_eq!(probe_time_range(&tmp.path().join("junk.jsonl")), (None, None));
+        assert_eq!(probe_time_range(&tmp.path().join("empty.jsonl")), (None, None));
+    }
+
+    #[test]
+    fn bundled_demo_recording_reports_its_time_range() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent()).unwrap();
+        let Some(path) = resolve_recording(&repo_root.join("recordings"), "demo-session") else {
+            return;
+        };
+        let (started, ended) = probe_time_range(&path);
+        assert_eq!(started, Some(1_756_000_000_000_000));
+        assert!(ended.unwrap() > started.unwrap());
     }
 
     #[test]

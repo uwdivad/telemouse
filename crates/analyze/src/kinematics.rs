@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use telemouse_core::units;
 
 use crate::savgol::SavGol;
-use crate::series::{Prepared, sg_run};
+use crate::series::{Prepared, SgScratch, sg_run_into};
 use crate::stats::{self, Summary};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,20 +75,37 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let d1 = SavGol::new(p.params.sg_half, p.params.sg_order, 1);
     let d2 = SavGol::new(p.params.sg_half, p.params.sg_order, 2);
 
-    // One push per moving cell; nothing here is ever session-length.
-    let moving_estimate = g.stored_cells().min(1 << 20);
-    let mut speeds = Vec::with_capacity(moving_estimate);
-    let mut speeds_deg = Vec::with_capacity(moving_estimate);
-    let mut accel = Vec::with_capacity(moving_estimate);
-    let mut jerk = Vec::with_capacity(moving_estimate);
+    // One push per moving cell; nothing here is ever session-length. The
+    // moving-cell count is taken up front (one cheap pass over the speed
+    // lane) so the sample vectors are allocated exactly once instead of
+    // doubling their way up from a guess.
+    let moving_total: usize = g
+        .runs
+        .iter()
+        .map(|r| r.speed.iter().filter(|&&s| s > still).count())
+        .sum();
+    let mut speeds = Vec::with_capacity(moving_total);
+    let mut speeds_deg = Vec::with_capacity(moving_total);
+    let mut accel = Vec::with_capacity(moving_total);
+    let mut jerk = Vec::with_capacity(moving_total);
     let mut moving = 0usize;
 
+    // Four derivative lanes per run, each into a reused scratch pair; the
+    // per-cell reduction below only needs one run's lanes at a time.
+    let mut sx1 = SgScratch::default();
+    let mut sy1 = SgScratch::default();
+    let mut sx2 = SgScratch::default();
+    let mut sy2 = SgScratch::default();
+    let half = p.params.sg_half;
     for r in &g.runs {
-        let ax = sg_run(&d1, &r.vx, r.start, n, p.params.sg_half, dt);
-        let ay = sg_run(&d1, &r.vy, r.start, n, p.params.sg_half, dt);
-        let jx = sg_run(&d2, &r.vx, r.start, n, p.params.sg_half, dt);
-        let jy = sg_run(&d2, &r.vy, r.start, n, p.params.sg_half, dt);
-        for j in 0..r.len() {
+        let (ax, ox) = sg_run_into(&d1, &r.vx, r.start, n, half, dt, &mut sx1);
+        let (ay, oy) = sg_run_into(&d1, &r.vy, r.start, n, half, dt, &mut sy1);
+        let (jx, ojx) = sg_run_into(&d2, &r.vx, r.start, n, half, dt, &mut sx2);
+        let (jy, ojy) = sg_run_into(&d2, &r.vy, r.start, n, half, dt, &mut sy2);
+        let len = r.len();
+        let (ax, ay) = (&ax[ox..ox + len], &ay[oy..oy + len]);
+        let (jx, jy) = (&jx[ojx..ojx + len], &jy[ojy..ojy + len]);
+        for j in 0..len {
             if r.speed[j] <= still {
                 continue;
             }
@@ -101,14 +118,16 @@ pub fn compute(p: &Prepared) -> Kinematics {
             }
         }
     }
+    debug_assert_eq!(moving, moving_total);
 
-    let to_cm = |xs: &[f64]| -> Vec<f64> { xs.iter().map(|&v| p.counts_to_cm(v)).collect() };
-    let to_deg = |xs: &[f64]| -> Vec<f64> { xs.iter().map(|&v| v * kx).collect() };
-    let speeds_cm = to_cm(&speeds);
-    let accel_cm = to_cm(&accel);
-    let accel_deg = to_deg(&accel);
-    let jerk_cm = to_cm(&jerk);
-    let jerk_deg = to_deg(&jerk);
+    // One selection pass per count-space sample; the cm and degree variants
+    // are the same sample rescaled, so they are derived from the summary
+    // rather than re-summarized (`Summary::scaled`). `counts_to_cm` is linear
+    // in counts.
+    let cm_per_count = p.counts_to_cm(1.0);
+    let speed_summary = Summary::of(&speeds);
+    let accel_summary = Summary::of(&accel);
+    let jerk_summary = Summary::of(&jerk);
 
     // Distances from the raw events, so the totals are exact counts rather
     // than a re-integration of the grid.
@@ -150,15 +169,15 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let span = p.analysis_duration_s;
 
     Kinematics {
-        speed_counts_per_s: Summary::of(&speeds),
-        speed_cm_per_s: Summary::of(&speeds_cm),
+        speed_counts_per_s: speed_summary,
+        speed_cm_per_s: speed_summary.scaled(cm_per_count),
         speed_deg_per_s: Summary::of(&speeds_deg),
-        accel_counts_per_s2: Summary::of(&accel),
-        accel_cm_per_s2: Summary::of(&accel_cm),
-        accel_deg_per_s2: Summary::of(&accel_deg),
-        jerk_counts_per_s3: Summary::of(&jerk),
-        jerk_cm_per_s3: Summary::of(&jerk_cm),
-        jerk_deg_per_s3: Summary::of(&jerk_deg),
+        accel_counts_per_s2: accel_summary,
+        accel_cm_per_s2: accel_summary.scaled(cm_per_count),
+        accel_deg_per_s2: accel_summary.scaled(kx),
+        jerk_counts_per_s3: jerk_summary,
+        jerk_cm_per_s3: jerk_summary.scaled(cm_per_count),
+        jerk_deg_per_s3: jerk_summary.scaled(kx),
         total_distance_counts: dist_counts,
         total_distance_cm: total_cm,
         total_distance_m: total_cm / 100.0,

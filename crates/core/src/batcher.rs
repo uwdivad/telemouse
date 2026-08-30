@@ -67,6 +67,26 @@ impl Batcher {
         self.first_qpc = None;
         std::mem::replace(&mut self.events, Vec::with_capacity(self.max_events))
     }
+
+    /// The accumulated events, borrowed. Together with [`Self::reset`] this is
+    /// the zero-realloc flush path: serialize a [`crate::batch::BatchView`]
+    /// over this slice, then `reset()` — the `Vec` and its capacity are never
+    /// surrendered, unlike [`Self::take`].
+    pub fn events(&self) -> &[RawEvent] {
+        &self.events
+    }
+
+    /// QPC of the current batch's first event, if any.
+    pub fn first_qpc(&self) -> Option<u64> {
+        self.first_qpc
+    }
+
+    /// Clear the events and per-batch state for the next batch, keeping the
+    /// allocated capacity.
+    pub fn reset(&mut self) {
+        self.events.clear();
+        self.first_qpc = None;
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +132,26 @@ mod tests {
         assert!(b.is_empty());
         assert!(!b.should_flush(u64::MAX));
         // Next batch's window starts from its own first event.
+        b.push(ev(5000));
+        assert!(!b.should_flush(5249));
+        assert!(b.should_flush(5250));
+    }
+
+    #[test]
+    fn reset_keeps_capacity_and_clears_batch_state() {
+        let mut b = Batcher::new(100, 250);
+        b.push(ev(1000));
+        b.push(ev(1100));
+        assert_eq!(b.events().len(), 2);
+        assert_eq!(b.first_qpc(), Some(1000));
+        let cap = b.events.capacity();
+
+        b.reset();
+        assert!(b.is_empty());
+        assert_eq!(b.first_qpc(), None);
+        assert!(!b.should_flush(u64::MAX));
+        assert_eq!(b.events.capacity(), cap, "reset must not shrink or realloc");
+        // Next batch's window starts from its own first event, same as take().
         b.push(ev(5000));
         assert!(!b.should_flush(5249));
         assert!(b.should_flush(5250));

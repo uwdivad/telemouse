@@ -63,43 +63,82 @@ impl SavGol {
     /// series too short to fit the polynomial returns the input (deriv 0) or
     /// zeros (deriv > 0).
     pub fn apply(&self, y: &[f64], dt: f64) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.apply_into(y, dt, &mut out);
+        out
+    }
+
+    /// [`Self::apply`] writing into a caller-owned buffer, which is cleared
+    /// and resized to `y.len()` — its capacity is reused across calls, so a
+    /// caller sweeping thousands of runs pays for no allocation after the
+    /// largest one. Output is bit-identical to `apply`.
+    pub fn apply_into(&self, y: &[f64], dt: f64, out: &mut Vec<f64>) {
+        out.clear();
         let n = y.len();
         if n == 0 {
-            return Vec::new();
+            return;
         }
         let scale = dt.powi(-(self.deriv as i32));
         if n > 2 * self.half {
-            return self.apply_with(&self.table, self.half, y, scale);
+            self.apply_with(&self.table, self.half, y, scale, out);
+            return;
         }
         // Short series: shrink the window to what the data supports.
         let h = (n - 1) / 2;
         if 2 * h < self.order {
-            return if self.deriv == 0 {
-                y.to_vec()
+            if self.deriv == 0 {
+                out.extend_from_slice(y);
             } else {
-                vec![0.0; n]
-            };
+                out.resize(n, 0.0);
+            }
+            return;
         }
         let table: Vec<Vec<f64>> = (0..=2 * h)
             .map(|o| coeffs(h, self.order, self.deriv, o as f64 - h as f64))
             .collect();
-        self.apply_with(&table, h, y, scale)
+        self.apply_with(&table, h, y, scale, out)
     }
 
-    fn apply_with(&self, table: &[Vec<f64>], half: usize, y: &[f64], scale: f64) -> Vec<f64> {
+    /// The convolution proper. `y.len() >= 2 * half + 1` is the caller's
+    /// promise. The `2 * half` edge outputs use their off-center tables; the
+    /// interior uses the centered kernel with a fixed-width sliding window,
+    /// which is where the bounds checks and the per-output table lookup of
+    /// the general loop were costing on multi-million-cell sessions. Both
+    /// loops accumulate taps in the same order, so the result is bit-identical
+    /// to the general loop applied everywhere (the tests check this).
+    fn apply_with(&self, table: &[Vec<f64>], half: usize, y: &[f64], scale: f64, out: &mut Vec<f64>) {
         let n = y.len();
-        let last_start = n - (2 * half + 1);
-        let mut out = vec![0.0; n];
-        for (i, o) in out.iter_mut().enumerate() {
+        let width = 2 * half + 1;
+        let last_start = n - width;
+        out.resize(n, 0.0);
+        let general = |i: usize| -> f64 {
             let start = i.saturating_sub(half).min(last_start);
             let w = &table[i - start];
             let mut acc = 0.0;
             for (k, wk) in w.iter().enumerate() {
                 acc += wk * y[start + k];
             }
+            acc * scale
+        };
+        // Leading edge: outputs whose window is pinned to the series start.
+        for (i, o) in out.iter_mut().enumerate().take(half) {
+            *o = general(i);
+        }
+        // Interior: output i uses window [i - half, i + half] and the centered
+        // kernel; that covers i in [half, last_start + half].
+        let kernel = &table[half];
+        let interior = &mut out[half..=last_start + half];
+        for (o, win) in interior.iter_mut().zip(y.windows(width)) {
+            let mut acc = 0.0;
+            for (wk, yk) in kernel.iter().zip(win) {
+                acc += wk * yk;
+            }
             *o = acc * scale;
         }
-        out
+        // Trailing edge: pinned to the series end.
+        for (i, o) in out.iter_mut().enumerate().skip(last_start + half + 1) {
+            *o = general(i);
+        }
     }
 }
 
@@ -203,6 +242,53 @@ mod tests {
         let want = [-2.0, 3.0, 6.0, 7.0, 6.0, 3.0, -2.0].map(|v| v / 21.0);
         for (got, want) in sg.kernel().iter().zip(want) {
             approx(*got, want, 1e-12);
+        }
+    }
+
+    /// The interior fast path and the reusable-buffer entry point must be
+    /// bit-identical to the plain per-output formulation, at every length
+    /// around the window size and for every derivative order.
+    #[test]
+    fn apply_is_bit_identical_to_the_general_formulation() {
+        let reference = |sg: &SavGol, y: &[f64], scale: f64| -> Vec<f64> {
+            let n = y.len();
+            let half = sg.half;
+            let last_start = n - (2 * half + 1);
+            (0..n)
+                .map(|i| {
+                    let start = i.saturating_sub(half).min(last_start);
+                    let w = &sg.table[i - start];
+                    let mut acc = 0.0;
+                    for (k, wk) in w.iter().enumerate() {
+                        acc += wk * y[start + k];
+                    }
+                    acc * scale
+                })
+                .collect()
+        };
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 2000) as f64 - 1000.0
+        };
+        let mut out = Vec::new();
+        for half in [2usize, 3, 5] {
+            for deriv in [0usize, 1, 2] {
+                let sg = SavGol::new(half, 2, deriv);
+                for n in (2 * half + 1)..(2 * half + 1 + 12) {
+                    let y: Vec<f64> = (0..n).map(|_| next()).collect();
+                    let want = reference(&sg, &y, 0.001f64.powi(-(deriv as i32)));
+                    let got = sg.apply(&y, 0.001);
+                    assert_eq!(want.len(), got.len());
+                    for (a, b) in want.iter().zip(&got) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "half={half} deriv={deriv} n={n}");
+                    }
+                    // Reused buffer: same answer after a longer previous call.
+                    sg.apply_into(&vec![1.0; n + 50], 0.001, &mut out);
+                    sg.apply_into(&y, 0.001, &mut out);
+                    assert_eq!(out, got);
+                }
+            }
         }
     }
 

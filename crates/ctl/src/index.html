@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>telemouse — control</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230e131c'/%3E%3Ccircle cx='8' cy='8' r='4' fill='none' stroke='%2335d0e0' stroke-width='2'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0a0e14; --panel: #0e131c; --line: #1b2331; --fg: #dfe7f1; --fg-dim: #7f8ea3;
+    --accent: #35d0e0; --ok: #46d68a; --warn: #ffb02e; --bad: #ff5c5c;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    --sans: system-ui, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+  a { color: var(--accent); }
+  .topbar { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 3; }
+  .brand { font: 600 15px var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+  .brand span { color: var(--accent); }
+  .pill { font: 11px var(--mono); padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--fg-dim); display: inline-flex; align-items: center; gap: 6px; }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-dim); }
+  .pill.on .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .pill.err .dot { background: var(--bad); }
+  .spacer { flex: 1; }
+  main { max-width: 1280px; margin: 0 auto; padding: 18px 16px 60px; display: grid; gap: 26px; }
+  h2 { font: 11px var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--fg-dim); margin: 0 0 10px; }
+  h2 small { letter-spacing: 0; text-transform: none; color: var(--fg-dim); margin-left: 8px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: grid; gap: 8px; min-width: 0; }
+  .card.running { border-color: #1f5a4a; }
+  .card .head { display: flex; align-items: center; gap: 10px; }
+  .card .head b { font-size: 15px; }
+  .card .sum { color: var(--fg-dim); font-size: 12px; }
+  .card .meta { font: 12px var(--mono); color: var(--fg-dim); display: flex; gap: 14px; flex-wrap: wrap; }
+  .card .meta .bad { color: var(--bad); }
+  .opts { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
+  .opts label { display: inline-flex; align-items: center; gap: 5px; color: var(--fg-dim); cursor: pointer; }
+  .opts label:hover { color: var(--fg); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .btn { font: 12px var(--mono); padding: 5px 11px; border-radius: 6px; border: 1px solid var(--line); background: #131a26; color: var(--fg); cursor: pointer; }
+  .btn:hover { background: #182130; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn.go { border-color: #1f5a4a; color: var(--ok); }
+  .btn.stop { border-color: #5a4a1f; color: var(--warn); }
+  .btn.kill { border-color: #5a1f1f; color: var(--bad); }
+  .btn.arm { background: var(--bad); color: #fff; border-color: var(--bad); }
+  select.btn { padding: 4px 8px; max-width: 260px; }
+  details { border-top: 1px solid var(--line); padding-top: 6px; }
+  summary { cursor: pointer; font: 12px var(--mono); color: var(--fg-dim); user-select: none; }
+  pre.log { margin: 6px 0 0; max-height: 260px; overflow: auto; font: 11px/1.4 var(--mono); color: #b9c4d3; background: #080b10; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--fg-dim); }
+  td.mono { font: 12px var(--mono); }
+  td.cmd { color: var(--fg-dim); font: 11px var(--mono); max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.num { text-align: right; font: 12px var(--mono); }
+  tr.self td { color: var(--fg-dim); font-style: italic; }
+  .kind { font: 11px var(--mono); padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line); color: var(--fg-dim); }
+  .kind.capture { color: var(--ok); border-color: #1f5a4a; }
+  .kind.viz { color: var(--accent); border-color: #1f4a5a; }
+  .kind.ctl { color: var(--warn); border-color: #5a4a1f; }
+  .empty { color: var(--fg-dim); font-size: 13px; padding: 14px; background: var(--panel); border: 1px dashed var(--line); border-radius: 8px; }
+  .tablewrap { overflow-x: auto; }
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 9; }
+  .toast { background: #131a26; border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 8px 12px; border-radius: 6px; font-size: 13px; max-width: 420px; box-shadow: 0 6px 20px #0008; }
+  .toast.bad { border-left-color: var(--bad); }
+  .toast.ok { border-left-color: var(--ok); }
+  .note { color: var(--fg-dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">tele<span>mouse</span> · control</div>
+  <div class="pill" id="connPill"><span class="dot"></span><span id="connText">connecting</span></div>
+  <div class="spacer"></div>
+  <a id="vizLink" href="#" target="_blank" rel="noopener">open viz dashboard ↗</a>
+</div>
+
+<main>
+  <section>
+    <h2>Components <small id="compNote"></small></h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Related processes <small id="procNote">every process on this machine whose executable is a telemouse binary, or a cargo run of one</small></h2>
+    <div class="tablewrap" id="procs"></div>
+  </section>
+</main>
+<div id="toasts"></div>
+
+<script>
+window.TELEMOUSE_CTL = {/*__TELEMOUSE_CTL_CONFIG__*/};
+</script>
+<script>
+"use strict";
+const CFG = window.TELEMOUSE_CTL || {};
+const $ = (id) => document.getElementById(id);
+const HEADERS = { "X-Telemouse-Ctl": "1", "Content-Type": "application/json" };
+
+/* ---------- state ---------- */
+let state = null;
+let sessions = [];
+let pollTimer = null;
+let busy = new Set();          // component ids with a request in flight
+let armed = new Map();         // "kill" buttons awaiting a second click, key → timeout
+const openLogs = new Set();    // component ids whose log <details> is open
+const chosen = {};             // component id → { flags:Set, session }
+let cardsKey = "", procsKey = ""; // what the DOM currently shows; re-render only on change
+
+$("vizLink").href = "http://" + (CFG.viz_http || "127.0.0.1:7879") + "/";
+
+/* ---------- helpers ---------- */
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function ago(unixS) {
+  if (!unixS || !state) return "";
+  const d = Math.max(0, state.now_unix_s - unixS);
+  if (d < 60) return d + "s";
+  if (d < 3600) return Math.floor(d / 60) + "m " + (d % 60) + "s";
+  return Math.floor(d / 3600) + "h " + Math.floor((d % 3600) / 60) + "m";
+}
+function clock(unixS) { return unixS ? new Date(unixS * 1000).toLocaleTimeString() : ""; }
+function toast(msg, cls) {
+  const el = document.createElement("div");
+  el.className = "toast " + (cls || "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+function setConn(ok, text) {
+  $("connPill").className = "pill " + (ok ? "on" : "err");
+  $("connText").textContent = text;
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: HEADERS, body: body === undefined ? undefined : JSON.stringify(body) });
+  let json = null;
+  try { json = await res.json(); } catch (_) { /* not JSON */ }
+  if (!res.ok) throw new Error((json && json.error) || (res.status + " " + res.statusText));
+  return json;
+}
+
+/* ---------- polling ---------- */
+async function poll() {
+  try {
+    const [s, sess] = await Promise.all([api("GET", "/api/state"), api("GET", "/api/sessions")]);
+    state = s; sessions = sess;
+    setConn(true, "pid " + s.self_pid);
+    render();
+  } catch (e) {
+    setConn(false, "unreachable");
+  }
+  pollTimer = setTimeout(poll, document.hidden ? 10000 : 2000);
+}
+/* A hidden tab polls slowly (nothing to show), and catches up the moment
+   it is visible again. */
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(pollTimer); poll(); } });
+
+/* ---------- actions ---------- */
+async function act(id, fn) {
+  if (busy.has(id)) return;
+  busy.add(id); render();
+  try { await fn(); } catch (e) { toast(e.message, "bad"); }
+  busy.delete(id);
+  clearTimeout(pollTimer); await poll();
+}
+
+function startComponent(c) {
+  const ch = chosen[c.id] || {};
+  const body = { flags: [...(ch.flags || [])] };
+  if (c.takes_session) body.session = ch.session || (sessions[0] || null);
+  return act(c.id, async () => {
+    const r = await api("POST", "/api/components/" + c.id + "/start", body);
+    toast(c.label + " started (pid " + r.pid + ")", "ok");
+    openLogs.add(c.id);
+  });
+}
+function stopComponent(c, force) {
+  return act(c.id, async () => {
+    const r = await api("POST", "/api/components/" + c.id + "/stop", { force: !!force });
+    toast(c.label + (r.outcome === "graceful" ? " stopped" : " terminated"), r.outcome === "graceful" ? "ok" : "");
+  });
+}
+function killProcess(p) {
+  const key = "p" + p.pid;
+  if (!armed.has(key)) {
+    // Two clicks, no modal: the first arms the button for 4 seconds.
+    armed.set(key, setTimeout(() => { armed.delete(key); render(); }, 4000));
+    render();
+    return;
+  }
+  clearTimeout(armed.get(key)); armed.delete(key);
+  return act(key, async () => {
+    await api("POST", "/api/processes/" + p.pid + "/kill");
+    toast("killed " + p.name + " (pid " + p.pid + ")", "ok");
+  });
+}
+
+/* ---------- rendering ---------- */
+function render() {
+  if (!state) return;
+  renderCards();
+  renderProcs();
+}
+
+function renderCards() {
+  const host = $("cards");
+  const key = JSON.stringify([
+    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.last_exit, c.log.length, c.log[c.log.length - 1]]),
+    sessions, [...busy], [...openLogs],
+  ]);
+  if (key === cardsKey) {
+    // Nothing structural changed: refresh the uptimes without rebuilding
+    // the cards (which would drop focus, hover and scroll positions).
+    for (const el of host.querySelectorAll("[data-uptime]")) {
+      const c = state.components.find((x) => x.id === el.dataset.uptime);
+      if (c && c.running) el.textContent = "running · pid " + c.pid + " · " + ago(c.since_unix_s);
+    }
+    return;
+  }
+  cardsKey = key;
+  const missing = state.components.filter((c) => !c.bin_found).length;
+  $("compNote").textContent = missing
+    ? missing + " binar" + (missing === 1 ? "y" : "ies") + " not found — cargo build --workspace, or set [ctl] bin_dir"
+    : "";
+
+  host.innerHTML = state.components.map((c) => {
+    const ch = chosen[c.id] || (chosen[c.id] = { flags: new Set(), session: null });
+    const isBusy = busy.has(c.id);
+    const run = c.running;
+    const exit = c.last_exit;
+    const exitText = exit ? ("exited " + (exit.code === -1073741510 ? "on Ctrl-Break" : exit.code === null ? "by signal" : "code " + exit.code) + " at " + clock(exit.at_unix_s)) : "";
+    const exitCls = exit && exit.code !== 0 && exit.code !== -1073741510 ? "bad" : "";
+
+    const flags = c.flags.map((f) =>
+      `<label title="${esc(f.help)}"><input type="checkbox" data-flag="${esc(f.flag)}" data-c="${c.id}" ${ch.flags.has(f.flag) ? "checked" : ""} ${run ? "disabled" : ""}>${esc(f.flag)}</label>`
+    ).join("");
+    const sessionSel = c.takes_session ? `<select class="btn" data-session="${c.id}" ${run ? "disabled" : ""}>` +
+      (sessions.length ? sessions.map((s) => `<option ${((ch.session || sessions[0]) === s) ? "selected" : ""}>${esc(s)}</option>`).join("") : `<option value="">— no recordings —</option>`) +
+      `</select>` : "";
+
+    const startLabel = c.kind === "task" ? "Run" : "Start";
+    const buttons = run
+      ? (c.kind === "service"
+          ? `<button class="btn stop" data-act="stop" data-c="${c.id}" ${isBusy ? "disabled" : ""} title="Ctrl-Break, then terminate after ${esc(CFG.stop_grace_secs)}s">Stop</button>
+             <button class="btn kill" data-act="kill" data-c="${c.id}" ${isBusy ? "disabled" : ""} title="Terminate immediately">Kill</button>`
+          : `<button class="btn kill" data-act="kill" data-c="${c.id}" ${isBusy ? "disabled" : ""}>Abort</button>`)
+      : `<button class="btn go" data-act="start" data-c="${c.id}" ${isBusy || !c.bin_found || (c.takes_session && !sessions.length) ? "disabled" : ""}>${startLabel}</button>`;
+
+    return `<div class="card ${run ? "running" : ""}">
+      <div class="head"><b>${esc(c.label)}</b>
+        <span class="pill ${run ? "on" : ""}"><span class="dot"></span><span data-uptime="${c.id}">${run ? "running · pid " + c.pid + " · " + ago(c.since_unix_s) : (c.kind === "task" ? "idle" : "stopped")}</span></span>
+      </div>
+      <div class="sum">${esc(c.summary)}</div>
+      <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}</div>
+      ${flags ? `<div class="opts">${flags}</div>` : ""}
+      <div class="row">${sessionSel}${buttons}</div>
+      <details ${openLogs.has(c.id) ? "open" : ""} data-log="${c.id}"><summary>output (${c.log.length} lines)</summary><pre class="log">${esc(c.log.join("\n")) || "—"}</pre></details>
+    </div>`;
+  }).join("");
+
+  // Keep logs pinned to the bottom.
+  for (const pre of host.querySelectorAll("details[open] pre.log")) pre.scrollTop = pre.scrollHeight;
+}
+
+function renderProcs() {
+  const host = $("procs");
+  const ps = state.processes;
+  const managedNow = new Set(state.components.filter((c) => c.running).map((c) => c.pid));
+  const key = JSON.stringify([ps.map((p) => [p.pid, p.kind, p.name, managedNow.has(p.pid)]), [...armed.keys()], [...busy]]);
+  if (key === procsKey) {
+    // Same rows: patch the live numbers in place.
+    for (const p of ps) {
+      const row = host.querySelector(`tr[data-pid="${p.pid}"]`);
+      if (!row) continue;
+      row.querySelector("[data-cpu]").textContent = p.cpu_pct.toFixed(1);
+      row.querySelector("[data-mem]").textContent = p.mem_mb.toFixed(1);
+      row.querySelector("[data-ago]").textContent = ago(p.started_unix_s) + " ago";
+    }
+    return;
+  }
+  procsKey = key;
+  if (!ps.length) { procsKey = ""; host.innerHTML = `<div class="empty">The process scan returned nothing — not even this panel. The scan failed; check the panel's log.</div>`; return; }
+  const managedPids = new Set(state.components.filter((c) => c.running).map((c) => c.pid));
+  host.innerHTML = `<table><thead><tr><th>pid</th><th>kind</th><th>name</th><th>command</th><th class="num">cpu %</th><th class="num">mem MB</th><th>started</th><th></th></tr></thead><tbody>` +
+    ps.map((p) => {
+      const key = "p" + p.pid;
+      const isArmed = armed.has(key);
+      const btn = p.is_self
+        ? `<span class="note">this panel</span>`
+        : `<button class="btn kill ${isArmed ? "arm" : ""}" data-kill="${p.pid}" ${busy.has(key) ? "disabled" : ""}>${isArmed ? "confirm kill" : "kill"}</button>`;
+      return `<tr class="${p.is_self ? "self" : ""}" data-pid="${p.pid}">
+        <td class="mono">${p.pid}${p.parent ? `<span class="note"> ← ${p.parent}</span>` : ""}</td>
+        <td><span class="kind ${p.kind}">${p.kind}</span>${managedPids.has(p.pid) ? ` <span class="note">managed</span>` : ""}</td>
+        <td class="mono">${esc(p.name)}</td>
+        <td class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</td>
+        <td class="num" data-cpu>${p.cpu_pct.toFixed(1)}</td>
+        <td class="num" data-mem>${p.mem_mb.toFixed(1)}</td>
+        <td class="mono" data-ago title="${clock(p.started_unix_s)}">${ago(p.started_unix_s)} ago</td>
+        <td>${btn}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+
+/* ---------- wiring (delegated, since the DOM is re-rendered) ---------- */
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.kill) {
+    const p = state.processes.find((x) => String(x.pid) === b.dataset.kill);
+    if (p) killProcess(p);
+    return;
+  }
+  const c = state && state.components.find((x) => x.id === b.dataset.c);
+  if (!c) return;
+  if (b.dataset.act === "start") startComponent(c);
+  else if (b.dataset.act === "stop") stopComponent(c, false);
+  else if (b.dataset.act === "kill") stopComponent(c, true);
+});
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.dataset.flag) {
+    const ch = chosen[t.dataset.c];
+    if (t.checked) ch.flags.add(t.dataset.flag); else ch.flags.delete(t.dataset.flag);
+  } else if (t.dataset.session) {
+    chosen[t.dataset.session].session = t.value;
+  }
+});
+document.addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (d.dataset && d.dataset.log) { if (d.open) openLogs.add(d.dataset.log); else openLogs.delete(d.dataset.log); }
+}, true);
+
+poll();
+</script>
+</body>
+</html>

@@ -1,8 +1,9 @@
 //! The shared context snapshot published by T3 and read by T2 when it
 //! assembles a batch.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use arc_swap::ArcSwap;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextSnapshot {
@@ -31,10 +32,11 @@ impl ContextSnapshot {
 ///
 /// The snapshot is behind an `Arc` so a reader clones a pointer, not a `String`
 /// — T2 reads this once per flush (~40×/s) and must not pay for the game name's
-/// allocation each time. The `Mutex` only guards the pointer swap.
+/// allocation each time. The pointer swap itself is an [`ArcSwap`], so the
+/// per-batch read never takes a lock.
 #[derive(Debug, Default)]
 pub struct SharedContext {
-    inner: Mutex<std::sync::Arc<ContextSnapshot>>,
+    inner: ArcSwap<ContextSnapshot>,
     /// Set by T1's window procedure on `WM_DISPLAYCHANGE`; T3 consumes it on
     /// its next tick and refreshes the screen metrics. An atomic keeps the
     /// window procedure lock-free.
@@ -44,25 +46,17 @@ pub struct SharedContext {
 impl SharedContext {
     pub fn new(initial: ContextSnapshot) -> Self {
         Self {
-            inner: Mutex::new(std::sync::Arc::new(initial)),
+            inner: ArcSwap::from_pointee(initial),
             display_changed: AtomicBool::new(false),
         }
     }
 
     pub fn get(&self) -> std::sync::Arc<ContextSnapshot> {
-        match self.inner.lock() {
-            Ok(g) => std::sync::Arc::clone(&g),
-            // A poisoned context is not worth killing capture over.
-            Err(p) => std::sync::Arc::clone(&p.into_inner()),
-        }
+        self.inner.load_full()
     }
 
     pub fn set(&self, snapshot: ContextSnapshot) {
-        let next = std::sync::Arc::new(snapshot);
-        match self.inner.lock() {
-            Ok(mut g) => *g = next,
-            Err(p) => *p.into_inner() = next,
-        }
+        self.inner.store(std::sync::Arc::new(snapshot));
     }
 
     /// Called from T1's window procedure: the desktop geometry changed.

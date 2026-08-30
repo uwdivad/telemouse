@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
-use telemouse_core::Envelope;
 use telemouse_core::wire::MAX_UDP_PAYLOAD;
 
 use super::Sink;
@@ -67,7 +66,7 @@ impl Sink for UdpSink {
         "udp"
     }
 
-    fn send(&mut self, _env: &Envelope, payload: &str) -> Result<()> {
+    fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
         if payload.len() > MAX_UDP_PAYLOAD {
             self.stats.udp_oversized.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!(
@@ -91,6 +90,8 @@ impl Sink for UdpSink {
 
 #[cfg(test)]
 mod tests {
+    use telemouse_core::Envelope;
+
     use super::*;
 
     fn marker() -> Envelope {
@@ -114,7 +115,7 @@ mod tests {
         // With nothing listening, Windows may report the earlier datagram's
         // ICMP unreachable on a later send. Either way this is never an error.
         for _ in 0..5 {
-            sink.send(&env, &payload).unwrap();
+            sink.send(env.topic(), env.key(), &payload).unwrap();
         }
         assert_eq!(stats.snapshot().udp_errors, 0);
     }
@@ -143,7 +144,8 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let mut sink = UdpSink::connect("127.0.0.1:59998", Arc::clone(&stats)).unwrap();
         let huge = "x".repeat(MAX_UDP_PAYLOAD + 1);
-        assert!(sink.send(&marker(), &huge).is_err());
+        let env = marker();
+        assert!(sink.send(env.topic(), env.key(), &huge).is_err());
         assert_eq!(stats.snapshot().udp_oversized, 1);
     }
 }

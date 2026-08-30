@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/capture", "crates/viz", "crates/analyze"]
+members = ["crates/core", "crates/capture", "crates/viz", "crates/analyze", "crates/ctl"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
+# Profile notes (2026-08 perf audit):
+# - lto stays "thin": a fat-LTO/panic=abort evaluation came out net-negative
+#   for this syscall-dominated workload, so neither is used here.
+# - panic stays "unwind": ordered teardown depends on it (partial-batch flush,
+#   bounded Kafka drain on shutdown).
+# - `-C target-cpu=znver3` is a worthwhile OPT-IN for telemouse-analyze math
+#   kernels on the 5950X, e.g.
+#     $env:RUSTFLAGS="-C target-cpu=znver3"; cargo bench -p telemouse-analyze
+#   It is deliberately not forced workspace-wide so binaries stay portable.
 [profile.release]
 lto = "thin"
 codegen-units = 1

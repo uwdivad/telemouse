@@ -18,9 +18,9 @@ pub mod session;
 pub mod units;
 pub mod wire;
 
-pub use batch::Batch;
+pub use batch::{Batch, BatchView};
 pub use batcher::Batcher;
 pub use clock::QpcAnchor;
 pub use event::{RawEvent, buttons};
 pub use session::{GameSens, Marker, MonitorInfo, SessionConfig};
-pub use wire::Envelope;
+pub use wire::{Envelope, EnvelopeView};

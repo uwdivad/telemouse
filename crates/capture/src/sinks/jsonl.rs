@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use telemouse_core::Envelope;
 
 use super::Sink;
 use crate::stats::Stats;
@@ -69,7 +68,7 @@ impl Sink for JsonlSink {
         "jsonl"
     }
 
-    fn send(&mut self, _env: &Envelope, payload: &str) -> Result<()> {
+    fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
         self.writer
             .write_all(payload.as_bytes())
             .context("write recording line")?;
@@ -90,7 +89,7 @@ impl Drop for JsonlSink {
 
 #[cfg(test)]
 mod tests {
-    use telemouse_core::{Batch, Marker};
+    use telemouse_core::{Batch, Envelope, Marker};
 
     use super::*;
 
@@ -113,7 +112,7 @@ mod tests {
 
     fn send(sink: &mut JsonlSink, env: &Envelope) {
         let json = env.to_json().unwrap();
-        sink.send(env, &json).unwrap();
+        sink.send(env.topic(), env.key(), &json).unwrap();
     }
 
     #[test]

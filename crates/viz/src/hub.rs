@@ -16,18 +16,20 @@
 //! a socket.
 
 use std::borrow::Cow;
-use std::sync::Arc;
 use std::sync::Mutex;
 
+use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::stats::{Stats, now_utc_us};
 
-/// A frame on its way to every connected browser. `Arc<str>` rather than
-/// `String` so the broadcast channel's per-subscriber clone is a refcount bump
-/// instead of a copy of the whole batch.
-pub type Frame = Arc<str>;
+/// A frame on its way to every connected browser. [`Utf8Bytes`] (a refcounted
+/// `Bytes` view, and exactly what `axum` wants in a WS text message) rather
+/// than `String` so both the broadcast channel's per-subscriber clone *and*
+/// each client's send are refcount bumps instead of copies of the whole batch.
+/// The payload is copied exactly once, at acceptance time.
+pub type Frame = Utf8Bytes;
 
 /// Why a datagram was not forwarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +88,10 @@ struct TagProbe<'a> {
 /// A datagram that passed validation and should be broadcast verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
-    /// The original JSON text (trimmed of surrounding whitespace only).
-    pub text: String,
+    /// The original JSON text (trimmed of surrounding whitespace only),
+    /// already in the shared [`Frame`] representation: the one payload copy
+    /// per datagram happens here, and every later hop clones the handle.
+    pub text: Frame,
     /// True for `{"type":"session"}` envelopes, which the hub caches.
     pub is_session: bool,
     /// `ts_anchor_us` of a `batch`, for the latency estimator. `None` on
@@ -113,26 +117,21 @@ pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted, RejectReason> {
     }
     let probe: TagProbe =
         serde_json::from_str(text).map_err(|e| RejectReason::BadEnvelope(e.to_string()))?;
-    match probe.kind.as_ref() {
-        "session" => Ok(Accepted {
-            text: text.to_string(),
-            is_session: true,
-            ts_anchor_us: None,
-        }),
-        "batch" => Ok(Accepted {
-            text: text.to_string(),
-            is_session: false,
-            ts_anchor_us: probe.ts_anchor_us,
-        }),
-        "marker" => Ok(Accepted {
-            text: text.to_string(),
-            is_session: false,
-            ts_anchor_us: None,
-        }),
-        other => Err(RejectReason::BadEnvelope(format!(
-            "unknown envelope type {other:?}"
-        ))),
-    }
+    let (is_session, ts_anchor_us) = match probe.kind.as_ref() {
+        "session" => (true, None),
+        "batch" => (false, probe.ts_anchor_us),
+        "marker" => (false, None),
+        other => {
+            return Err(RejectReason::BadEnvelope(format!(
+                "unknown envelope type {other:?}"
+            )));
+        }
+    };
+    Ok(Accepted {
+        text: Frame::from(text),
+        is_session,
+        ts_anchor_us,
+    })
 }
 
 /// Frames to push to a WebSocket client the instant it connects.
@@ -194,14 +193,15 @@ impl Hub {
                     // (~25ms window) plus the loopback hop.
                     self.stats.record_latency(now_utc_us - anchor);
                 }
-                let frame: Frame = Arc::from(accepted.text.as_str());
+                // `accepted.text` already is the shared frame — caching and
+                // broadcasting it are refcount bumps, not copies.
                 if accepted.is_session {
-                    *self.session.lock().unwrap() = Some(frame.clone());
+                    *self.session.lock().unwrap() = Some(accepted.text.clone());
                 }
                 // Err just means "no subscribers right now" — still counted as
                 // forwarded work done; the session cache above is what matters
                 // for a browser that connects later.
-                let _ = self.tx.send(frame);
+                let _ = self.tx.send(accepted.text);
                 self.stats.forwarded.fetch_add(1, Relaxed);
                 Ok(())
             }
@@ -271,6 +271,7 @@ mod tests {
             games: BTreeMap::new(),
             monitors: vec![],
             capture_version: "0.1.0".into(),
+            coalesce_ms: 0,
         };
         Envelope::Session(cfg).to_json().unwrap()
     }
@@ -478,7 +479,7 @@ mod tests {
     #[test]
     fn frames_on_connect_is_empty_without_a_session() {
         assert!(frames_on_connect(None).is_empty());
-        let f: Frame = Arc::from("x");
+        let f: Frame = Frame::from_static("x");
         assert_eq!(frames_on_connect(Some(&f)), vec![f]);
     }
 
@@ -526,7 +527,7 @@ mod tests {
     fn hub_generated_frames_reach_clients_without_counting_as_telemetry() {
         let hub = Hub::new();
         let (_frames, mut rx) = hub.subscribe();
-        hub.broadcast(Arc::from(r#"{"type":"viz_stats"}"#));
+        hub.broadcast(Frame::from_static(r#"{"type":"viz_stats"}"#));
         assert_eq!(&*rx.try_recv().unwrap(), r#"{"type":"viz_stats"}"#);
         let s = hub.stats.snapshot();
         assert_eq!(s.datagrams, 0);

@@ -54,6 +54,13 @@ pub struct SessionConfig {
     pub games: BTreeMap<String, GameSens>,
     pub monitors: Vec<MonitorInfo>,
     pub capture_version: String,
+    /// Raw-input read coalescing window the agent ran with, in ms. Within one
+    /// drain only the first report's arrival time is observed; the others are
+    /// spaced by the estimated report interval, so `ts_qpc` is exact to about
+    /// this many ms. 0 (and recordings made before this existed) means every
+    /// report was stamped at its own wake.
+    #[serde(default)]
+    pub coalesce_ms: u64,
 }
 
 impl SessionConfig {
@@ -100,6 +107,7 @@ mod tests {
             games,
             monitors: vec![MonitorInfo { width: 2560, height: 1440, refresh_hz: Some(240), primary: true }],
             capture_version: "0.1.0".into(),
+            coalesce_ms: 2,
         }
     }
 
@@ -116,6 +124,14 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let back: SessionConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn pre_coalescing_session_json_still_parses() {
+        let mut v: serde_json::Value = serde_json::to_value(cfg()).unwrap();
+        v.as_object_mut().unwrap().remove("coalesce_ms");
+        let back: SessionConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back.coalesce_ms, 0);
     }
 
     #[test]

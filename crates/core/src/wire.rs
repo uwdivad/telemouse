@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{batch::Batch, session::Marker, session::SessionConfig};
+use crate::{batch::Batch, batch::BatchView, session::Marker, session::SessionConfig};
 
 pub const TOPIC_EVENTS: &str = "mouse.events";
 pub const TOPIC_SESSIONS: &str = "mouse.sessions";
@@ -33,7 +33,25 @@ impl Envelope {
         serde_json::to_string(self)
     }
 
+    /// Parse an envelope.
+    ///
+    /// Serde's internally-tagged enum has to buffer the whole document as a
+    /// generic `Content` tree before it can see the tag, which on a batch
+    /// costs ~3× the direct struct parse (measured: 116µs vs 37µs for a full
+    /// 448-event batch, 6.8µs vs 2.5µs for a 25-event one). Every envelope
+    /// telemouse itself writes starts with `{"type":"<tag>",` verbatim, so
+    /// that prefix is matched first and the variant's struct is parsed
+    /// directly (the `type` key is then just an ignored unknown field).
+    /// Anything else — reordered keys, whitespace, hand-written JSON — takes
+    /// the general tagged path, so the accepted language is unchanged.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
+        if let Some(tag) = fast_tag(s) {
+            return match tag {
+                FastTag::Batch => serde_json::from_str(s).map(Envelope::Batch),
+                FastTag::Session => serde_json::from_str(s).map(Envelope::Session),
+                FastTag::Marker => serde_json::from_str(s).map(Envelope::Marker),
+            };
+        }
         serde_json::from_str(s)
     }
 
@@ -57,10 +75,67 @@ impl Envelope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastTag {
+    Batch,
+    Session,
+    Marker,
+}
+
+/// The exact prefixes serde emits for each variant of the tagged enum, so a
+/// document that matches one is known to carry that tag as its first key.
+fn fast_tag(s: &str) -> Option<FastTag> {
+    const BATCH: &str = "{\"type\":\"batch\",";
+    const SESSION: &str = "{\"type\":\"session\",";
+    const MARKER: &str = "{\"type\":\"marker\",";
+    if s.starts_with(BATCH) {
+        Some(FastTag::Batch)
+    } else if s.starts_with(SESSION) {
+        Some(FastTag::Session)
+    } else if s.starts_with(MARKER) {
+        Some(FastTag::Marker)
+    } else {
+        None
+    }
+}
+
+/// Serialize-side borrowing mirror of [`Envelope`], carrying a [`BatchView`]
+/// where the owned enum carries a [`Batch`]. Same `type` tag, same variant
+/// name, so serializing it produces JSON byte-identical to the owned path
+/// (the parity test enforces this). Only the batch variant exists: batches
+/// are the 40/s hot path; session and marker envelopes are rare enough that
+/// the owned [`Envelope`] stays fine for them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EnvelopeView<'a> {
+    Batch(BatchView<'a>),
+}
+
+impl EnvelopeView<'_> {
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    /// Kafka topic this envelope belongs on.
+    pub fn topic(&self) -> &'static str {
+        match self {
+            EnvelopeView::Batch(_) => TOPIC_EVENTS,
+        }
+    }
+
+    /// Kafka message key: the session id, matching [`Envelope::key`].
+    pub fn key(&self) -> &str {
+        match self {
+            EnvelopeView::Batch(b) => b.session_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::RawEvent;
+    use crate::event::buttons;
 
     fn batch() -> Batch {
         Batch {
@@ -116,6 +191,149 @@ mod tests {
             "serialized full batch is {} bytes",
             s.len()
         );
+    }
+
+    /// The owned and view serialize paths must be byte-identical — the wire
+    /// format is defined by [`Envelope`], and [`EnvelopeView`] only exists to
+    /// avoid allocation, never to diverge.
+    fn assert_view_parity(b: Batch) {
+        let owned = Envelope::Batch(b.clone()).to_json().unwrap();
+        let view = EnvelopeView::Batch(b.as_view()).to_json().unwrap();
+        assert_eq!(owned, view);
+    }
+
+    #[test]
+    fn view_json_matches_owned_byte_for_byte() {
+        // Representative batch: mixed zero/nonzero rare event fields, Some
+        // cursor and game, several events.
+        let mut b = batch();
+        b.seq_no = 42;
+        b.game = Some("cs2.exe".into());
+        b.pointer_locked = true;
+        b.drops_since_last = 3;
+        b.abs_frames_since_last = 1;
+        b.events = vec![
+            RawEvent { ts_qpc: 100, dx: 3, dy: -1, ..Default::default() },
+            RawEvent {
+                ts_qpc: 110,
+                dx: 0,
+                dy: 0,
+                buttons: buttons::LEFT_DOWN,
+                wheel: -120,
+                wheel_h: 0,
+                device_ix: 0,
+            },
+            RawEvent {
+                ts_qpc: 120,
+                dx: -7,
+                dy: 2,
+                buttons: 0,
+                wheel: 0,
+                wheel_h: 120,
+                device_ix: 1,
+            },
+        ];
+        assert_view_parity(b);
+    }
+
+    #[test]
+    fn view_parity_with_empty_events_and_absent_options() {
+        let mut b = batch();
+        b.game = None;
+        b.cursor_x = None;
+        b.cursor_y = None;
+        b.events = Vec::new();
+        assert_view_parity(b);
+    }
+
+    #[test]
+    fn view_parity_with_every_field_populated() {
+        let mut b = batch();
+        b.game = Some("some-long-process-name.exe".into());
+        b.cursor_x = Some(-1);
+        b.cursor_y = Some(i32::MAX);
+        b.drops_since_last = u32::MAX;
+        b.abs_frames_since_last = u32::MAX;
+        b.events = vec![RawEvent {
+            ts_qpc: u64::MAX,
+            dx: i32::MIN,
+            dy: i32::MIN,
+            buttons: buttons::MASK,
+            wheel: i16::MIN,
+            wheel_h: i16::MIN,
+            device_ix: u8::MAX,
+        }];
+        assert_view_parity(b);
+    }
+
+    #[test]
+    fn view_topic_and_key_match_owned() {
+        let b = batch();
+        let v = EnvelopeView::Batch(b.as_view());
+        assert_eq!(v.topic(), TOPIC_EVENTS);
+        assert_eq!(v.key(), "s-1");
+    }
+
+    /// The prefix fast path must accept exactly what the general tagged path
+    /// accepts, and produce the same value — for every variant, and for the
+    /// documents that miss the prefix (reordered keys, leading whitespace),
+    /// which must still parse via the general path.
+    #[test]
+    fn fast_path_matches_general_tagged_parse() {
+        let general = |s: &str| -> Envelope { serde_json::from_str(s).unwrap() };
+        let mut b = batch();
+        b.game = Some("cs2.exe".into());
+        b.events.push(RawEvent { ts_qpc: 5, dx: -2, dy: 9, buttons: 1, ..Default::default() });
+        let cfg = SessionConfig {
+            session_id: "s-1".into(),
+            started_utc_us: 1,
+            qpc_freq: 10_000_000,
+            anchor: crate::QpcAnchor { qpc: 1, utc_us: 1, qpc_freq: 10_000_000 },
+            anchor_uncertainty_us: Some(3),
+            mouse_cpi: 1600.0,
+            devices: vec!["mouse".into()],
+            games: Default::default(),
+            monitors: vec![],
+            capture_version: "t".into(),
+            coalesce_ms: 2,
+        };
+        let m = Marker {
+            session_id: "s-1".into(),
+            seq_no: 7,
+            ts_qpc: 9,
+            ts_utc_us: 10,
+            label: "round".into(),
+        };
+        for e in [Envelope::Batch(b), Envelope::Session(cfg), Envelope::Marker(m)] {
+            let s = e.to_json().unwrap();
+            assert!(fast_tag(&s).is_some(), "own output must hit the fast path: {s}");
+            assert_eq!(Envelope::from_json(&s).unwrap(), e);
+            assert_eq!(Envelope::from_json(&s).unwrap(), general(&s));
+
+            // Same document, tag not first: general path, same value.
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            let mut keys: Vec<_> = v.as_object().unwrap().iter().collect();
+            keys.reverse();
+            let reordered = serde_json::Value::Object(
+                keys.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            )
+            .to_string();
+            assert!(fast_tag(&reordered).is_none() || reordered.starts_with("{\"type\""));
+            assert_eq!(Envelope::from_json(&reordered).unwrap(), e);
+            let padded = format!("  {s}");
+            assert!(fast_tag(&padded).is_none());
+            assert_eq!(Envelope::from_json(&padded).unwrap(), e);
+        }
+    }
+
+    #[test]
+    fn fast_path_rejects_what_the_general_path_rejects() {
+        // Prefix matches but the body is not a batch.
+        assert!(Envelope::from_json(r#"{"type":"batch","seq_no":"x"}"#).is_err());
+        assert!(Envelope::from_json(r#"{"type":"batch","#).is_err());
+        // Trailing garbage after a valid document is still an error.
+        let s = Envelope::Batch(batch()).to_json().unwrap() + "x";
+        assert!(Envelope::from_json(&s).is_err());
     }
 
     #[test]

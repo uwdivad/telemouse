@@ -1,0 +1,631 @@
+//! The Win32 side of the GUI: one top-level window holding one read-only
+//! `EDIT` control, a `Shell_NotifyIcon` tray icon with a popup menu, and the
+//! message loop that owns them, on the `ctl-gui` thread.
+//!
+//! Nothing here blocks on the runtime. A snapshot arrives as
+//! `WM_APP_REFRESH` (posted by the publisher's `wake`), the window text is
+//! re-rendered from `model::render_text`, and the tray icon is modified only
+//! when its state or tooltip actually changed. Actions are spawned through
+//! `feed::start` / `feed::stop`; Exit notifies `main`, which stops the
+//! children and then calls [`post_quit`].
+//!
+//! Every failure is a `warn!` and a headless server, never a panic. The
+//! window state lives on this thread's stack and is reached from the window
+//! procedure through `GWLP_USERDATA`, the same idiom as the capture crate.
+//! Handlers take a raw pointer and read fields as they go rather than holding
+//! a `&mut` across Win32 calls, because several of those (`ShowWindow`,
+//! `SetWindowTextW`, `TrackPopupMenu`, …) re-enter the window procedure.
+
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+
+use anyhow::{Context, Result};
+use tracing::{debug, info, warn};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    ANSI_FIXED_FONT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateBitmap, CreateFontW,
+    DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject, HBRUSH,
+    HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
+};
+use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, ShellExecuteW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
+    LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SendMessageW,
+    SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WS_VSCROLL,
+};
+use windows::core::{PCWSTR, w};
+
+use super::feed::{self, GuiLink};
+use super::model::{self, IconState, MenuEntry};
+
+const CLASS_NAME: PCWSTR = w!("TelemouseCtlWindow");
+/// Tray icon callback (legacy semantics: the mouse message in `lParam`).
+const WM_APP_TRAY: u32 = WM_APP + 1;
+/// A new snapshot is in the watch channel.
+const WM_APP_REFRESH: u32 = WM_APP + 2;
+/// `main` is done: remove the icon, leave the loop.
+const WM_APP_QUIT: u32 = WM_APP + 3;
+// Edit-control messages (fixed values from winuser.h; they live behind the
+// `Win32_UI_Controls` feature, which nothing else here needs).
+const EM_LINESCROLL: u32 = 0x00B6;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EM_GETFIRSTVISIBLELINE: u32 = 0x00CE;
+const TRAY_ID: u32 = 1;
+const EDIT_ID: usize = 100;
+const ICON_SIZE: u32 = 16;
+const WINDOW_W: i32 = 900;
+const WINDOW_H: i32 = 560;
+
+struct UiState {
+    link: GuiLink,
+    hwnd: HWND,
+    edit: HWND,
+    font: HFONT,
+    /// Indexed by `IconState::index()`.
+    icons: [HICON; 2],
+    tray_added: bool,
+    icon_state: IconState,
+    tooltip: String,
+    /// `RegisterWindowMessageW("TaskbarCreated")`: Explorer restarted.
+    taskbar_created: u32,
+    visible: bool,
+    /// Exit was requested; the tooltip says so until `main` posts quit.
+    exiting: bool,
+    /// A double-click's trailing `WM_LBUTTONUP` must not toggle the window.
+    swallow_up: bool,
+}
+
+/// Wake the UI thread: a snapshot is ready. No-op before the window exists.
+pub fn post_refresh(hwnd: isize) {
+    post(hwnd, WM_APP_REFRESH);
+}
+
+/// Ask the UI thread to tear down. Safe from any thread.
+pub fn post_quit(hwnd: isize) {
+    post(hwnd, WM_APP_QUIT);
+}
+
+/// Fallback for a thread whose window was never created (or is already
+/// gone): `WM_QUIT` straight into its queue so `join` cannot hang.
+pub fn post_thread_quit(thread_id: u32) {
+    if thread_id == 0 {
+        return;
+    }
+    // SAFETY: plain FFI with integers.
+    unsafe {
+        let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn post(hwnd: isize, msg: u32) {
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: PostMessageW is thread-safe; a stale HWND just fails.
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd as *mut c_void)), msg, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn loword(v: usize) -> u32 {
+    (v & 0xFFFF) as u32
+}
+
+fn hiword(v: usize) -> u32 {
+    ((v >> 16) & 0xFFFF) as u32
+}
+
+/// Hide the console window when this process is the only one attached to
+/// it — i.e. it was started from Explorer or a shortcut, not from a shell.
+/// The console itself stays: `GenerateConsoleCtrlEvent` (graceful stop)
+/// needs it, and the children attach to it instead of opening their own.
+fn hide_console_if_owned() {
+    let mut pids = [0u32; 4];
+    // SAFETY: the buffer is a plain array; the call reports how many fit.
+    let n = unsafe { GetConsoleProcessList(&mut pids) };
+    if n != 1 {
+        debug!(attached = n, "console shared with a shell; leaving it visible");
+        return;
+    }
+    // SAFETY: no arguments; a null HWND means no console.
+    let console = unsafe { GetConsoleWindow() };
+    if console.0.is_null() {
+        return;
+    }
+    // SAFETY: ShowWindow on a valid HWND.
+    unsafe {
+        let _ = ShowWindow(console, SW_HIDE);
+    }
+    info!("console window hidden (this process owns it); run from a terminal or with --no-gui to keep it");
+}
+
+/// The UI thread body. Returns when [`post_quit`] / [`post_thread_quit`]
+/// arrive, or early (with the reason) if the window cannot be created.
+pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>) -> Result<()> {
+    // SAFETY: thread id of the calling thread.
+    tid_slot.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    hide_console_if_owned();
+
+    // SAFETY: standard window creation; every handle created here is
+    // released in `teardown`, and `GWLP_USERDATA` is cleared before the
+    // state goes out of scope.
+    unsafe {
+        let hinstance: HINSTANCE = GetModuleHandleW(None).context("GetModuleHandleW")?.into();
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance,
+            lpszClassName: CLASS_NAME,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH((COLOR_WINDOW.0 as usize + 1) as *mut c_void),
+            ..Default::default()
+        };
+        // Zero means "already registered" on a restart of the thread; fine.
+        let _ = RegisterClassW(&class);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_APPWINDOW,
+            CLASS_NAME,
+            w!("telemouse-ctl"),
+            WS_OVERLAPPEDWINDOW,
+            120,
+            120,
+            WINDOW_W,
+            WINDOW_H,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+        .context("create the status window")?;
+
+        let edit = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            PCWSTR::null(),
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_VSCROLL
+                | WS_HSCROLL
+                | WS_BORDER
+                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+            0,
+            0,
+            WINDOW_W,
+            WINDOW_H,
+            Some(hwnd),
+            Some(HMENU(EDIT_ID as *mut c_void)),
+            Some(hinstance),
+            None,
+        );
+        let edit = match edit {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = DestroyWindow(hwnd);
+                return Err(e).context("create the EDIT control");
+            }
+        };
+
+        let font = {
+            let f = CreateFontW(
+                -15,
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                (FIXED_PITCH.0 | FF_MODERN.0) as u32,
+                w!("Consolas"),
+            );
+            if f.is_invalid() { HFONT(GetStockObject(ANSI_FIXED_FONT).0) } else { f }
+        };
+        SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(1 << 20)), None);
+
+        let icons = [make_icon(IconState::Idle), make_icon(IconState::CaptureRunning)];
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+
+        let mut state = UiState {
+            link,
+            hwnd,
+            edit,
+            font,
+            icons,
+            tray_added: false,
+            icon_state: IconState::Idle,
+            tooltip: String::new(),
+            taskbar_created,
+            visible: true,
+            exiting: false,
+            swallow_up: false,
+        };
+        let ptr: *mut UiState = &mut state;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+        hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
+
+        state.tooltip = model::tooltip(&state.link.state.borrow());
+        tray_add(ptr);
+        if !state.tray_added {
+            warn!("tray icon unavailable; closing the window will exit the panel");
+        }
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        state.link.visible.store(true, Ordering::Relaxed);
+        state.link.poke.notify_one();
+        refresh(ptr);
+        info!(tray = state.tray_added, "gui running; double-click the tray icon to show the window");
+
+        let mut msg = MSG::default();
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            if r.0 == 0 {
+                break; // WM_QUIT
+            }
+            if r.0 == -1 {
+                warn!(error = %windows::core::Error::from_thread(), "GetMessageW failed; leaving the gui loop");
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        hwnd_slot.store(0, Ordering::Release);
+        teardown(ptr);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        let _ = DestroyWindow(hwnd);
+        info!("gui stopped");
+    }
+    Ok(())
+}
+
+unsafe fn teardown(s: *mut UiState) {
+    // SAFETY: caller guarantees `s` is the live state on this thread.
+    unsafe {
+        if (*s).tray_added {
+            let data = tray_data(s);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            (*s).tray_added = false;
+        }
+        for icon in (*s).icons {
+            if !icon.is_invalid() {
+                let _ = DestroyIcon(icon);
+            }
+        }
+        if !(*s).font.is_invalid() && (*s).font != HFONT(GetStockObject(ANSI_FIXED_FONT).0) {
+            let _ = DeleteObject((*s).font.into());
+        }
+    }
+}
+
+/// A disc icon drawn at runtime (there is no `.ico` in the repo and no
+/// resource compiler); the stock application icon if GDI says no.
+unsafe fn make_icon(state: IconState) -> HICON {
+    let px = model::icon_bitmap(state, ICON_SIZE);
+    // SAFETY: the pixel buffers outlive the CreateBitmap calls, which copy;
+    // both bitmaps are deleted after the icon is made from them.
+    unsafe {
+        let color = CreateBitmap(ICON_SIZE as i32, ICON_SIZE as i32, 1, 32, Some(px.bgra.as_ptr() as *const c_void));
+        let mask = CreateBitmap(ICON_SIZE as i32, ICON_SIZE as i32, 1, 1, Some(px.mask.as_ptr() as *const c_void));
+        let icon = if color.is_invalid() || mask.is_invalid() {
+            None
+        } else {
+            let info = ICONINFO {
+                fIcon: true.into(),
+                xHotspot: 0,
+                yHotspot: 0,
+                hbmMask: mask,
+                hbmColor: color,
+            };
+            CreateIconIndirect(&info).ok()
+        };
+        if !color.is_invalid() {
+            let _ = DeleteObject(color.into());
+        }
+        if !mask.is_invalid() {
+            let _ = DeleteObject(mask.into());
+        }
+        match icon {
+            Some(i) => i,
+            None => {
+                warn!(?state, "could not draw the tray icon; using the stock one");
+                LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+            }
+        }
+    }
+}
+
+unsafe fn tray_data(s: *mut UiState) -> NOTIFYICONDATAW {
+    // SAFETY: reads plain fields of the live state.
+    unsafe {
+        let mut d = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: (*s).hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_APP_TRAY,
+            hIcon: (*s).icons[(*s).icon_state.index()],
+            ..Default::default()
+        };
+        let tip: Vec<u16> = (*s).tooltip.encode_utf16().take(d.szTip.len() - 1).collect();
+        d.szTip[..tip.len()].copy_from_slice(&tip);
+        d
+    }
+}
+
+unsafe fn tray_add(s: *mut UiState) {
+    // SAFETY: `s` is live; Shell_NotifyIconW copies the struct.
+    unsafe {
+        let data = tray_data(s);
+        (*s).tray_added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+        if (*s).tray_added {
+            debug!("tray icon added");
+        } else {
+            warn!(error = %windows::core::Error::from_thread(), "Shell_NotifyIcon(NIM_ADD) failed");
+        }
+    }
+}
+
+unsafe fn tray_modify(s: *mut UiState) {
+    // SAFETY: as `tray_add`.
+    unsafe {
+        if !(*s).tray_added {
+            return;
+        }
+        let data = tray_data(s);
+        if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
+            warn!(error = %windows::core::Error::from_thread(), "Shell_NotifyIcon(NIM_MODIFY) failed");
+        }
+    }
+}
+
+unsafe fn set_visible(s: *mut UiState, show: bool) {
+    // SAFETY: `s` is live; ShowWindow re-enters wndproc (WM_SIZE), which is
+    // why no `&mut` is held here.
+    unsafe {
+        let hwnd = (*s).hwnd;
+        (*s).visible = show;
+        (*s).link.visible.store(show, Ordering::Relaxed);
+        if show {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            // Fresh numbers now, not at the next cadence tick.
+            (*s).link.poke.notify_one();
+        } else {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        debug!(show, "window visibility");
+    }
+}
+
+/// Replace the EDIT text, keeping the scroll position (SetWindowText
+/// resets it to the top).
+unsafe fn set_text(edit: HWND, text: &str) {
+    // SAFETY: `edit` is our control; the wide buffer outlives the call.
+    unsafe {
+        let first = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, None, None).0;
+        SendMessageW(edit, WM_SETREDRAW, Some(WPARAM(0)), None);
+        let w = wide(text);
+        if let Err(e) = SetWindowTextW(edit, PCWSTR(w.as_ptr())) {
+            debug!(error = %e, "SetWindowTextW");
+        }
+        if first > 0 {
+            SendMessageW(edit, EM_LINESCROLL, Some(WPARAM(0)), Some(LPARAM(first)));
+        }
+        SendMessageW(edit, WM_SETREDRAW, Some(WPARAM(1)), None);
+        let _ = InvalidateRect(Some(edit), None, true);
+    }
+}
+
+unsafe fn refresh(s: *mut UiState) {
+    // SAFETY: `s` is live; the snapshot is cloned out before any Win32 call.
+    unsafe {
+        let snap = (*s).link.state.borrow().clone();
+        if (*s).visible {
+            let edit = (*s).edit;
+            set_text(edit, &model::render_text(&snap));
+        }
+        let icon = model::icon_state(&snap);
+        let tip = if (*s).exiting { "telemouse-ctl — stopping…".to_string() } else { model::tooltip(&snap) };
+        if icon != (*s).icon_state || tip != (*s).tooltip {
+            if icon != (*s).icon_state {
+                info!(?icon, "tray icon state");
+            }
+            (*s).icon_state = icon;
+            (*s).tooltip = tip;
+            tray_modify(s);
+        }
+    }
+}
+
+unsafe fn show_menu(s: *mut UiState) {
+    // SAFETY: everything the modal TrackPopupMenu loop needs is copied out
+    // first; wndproc may run (WM_APP_REFRESH) while the menu is open.
+    unsafe {
+        let hwnd = (*s).hwnd;
+        let entries = {
+            let snap = (*s).link.state.borrow().clone();
+            model::menu(&snap, (*s).visible)
+        };
+        let Ok(menu) = CreatePopupMenu() else {
+            warn!("CreatePopupMenu failed");
+            return;
+        };
+        for e in &entries {
+            let r = match e {
+                MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
+                MenuEntry::Item(i) => {
+                    let flags = if i.enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
+                    let label = wide(&i.label);
+                    AppendMenuW(menu, flags, i.id as usize, PCWSTR(label.as_ptr()))
+                }
+            };
+            if let Err(e) = r {
+                warn!(error = %e, "AppendMenuW");
+            }
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        // Without this the menu does not close when the user clicks away.
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, None, hwnd, None);
+        // ...and without this the next click on the icon is swallowed.
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
+}
+
+unsafe fn request_exit(s: *mut UiState) {
+    // SAFETY: `s` is live.
+    unsafe {
+        if (*s).exiting {
+            return;
+        }
+        (*s).exiting = true;
+        info!("exit requested from the gui");
+        (*s).tooltip = "telemouse-ctl — stopping…".into();
+        tray_modify(s);
+        let hwnd = (*s).hwnd;
+        (*s).visible = false;
+        (*s).link.visible.store(false, Ordering::Relaxed);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        (*s).link.quit.notify_one();
+    }
+}
+
+unsafe fn open_panel(s: *mut UiState) {
+    // SAFETY: `s` is live; the wide URL outlives the call.
+    unsafe {
+        let url = wide(&(*s).link.panel_url);
+        let r = ShellExecuteW(None, w!("open"), PCWSTR(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        if r.0 as usize > 32 {
+            info!(url = %(*s).link.panel_url, "opened the web panel");
+        } else {
+            warn!(url = %(*s).link.panel_url, code = r.0 as usize, "ShellExecuteW could not open the web panel");
+        }
+    }
+}
+
+unsafe fn command(s: *mut UiState, id: u16) {
+    // SAFETY: `s` is live.
+    unsafe {
+        match id {
+            model::MENU_TOGGLE_WINDOW => set_visible(s, !(*s).visible),
+            model::MENU_START_CAPTURE => feed::start(&(*s).link, "capture"),
+            model::MENU_STOP_CAPTURE => feed::stop(&(*s).link, "capture"),
+            model::MENU_START_VIZ => feed::start(&(*s).link, "viz"),
+            model::MENU_STOP_VIZ => feed::stop(&(*s).link, "viz"),
+            model::MENU_OPEN_PANEL => open_panel(s),
+            model::MENU_EXIT => request_exit(s),
+            other => debug!(id = other, "unknown menu command"),
+        }
+    }
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: GWLP_USERDATA is either 0 or the live `UiState` of this
+    // thread, set before any message that needs it and cleared before the
+    // state is dropped.
+    let s = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
+    if s.is_null() {
+        return match msg {
+            WM_DESTROY | WM_APP_QUIT => {
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        };
+    }
+    unsafe {
+        match msg {
+            WM_SIZE => {
+                let edit = (*s).edit;
+                let _ = MoveWindow(edit, 0, 0, loword(lparam.0 as usize) as i32, hiword(lparam.0 as usize) as i32, true);
+                LRESULT(0)
+            }
+            WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE && (*s).tray_added => {
+                set_visible(s, false);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if shift || !(*s).tray_added {
+                    request_exit(s);
+                } else {
+                    set_visible(s, false);
+                }
+                LRESULT(0)
+            }
+            WM_APP_REFRESH => {
+                refresh(s);
+                LRESULT(0)
+            }
+            WM_APP_TRAY => {
+                // A double-click arrives as UP, DBLCLK, UP: a single click
+                // toggles, a double-click shows and swallows its second UP.
+                match loword(lparam.0 as usize) {
+                    WM_LBUTTONUP => {
+                        if (*s).swallow_up {
+                            (*s).swallow_up = false;
+                        } else {
+                            set_visible(s, !(*s).visible);
+                        }
+                    }
+                    WM_LBUTTONDBLCLK => {
+                        (*s).swallow_up = true;
+                        set_visible(s, true);
+                    }
+                    WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(s),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            // Menu commands come with a zero lParam; EN_* notifications from
+            // the EDIT carry its HWND and are ignored.
+            WM_COMMAND if lparam.0 == 0 && hiword(wparam.0) == 0 => {
+                command(s, loword(wparam.0) as u16);
+                LRESULT(0)
+            }
+            WM_APP_QUIT | WM_DESTROY => {
+                if (*s).tray_added {
+                    let data = tray_data(s);
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+                    (*s).tray_added = false;
+                }
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            m if m == (*s).taskbar_created && m != 0 => {
+                info!("taskbar recreated; re-adding the tray icon");
+                (*s).tray_added = false;
+                tray_add(s);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}

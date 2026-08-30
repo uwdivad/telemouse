@@ -770,15 +770,44 @@ pub(crate) fn sg_run(
     half: usize,
     dt: f64,
 ) -> Vec<f64> {
+    let mut scratch = SgScratch::default();
+    let (out, from) = sg_run_into(sg, x, start, n, half, dt, &mut scratch);
+    out[from..from + x.len()].to_vec()
+}
+
+/// Reusable buffers for [`sg_run_into`]: the framed input and the framed
+/// output. One pair serves every run and lane of a sweep, so the sweep
+/// allocates at most twice (for the longest run) instead of three times per
+/// run per lane.
+#[derive(Debug, Default)]
+pub(crate) struct SgScratch {
+    framed: Vec<f64>,
+    out: Vec<f64>,
+}
+
+/// [`sg_run`] without the per-call allocations: returns the framed output
+/// buffer and the offset at which the run's `x.len()` results start, so the
+/// caller reads `out[from..from + x.len()]`. Bit-identical to `sg_run`.
+pub(crate) fn sg_run_into<'s>(
+    sg: &SavGol,
+    x: &[f64],
+    start: usize,
+    n: usize,
+    half: usize,
+    dt: f64,
+    scratch: &'s mut SgScratch,
+) -> (&'s [f64], usize) {
     let left = half.min(start);
     let right = half.min(n - (start + x.len()));
     if left == 0 && right == 0 {
-        return sg.apply(x, dt);
+        sg.apply_into(x, dt, &mut scratch.out);
+        return (&scratch.out, 0);
     }
-    let mut buf = vec![0.0; left + x.len() + right];
-    buf[left..left + x.len()].copy_from_slice(x);
-    let out = sg.apply(&buf, dt);
-    out[left..left + x.len()].to_vec()
+    scratch.framed.clear();
+    scratch.framed.resize(left + x.len() + right, 0.0);
+    scratch.framed[left..left + x.len()].copy_from_slice(x);
+    sg.apply_into(&scratch.framed, dt, &mut scratch.out);
+    (&scratch.out, left)
 }
 
 /// Build the prepared series from a loaded recording.

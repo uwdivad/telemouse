@@ -18,6 +18,7 @@ use telemouse_core::config::AppConfig;
 use crate::context::{ContextSnapshot, SharedContext};
 use crate::platform::{self, ForegroundCache};
 use crate::pointer_lock::PointerLockDetector;
+use crate::raw_input::RingWaker;
 use crate::session_setup::{anchor_drift_us, drift_ppm, measure_anchor};
 use crate::shipping::MarkerSignal;
 use crate::shutdown::Shutdown;
@@ -27,6 +28,8 @@ pub const TICK: Duration = Duration::from_millis(250);
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the session anchor is re-measured against the wall clock.
 pub const ANCHOR_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// How often `telemouse.toml` is stat'ed for a mid-session edit.
+pub const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// Drift past this is worth recording in the stream, not just the log.
 pub const ANCHOR_DRIFT_MARKER_US: i64 = 200;
 
@@ -40,16 +43,21 @@ pub struct ContextArgs {
     pub config: AppConfig,
     /// Markers go out through T2 (which owns the sinks), same as the hotkey's.
     pub marker_tx: Sender<MarkerSignal>,
+    /// T2 parks indefinitely on an idle desk; a marker has to wake it.
+    pub waker: Arc<RingWaker>,
 }
 
 /// Sample the environment once. Pure-ish: everything platform-specific is a
-/// call into [`crate::platform`].
+/// call into [`crate::platform`]. `screen` is passed in rather than read
+/// here: the primary screen only changes on `WM_DISPLAYCHANGE`, which T1
+/// flags, so the loop re-reads it then instead of four times a second.
 pub fn sample(
     detector: &mut PointerLockDetector,
     foreground: &mut ForegroundCache,
     events_delta: u64,
+    screen: (u32, u32),
 ) -> ContextSnapshot {
-    let (screen_w, screen_h) = platform::primary_screen();
+    let (screen_w, screen_h) = screen;
     let cursor = platform::cursor_pos();
     let pointer_locked = match cursor {
         Some(pos) => detector.observe(pos, events_delta),
@@ -156,6 +164,7 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
         config_path,
         mut config,
         marker_tx,
+        waker,
     } = args;
 
     let mut detector = PointerLockDetector::default();
@@ -167,10 +176,23 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
     let mut last_locked = false;
     let mut last_anchor_check = Instant::now();
     let mut config_mtime = mtime(&config_path);
+    let mut last_config_check = Instant::now();
+    let mut screen = platform::primary_screen();
 
     while !shutdown.is_set() {
+        // T1 saw WM_DISPLAYCHANGE: the desktop geometry changed, so this
+        // tick's snapshot carries fresh metrics.
+        let display_changed = ctx.take_display_changed();
+        if display_changed {
+            screen = platform::primary_screen();
+        }
         let events = stats.events();
-        let snapshot = sample(&mut detector, &mut foreground, events.saturating_sub(last_events));
+        let snapshot = sample(
+            &mut detector,
+            &mut foreground,
+            events.saturating_sub(last_events),
+            screen,
+        );
         last_events = events;
 
         if snapshot.game != last_game {
@@ -193,10 +215,10 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
         let (screen_w, screen_h) = (snapshot.screen_w, snapshot.screen_h);
         ctx.set(snapshot);
 
-        // T1 saw WM_DISPLAYCHANGE; the snapshot above already carries the new
-        // metrics, so this is about telling the operator (and refreshing the
-        // full monitor list, which the per-tick sample does not read).
-        if ctx.take_display_changed() {
+        // The snapshot above already carries the new metrics; this is about
+        // telling the operator (and refreshing the full monitor list, which
+        // the per-tick sample does not read).
+        if display_changed {
             let monitors = platform::monitors();
             tracing::info!(
                 screen_w,
@@ -208,13 +230,21 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
 
         if last_anchor_check.elapsed() >= ANCHOR_CHECK_INTERVAL {
             check_anchor_drift(&anchor, &marker_tx);
+            waker.wake();
             last_anchor_check = Instant::now();
         }
 
-        let current_mtime = mtime(&config_path);
-        if current_mtime != config_mtime {
-            config_mtime = current_mtime;
-            reload_config(&config_path, &mut config, &marker_tx);
+        // A file stat four times a second is the most expensive thing an
+        // idle agent does; once every couple of seconds is plenty for a
+        // config edit to be noticed.
+        if last_config_check.elapsed() >= CONFIG_CHECK_INTERVAL {
+            last_config_check = Instant::now();
+            let current_mtime = mtime(&config_path);
+            if current_mtime != config_mtime {
+                config_mtime = current_mtime;
+                reload_config(&config_path, &mut config, &marker_tx);
+                waker.wake();
+            }
         }
 
         if last_report.elapsed() >= REPORT_INTERVAL {
@@ -341,6 +371,7 @@ mod tests {
             config_path: PathBuf::from("definitely-not-a-config-file.toml"),
             config: AppConfig::default(),
             marker_tx,
+            waker: Arc::new(RingWaker::default()),
         }
     }
 
@@ -348,11 +379,13 @@ mod tests {
     fn sampling_fills_the_snapshot_without_panicking() {
         let mut d = PointerLockDetector::default();
         let mut f = ForegroundCache::new();
-        let s = sample(&mut d, &mut f, 0);
+        let s = sample(&mut d, &mut f, 0, (2560, 1440));
         // Off Windows the platform layer returns zeros; either way it must not
         // report a lock from a single idle sample.
         assert!(!s.pointer_locked);
         assert_eq!(s.batch_cursor(), (Some(s.cursor_x), Some(s.cursor_y)));
+        // The screen is whatever the loop handed in, not re-read per tick.
+        assert_eq!((s.screen_w, s.screen_h), (2560, 1440));
     }
 
     #[test]

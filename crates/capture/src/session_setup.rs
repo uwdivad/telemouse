@@ -24,6 +24,8 @@ pub struct SessionEnv {
     pub games: BTreeMap<String, GameSens>,
     pub monitors: Vec<MonitorInfo>,
     pub capture_version: String,
+    /// `batch.coalesce_ms` the agent is running with.
+    pub coalesce_ms: u64,
 }
 
 /// Build an anchor from a QPC/UTC/QPC sandwich.
@@ -113,6 +115,7 @@ pub fn build_session_config(session_id: String, env: SessionEnv) -> SessionConfi
         games: env.games,
         monitors: env.monitors,
         capture_version: env.capture_version,
+        coalesce_ms: env.coalesce_ms,
     }
 }
 
@@ -150,6 +153,7 @@ mod tests {
                 primary: true,
             }],
             capture_version: "0.1.0".into(),
+            coalesce_ms: 2,
         }
     }
 
