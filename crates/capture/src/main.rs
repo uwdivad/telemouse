@@ -62,8 +62,12 @@ struct RunArgs {
     #[arg(long)]
     no_udp: bool,
     /// Disable the local JSONL recording regardless of config.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "record")]
     no_record: bool,
+    /// Enable the local JSONL recording regardless of config
+    /// (`recording.enabled = false` in telemouse.toml).
+    #[arg(long)]
+    record: bool,
     /// Stop automatically after N seconds (smoke testing).
     #[arg(long)]
     duration_secs: Option<u64>,
@@ -99,6 +103,9 @@ fn apply_cli(cfg: &mut AppConfig, args: &RunArgs) {
     }
     if args.no_record {
         cfg.recording.enabled = false;
+    }
+    if args.record {
+        cfg.recording.enabled = true;
     }
 }
 
@@ -613,5 +620,19 @@ mod tests {
         assert!(!cfg.udp.enabled);
         assert!(!cfg.recording.enabled);
         assert!(!cfg.kafka.enabled);
+    }
+
+    #[test]
+    fn record_flag_forces_recording_on_and_excludes_no_record() {
+        let missing = PathBuf::from("definitely-not-a-config-file.toml");
+        let mut off = resolve_config(&missing, None).unwrap();
+        off.recording.enabled = false;
+        let Command::Run(args) = Cli::parse_from(["telemouse", "run", "--record"]).command else {
+            panic!("expected run");
+        };
+        assert!(args.record && !args.no_record);
+        apply_cli(&mut off, &args);
+        assert!(off.recording.enabled, "--record overrides recording.enabled = false");
+        assert!(Cli::try_parse_from(["telemouse", "run", "--record", "--no-record"]).is_err());
     }
 }

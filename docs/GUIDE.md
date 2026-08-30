@@ -1307,7 +1307,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 
 | Route | Effect |
 |---|---|
-| `GET /api/state` | `{ self_pid, now_unix_s, components: [ComponentState], processes: [ProcInfo] }`. Reaps exited children as a side effect. |
+| `GET /api/state` | `{ self_pid, now_unix_s, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `recording` is the config default; each component carries its run's `args` and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
 | `GET /api/sessions` | `*.jsonl` names in `recording.dir`, newest first (the report picker). |
 | `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl" }`. 404 unknown, 409 already running, 400 disallowed flag / bad session, 500 spawn failure (binary missing). |
 | `POST /api/components/{id}/stop` | body `{ force?: bool }` → `{ outcome: "graceful" \| "terminated" }`. 409 if not running. |
@@ -1385,8 +1385,11 @@ while idle and a green one while capture runs (drawn at runtime by
 compiler); its tooltip names both services with uptime.
 
 **What it does.** Left click toggles the window; right click opens the menu:
-*Show/Hide window*, *Start capture* **or** *Stop capture* (start greyed when
-the binary is missing), the same for the viz server, *Open web panel*
+*Show/Hide window*, *Start capture (save data → dir)* and *Start capture
+(don't save)* **or** *Stop capture (saving data | not saving)* (starts greyed
+when the binary is missing; the save choice becomes `--record` /
+`--no-record` only when it differs from `[recording] enabled`), the same
+start/stop for the viz server, *Open web panel*
 (`ShellExecuteW` on the panel URL, loopback if the bind address was
 unspecified), and *Exit*. Closing or minimising the window hides it to the
 tray; Shift+close, or the tray's Exit, quits — through the same graceful

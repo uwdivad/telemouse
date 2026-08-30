@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 
 use crate::gui::feed::Snapshot;
-use crate::manager::{ComponentState, Kind, describe_exit};
+use crate::manager::{ComponentState, Kind, describe_exit, recording_flags};
 
 /// `NOTIFYICONDATAW.szTip` is 128 UTF-16 units including the terminator.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
@@ -61,14 +61,30 @@ fn service_status(c: Option<&ComponentState>, now: u64) -> String {
     }
 }
 
+/// "saving" / "not saving" for a running capture agent, nothing otherwise.
+fn saving_note(c: Option<&ComponentState>) -> &'static str {
+    match c {
+        Some(c) if c.running && c.saving => " (saving)",
+        Some(c) if c.running => " (not saving)",
+        _ => "",
+    }
+}
+
 /// Tray tooltip, never longer than [`TOOLTIP_MAX_CHARS`].
 pub fn tooltip(s: &Snapshot) -> String {
+    let cap = component(s, "capture");
     let text = format!(
-        "telemouse-ctl — capture: {}, viz: {}",
-        service_status(component(s, "capture"), s.now_unix_s),
+        "telemouse-ctl — capture: {}{}, viz: {}",
+        service_status(cap, s.now_unix_s),
+        saving_note(cap),
         service_status(component(s, "viz"), s.now_unix_s),
     );
     text.chars().take(TOOLTIP_MAX_CHARS).collect()
+}
+
+/// Flags for a tray-started capture run that should (not) save data.
+pub fn start_flags(s: &Snapshot, save: bool) -> Vec<String> {
+    recording_flags(s.recording_enabled, save)
 }
 
 /// Whose log tail the window shows: the running capture agent, else the
@@ -124,6 +140,19 @@ pub fn render_text(s: &Snapshot) -> String {
         out.push(format!("{:<17} {:<8} {:<10} {:<11} {:<12} {:<18} {}", c.label, kind, state, pid, up, last, c.summary));
     }
     out.push(String::new());
+    let cap = component(s, "capture");
+    let default = if s.recording_enabled {
+        format!("on → {}", s.recording_dir)
+    } else {
+        "off".to_string()
+    };
+    let now_line = match cap {
+        Some(c) if c.running && c.saving => format!("; capture is SAVING → {}", s.recording_dir),
+        Some(c) if c.running => "; capture is NOT saving".to_string(),
+        _ => String::new(),
+    };
+    out.push(format!("SAVE DATA           default {default} (telemouse.toml [recording] enabled){now_line}"));
+    out.push(String::new());
     out.push("RELATED PROCESSES".into());
     if s.processes.is_empty() {
         out.push("  (none)".into());
@@ -155,6 +184,7 @@ pub const MENU_START_VIZ: u16 = 1004;
 pub const MENU_STOP_VIZ: u16 = 1005;
 pub const MENU_OPEN_PANEL: u16 = 1006;
 pub const MENU_EXIT: u16 = 1007;
+pub const MENU_START_CAPTURE_NOSAVE: u16 = 1008;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuItem {
@@ -183,17 +213,40 @@ fn service_items(c: Option<&ComponentState>, label: &str, start_id: u16, stop_id
     }
 }
 
+/// The capture entries: while running, one *Stop* that says whether data is
+/// being saved; otherwise two *Start*s — with and without saving — both
+/// greyed when the binary is missing.
+fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
+    match component(s, "capture") {
+        Some(c) if c.running => vec![item(
+            MENU_STOP_CAPTURE,
+            if c.saving { "Stop capture (saving data)" } else { "Stop capture (not saving)" },
+            true,
+        )],
+        c => {
+            let ok = c.is_some_and(|c| c.bin_found);
+            vec![
+                item(MENU_START_CAPTURE, &format!("Start capture (save data → {})", s.recording_dir), ok),
+                item(MENU_START_CAPTURE_NOSAVE, "Start capture (don't save)", ok),
+            ]
+        }
+    }
+}
+
 pub fn menu(s: &Snapshot, window_visible: bool) -> Vec<MenuEntry> {
-    vec![
+    let mut v = vec![
         item(MENU_TOGGLE_WINDOW, if window_visible { "Hide window" } else { "Show window" }, true),
         MenuEntry::Separator,
-        service_items(component(s, "capture"), "capture", MENU_START_CAPTURE, MENU_STOP_CAPTURE),
+    ];
+    v.extend(capture_items(s));
+    v.extend([
         service_items(component(s, "viz"), "viz server", MENU_START_VIZ, MENU_STOP_VIZ),
         MenuEntry::Separator,
         item(MENU_OPEN_PANEL, "Open web panel", true),
         MenuEntry::Separator,
         item(MENU_EXIT, "Exit (stops what the panel started)", true),
-    ]
+    ]);
+    v
 }
 
 /// Where a browser reaches the panel. An unspecified bind address
@@ -276,12 +329,16 @@ mod tests {
             pid: running.then_some(4242),
             since_unix_s: running.then_some(1_000_000),
             last_exit: None,
+            args: Vec::new(),
+            saving: running && id == "capture",
             log: vec!["line one".into(), "line two".into()],
         }
     }
 
     fn snap(capture_running: bool, viz_running: bool) -> Snapshot {
         Snapshot {
+            recording_enabled: true,
+            recording_dir: "recordings".into(),
             now_unix_s: 1_000_000 + 3661,
             components: vec![
                 comp("capture", "Capture agent", Kind::Service, capture_running, true),
@@ -322,7 +379,11 @@ mod tests {
     #[test]
     fn tooltip_names_both_services_and_is_bounded() {
         let t = tooltip(&snap(true, false));
-        assert_eq!(t, "telemouse-ctl — capture: running 1:01:01, viz: stopped");
+        assert_eq!(t, "telemouse-ctl — capture: running 1:01:01 (saving), viz: stopped");
+        let mut nosave = snap(true, false);
+        nosave.components[0].saving = false;
+        assert!(tooltip(&nosave).contains("(not saving)"));
+        assert!(!tooltip(&snap(false, false)).contains("saving"), "no note while stopped");
         assert!(tooltip(&Snapshot::default()).contains("capture: ?"));
         let mut long = snap(false, false);
         long.components[0].running = true;
@@ -358,6 +419,15 @@ mod tests {
         assert!(text.contains("pid 4242"));
         assert!(text.contains("up 1:01:01"));
         assert!(text.contains("not built"), "a missing binary is said so");
+        assert!(text.contains("SAVE DATA           default on → recordings"));
+        assert!(text.contains("capture is SAVING → recordings"));
+        let mut off = snap(true, false);
+        off.recording_enabled = false;
+        off.components[0].saving = false;
+        let t = render_text(&off);
+        assert!(t.contains("default off"));
+        assert!(t.contains("capture is NOT saving"));
+        assert!(!render_text(&snap(false, false)).contains("capture is"), "no live note while stopped");
         assert!(text.contains("RELATED PROCESSES"));
         assert!(text.contains("telemouse-ctl.exe"));
         assert!(text.contains("(this panel)"));
@@ -366,6 +436,17 @@ mod tests {
         let empty = render_text(&Snapshot::default());
         assert!(empty.contains("(none)"));
         assert!(empty.contains("nothing has run yet"));
+    }
+
+    #[test]
+    fn start_flags_only_override_a_disagreeing_default() {
+        let on = snap(false, false);
+        assert!(start_flags(&on, true).is_empty());
+        assert_eq!(start_flags(&on, false), vec!["--no-record".to_string()]);
+        let mut off = snap(false, false);
+        off.recording_enabled = false;
+        assert_eq!(start_flags(&off, true), vec!["--record".to_string()]);
+        assert!(start_flags(&off, false).is_empty());
     }
 
     #[test]
@@ -381,7 +462,18 @@ mod tests {
         };
         let m = ids(&menu(&snap(true, false), true));
         assert!(m.contains(&(MENU_STOP_CAPTURE, true)));
-        assert!(!m.iter().any(|(id, _)| *id == MENU_START_CAPTURE));
+        assert!(!m.iter().any(|(id, _)| *id == MENU_START_CAPTURE || *id == MENU_START_CAPTURE_NOSAVE));
+        let labels: Vec<String> = menu(&snap(true, false), true)
+            .into_iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i.label),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.iter().any(|l| l == "Stop capture (saving data)"), "{labels:?}");
+        let both = ids(&menu(&snap(false, false), true));
+        assert!(both.contains(&(MENU_START_CAPTURE, true)));
+        assert!(both.contains(&(MENU_START_CAPTURE_NOSAVE, true)));
         assert!(m.contains(&(MENU_START_VIZ, true)));
         assert!(m.contains(&(MENU_OPEN_PANEL, true)));
         assert!(m.contains(&(MENU_EXIT, true)));
@@ -391,6 +483,7 @@ mod tests {
         s.components[0].bin_found = false;
         let m = ids(&menu(&s, false));
         assert!(m.contains(&(MENU_START_CAPTURE, false)), "missing binary greys start");
+        assert!(m.contains(&(MENU_START_CAPTURE_NOSAVE, false)));
         assert!(m.contains(&(MENU_START_VIZ, true)));
         assert!(ids(&menu(&Snapshot::default(), false)).contains(&(MENU_START_CAPTURE, false)));
 

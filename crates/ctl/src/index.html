@@ -67,12 +67,18 @@
   .toast.bad { border-left-color: var(--bad); }
   .toast.ok { border-left-color: var(--ok); }
   .note { color: var(--fg-dim); font-size: 12px; }
+  .save { font: 11px var(--mono); padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line); }
+  .save.on { color: var(--ok); border-color: #1f5a4a; }
+  .save.off { color: var(--warn); border-color: #5a4a1f; }
+  .opts label.savectl { color: var(--fg); }
+  .opts label.savectl b { font-weight: 600; }
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="brand">tele<span>mouse</span> · control</div>
   <div class="pill" id="connPill"><span class="dot"></span><span id="connText">connecting</span></div>
+  <div class="pill" id="recPill" title="telemouse.toml → [recording] enabled; the capture card can override it per run"><span class="dot"></span><span id="recText">save data: ?</span></div>
   <div class="spacer"></div>
   <a id="vizLink" href="#" target="_blank" rel="noopener">open viz dashboard ↗</a>
 </div>
@@ -106,7 +112,8 @@ let pollTimer = null;
 let busy = new Set();          // component ids with a request in flight
 let armed = new Map();         // "kill" buttons awaiting a second click, key → timeout
 const openLogs = new Set();    // component ids whose log <details> is open
-const chosen = {};             // component id → { flags:Set, session }
+const chosen = {};             // component id → { flags:Set, session, save (null = config default) }
+const SAVE_FLAGS = new Set(["--record", "--no-record"]);
 let cardsKey = "", procsKey = ""; // what the DOM currently shows; re-render only on change
 
 $("vizLink").href = "http://" + (CFG.viz_http || "127.0.0.1:7879") + "/";
@@ -147,6 +154,8 @@ async function poll() {
     const [s, sess] = await Promise.all([api("GET", "/api/state"), api("GET", "/api/sessions")]);
     state = s; sessions = sess;
     setConn(true, "pid " + s.self_pid);
+    $("recPill").className = "pill " + (s.recording.enabled ? "on" : "");
+    $("recText").textContent = "save data: " + (s.recording.enabled ? "on → " + s.recording.dir : "off") + " (default)";
     render();
   } catch (e) {
     setConn(false, "unreachable");
@@ -207,8 +216,8 @@ function render() {
 function renderCards() {
   const host = $("cards");
   const key = JSON.stringify([
-    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.last_exit, c.log.length, c.log[c.log.length - 1]]),
-    sessions, [...busy], [...openLogs],
+    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.saving, c.last_exit, c.log.length, c.log[c.log.length - 1]]),
+    sessions, [...busy], [...openLogs], state.recording,
   ]);
   if (key === cardsKey) {
     // Nothing structural changed: refresh the uptimes without rebuilding
@@ -226,14 +235,24 @@ function renderCards() {
     : "";
 
   host.innerHTML = state.components.map((c) => {
-    const ch = chosen[c.id] || (chosen[c.id] = { flags: new Set(), session: null });
+    const ch = chosen[c.id] || (chosen[c.id] = { flags: new Set(), session: null, save: null });
     const isBusy = busy.has(c.id);
     const run = c.running;
     const exit = c.last_exit;
     const exitText = exit ? ("exited " + (exit.code === -1073741510 ? "on Ctrl-Break" : exit.code === null ? "by signal" : "code " + exit.code) + " at " + clock(exit.at_unix_s)) : "";
     const exitCls = exit && exit.code !== 0 && exit.code !== -1073741510 ? "bad" : "";
 
-    const flags = c.flags.map((f) =>
+    // The recording switch is one checkbox, not two raw flags: it defaults
+    // to telemouse.toml and only sends --record / --no-record when it disagrees.
+    const hasSave = c.flags.some((f) => SAVE_FLAGS.has(f.flag));
+    const wantSave = ch.save === null ? state.recording.enabled : ch.save;
+    const saveCtl = hasSave
+      ? `<label class="savectl" title="Save this run as recordings/<session>.jsonl. Default: [recording] enabled = ${state.recording.enabled} in telemouse.toml"><input type="checkbox" data-save="${c.id}" ${wantSave ? "checked" : ""} ${run ? "disabled" : ""}><b>save data</b> → ${esc(state.recording.dir)}</label>`
+      : "";
+    const saveNow = run && hasSave
+      ? `<span class="save ${c.saving ? "on" : "off"}">${c.saving ? "saving → " + esc(state.recording.dir) : "not saving"}</span>`
+      : "";
+    const flags = c.flags.filter((f) => !SAVE_FLAGS.has(f.flag)).map((f) =>
       `<label title="${esc(f.help)}"><input type="checkbox" data-flag="${esc(f.flag)}" data-c="${c.id}" ${ch.flags.has(f.flag) ? "checked" : ""} ${run ? "disabled" : ""}>${esc(f.flag)}</label>`
     ).join("");
     const sessionSel = c.takes_session ? `<select class="btn" data-session="${c.id}" ${run ? "disabled" : ""}>` +
@@ -250,11 +269,11 @@ function renderCards() {
 
     return `<div class="card ${run ? "running" : ""}">
       <div class="head"><b>${esc(c.label)}</b>
-        <span class="pill ${run ? "on" : ""}"><span class="dot"></span><span data-uptime="${c.id}">${run ? "running · pid " + c.pid + " · " + ago(c.since_unix_s) : (c.kind === "task" ? "idle" : "stopped")}</span></span>
+        <span class="pill ${run ? "on" : ""}"><span class="dot"></span><span data-uptime="${c.id}">${run ? "running · pid " + c.pid + " · " + ago(c.since_unix_s) : (c.kind === "task" ? "idle" : "stopped")}</span></span>${saveNow}
       </div>
       <div class="sum">${esc(c.summary)}</div>
       <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}</div>
-      ${flags ? `<div class="opts">${flags}</div>` : ""}
+      ${flags || saveCtl ? `<div class="opts">${saveCtl}${flags}</div>` : ""}
       <div class="row">${sessionSel}${buttons}</div>
       <details ${openLogs.has(c.id) ? "open" : ""} data-log="${c.id}"><summary>output (${c.log.length} lines)</summary><pre class="log">${esc(c.log.join("\n")) || "—"}</pre></details>
     </div>`;
@@ -322,6 +341,12 @@ document.addEventListener("change", (e) => {
   if (t.dataset.flag) {
     const ch = chosen[t.dataset.c];
     if (t.checked) ch.flags.add(t.dataset.flag); else ch.flags.delete(t.dataset.flag);
+  } else if (t.dataset.save) {
+    const ch = chosen[t.dataset.save];
+    ch.save = t.checked;
+    ch.flags.delete("--record"); ch.flags.delete("--no-record");
+    if (ch.save && !state.recording.enabled) ch.flags.add("--record");
+    if (!ch.save && state.recording.enabled) ch.flags.add("--no-record");
   } else if (t.dataset.session) {
     chosen[t.dataset.session].session = t.value;
   }

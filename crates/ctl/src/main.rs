@@ -103,6 +103,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         bin_dir.clone(),
         args.config.clone(),
         cfg.recording.dir.clone(),
+        cfg.recording.enabled,
         Duration::from_secs(cfg.ctl.stop_grace_secs),
     ));
     let state = AppState {

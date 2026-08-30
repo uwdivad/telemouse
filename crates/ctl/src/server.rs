@@ -107,6 +107,7 @@ async fn api_state(State(st): State<AppState>) -> Response {
     axum::Json(json!({
         "self_pid": st.scanner.self_pid(),
         "now_unix_s": crate::manager::now_unix(),
+        "recording": st.manager.recording(),
         "components": components,
         "processes": processes,
     }))
@@ -220,6 +221,7 @@ mod tests {
                 Some(std::env::temp_dir().join("telemouse-ctl-no-bins")),
                 PathBuf::from("telemouse.toml"),
                 PathBuf::from("recordings"),
+                true,
                 Duration::from_secs(1),
             )),
             scanner: Arc::new(Scanner::new()),
@@ -294,6 +296,11 @@ mod tests {
         assert_eq!(cap["running"], false);
         assert_eq!(cap["bin_found"], false);
         assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--no-kafka"));
+        assert!(cap["flags"].as_array().unwrap().iter().any(|f| f["flag"] == "--record"));
+        assert_eq!(cap["saving"], false);
+        assert!(cap["args"].is_array());
+        assert_eq!(v["recording"]["enabled"], true);
+        assert_eq!(v["recording"]["dir"], "recordings");
         assert!(v["processes"].is_array());
         for p in v["processes"].as_array().unwrap() {
             assert!(p["pid"].is_number());

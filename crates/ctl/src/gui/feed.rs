@@ -39,6 +39,9 @@ pub struct Snapshot {
     pub components: Vec<ComponentState>,
     /// Empty while the window is hidden — the tray does not show processes.
     pub processes: Vec<ProcInfo>,
+    /// `recording.enabled` in the config the children are launched with.
+    pub recording_enabled: bool,
+    pub recording_dir: String,
 }
 
 /// What the UI thread holds: the shared handles it reads and pokes.
@@ -81,19 +84,23 @@ pub async fn run_publisher(
         if !poked && !vis && !tick.is_multiple_of(HIDDEN_EVERY) {
             continue;
         }
-        let snap = if vis {
+        let rec = manager.recording();
+        let (components, processes) = if vis {
             let components = manager.snapshot(GUI_LOG_LINES).await;
             let sc = scanner.clone();
             let processes = tokio::task::spawn_blocking(move || sc.scan_cached(SCAN_TTL))
                 .await
                 .unwrap_or_default();
-            Snapshot { now_unix_s: crate::manager::now_unix(), components, processes }
+            (components, processes)
         } else {
-            Snapshot {
-                now_unix_s: crate::manager::now_unix(),
-                components: manager.snapshot(0).await,
-                processes: Vec::new(),
-            }
+            (manager.snapshot(0).await, Vec::new())
+        };
+        let snap = Snapshot {
+            now_unix_s: crate::manager::now_unix(),
+            components,
+            processes,
+            recording_enabled: rec.enabled,
+            recording_dir: rec.dir,
         };
         debug!(visible = vis, poked, processes = snap.processes.len(), "gui snapshot");
         if tx.send(Arc::new(snap)).is_err() {
@@ -104,13 +111,14 @@ pub async fn run_publisher(
     }
 }
 
-/// Start a component with no extra flags (the tray's quick action). The
+/// Start a component with the given flags (the tray's quick action). The
 /// outcome is logged and shows up in the next snapshot.
-pub fn start(link: &GuiLink, id: &'static str) {
+pub fn start(link: &GuiLink, id: &'static str, flags: Vec<String>) {
     let (m, s, poke) = (link.manager.clone(), link.scanner.clone(), link.poke.clone());
     link.handle.spawn(async move {
-        match m.start(id, &StartRequest::default()).await {
-            Ok(pid) => info!(component = id, pid, "started from the tray"),
+        let req = StartRequest { flags, session: None };
+        match m.start(id, &req).await {
+            Ok(pid) => info!(component = id, pid, flags = ?req.flags, "started from the tray"),
             Err(e) => warn!(component = id, error = %e, "tray start refused"),
         }
         s.invalidate();
@@ -144,6 +152,7 @@ mod tests {
             Some(std::env::temp_dir().join("telemouse-ctl-gui-no-bins")),
             PathBuf::from("telemouse.toml"),
             PathBuf::from("recordings"),
+            true,
             Duration::from_secs(1),
         ))
     }
@@ -190,6 +199,8 @@ mod tests {
         // This test binary is itself a telemouse process, so the scan is never empty.
         assert!(!s.processes.is_empty());
         assert!(s.now_unix_s > 1_700_000_000);
+        assert!(s.recording_enabled);
+        assert_eq!(s.recording_dir, "recordings");
         assert!(r.wakes.load(Ordering::Relaxed) >= 1);
         r.task.abort();
     }
@@ -234,7 +245,7 @@ mod tests {
         };
         // No binaries: the start fails at spawn, the stop finds nothing running;
         // both must still poke so the UI refreshes.
-        start(&link, "capture");
+        start(&link, "capture", vec!["--no-record".into()]);
         tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();
         stop(&link, "viz");
         tokio::time::timeout(Duration::from_secs(5), poke.notified()).await.unwrap();

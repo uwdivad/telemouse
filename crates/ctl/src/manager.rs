@@ -71,7 +71,8 @@ pub const COMPONENTS: &[Component] = &[
             Flag { flag: "--print", help: "log a one-line summary for every batch" },
             Flag { flag: "--no-kafka", help: "disable the Kafka sink" },
             Flag { flag: "--no-udp", help: "disable the localhost UDP sink (live viz)" },
-            Flag { flag: "--no-record", help: "disable the JSONL recording" },
+            Flag { flag: "--no-record", help: "do not save the JSONL recording, whatever telemouse.toml says" },
+            Flag { flag: "--record", help: "save the JSONL recording, whatever telemouse.toml says" },
         ],
         takes_session: false,
         passes_config: true,
@@ -153,7 +154,42 @@ pub struct ComponentState {
     pub pid: Option<u32>,
     pub since_unix_s: Option<u64>,
     pub last_exit: Option<ExitInfo>,
+    /// Arguments of the current (or last) run, after the base arguments.
+    pub args: Vec<String>,
+    /// Capture only: is this run writing a JSONL recording? False for
+    /// everything else and whenever not running.
+    pub saving: bool,
     pub log: Vec<String>,
+}
+
+/// Whether recording is on by default (`recording.enabled`) and where it
+/// goes — the panel's single "save data" switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecordingInfo {
+    pub enabled: bool,
+    pub dir: String,
+}
+
+/// Does a capture run with these arguments save a recording? The CLI
+/// switches beat the config; they are mutually exclusive on the agent.
+pub fn recording_saves(config_enabled: bool, args: &[String]) -> bool {
+    if args.iter().any(|a| a == "--no-record") {
+        false
+    } else if args.iter().any(|a| a == "--record") {
+        true
+    } else {
+        config_enabled
+    }
+}
+
+/// The flags that make a capture run save (or not), given the config
+/// default: nothing when the default already agrees.
+pub fn recording_flags(config_enabled: bool, save: bool) -> Vec<String> {
+    match (config_enabled, save) {
+        (true, false) => vec!["--no-record".into()],
+        (false, true) => vec!["--record".into()],
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -226,6 +262,7 @@ struct Slot {
     pid: Option<u32>,
     since: Option<u64>,
     last_exit: Option<ExitInfo>,
+    args: Vec<String>,
     log: Arc<Mutex<LogRing>>,
 }
 
@@ -236,6 +273,7 @@ impl Slot {
             pid: None,
             since: None,
             last_exit: None,
+            args: Vec::new(),
             log: Arc::new(Mutex::new(LogRing::default())),
         }
     }
@@ -291,6 +329,8 @@ pub struct Manager {
     bin_dir: Option<PathBuf>,
     config_path: PathBuf,
     recordings_dir: PathBuf,
+    /// `recording.enabled` from the config every child is launched with.
+    recording_enabled: bool,
     grace: Duration,
     slots: tokio::sync::Mutex<HashMap<&'static str, Slot>>,
 }
@@ -301,6 +341,7 @@ impl Manager {
         bin_dir: Option<PathBuf>,
         config_path: PathBuf,
         recordings_dir: PathBuf,
+        recording_enabled: bool,
         grace: Duration,
     ) -> Self {
         let slots = components.iter().map(|c| (c.id, Slot::new())).collect();
@@ -309,8 +350,16 @@ impl Manager {
             bin_dir,
             config_path,
             recordings_dir,
+            recording_enabled,
             grace,
             slots: tokio::sync::Mutex::new(slots),
+        }
+    }
+
+    pub fn recording(&self) -> RecordingInfo {
+        RecordingInfo {
+            enabled: self.recording_enabled,
+            dir: self.recordings_dir.display().to_string(),
         }
     }
 
@@ -403,6 +452,10 @@ impl Manager {
                     pid: s.pid,
                     since_unix_s: s.since,
                     last_exit: s.last_exit,
+                    args: s.args.clone(),
+                    saving: s.child.is_some()
+                        && c.id == "capture"
+                        && recording_saves(self.recording_enabled, &s.args),
                     log: s.log.lock().unwrap_or_else(|p| p.into_inner()).tail(log_lines),
                 }
             })
@@ -469,6 +522,7 @@ impl Manager {
         slot.child = Some(child);
         slot.pid = Some(pid);
         slot.since = Some(now_unix());
+        slot.args = args;
         info!(component = c.id, pid, bin = %bin.display(), "started");
         Ok(pid)
     }
@@ -598,8 +652,35 @@ mod tests {
             None,
             PathBuf::from("telemouse.toml"),
             dir.to_path_buf(),
+            true,
             Duration::from_secs(2),
         )
+    }
+
+    #[test]
+    fn recording_switch_is_cli_over_config() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(recording_saves(true, &s(&["run", "--print"])));
+        assert!(!recording_saves(false, &s(&["run"])));
+        assert!(!recording_saves(true, &s(&["run", "--no-record"])));
+        assert!(recording_saves(false, &s(&["run", "--record"])));
+        assert_eq!(recording_flags(true, true), Vec::<String>::new());
+        assert_eq!(recording_flags(false, false), Vec::<String>::new());
+        assert_eq!(recording_flags(true, false), s(&["--no-record"]));
+        assert_eq!(recording_flags(false, true), s(&["--record"]));
+        let m = manager(Path::new("."));
+        assert_eq!(m.recording(), RecordingInfo { enabled: true, dir: ".".into() });
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_the_arguments_of_a_run() {
+        let m = manager(Path::new("."));
+        m.start("sleeper", &StartRequest { flags: vec!["--ok".into()], session: None }).await.unwrap();
+        let st = m.snapshot(1).await;
+        let s = st.iter().find(|s| s.id == "sleeper").unwrap();
+        assert_eq!(s.args.last().map(String::as_str), Some("--ok"));
+        assert!(!s.saving, "only the capture component saves");
+        m.stop("sleeper", true).await.unwrap();
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -744,6 +825,7 @@ mod tests {
             Some(dir.clone()),
             PathBuf::from("telemouse.toml"),
             PathBuf::from("."),
+            true,
             Duration::from_secs(1),
         );
         let (p, found) = m.resolve_bin("telemouse-viz");

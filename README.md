@@ -65,6 +65,7 @@ enabled = false               # durable log; capture degrades gracefully without
 brokers = ["127.0.0.1:9092"]
 
 [recording]
+enabled = true                # save data: one JSONL file per session (the control panel shows and can override this per run)
 dir = "recordings"            # per-session JSONL files
 
 [ctl]
@@ -188,11 +189,14 @@ shows no toasts (markers still flash the panels).
 
 - **Components** — a card each for the capture agent, the viz server, `doctor`,
   `analyze trend` and `analyze report`. *Start* launches the binary with the
-  panel's own `--config`; the capture card exposes its `--print` /
-  `--no-kafka` / `--no-udp` / `--no-record` switches as checkboxes and the
-  report card has a recording picker. Each card shows pid, uptime, how the
-  last run exited, and the last lines the child printed (`stdout` and
-  `stderr`, kept across restarts).
+  panel's own `--config`; the capture card has a **save data** switch (it
+  defaults to `[recording] enabled` in `telemouse.toml` and sends
+  `--record` / `--no-record` only when you flip it the other way), shows
+  *saving → recordings/* or *not saving* while the agent runs, and exposes
+  `--print` / `--no-kafka` / `--no-udp` as checkboxes; the report card has a
+  recording picker. The top bar shows the configured default. Each card
+  shows pid, uptime, how the last run exited, and the last lines the child
+  printed (`stdout` and `stderr`, kept across restarts).
 - **Related processes** — every process on the machine whose executable is a
   telemouse binary, or a `cargo run` of one, whoever started it: pid, parent,
   command line, CPU, memory, start time, and a two-click *kill* button. The
@@ -254,10 +258,12 @@ a game is running.
 
 4. Use the tray:
    - **Left click** the icon: show / hide the window.
-   - **Right click**: *Show/Hide window* · *Start capture* or *Stop capture*
-     (whichever applies; greyed if the binary is not built) · *Start/Stop viz
-     server* · *Open web panel* (your browser, on the panel's address) ·
-     *Exit*.
+   - **Right click**: *Show/Hide window* · *Start capture (save data →
+     recordings)* / *Start capture (don't save)* — or, while it runs, *Stop
+     capture (saving data | not saving)* (greyed if the binary is not
+     built) · *Start/Stop viz server* · *Open web panel* (your browser, on
+     the panel's address) · *Exit*. The window's `SAVE DATA` line shows the
+     configured default and what the running agent is actually doing.
    - **Close** or **minimise** the window: it only hides to the tray.
    - **Quit**: *Exit* from the tray, Shift+close on the window, or Ctrl-C in
      the console. All three stop what the panel started (Ctrl-Break, then
