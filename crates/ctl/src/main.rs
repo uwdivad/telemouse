@@ -153,7 +153,9 @@ async fn serve(args: ServeArgs, cfg: AppConfig, log_dir: PathBuf) -> Result<()> 
         manager: manager.clone(),
         scanner: Arc::new(Scanner::new()),
         page: Arc::new(server::render_page(&PageConfig {
-            viz_http: cfg.viz.http_addr.clone(),
+            // The page links to the viz; a wildcard bind is not a URL a
+            // browser will open, so link to the loopback of the same family.
+            viz_http: telemouse_core::localhost::browse_addr_str(&cfg.viz.http_addr),
             stop_grace_secs: cfg.ctl.stop_grace_secs,
         })),
     };

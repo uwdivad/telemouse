@@ -147,12 +147,23 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .with_context(|| format!("failed to bind http {http_addr}"))?,
     );
 
+    // A wildcard bind is where the server listens, not a URL anyone can open:
+    // print the loopback form, and say the LAN form is this machine's IP.
+    let browse = telemouse_core::localhost::browse_addr(http_addr);
+    let lan_hint = if browse == http_addr {
+        String::new()
+    } else {
+        format!(
+            " (from another PC: http://<this machine's IP>:{}/obs)",
+            http_addr.port()
+        )
+    };
     info!(
         http = %http_addr,
         udp = %udp_addr_s,
         recordings = %recordings_dir.display(),
         obs_layout = %cfg.viz.obs.layout,
-        "telemouse-viz serving; dashboard http://{http_addr}/ — OBS browser source http://{http_addr}/obs"
+        "telemouse-viz serving; dashboard http://{browse}/ — OBS browser source http://{browse}/obs{lan_hint}"
     );
 
     axum::serve(listener, app)

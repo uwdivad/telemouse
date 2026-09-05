@@ -25,9 +25,9 @@ enabled = true
 addr = "127.0.0.1:7878"
 
 [kafka]
-# Off by default so capture works with no broker running. UDP + local
-# recording always work; Kafka failures never stall capture either way.
-enabled = false
+# Local broker: `docker compose up -d` (see compose.yaml). UDP + local recording
+# always work; if the broker is down capture warns and runs without Kafka.
+enabled = true
 brokers = ["127.0.0.1:9092"]
 
 [recording]
@@ -35,7 +35,13 @@ enabled = true
 dir = "recordings"
 
 [viz]
-http_addr = "127.0.0.1:7879"
+# 0.0.0.0 = every interface, so an OBS browser source on another PC on the
+# LAN can load http://<this PC's IP>:7879/obs (see the [viz.obs] note below).
+# There is no login: anyone who can reach the port can watch the live stream
+# and download the recordings, so keep it to a trusted network (Windows
+# Firewall: allow TCP 7879 inbound on the Private profile only). Set it back
+# to "127.0.0.1:7879" to keep the viz to this machine.
+http_addr = "0.0.0.0:7879"
 
 # Control panel (telemouse-ctl): start/stop the components above, run the
 # tools, see and kill telemouse processes. It can terminate processes, so
@@ -50,7 +56,10 @@ stop_grace_secs = 5
 # Explorer) and one <component>.log per launched component go here.
 log_dir = "logs"
 
-# OBS browser source: add http://127.0.0.1:7879/obs as a Browser source.
+# OBS browser source: add http://127.0.0.1:7879/obs as a Browser source. From
+# OBS on another PC use this machine's LAN IP instead (`ipconfig` → IPv4
+# Address, e.g. http://192.168.1.168:7879/obs); it has to be the IP literal,
+# a hostname like http://GAMING-PC:7879 is refused (DNS-rebinding guard).
 # These are the defaults; any of them can be overridden per source with URL
 # query parameters, e.g. /obs?layout=aim&hud=speed,aim&scale=1.5&bg=0e131c80
 [viz.obs]

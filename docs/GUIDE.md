@@ -3,7 +3,8 @@
 This document explains the whole repository as if you had never seen it: what
 the program is for, how the pieces fit, what every crate does internally,
 where the important numbers come from, and how to build, run, test, and
-extend it. It is written from a full read of the code as of 2026-08-26 and
+extend it. It is written from a full read of the code as of 2026-09-04
+(v0.1.0 plus the unreleased changes listed at the top of `CHANGELOG.md`) and
 cites `file:line` so you can jump straight to the source.
 
 If you only read one section, read **§2 (the 10-minute mental model)**.
@@ -70,13 +71,15 @@ TimescaleDB/Parquet.
 
 ## 2. The 10-minute mental model
 
-There are four crates in one Cargo workspace:
+There are five crates in one Cargo workspace — four binaries over one shared
+library:
 
 ```
                     ┌─────────────────────────────────────────────┐
                     │  crates/core  (library: telemouse-core)     │
                     │  RawEvent, Batch, SessionConfig, Marker,    │
-                    │  Envelope (wire), QpcAnchor, units, config  │
+                    │  Envelope (wire), QpcAnchor, units, config, │
+                    │  localhost (Host/Origin guard)              │
                     └────────┬──────────────┬───────────────┬─────┘
                              │              │               │
         ┌────────────────────▼───┐   ┌──────▼─────────┐  ┌──▼────────────────────┐
@@ -90,7 +93,12 @@ There are four crates in one Cargo workspace:
                 └───────────────────────────┘                        │
                 │ recordings/<session>.jsonl ─────────────────────────┘
                 │                              (also served by viz for replay)
-                └─▶ Kafka (optional)
+                └─▶ Kafka (optional; compose.yaml runs a local broker)
+
+        ┌────────────────────────────────────────────────────────────────────┐
+        │ crates/ctl  bin: telemouse-ctl — control panel on 127.0.0.1:7880   │
+        │ starts/stops the three binaries above, tray icon + status window   │
+        └────────────────────────────────────────────────────────────────────┘
 ```
 
 The data model has exactly **three record types**, and every transport (UDP
@@ -99,17 +107,19 @@ datagram, JSONL line, Kafka message) carries one JSON-encoded record per unit:
 | Record | When | Contains |
 |---|---|---|
 | `session` | once, at start | session id, QPC frequency, QPC↔UTC anchor, mouse CPI, per-game sens table, monitors, device list |
-| `batch` | every ~25 ms while the mouse moves | up to 448 `RawEvent`s (`ts_qpc, dx, dy, buttons, wheel, wheel_h, device_ix`) plus context (game, pointer-locked, cursor, drop counters, seq_no) |
+| `batch` | every ~50 ms while the mouse moves (`batch.window_ms`) | up to 448 `RawEvent`s (`ts_qpc, dx, dy, buttons, wheel, wheel_h, device_ix`) plus context (game, pointer-locked, cursor, drop counters, seq_no) |
 | `marker` | on F9 / config change / clock drift | a labelled timestamp |
 
 The capture agent runs **three threads**:
 
-- **T1 (hot path)** owns the hidden window. When Windows says "input is
-  available", T1 waits a tiny coalescing window (2 ms by default), drains every
-  pending report in one syscall, stamps them with `QueryPerformanceCounter`,
-  and pushes fixed-size structs into a lock-free single-producer/single-consumer
-  ring buffer. It never allocates, never blocks, never touches the network. If
-  the ring is full it drops and counts.
+- **T1 (hot path)** owns the hidden window. While the mouse is still it
+  blocks on the input queue; the first report of a burst wakes it, and from
+  then on a high-resolution timer paces one drain every
+  `batch.coalesce_ms + 1` ms (9 ms by default) until a drain comes back empty.
+  Each drain reads every pending report in one syscall, stamps them with
+  `QueryPerformanceCounter`, and pushes fixed-size structs into a lock-free
+  single-producer/single-consumer ring buffer. It never allocates, never
+  blocks, never touches the network. If the ring is full it drops and counts.
 - **T2 (shipper)** drains the ring, groups events into 50 ms batches (`batch.window_ms`), serializes
   each batch to JSON *once*, and hands the bytes to every enabled sink (UDP,
   JSONL, Kafka).
@@ -137,36 +147,51 @@ That is the whole system. Everything below is detail.
 telemouse/
 ├── Cargo.toml                 workspace: 5 members, shared deps, release/profiling profiles
 ├── telemouse.toml             the one config file (every binary reads it)
+├── compose.yaml               local single-node Kafka broker (docker compose up -d)
+├── CHANGELOG.md               release notes; the release workflow publishes the matching section
 ├── README.md                  user-facing overview
 ├── mouse-telemetry-plan.md    the original design/plan document
+├── .github/workflows/
+│   ├── ci.yml                 fmt --check, clippy -D warnings, tests on windows-latest, every push
+│   └── release.yml            on a vX.Y.Z tag: build, test, zip the binaries, GitHub Release
 ├── docs/
 │   ├── CONVENTIONS.md         workspace rules (edition 2024, tracing, no panics on degraded env…)
-│   ├── AUDIT-2026-08.md       Aug-2026 perf/observability audit: what was found and fixed
+│   ├── AUDIT-2026-08.md       Aug-2026 perf/observability audit and every pass since, with leftovers
+│   ├── BENCHMARKS.md          criterion numbers, the live-stack CPU table, what is left on the table
+│   ├── HANDOFF-2026-09-03-kafka.md  standing up the Kafka broker on another machine
 │   └── GUIDE.md               this file
 ├── recordings/                per-session JSONL files; demo-session.jsonl is bundled
+├── tools/cpubench/            `tmbench` (not a workspace member) + bench.ps1: cycle-exact CPU harness
 └── crates/
-    ├── core/      src/{lib,event,batch,batcher,wire,clock,units,session,config}.rs
+    ├── core/      src/{lib,event,batch,batcher,wire,clock,units,session,config,localhost}.rs
+    │              benches/wire.rs
     ├── capture/   src/{main,raw_input,shipping,context_thread,context,session_setup,
     │                   stats,platform,devices,pointer_lock,shutdown,sinks}.rs
     │              src/sinks/{udp,jsonl,kafka}.rs
     ├── viz/       src/{main,udp,hub,server,recordings,stats}.rs + src/index.html
-    ├── ctl/       src/{main,procs,manager,server}.rs + src/index.html
+    ├── ctl/       src/{main,procs,manager,server}.rs + src/gui/{mod,feed,model,win}.rs
+    │              + src/index.html
     └── analyze/   src/{lib,main,load,series,savgol,kinematics,flicks,micro,clicks,
                         quality,lifts,markers,per_second,per_minute,stats,timefmt,
                         trend,report,testutil}.rs
                    tests/report_pipeline.rs   benches/hot_math.rs
 ```
 
-Sizes, roughly: core ~1.1k lines, capture ~4k, viz ~1.9k Rust + ~2.4k HTML/JS,
-analyze ~7k. `.idea/` and `.playwright-mcp/` are IDE / browser-automation
-leftovers and not part of the build.
+Sizes, roughly: core ~2k lines, capture ~5.6k, viz ~2.3k Rust + ~2.5k HTML/JS,
+ctl ~4.4k Rust + ~0.3k HTML, analyze ~8.9k. `.idea/`, `.playwright-mcp/`,
+`logs/` and `target-bench*/` are git-ignored IDE, browser-automation, panel-log
+and benchmark leftovers, not part of the build.
 
 Workspace-level facts (`Cargo.toml`):
 
 - Edition **2024**, resolver 3.
+- `[workspace.package] version` is the release version; `release.yml` refuses
+  a `vX.Y.Z` tag that does not match it.
 - Shared deps: `serde`, `serde_json`, `thiserror`, `anyhow`, `toml 0.9`,
   `tracing`, `tracing-subscriber` (env-filter), `clap 4` (derive).
-- `[profile.release]`: thin LTO, `codegen-units = 1`.
+- `[profile.release]`: thin LTO, `codegen-units = 1` (fat LTO / `panic=abort`
+  were measured net-negative for this syscall-bound workload, and ordered
+  teardown relies on unwinding).
 - `[profile.profiling]`: release + debug symbols, for flamegraphs
   (`cargo build --profile profiling`).
 
@@ -179,6 +204,9 @@ Requirements: recent stable Rust; Windows for actual capture. Everything
 `#[cfg(windows)]`, and `doctor`, the viz, and the analyzer are portable).
 
 ```powershell
+# optional: the local Kafka broker (compose.yaml). Capture runs fine without it.
+docker compose up -d
+
 # sanity-check the machine: QPC, monitors, devices, UDP bind, Kafka reachability
 cargo run -p telemouse-capture -- doctor
 
@@ -193,13 +221,27 @@ cargo run -p telemouse-analyze -- list
 cargo run -p telemouse-analyze -- report recordings\demo-session.jsonl
 cargo run -p telemouse-analyze -- trend --dir recordings
 
+# or drive capture / viz / the tools from one page + tray icon (§19)
+cargo build --release --workspace
+target\release\telemouse-ctl.exe    # http://127.0.0.1:7880
+
 # tests / benches
-cargo test --workspace              # ~318 tests, no mouse/admin/Kafka/browser needed
-cargo bench -p telemouse-analyze    # criterion over the hot math
+cargo test --workspace              # 407 tests, no mouse/admin/Kafka/browser needed (ctl's child-process tests take minutes)
+cargo bench -p telemouse-analyze    # criterion over the loader + hot math
+cargo bench -p telemouse-core       # wire encode/decode, batcher
 ```
 
 Logging everywhere is `tracing` with `RUST_LOG` (default `info`), e.g.
 `$env:RUST_LOG="debug"; cargo run -p telemouse-capture -- run`.
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` and the tests on
+`windows-latest` for every push, so the tree must stay rustfmt-clean at
+default settings. A release is a tag: bump `version` in the root `Cargo.toml`,
+add a `## [X.Y.Z]` section to `CHANGELOG.md`, commit, tag `vX.Y.Z`, push the
+tag; `release.yml` builds and tests in release mode and publishes a GitHub
+Release (`telemouse-vX.Y.Z-windows-x86_64.zip` + SHA-256) whose notes are that
+changelog section.
 
 A good first hands-on exercise: run `telemouse-viz`, open the page, pick
 `demo-session` in the replay dropdown, and scrub. Then run
@@ -243,7 +285,7 @@ down", not "left is held".
 
 ### 5.2 `batch.rs` — `Batch`
 
-The envelope T2 assembles every ~25 ms:
+The envelope T2 assembles every ~50 ms (`batch.window_ms`):
 
 | field | meaning |
 |---|---|
@@ -257,6 +299,12 @@ The envelope T2 assembles every ~25 ms:
 | `drops_since_last` | ring-buffer drops since previous batch (should be 0) |
 | `abs_frames_since_last` | absolute-motion `WM_INPUT` frames discarded (RDP, tablets, virtual devices) |
 | `events` | `Vec<RawEvent>`, ≤ `MAX_EVENTS_PER_BATCH` |
+
+`BatchView<'a>` is a serialize-only borrowing mirror of `Batch` (same field
+order, same `skip_serializing_if`s, byte-identical JSON — a parity test
+enforces it) so T2 can encode a batch straight out of the batcher's `Vec` and
+the context snapshot without cloning; `Batch::as_view()` builds one. The
+deserialize side stays on the owned `Batch`.
 
 ### 5.3 `batcher.rs` — `Batcher`
 
@@ -276,12 +324,15 @@ pub enum Envelope { Session(SessionConfig), Batch(Batch), Marker(Marker) }
 One JSON `Envelope` per UDP datagram / JSONL line / Kafka message. `topic()`
 maps to `mouse.sessions` / `mouse.events` / `mouse.markers`; `key()` is always
 the session id so a session lands in one Kafka partition (ordering).
+`EnvelopeView<'a>` is the borrowing twin for the hot path — only a `Batch`
+variant exists, wrapping a `BatchView`, because session and marker envelopes
+are rare enough to serialize from the owned type.
 
 Two constants matter: `MAX_UDP_PAYLOAD = 60_000` bytes and
 `MAX_EVENTS_PER_BATCH = 448`. The test `full_batch_fits_in_udp_datagram`
 serializes a worst-case batch (every field at its widest value) and asserts it
-fits; this is why the cap is 448 and not a round number. At 25 ms windows the
-cap only binds above ~17 kHz polling.
+fits; this is why the cap is 448 and not a round number. At the default 50 ms
+window the cap only binds above ~9 kHz polling (~17 kHz at 25 ms).
 
 ### 5.5 `clock.rs` — `QpcAnchor`
 
@@ -337,30 +388,46 @@ audit:
   metrics or destabilize the pipeline: non-positive CPI/sens/coeffs,
   `window_ms == 0`, `max_events` outside `1..=448`, `ring_capacity <
   max_events`, `coalesce_ms > MAX_COALESCE_MS (10)`, Kafka enabled with no
-  brokers, and every `[viz.obs]` field against its allowed vocabulary
+  brokers, `ctl.stop_grace_secs > MAX_STOP_GRACE_SECS (60)`, and every
+  `[viz.obs]` field against its allowed vocabulary
   (`OBS_LAYOUTS`, `OBS_HUD_ITEMS`, `OBS_HUD_POSITIONS`, ranges for scale /
   trail / buffer).
 
 `load_or_default(path)` returns defaults if the file is absent, so every
 binary runs with zero configuration.
 
+### 5.9 `localhost.rs` — the local-server trust rule
+
+Shared by viz and ctl so both apply the same rule. `host_is_trusted(host)`
+accepts a `Host` header (with or without port) only when it is an IP literal,
+`localhost`, or `*.localhost` — a name an attacker's DNS could point at this
+machine is refused, which is the DNS-rebinding guard behind every `403 host
+not allowed`. `origin_is_trusted(origin)` applies the same rule to an `Origin`
+URL (viz uses it on `/ws`). `browse_addr` / `browse_addr_str` turn a wildcard
+bind (`0.0.0.0` / `[::]`) into the loopback of the same family for anything
+that prints or links a URL, since browsers refuse `http://0.0.0.0/`; every
+other address, and anything unparseable, is returned unchanged.
+
 ---
 
 ## 6. `crates/capture` — the capture agent (`telemouse`)
 
-### 6.1 CLI (`main.rs:33-74`)
+### 6.1 CLI (`main.rs:33-84`)
 
 - `telemouse run [--config telemouse.toml] [--print] [--no-kafka] [--no-udp]
-  [--no-record] [--duration-secs N]`
+  [--no-record | --record] [--duration-secs N]`
   `--print` logs one line per batch; the `--no-*` flags force the
-  corresponding `enabled` false; `--duration-secs` auto-stops (smoke tests).
+  corresponding `enabled` false and `--record` forces `recording.enabled`
+  true (the two recording flags conflict; the control panel's save-data
+  switch is implemented with them); `--duration-secs` auto-stops (smoke
+  tests).
 - `telemouse doctor [--config …]` prints what the agent sees: OS, config
   loaded?, QPC frequency and resolution, monitors + refresh, cursor, foreground
   process, enumerated mice (numbered from 1; 0 is "unknown"), UDP bind test,
   recording dir writable?, TCP probe of each Kafka broker (500 ms), then the
   resolved config as TOML. Works on non-Windows.
 
-### 6.2 Startup, step by step (`cmd_run`, `main.rs:122-386`)
+### 6.2 Startup, step by step (`cmd_run`, `main.rs:172-452`)
 
 1. Load `file_cfg` from disk and `cfg` = file_cfg + CLI overrides. Both are
    kept: T3 diffs later reloads against the *file* version.
@@ -374,7 +441,7 @@ binary runs with zero configuration.
 5. Build `SessionConfig`.
 6. Create `Arc<Stats>` and the sinks in order **UDP, JSONL, Kafka**. Any
    constructor failure is a `warn!` and that sink is skipped — never a crash
-   (`main.rs:189-223`).
+   (`main.rs:240-270`).
 7. Create the `rtrb::RingBuffer<RawEvent>` (`ring_capacity` slots, default
    65 536), the `mpsc` marker channel, the `SharedContext`, and the
    coordination objects: `Shutdown` (flag + condvar), `capture_stopped`,
@@ -385,21 +452,26 @@ binary runs with zero configuration.
    immediately instead of leaving a zombie agent.
 10. Spawn **T3** `"telemouse-context"`, then **T2** `"telemouse-shipping"`.
 11. Main sleeps on the shutdown condvar (with the `--duration-secs` deadline
-    if given), waking on Ctrl-C, deadline, or `capture_alive == false` (logged
-    as an error).
+    if given), waking on Ctrl-C / Ctrl-Break (the `ctrlc` crate treats both
+    the same, which is what the control panel's graceful stop relies on),
+    deadline, `capture_alive == false`, or `shipping_alive == false` — a dead
+    T1 or T2 is logged as an error and shuts the agent down rather than
+    leaving a zombie.
 
-**Teardown** (`main.rs:339-362`) is ordered so nothing hangs: `shutdown.set()`
+**Teardown** (`main.rs:397-450`) is ordered so nothing hangs: `shutdown.set()`
 → post `WM_TELEMOUSE_QUIT` to T1's window (fallback: `PostThreadMessageW`
 `WM_QUIT`; last resort: detach T1 rather than join forever) → join T1 → set
 `capture_stopped`, wake T2 → join T2 (which flushes the partial batch) → join
-T3 → log the final `StatsSnapshot` including latency percentiles.
+T3 → log the final `session finished` line including latency percentiles.
+Joins go through `join_loudly`: a worker that panicked is reported and the
+process exits with an error instead of pretending the run was clean.
 
 ### 6.3 T1 — `raw_input.rs`
 
 This is the only genuinely hard code in the repo, and the audit spent most of
 its effort here.
 
-**Setup** (`win::run`, `raw_input.rs:535-669`): publish the thread id; raise
+**Setup** (`win::run`, `raw_input.rs:647-760`): publish the thread id; raise
 priority to `ABOVE_NORMAL`; `RegisterClassW` a window class
 `"TelemouseRawInputClass"` with `wndproc`; `CreateWindowExW` with parent
 `HWND_MESSAGE` (a *message-only* window: no screen presence at all);
@@ -409,8 +481,11 @@ All per-thread state (`CaptureState`: the ring producer, stats, marker
 sender, waker, context, device table, running totals) lives on the thread's
 stack with a pointer in `GWLP_USERDATA`.
 
-**The pump** (`'pump` in `raw_input.rs`) — the key idea from the two CPU
-passes:
+**The pump** (`'pump`, `raw_input.rs:759-860`) — the key idea from the two
+CPU passes. The cadence timer is a `CreateWaitableTimerExW` with
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (falling back to a plain waitable
+timer, then to `thread::sleep`, which overshoots by ~0.5–0.8 ms); no
+`timeBeginPeriod` anywhere:
 
 ```
 live = false
@@ -464,7 +539,7 @@ drains; a pause shorter than the window inside a burst is smoothed over). The
 session record stores `coalesce_ms` so the analyzer knows the precision. Set
 `coalesce_ms = 0` for one read per report and exact stamps.
 
-**Per report** (`process_mouse`, `raw_input.rs:480-527`): resolve `hDevice`
+**Per report** (`process_mouse`, `raw_input.rs:551-600`): resolve `hDevice`
 → `device_ix` (`devices::index_for`, resolves each handle's name exactly
 once); `decode_mouse` (rejects `MOUSE_MOVE_ABSOLUTE` frames → counted as
 `abs_frames`; reads `usButtonData` as a signed wheel into `wheel` or `wheel_h`
@@ -475,7 +550,7 @@ thread-local running total**, not atomic RMWs, and `T1Counters` is
 `#[repr(align(64))]` so nothing T2/T3 writes shares T1's cache line
 (`t1_counters_own_their_cache_line`).
 
-**`RingWaker`** (`raw_input.rs:114-120`): a `parked: AtomicBool` plus the T2
+**`RingWaker`** (`raw_input.rs:106-150`): a `parked: AtomicBool` plus the T2
 `Thread` handle. `wake()` is one relaxed load and only calls `unpark` if T2
 actually armed the flag — so the per-report cost is a load, not a syscall.
 
@@ -496,7 +571,7 @@ carries "since last"). `build_batch` maps the first event's QPC to
 `ts_anchor_us`, copies the context snapshot (game / locked / screen), and uses
 `ctx.batch_cursor()` (cursor omitted while locked).
 
-The loop (`run`, `shipping.rs:279-429`):
+The loop (`run`, `shipping.rs:343-510`):
 
 1. First thing, deliver `Envelope::Session` so the recording's first line is
    always the session record.
@@ -512,7 +587,8 @@ The loop (`run`, `shipping.rs:279-429`):
    expires. This is the second half of the CPU win: T2 wakes once per batch,
    not once per report (ring high-water ~45 instead of 1).
 
-`flush` reads the context `Arc` once per batch (~40×/s), records latency
+`flush` (`shipping.rs:512`) reads the context `Arc` once per batch (~20×/s at
+the default window), records latency
 (`capture_to_ship` from the first event, `ship_tail` from the last),
 optionally prints, then `encode_and_deliver`: **serialize once** into a reused
 64 KiB buffer (`EnvelopeEncoder`) and `fan_out` the same `&str` to every sink.
@@ -614,9 +690,16 @@ continues.
 `telemouse-viz [serve] [--config] [--udp ADDR] [--http ADDR] [--recordings DIR]`.
 Runtime: tokio multi-thread pinned to **2 workers** (one socket, one listener,
 a few WebSockets; a single-thread runtime measured no better). Startup
-(`main.rs:93-149`): load config (defaults on error), build `Arc<Hub>`, spawn
-`udp::listen` (bind failure = warn, "live mode stays idle"), spawn
-`stats_reporter` (1 Hz), build the axum router, serve.
+(`serve`, `main.rs:98-173`): load config (defaults on error), warn once if
+the HTTP bind is not loopback (there is no authentication on the page, the
+stream or the recordings), build `Arc<Hub>`, spawn `udp::listen` (bind
+failure = warn, "live mode stays idle"), spawn `stats_reporter` (1 Hz), build
+the axum router, serve. The listener is wrapped in `NoDelayListener`, which
+sets `TCP_NODELAY` on every accepted connection — axum 0.8 dropped the option
+and one small WebSocket frame every batch window is the worst case for Nagle
+plus delayed ACK. The startup line prints the dashboard and `/obs` URLs
+through `localhost::browse_addr`, so a `0.0.0.0` bind is shown as
+`127.0.0.1` with a hint that other PCs use this machine's IP.
 
 **`udp.rs`** — `recv_from` into a buffer of `MAX_UDP_PAYLOAD + 8 KiB`, hand
 bytes to `hub.publish`. Rejections are logged with a sanitized 96-byte
@@ -667,7 +750,7 @@ Single file, no CDN (a test asserts no external references). Roughly:
 `engine.draw()`. Live: `ws.onmessage → JSON.parse → ingest`. Replay:
 `/api/session/{id}` streamed, split into lines, parsed → the same `ingest`.
 
-**Ingest** (`engine.ingest`, `index.html:853-957`) appends into
+**Ingest** (`engine.ingest`, `index.html:909-1060`) appends into
 `EventColumns`, a struct-of-arrays timeline (`t: Float64Array`, `dx/dy/b/w/wh/mi:
 Int32Array`, doubling growth, `dropFront` via `copyWithin`). Each batch pushes
 one shared `meta` (`game, locked, sens, cx, cy, sw, sh`) and events index it.
@@ -677,10 +760,11 @@ lastSeq − 1`) are accumulated, with red notches on the scrub track and a
 one-time toast. A `session` envelope with a *different* id calls
 `engine.reset()` first — a capture-agent restart must not mix timelines.
 
-**Integrator** (`applyIdx`, `:1188-1268`) is the unit conversion: desk
+**Integrator** (`applyIdx`, `:1261-1345`) is the unit conversion: desk
 `dx / cpi × 2.54` cm; aim `dx × sens × yaw_coeff`, `dy × sens × pitch_coeff`,
-pitch clamped to ±89°, yaw accumulated raw and displayed through `wrapYaw` with
-a polyline break on the ±180° jump. `sensFor(game)` uses the session's `games`
+pitch clamped to ±89°, yaw accumulated raw and drawn unwrapped so the head
+glides across the ±180° seam (a dashed line at every odd multiple of 180°, with
+the origin axis repeated every 360°) instead of teleporting to the far edge. `sensFor(game)` uses the session's `games`
 table or a flagged fallback (`sens 1.0, 0.022`; the CPI/sens tile shows `*`).
 Velocity colouring uses a decaying peak reference (8 s half-life).
 
@@ -715,7 +799,13 @@ FPS, ring drops, lost batches, abs frames, bridge (datagrams/s + p50 from
 
 **Controls**: play/pause, prev/next marker, session select, speed 0.25×–8×,
 scrub with amber marker notches; keys `R` recenter, `Space` pause,
-`←/→` ±1 s (`Shift` ±10 s) in replay. **Go to time**: a `datetime-local`
+`←/→` ±1 s (`Shift` ±10 s) in replay, `V` cycles the view. **View switch**:
+the Both / Desk / Aim segment in the top bar (`setView`) shows one panel or
+both and mirrors the choice into `?view=` so a bookmark keeps it; `/obs`
+accepts `view=` as an alias of `layout=`. **Draw-rate cap** (`MAX_FPS`,
+`?fps=`, 5–400): the dashboard repaints at most 120×/s, 60 in OBS mode, and
+`FPS_BACKGROUND` (30) while the window is not focused; `engine.tick` still
+runs every rAF so the data stays exact. **Go to time**: a `datetime-local`
 picker (local time) → `ui.gotoUtcUs`, which picks the recording whose
 `[started_utc_us, ended_utc_us]` contains the moment (else the newest one
 that started before it, with a toast saying how far off it landed), loads it
@@ -731,6 +821,16 @@ buffer, grid, legend, labels`); chrome hidden, HUD replaces the stats bar,
 toasts suppressed, no localStorage. **Hidden tabs**: rAF stops but the socket
 doesn't, so `ingest` enforces the hard cap and a `setInterval(trim, 250)`
 keeps memory bounded; on return the play head snaps forward.
+
+**OBS on another PC**: bind the viz to the LAN (`[viz] http_addr =
+"0.0.0.0:7879"` or `--http 0.0.0.0:7879`; `serve` warns once that the stream
+and the recordings are now reachable without authentication), allow TCP 7879
+inbound on the Private firewall profile, and point the streaming PC's Browser
+source at `http://<gaming PC's IPv4>:7879/obs`. The page builds its WebSocket
+URL from `location.host`, so nothing else changes. The `Host`/`Origin` guards
+in `telemouse_core::localhost` accept IP literals, which is why the URL must be
+an IP and not a machine name (a name would be refused as a possible DNS
+rebind). UDP capture → viz stays on loopback; only the HTTP/WS side opens up.
 
 ### 7.3 Datagram → pixel
 
@@ -942,7 +1042,7 @@ enabled = true
 addr = "127.0.0.1:7878"       # capture → viz
 
 [kafka]
-enabled = false               # off by default; capture never depends on it
+enabled = true                # local broker via compose.yaml; capture never depends on it
 brokers = ["127.0.0.1:9092"]
 
 [recording]
@@ -950,7 +1050,7 @@ enabled = true
 dir = "recordings"
 
 [viz]
-http_addr = "127.0.0.1:7879"
+http_addr = "127.0.0.1:7879"  # 0.0.0.0:7879 to serve the OBS overlay to another PC on the LAN (no auth: trusted networks only)
 
 [ctl]
 http_addr = "127.0.0.1:7880"  # control panel; loopback — it can kill processes
@@ -1069,7 +1169,8 @@ analyzer picks the **dominant game** for the whole session (and warns if it
 holds <80% of events). A missing profile falls back to 0.022 and is flagged
 (`aim_profile_missing`, `*` in the viz tile, `FALLBACK` in the report).
 
-Yaw accumulates without bound; display wraps to (−180°, 180°]. Pitch is
+Yaw accumulates without bound and the viz draws it unwrapped, marking each
+±180° seam with a dashed line; `analyze` wraps to (−180°, 180°]. Pitch is
 clamped at ±89° in the viz. `--locked-only` restricts degree metrics to
 pointer-locked spans so desktop mousing doesn't count as "aim".
 
@@ -1154,7 +1255,7 @@ those rates; `docs/BENCHMARKS.md` has the table to pick other points from.
 | Sparse run-based grid, by-value `prepare`, fused derivatives | analyze | 562 → 358 MB on the bench fixture; −192 MB clone |
 | Two-pointer flick/click matching, reverse tables for click-to-still | analyze | both quadratics gone |
 | 20:1 decimated Welch/Goertzel | analyze | ~40× less spectral work, ground truth unchanged |
-| `thread::sleep` for coalescing, **no** `timeBeginPeriod` | T1 | Windows 10 1803+ uses high-res timers already; verified in std source |
+| High-resolution waitable timer for the cadence (`thread::sleep` only as a fallback), **no** `timeBeginPeriod` | T1 | `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` fires on time; std's sleep overshoots by ~0.5–0.8 ms and a global timer-period change would tax every process |
 
 Things measured and *left alone*: the viz bridge's ~0.45% (it's recv/send
 syscalls), a binary wire schema (the JSON seam is intact and skip-zero-fields
@@ -1165,13 +1266,16 @@ no data yet justifies it).
 
 ## 15. Testing philosophy
 
-`cargo test --workspace` runs ~318 tests with no mouse, admin rights, Kafka,
-or browser. The rule (CONVENTIONS.md) is that every crate's *pure logic* is
-unit-tested and Win32/network side effects sit behind thin traits or
-`#[cfg(windows)]` modules exercised manually.
+`cargo test --workspace` runs 407 tests (core 51, capture 107, viz 62, ctl 51,
+analyze 132 + 4 integration) with no mouse, admin rights, Kafka, or browser;
+CI runs the same on `windows-latest`. The rule (CONVENTIONS.md) is that every
+crate's *pure logic* is unit-tested and Win32/network side effects sit behind
+thin traits or `#[cfg(windows)]` modules exercised manually.
 
 - **core**: JSON round-trips, backward-compat of old files, the datagram
-  budget test, config rejection tables.
+  budget test, `BatchView`/`EnvelopeView` byte-parity with the owned types,
+  config rejection tables (including `[ctl]`), and the `localhost` rule
+  (trusted hosts/origins, wildcard binds browse as loopback).
 - **capture**: `DrainStamper` against a synthetic 10 MHz clock at 1 and 8 kHz;
   `ShipperCore` end-to-end with `mock::RecordingSink` / `FailingSink` (batch
   boundaries, drop attribution, marker sequencing); sandwich anchor math;
@@ -1180,8 +1284,11 @@ unit-tested and Win32/network side effects sit behind thin traits or
   single `windows_reports_a_primary_screen_and_at_least_one_monitor`.
 - **viz**: tag-probe acceptance/rejection cases, late-joiner session cache,
   lagging subscribers, config injection can't escape `<script>`, page is
-  self-contained, path-traversal rejection, latency percentile behaviour,
+  self-contained, path-traversal rejection, rebound `Host` names refused on
+  every route and foreign `Origin`s on `/ws`, `/api/session/{id}` streams
+  with a length, recording time-range probing, latency percentile behaviour,
   the bundled demo recording is a valid envelope stream. No JS tests.
+- **ctl**: see §19.4.
 - **analyze**: **ground-truth synthetic streams** via `testutil::StreamBuilder`
   (`move_ms`, `tremor_ms(drift, amp, hz)`, `lift(...)`, `button(bits)`,
   `push_at_us` for out-of-order) — e.g. a 1500-count pull with a 100-count
@@ -1246,8 +1353,17 @@ Observed during this read; none are correctness bugs in normal use.
   backlog (by design, but worth knowing when a client connects mid-session).
 - The plan's TimescaleDB/Parquet storage and aim/desk-space heatmaps are not
   implemented; `trend`/`--json-dir` are the intended substrate.
-- Working tree currently has uncommitted modifications across all crates
-  (see `git status`); the single commit `28b0371` is the baseline.
+- The local servers have no authentication: the `Host`/`Origin` rule (§5.9)
+  and the loopback default are the whole model. Binding the viz to
+  `0.0.0.0` for a LAN OBS source exposes the live stream and every recording
+  to that network.
+- In-game hitching traced to the dashboard tab's GPU load and the panel's
+  process scan, not to capture (§14); an input drop-out while dragging the
+  OBS window is still unexplained.
+- The performance leftovers ranked by value are in `docs/BENCHMARKS.md`
+  ("What is left on the table" / "What is left on the live path") and the
+  end of `docs/AUDIT-2026-08.md`; `CHANGELOG.md` `[Unreleased]` lists what
+  is in the tree but not yet in a release.
 
 ---
 
@@ -1301,7 +1417,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, and the message loop. See §19.5. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` keeps a `sysinfo::System` between scans so CPU % is per interval, refreshes only cpu/memory/cmd/exe (no per-process user lookup — that cost seconds), and serves `scan_cached(ttl)` from a 4 s cache because a full table walk was ~5% of a core when polled every poll; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
-| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config. |
+| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, and `stop_grace_secs`). |
 | `index.html` | Self-contained page: polls `/api/state` + `/api/sessions` every 2 s (10 s while the tab is hidden), re-renders only when something structural changed and patches the live numbers otherwise, two-click kill (no modal dialogs). |
 
 ### 19.2 The API

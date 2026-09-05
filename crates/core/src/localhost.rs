@@ -21,7 +21,34 @@
 //! `localhost` and `*.localhost` (RFC 6761, always loopback in browsers) are
 //! accepted as names.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// The address a browser on *this* machine should use to reach a server bound
+/// to `bind`. A wildcard bind (`0.0.0.0` / `[::]`, used to expose the viz to
+/// a LAN for an OBS source on another PC) is not a destination: browsers
+/// refuse `http://0.0.0.0/`, so it becomes the loopback of the same family.
+/// Every other address (loopback, a specific interface) is returned as is.
+pub fn browse_addr(bind: SocketAddr) -> SocketAddr {
+    match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), bind.port())
+        }
+        _ => bind,
+    }
+}
+
+/// [`browse_addr`] for a config string. Anything that does not parse as a
+/// socket address is handed back unchanged, so a bad value still shows up
+/// verbatim wherever it is displayed.
+pub fn browse_addr_str(bind: &str) -> String {
+    match bind.trim().parse::<SocketAddr>() {
+        Ok(addr) => browse_addr(addr).to_string(),
+        Err(_) => bind.to_string(),
+    }
+}
 
 /// Whether a `Host` header value (`host` or `host:port`) names this machine
 /// in a way an attacker's DNS name cannot: an IP literal, `localhost`, or a
@@ -114,6 +141,17 @@ mod tests {
         ] {
             assert!(!host_is_trusted(h), "{h}");
         }
+    }
+
+    #[test]
+    fn wildcard_binds_browse_as_loopback() {
+        assert_eq!(browse_addr_str("0.0.0.0:7879"), "127.0.0.1:7879");
+        assert_eq!(browse_addr_str("[::]:7879"), "[::1]:7879");
+        assert_eq!(browse_addr_str("127.0.0.1:7879"), "127.0.0.1:7879");
+        assert_eq!(browse_addr_str("192.168.1.20:7879"), "192.168.1.20:7879");
+        assert_eq!(browse_addr_str("[::1]:7879"), "[::1]:7879");
+        // Unparseable input is displayed as written, never silently rewritten.
+        assert_eq!(browse_addr_str("not an address"), "not an address");
     }
 
     #[test]

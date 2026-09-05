@@ -47,8 +47,10 @@ cargo build --release --workspace
 target\release\telemouse-ctl.exe
 ```
 
-Everything works with zero external services: UDP live-viz and JSONL recording
-are always on; Kafka is optional and off by default. A bundled demo recording
+UDP live-viz and JSONL recording are always on and need no external services.
+Kafka is on in the repo config and expects the local broker from `compose.yaml`
+(`docker compose up -d`); if it is not running, capture logs a warning and
+carries on without it. A bundled demo recording
 (`recordings/demo-session.jsonl`) lets you try replay and analysis immediately.
 
 ## Configuration
@@ -66,7 +68,7 @@ coalesce_ms = 8               # raw-input drain cadence (0–10); 0 = exact per-
 addr = "127.0.0.1:7878"       # capture → viz live path
 
 [kafka]
-enabled = false               # durable log; capture degrades gracefully without it
+enabled = true                # durable log; capture degrades gracefully without it
 brokers = ["127.0.0.1:9092"]
 
 [recording]
@@ -131,8 +133,8 @@ pointer-lock heuristic, cursor, screen                                       mou
 
 - **Desk-space panel** — your hand's path in real cm, velocity-colored trail
   with time decay.
-- **Aim-space panel** — crosshair path in degrees (yaw wrapped at ±180°,
-  pitch clamped), using the sens profile of whatever game is foreground.
+- **Aim-space panel** — crosshair path in degrees (yaw unbounded, with dashed
+  seams at every ±180°; pitch clamped), using the sens profile of whatever game is foreground.
 - Click rings per button (an expanding flash on press, plus a steady ring on
   the head for as long as the button is held), wheel ticks, marker toasts, live readouts (cm/s,
   °/s, session distance, clicks/min, events/s, ring drops).
@@ -166,6 +168,55 @@ transparent, which the page does anyway). Size it however you like; the
 panels fill the source. Tick *Refresh browser when scene becomes active* if
 you toggle the scene a lot — the page reconnects to the bridge on its own
 either way.
+
+### OBS on a different computer
+
+The overlay is just a web page, so a streaming PC on the same LAN can load it
+from the gaming PC. Three things on the gaming PC (the one running capture and
+`telemouse-viz`):
+
+1. Bind the viz to every interface instead of loopback, in `telemouse.toml`:
+
+   ```toml
+   [viz]
+   http_addr = "0.0.0.0:7879"
+   ```
+
+   (or once, without touching the config: `telemouse-viz serve --http 0.0.0.0:7879`).
+   Restart `telemouse-viz`; it logs a warning that it is reachable from the
+   network, which is the point.
+
+2. Let the port through Windows Firewall, Private profile only, from an
+   elevated PowerShell:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "telemouse-viz (LAN)" -Direction Inbound `
+     -Protocol TCP -LocalPort 7879 -Action Allow -Profile Private
+   ```
+
+   (`Remove-NetFirewallRule -DisplayName "telemouse-viz (LAN)"` undoes it.)
+   The network the two PCs share must be marked *Private* in Windows
+   (`Get-NetConnectionProfile`), or the rule does not apply.
+
+3. Find the gaming PC's LAN address: `ipconfig` → *IPv4 Address* on the wired
+   or Wi-Fi adapter, e.g. `192.168.1.168`. Give it a DHCP reservation on the
+   router if you can, so the OBS source does not go stale after a reboot.
+
+Then, in OBS on the streaming PC, the Browser source URL is
+
+```
+http://192.168.1.168:7879/obs
+```
+
+with the same URL parameters as above. **Use the IP literal, not the PC's
+name**: `http://GAMING-PC:7879/obs` is answered with `403 host not allowed`,
+because the server only trusts `Host`/`Origin` headers that are `localhost`
+or an IP address (its DNS-rebinding guard). Note there is no login: anyone
+who can reach the port can watch the live stream and download every
+recording, so keep the bind on a network you trust, and set `http_addr` back
+to `127.0.0.1:7879` when you do not need it. The capture → viz UDP hop stays
+on loopback either way, and `telemouse-ctl` stays on loopback (it can kill
+processes); its *viz* link still opens the local address.
 
 Defaults live in `telemouse.toml` under `[viz.obs]`; every one of them can be
 overridden per source with URL parameters, so several sources can share one
@@ -360,11 +411,32 @@ prints one row per session (flicks, overshoot, settle, tremor, path
 efficiency) — the substrate for warmup curves, day-to-day consistency, and
 sensitivity A/B experiments. Every detector threshold is a CLI flag.
 
-## Kafka topics (optional durable log)
+## Kafka (durable log)
 
 `mouse.events` (batches, keyed by session id), `mouse.sessions` (compacted
 session configs), `mouse.markers` (hotkey/game-state annotations). JSON
 envelopes today; the tagged wire format leaves a seam for a binary schema.
+Capture creates the three topics on connect.
+
+A single-node KRaft broker for local use ships as `compose.yaml` (Apache Kafka
+3.9, data in a named volume, bound to `127.0.0.1:9092`):
+
+```powershell
+docker compose up -d                                  # start the broker
+cargo run -p telemouse-capture -- doctor              # ...should now say "reachable"
+cargo run --release -p telemouse-capture -- run       # ships every batch to Kafka too
+
+# watch batches arrive (Ctrl-C to stop)
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server localhost:9092 --topic mouse.events --from-beginning
+
+docker compose down                                   # stop; "down -v" also wipes the data
+```
+
+The sink is a bounded queue in front of a forwarder thread (rskafka, zstd,
+25ms linger). If the broker stalls the queue fills and envelopes are dropped
+and counted (`kafka_dropped` in the stats line) rather than ever blocking
+capture; `--no-kafka` turns the sink off for one run.
 
 ## Observability
 

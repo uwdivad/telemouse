@@ -4,6 +4,23 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- Viz aim panel: yaw is drawn unwrapped. Crossing ±180° no longer teleports
+  the head to the far edge (which made the camera pan and the zoom balloon);
+  the seam is a dashed line at every odd multiple of 180° and the origin axis
+  repeats every 360°.
+- Local Kafka broker: `compose.yaml` runs a single-node KRaft Apache Kafka
+  3.9 on `127.0.0.1:9092` with persistent data; `[kafka] enabled` is now
+  `true` in the repo `telemouse.toml`. Capture still degrades to UDP +
+  JSONL with a warning when the broker is down.
+- OBS overlay from another PC: the repo `telemouse.toml` now binds the viz
+  to `0.0.0.0:7879` so a streaming PC on the LAN can use
+  `http://<gaming PC IP>:7879/obs` as its Browser source; README and GUIDE
+  document the firewall rule and the IP-literal requirement. The control
+  panel's *viz* link and the viz's own startup line print a browsable
+  loopback URL when the bind is unspecified (`0.0.0.0` / `[::]`).
+
 ## [0.1.0] — 2026-08-30
 
 First release: the whole pipeline, Windows only.

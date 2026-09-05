@@ -510,12 +510,6 @@ const GRID = OBS && OBS.bg.alpha < 1
   ? { line: "rgba(255,255,255,0.07)", axis: "rgba(255,255,255,0.16)", wrap: "rgba(200,140,255,0.35)" }
   : { line: "#151c28", axis: "#25303f", wrap: "#3a2b46" };
 
-function wrapYaw(deg) {
-  let d = deg % 360;
-  if (d > 180) d -= 360;
-  else if (d <= -180) d += 360;
-  return d;
-}
 
 function niceStep(raw) {
   if (!(raw > 0) || !isFinite(raw)) return 1;
@@ -780,7 +774,6 @@ const engine = {
   /* integrators */
   deskX: 0, deskY: 0,
   yawRaw: 0, pitch: 0,
-  lastYawWrapped: 0,
   lastEventT: null,
 
   /* visuals */
@@ -873,7 +866,6 @@ const engine = {
   resetIntegrators() {
     this.deskX = 0; this.deskY = 0;
     this.yawRaw = 0; this.pitch = 0;
-    this.lastYawWrapped = 0;
     this.lastEventT = null;
     this.deskTrail.clear();
     this.aimTrail.clear();
@@ -1113,7 +1105,6 @@ const engine = {
       i: i, t: this.ev.t[i],
       deskX: this.deskX, deskY: this.deskY,
       yawRaw: this.yawRaw, pitch: this.pitch,
-      lastYawWrapped: this.lastYawWrapped,
       lastEventT: this.lastEventT,
       totalCm: this.totalCm, totalDeg: this.totalDeg, totalClicks: this.totalClicks,
       held: this.held,
@@ -1126,7 +1117,6 @@ const engine = {
     this.cursor = cp.i;
     this.deskX = cp.deskX; this.deskY = cp.deskY;
     this.yawRaw = cp.yawRaw; this.pitch = cp.pitch;
-    this.lastYawWrapped = cp.lastYawWrapped;
     this.lastEventT = cp.lastEventT;
     this.totalCm = cp.totalCm; this.totalDeg = cp.totalDeg;
     this.totalClicks = cp.totalClicks;
@@ -1317,15 +1307,12 @@ const engine = {
       if (vCm > this.vrefDesk) this.vrefDesk = vCm;
       if (vDeg > this.vrefAim) this.vrefAim = vDeg;
 
-      const yawW = wrapYaw(this.yawRaw);
-      /* A wrap is a teleport in panel space: break the polyline so the
-         path does not draw a bogus line straight across the panel. */
-      const broke = Math.abs(yawW - this.lastYawWrapped) > 180;
-      this.lastYawWrapped = yawW;
-
+      /* Yaw is kept unwrapped in panel space: the head glides across the
+         ±180° seam (drawn as a dashed line) instead of teleporting to the
+         far edge, and the camera follows it continuously. */
       if (visible) {
         this.deskTrail.push(this.deskX, this.deskY, et, vCm, false);
-        this.aimTrail.push(yawW, this.pitch, et, vDeg, broke);
+        this.aimTrail.push(this.yawRaw, this.pitch, et, vDeg, false);
       }
     }
 
@@ -1343,7 +1330,7 @@ const engine = {
           this.rings.push({
             t: et, kind: kind,
             dx: this.deskX, dy: this.deskY,
-            ax: wrapYaw(this.yawRaw), ay: this.pitch,
+            ax: this.yawRaw, ay: this.pitch,
           });
         }
       }
@@ -1472,7 +1459,7 @@ class Panel {
     const trail = isDesk ? eng.deskTrail : eng.aimTrail;
     const head = isDesk
       ? { x: eng.deskX, y: eng.deskY }
-      : { x: wrapYaw(eng.yawRaw), y: eng.pitch };
+      : { x: eng.yawRaw, y: eng.pitch };
     const vref = isDesk ? eng.vrefDesk : eng.vrefAim;
 
     if (this.hidden) return;
@@ -1534,20 +1521,32 @@ class Panel {
     }
     ctx.stroke();
 
-    /* Origin axes: where "recenter" put you. */
+    /* Origin axes: where "recenter" put you. On the aim panel yaw is
+       unwrapped, so every full turn (k·360°) is the same facing and gets
+       the axis too. */
     ctx.beginPath();
     ctx.strokeStyle = GRID.axis;
-    const ox = Math.round(this.toX(0)) + 0.5, oy = Math.round(this.toY(0)) + 0.5;
-    ctx.moveTo(ox, 0); ctx.lineTo(ox, this.h);
+    const oy = Math.round(this.toY(0)) + 0.5;
     ctx.moveTo(0, oy); ctx.lineTo(this.w, oy);
+    if (isDesk) {
+      const ox = Math.round(this.toX(0)) + 0.5;
+      ctx.moveTo(ox, 0); ctx.lineTo(ox, this.h);
+    } else {
+      for (let x = Math.ceil((this.cx - halfX) / 360) * 360; x <= x1; x += 360) {
+        const px = Math.round(this.toX(x)) + 0.5;
+        ctx.moveTo(px, 0); ctx.lineTo(px, this.h);
+      }
+    }
     ctx.stroke();
 
     if (!isDesk) {
-      /* Yaw wrap boundaries at ±180°. */
+      /* Yaw seams: the ±180° boundary of each turn, i.e. every odd multiple
+         of 180°. Crossing one means you are now facing directly behind
+         where "recenter" left you. */
       ctx.beginPath();
       ctx.strokeStyle = GRID.wrap;
       ctx.setLineDash([4, 5]);
-      for (const b of [-180, 180]) {
+      for (let b = (Math.floor((this.cx - halfX - 180) / 360) * 360) + 180; b <= x1; b += 360) {
         const px = Math.round(this.toX(b)) + 0.5;
         if (px > -10 && px < this.w + 10) { ctx.moveTo(px, 0); ctx.lineTo(px, this.h); }
       }
