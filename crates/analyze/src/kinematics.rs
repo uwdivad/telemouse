@@ -220,14 +220,23 @@ pub fn mean_speed_in_window(p: &Prepared, t0: f64, t1: f64) -> Option<f64> {
 
 /// Path efficiency over the movement segments falling inside `[a, b)` cells:
 /// the length-weighted ratio, and the per-segment median.
+///
+/// `Prepared::segments` is generated in ascending start-cell order by
+/// [`crate::series::prepare`]; preserving that invariant makes the two boundary
+/// searches logarithmic. A debug assertion catches hand-mutated `Prepared`
+/// values without adding work to release report builds.
 pub fn path_efficiency_in(p: &Prepared, a: usize, b: usize) -> (f64, f64) {
     let mut sum_net = 0.0;
     let mut sum_path = 0.0;
-    let mut effs = Vec::new();
-    for s in p.segments() {
-        if s.start < a || s.start >= b {
-            continue;
-        }
+    // Segments are emitted in grid order. Narrow to the requested start-cell
+    // range instead of rescanning every session segment for every minute or
+    // marker interval.
+    let segments = p.segments();
+    debug_assert!(segments.windows(2).all(|w| w[0].start <= w[1].start));
+    let from = segments.partition_point(|s| s.start < a);
+    let to = segments[from..].partition_point(|s| s.start < b) + from;
+    let mut effs = Vec::with_capacity(to - from);
+    for s in &segments[from..to] {
         let (dx, dy) = p.grid.displacement(s.start, s.end);
         let path = p.grid.path_length(s.start, s.end);
         if path <= 0.0 {

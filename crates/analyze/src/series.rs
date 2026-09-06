@@ -587,10 +587,8 @@ pub struct Prepared {
     /// durations are decided by whether a gap is `<= 1.0 ms`, and
     /// `0.003_f64 / 0.001` is `2.999…`, which silently mis-bins events by a
     /// whole grid cell. Every timeline decision is made on these integers;
-    /// `event_t` exists only for display and coarse arithmetic.
+    /// sparse callers convert individual values to seconds when needed.
     pub event_us: Vec<i64>,
-    /// Seconds since `t0_utc_us`, one per event.
-    pub event_t: Vec<f64>,
     /// Grid cell width in microseconds.
     pub grid_dt_us: i64,
     pub grid: Grid,
@@ -830,7 +828,6 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
     for u in &mut event_us {
         *u -= t0_utc_us;
     }
-    let event_t: Vec<f64> = event_us.iter().map(|u| *u as f64 / 1e6).collect();
     let duration_us = event_us.iter().copied().max().unwrap_or(0).max(0);
     let duration_s = duration_us as f64 / 1e6;
 
@@ -943,7 +940,6 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
         aim_fallback,
         game,
         event_us,
-        event_t,
         grid_dt_us,
         grid,
         grid_truncated,

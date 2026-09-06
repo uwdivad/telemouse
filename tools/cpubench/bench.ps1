@@ -10,7 +10,7 @@
 #
 #   cargo build --release            # in this directory: builds tmbench
 #   $env:CARGO_TARGET_DIR="..\..\target-bench"; cargo build --release --workspace   # the binaries under test
-#   .\bench.ps1 -Label base                       # defaults from the config (window 50, coalesce 8)
+#   .\bench.ps1 -Label base                       # defaults from the config (window 25, coalesce 8)
 #   .\bench.ps1 -Label w25c2 -WindowMs 25 -CoalesceMs 2
 #   .\bench.ps1 -Label two-clients -Clients 2     # dashboard + OBS overlay
 #

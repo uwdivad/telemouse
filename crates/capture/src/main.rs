@@ -257,10 +257,11 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     if cfg.kafka.enabled {
         match KafkaSink::connect(&cfg.kafka.brokers, Arc::clone(&stats)) {
             Ok(s) => {
-                tracing::info!(brokers = ?cfg.kafka.brokers, "kafka sink ready");
+                tracing::info!(brokers = ?cfg.kafka.brokers, "kafka sink starting");
                 sinks.push(Box::new(s));
             }
-            // A missing broker degrades the pipeline; it never stops it.
+            // Invalid setup degrades the pipeline; broker reachability is
+            // resolved asynchronously by the worker after capture starts.
             Err(e) => tracing::warn!(
                 error = %format!("{e:#}"),
                 "kafka unavailable; continuing without it"
@@ -438,7 +439,11 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         udp_oversized = final_stats.udp_oversized,
         jsonl_errors = final_stats.jsonl_errors,
         jsonl_flush_max_us = final_stats.jsonl_flush_max_us,
+        jsonl_queued = final_stats.jsonl_queued,
+        jsonl_dropped = final_stats.jsonl_dropped,
+        jsonl_abandoned = final_stats.jsonl_abandoned,
         kafka_errors = final_stats.kafka_errors,
+        kafka_queued = final_stats.kafka_queued,
         kafka_dropped = final_stats.kafka_dropped,
         kafka_abandoned = final_stats.kafka_abandoned,
         capture_to_ship_us_p50 = final_stats.ship_latency_first.percentile_us(0.50),

@@ -15,7 +15,7 @@ no in-game overlay.
 
 | Binary | Crate | Role |
 |---|---|---|
-| `telemouse` | `crates/capture` | Capture agent: raw input → 50ms batches → UDP + JSONL recording + optional Kafka |
+| `telemouse` | `crates/capture` | Capture agent: raw input → 25ms batches → UDP + asynchronous JSONL recording + optional Kafka |
 | `telemouse-viz` | `crates/viz` | Live browser visualization + session replay (UDP→WebSocket bridge, single-file page) |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions |
 | `telemouse-ctl` | `crates/ctl` | Control panel: start/stop the others, run the tools, see and kill telemouse processes |
@@ -61,7 +61,7 @@ carries on without it. A bundled demo recording
 mouse_cpi = 1600.0            # your mouse's real CPI/DPI → physical cm
 
 [batch]
-window_ms = 50                # batch window: live latency floor; 25 = half the latency, twice the per-batch CPU
+window_ms = 25                # responsive live default; use 50 to halve per-batch CPU
 coalesce_ms = 8               # raw-input drain cadence (0–10); 0 = exact per-report stamps, ~13× the capture CPU
 
 [udp]
@@ -97,11 +97,11 @@ this config — so you can fix a wrong CPI or sens *after* the fact and re-analy
 ## How capture works
 
 ```
-mouse HID ──WM_INPUT──▶ T1 hot path ──▶ lock-free SPSC ring ──▶ T2 shipper (50ms batches)
+mouse HID ──WM_INPUT──▶ T1 hot path ──▶ lock-free SPSC ring ──▶ T2 shipper (25ms batches)
             (QPC timestamp, zero alloc,                            ├─▶ UDP → telemouse-viz → browser (<10ms)
-             never blocks)                                         ├─▶ recordings/<session>.jsonl
-T3 context (250ms): foreground game,                               └─▶ Kafka mouse.events / mouse.sessions /
-pointer-lock heuristic, cursor, screen                                       mouse.markers   (optional)
+             never blocks)                                         ├─▶ bounded queue → JSONL writer
+T3 context (250ms): foreground game,                               └─▶ bounded queue → Kafka worker (optional)
+pointer-lock heuristic, cursor, screen
 ```
 
 - **T1** never allocates or blocks after startup; if the ring ever fills, events
@@ -124,6 +124,10 @@ pointer-lock heuristic, cursor, screen                                       mou
 - Each session opens with a `session` record: QPC frequency, QPC↔UTC anchor,
   CPI, sens table, monitor setup — everything needed to reconstruct physical
   units later.
+- UDP stays on T2 for minimum live latency. JSONL writes/flushes and Kafka
+  connection/production run on bounded workers, so slow storage or an
+  unreachable broker cannot stall capture or the live stream. Queue drops and
+  abandoned shutdown work are visible in the periodic stats line.
 - Useful flags: `--print` (per-batch log line), `--no-kafka` / `--no-udp` /
   `--no-record`, `--duration-secs N` (smoke tests).
 
@@ -453,7 +457,7 @@ in the browser alongside lag-behind-live and render FPS. `seq_no` gaps
 ## Development
 
 ```powershell
-cargo test --workspace              # 407 tests; no mouse, admin, Kafka, or browser needed
+cargo test --workspace              # no mouse, admin, Kafka, or browser needed
 cargo bench -p telemouse-analyze    # criterion benches over the loader + hot math
 cargo bench -p telemouse-core       # wire encode/decode, batcher
 # numbers, method and what is left on the table: docs/BENCHMARKS.md
@@ -463,6 +467,9 @@ cargo build --profile profiling     # release speed + debug symbols for flamegra
 Append `?profile=1` to the viz URL for an in-page frame-time breakdown.
 The August 2026 performance/observability audit and its resolutions are
 documented in [docs/AUDIT-2026-08.md](docs/AUDIT-2026-08.md).
+The September implementation pass, including reproducible before/after replay,
+analyzer, memory, and sink-latency measurements, is documented in
+[docs/PERFORMANCE-2026-09.md](docs/PERFORMANCE-2026-09.md).
 
 **Releasing.** CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on
 every push. A release is a tag: bump `version` in the root `Cargo.toml`, add

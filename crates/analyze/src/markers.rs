@@ -127,24 +127,32 @@ pub fn segment_reports(
     intervals: &[MarkerInterval],
 ) -> Vec<SegmentReport> {
     let (kx, ky) = p.aim_scale();
+    let flicks = crate::flicks::ordered_by_start(flicks);
+    // ClickReport intentionally preserves source-event order so hold and
+    // double-click pairing remain faithful even when a recording contains a
+    // timestamp inversion. Sort only the sparse timestamps used for interval
+    // attribution; NaNs did not match the former range predicate either.
+    let mut click_times: Vec<f64> = clicks
+        .clicks
+        .iter()
+        .map(|c| c.t_s)
+        .filter(|t| !t.is_nan())
+        .collect();
+    click_times.sort_by(f64::total_cmp);
     intervals
         .iter()
         .map(|iv| {
             let dur = (iv.t_end_s - iv.t_start_s).max(0.0);
             let minutes = (dur / 60.0).max(f64::MIN_POSITIVE);
-            let in_range = |t: f64| t >= iv.t_start_s && t < iv.t_end_s;
-
-            let os: Vec<f64> = flicks
-                .iter()
-                .filter(|f| in_range(f.t_start_s))
-                .map(|f| f.overshoot_ratio)
-                .collect();
-            let settle: Vec<f64> = flicks
-                .iter()
-                .filter(|f| in_range(f.t_start_s))
-                .map(|f| f.settle_ms)
-                .collect();
-            let n_clicks = clicks.clicks.iter().filter(|c| in_range(c.t_s)).count();
+            // Restrict each ordered timeline with two logarithmic searches.
+            let flick_a = flicks.partition_point(|f| f.t_start_s < iv.t_start_s);
+            let flick_b = flicks.partition_point(|f| f.t_start_s < iv.t_end_s);
+            let interval_flicks = &flicks[flick_a..flick_b];
+            let click_a = click_times.partition_point(|&t| t < iv.t_start_s);
+            let click_b = click_times.partition_point(|&t| t < iv.t_end_s);
+            let n_clicks = click_b - click_a;
+            let os: Vec<f64> = interval_flicks.iter().map(|f| f.overshoot_ratio).collect();
+            let settle: Vec<f64> = interval_flicks.iter().map(|f| f.settle_ms).collect();
             let (eff, _) = kinematics::path_efficiency_in(p, iv.start_cell, iv.end_cell);
 
             // Distances come off the grid so an interval boundary lands on a
@@ -266,6 +274,47 @@ mod tests {
         assert!(reps[0].path_efficiency > 0.5);
         assert!(reps[1].tremor_rms_counts_s > 0.0);
         assert_eq!(reps[1].label, "second-half");
+    }
+
+    #[test]
+    fn interval_attribution_handles_inverted_click_timestamps_and_boundaries() {
+        let mut b = StreamBuilder::new();
+        // File order is deliberately unrelated to timestamp order. Clicks at
+        // exactly 1 s and 2 s belong to the intervals those markers open.
+        b.push_at_us(2_000_000, 0, 0, buttons::LEFT_DOWN)
+            .push_at_us(500_000, 0, 0, buttons::RIGHT_DOWN)
+            .push_at_us(1_000_000, 0, 0, buttons::MIDDLE_DOWN)
+            .push_at_us(999_000, 0, 0, buttons::X1_DOWN)
+            .push_at_us(2_500_000, 0, 0, buttons::X2_DOWN);
+        let mut s = loaded_from(b.into_events(), Some("cs2.exe"));
+        s.markers = vec![marker_at(1000, "one"), marker_at(2000, "two")];
+        let p = crate::series::prepare(s, crate::series::Params::default());
+        let cl = clicks::compute(&p);
+        let iv = intervals(&p, &rows(&p));
+        let reps = segment_reports(&p, &[], &cl, &TremorSeries::default(), &iv);
+
+        assert_eq!(
+            reps.iter().map(|r| r.clicks).collect::<Vec<_>>(),
+            vec![2, 1, 2]
+        );
+        assert_eq!(
+            reps.iter().map(|r| r.clicks).sum::<usize>(),
+            cl.total_clicks
+        );
+    }
+
+    #[test]
+    fn interval_metrics_accept_unsorted_flick_input() {
+        let p = session_with_markers(&[(1500, "second-half")]);
+        let fl = flicks::detect(&p);
+        let cl = clicks::compute(&p);
+        let (_, tremor) = micro::compute_full(&p);
+        let iv = intervals(&p, &rows(&p));
+        let expected = segment_reports(&p, &fl, &cl, &tremor, &iv);
+        let mut reversed = fl;
+        reversed.reverse();
+
+        assert_eq!(segment_reports(&p, &reversed, &cl, &tremor, &iv), expected);
     }
 
     /// A marker past the end of the grid cannot open an empty trailing

@@ -25,6 +25,12 @@ thiserror.workspace = true
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3.27.0"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [[bench]]
 name = "hot_math"
 harness = false

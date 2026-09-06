@@ -6,6 +6,11 @@ thin LTO, `codegen-units = 1`). Re-run after touching anything on these paths
 and update the tables; criterion keeps its own baseline under
 `target/criterion` and prints the delta.
 
+The 2026-09 follow-up implements recording-list caching, duplicate timestamp
+removal, interval-range aggregation, dependency-aware report parallelism,
+replay streaming, and capture-sink isolation. Its current before/after numbers
+and reproduction commands are in [PERFORMANCE-2026-09.md](PERFORMANCE-2026-09.md).
+
 Two kinds of measurement live here. The criterion benches cover the pure,
 in-process hot paths (wire encode/decode, batcher, analyzer kernels). The
 live pipeline — capture + viz + ctl CPU while a synthetic 1 kHz mouse runs —
@@ -121,18 +126,24 @@ event distance loop 67 ms, segment loop 52 ms.
 Together: kinematics 2306 → 1047 ms (−55%) with no numeric change beyond
 floating-point summation order in `mean`/`stddev`.
 
-## What is left on the table
+## What was left on the table after the August pass
 
-Ordered by expected payoff on the 462 MB session; none is implemented.
+This table is retained as the decision record for the August baseline. The
+timestamp-vector and parallelism rows were implemented in September; see
+[PERFORMANCE-2026-09.md](PERFORMANCE-2026-09.md). The other rows remain
+candidates.
+
+Ordered by expected payoff on the 462 MB session. Rows marked implemented are
+kept to preserve the August decision record; the rest remain candidates.
 
 | Candidate | Est. gain | Why not yet |
 |---|---|---|
 | Fuse the four derivative lanes into one pass (`d1`/`d2` on `vx`/`vy` read the same input twice; the reduction only needs one run at a time) and reduce `ax/ay/jx/jy` straight into `accel`/`jerk` without materializing the lanes | ~200–300 ms | Touches the `sg_run` parity contract that the sparse-grid tests lean on; do it with a dense-vs-sparse parity test in hand. |
 | Load: `serde_json` parses every event's `ts_qpc` as a full `u64` through the generic visitor; a hand-rolled line parser for the fixed `{"ts_qpc":..,"dx":..,"dy":..}` shape would roughly halve the ~1.3 s load | ~600 ms | Only worth it if a binary wire format (deferred in the audit) is *not* going to happen; a `RecordingReader` abstraction should land first either way. |
-| `prepare` builds `event_us`/`event_t` (two session-length `Vec`s) that only a few phases read | ~100 ms + 110 MB | Needs a survey of which phases actually index by event. |
+| ~~`prepare` builds `event_us`/`event_t` (two session-length `Vec`s) that only a few phases read~~ | 61.0 MiB on the measured 8M-event recording | **Implemented 2026-09:** `event_t` was removed; sparse click paths convert integer microseconds on demand. |
 | `Summary::of` filters into a fresh `Vec` even when the sample has no non-finite values; take `&mut Vec<f64>` from callers that own the sample and partition in place | ~50 ms | Small; API churn across every metric module. |
 | `hypot` → `sqrt(x*x + y*y)` in the moving-cell loop (22 M calls) | ~50 ms | Changes results in the last ulp; the accuracy is not needed but the parity tests would need loosening. |
-| Parallelism: the phases after `prepare` are independent reads of `Prepared`; `kinematics`, `micro` and `per_second` could run on three threads | ~1 s wall | A 16-core box makes this the biggest wall-clock win, but the crate is deliberately dependency-light; `std::thread::scope` would do without rayon. Do it after the single-thread items so it does not hide them. |
+| ~~Parallelism: the phases after `prepare` are independent reads of `Prepared`; `kinematics`, `micro` and `per_second` could run on three threads~~ | 544 ms / 39.2% report-build reduction on the measured 8M-event recording | **Implemented 2026-09:** dependency-aware `std::thread::scope` groups, enabled at ≥250k events and ≥4 logical CPUs. |
 
 Verified not worth it: `lto = "fat"` / `panic = "abort"` (audit, rejected);
 `-C target-cpu=znver3` for the analyzer is a documented opt-in in the root

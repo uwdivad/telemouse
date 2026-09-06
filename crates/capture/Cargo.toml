@@ -25,7 +25,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 # zstd on the wire: at 1KHz these batches compress hard, and the BatchProducer
 # needs `rt` on tokio for its linger tasks.
 rskafka = { version = "0.6.0", features = ["compression-zstd"] }
-tokio = { version = "1.53.1", features = ["rt", "time", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["rt", "time", "net", "sync", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

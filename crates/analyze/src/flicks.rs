@@ -21,6 +21,8 @@
 //! exact count sums; thresholds are applied to the *smoothed* speed, so sensor
 //! noise does not trigger detections.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::series::Prepared;
@@ -55,6 +57,28 @@ pub struct Flick {
     pub direction_deg: f64,
     /// Direction reversals inside the whole flick — extra corrective stutters.
     pub corrections: usize,
+}
+
+/// Borrow detector output as-is, or order a caller-provided flick list by its
+/// start time when necessary. The detector already emits finite, ascending
+/// starts, so report builds pay only one linear validation pass and allocate
+/// nothing. Public aggregation helpers also accept hand-built or deserialized
+/// lists; sorting that uncommon input preserves their historical semantics.
+/// NaN starts never belonged to a half-open time interval and are discarded.
+pub(crate) fn ordered_by_start(flicks: &[Flick]) -> Cow<'_, [Flick]> {
+    let is_ordered = flicks.iter().all(|f| !f.t_start_s.is_nan())
+        && flicks.windows(2).all(|w| w[0].t_start_s <= w[1].t_start_s);
+    if is_ordered {
+        return Cow::Borrowed(flicks);
+    }
+
+    let mut ordered: Vec<Flick> = flicks
+        .iter()
+        .filter(|f| !f.t_start_s.is_nan())
+        .cloned()
+        .collect();
+    ordered.sort_by(|a, b| a.t_start_s.total_cmp(&b.t_start_s));
+    Cow::Owned(ordered)
 }
 
 /// The detector settings a report was produced with, echoed for provenance.

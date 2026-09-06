@@ -6,9 +6,9 @@ mouse_cpi = 1600.0
 [batch]
 # Batch window: the live-viz latency floor and the batches/s every hop pays
 # for (~150us of kernel CPU per batch across capture, bridge and each
-# browser). 50 = 20 batches/s. 25 halves live latency for double that cost;
-# recordings and analysis are the same either way.
-window_ms = 50
+# browser). 25 = 40 batches/s for responsive live visualization; use 50 to
+# halve that per-batch CPU cost. Recordings and analysis are unchanged.
+window_ms = 25
 max_events = 448
 ring_capacity = 65536
 # Raw-input reads are batched: the capture thread wakes on the first report
@@ -28,7 +28,7 @@ addr = "127.0.0.1:7878"
 # Local broker: `docker compose up -d` (see compose.yaml). UDP + local recording
 # always work; if the broker is down capture warns and runs without Kafka.
 enabled = true
-brokers = ["127.0.0.1:9092"]
+brokers = ["127.0.0.1:9092", "192.168.137.67", "192.168.1.188:9092"]
 
 [recording]
 enabled = true
@@ -69,7 +69,7 @@ hud = ["speed", "aim", "cpm"]  # also: eps, dist, aimdist, clicks, game, latency
 hud_position = "bottom-left"
 scale = 1.0                 # stroke/marker/HUD size multiplier for small sources
 trail_secs = 3.0
-buffer_ms = 55
+buffer_ms = 35
 grid = true
 legend = false
 labels = false

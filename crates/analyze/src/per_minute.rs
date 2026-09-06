@@ -59,9 +59,11 @@ pub fn compute(
     if seconds.is_empty() {
         return Vec::new();
     }
+    let flicks = crate::flicks::ordered_by_start(flicks);
     let per_sec = (1.0 / p.grid.dt).round() as usize;
     let n_min = seconds.len().div_ceil(60);
     let mut out = Vec::with_capacity(n_min);
+    let mut flick_from = 0usize;
 
     for m in 0..n_min {
         let sa = m * 60;
@@ -82,17 +84,14 @@ pub fn compute(
             .fold(0.0f64, |a, r| a.max(r.max_speed_counts_s));
 
         let (t0, t1) = (sa as f64, sb as f64);
-        let in_range = |t: f64| t >= t0 && t < t1;
-        let os: Vec<f64> = flicks
-            .iter()
-            .filter(|f| in_range(f.t_start_s))
-            .map(|f| f.overshoot_ratio)
-            .collect();
-        let settle: Vec<f64> = flicks
-            .iter()
-            .filter(|f| in_range(f.t_start_s))
-            .map(|f| f.settle_ms)
-            .collect();
+        while flick_from < flicks.len() && flicks[flick_from].t_start_s < t0 {
+            flick_from += 1;
+        }
+        let flick_to = flicks[flick_from..].partition_point(|f| f.t_start_s < t1) + flick_from;
+        let minute_flicks = &flicks[flick_from..flick_to];
+        flick_from = flick_to;
+        let os: Vec<f64> = minute_flicks.iter().map(|f| f.overshoot_ratio).collect();
+        let settle: Vec<f64> = minute_flicks.iter().map(|f| f.settle_ms).collect();
 
         let (eff, _) = kinematics::path_efficiency_in(p, sa * per_sec, sb * per_sec);
         let rms = tremor.rms_seconds(sa, sb);
@@ -226,6 +225,12 @@ mod tests {
         assert!(mins[0].tremor_rms_counts_s > 0.0);
         assert!(mins[0].path_efficiency > 0.5);
         assert!(mins[0].flicks_per_min > 60.0, "{}", mins[0].flicks_per_min);
+
+        // Public callers may provide deserialized or hand-built flick lists;
+        // aggregation remains identical even when those are not time ordered.
+        let mut reversed = fl;
+        reversed.reverse();
+        assert_eq!(compute(&p, &secs, &reversed, &tremor), mins);
     }
 
     #[test]

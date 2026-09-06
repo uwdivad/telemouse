@@ -1,0 +1,7 @@
+confluent-kafka>=2.5
+pyarrow>=17
+duckdb>=1.1
+orjson>=3.10
+pandas>=2.2
+jupyterlab>=4.2
+pyspark>=4.0          # spark_time_ranges.ipynb only; needs Java 17+

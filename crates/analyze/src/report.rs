@@ -114,7 +114,6 @@ fn now_utc_us() -> i64 {
 /// Times one phase, logs it, and records it for the `--timing` table.
 struct Phases {
     started: std::time::Instant,
-    mark: std::time::Instant,
     out: Vec<PhaseTiming>,
 }
 
@@ -123,19 +122,15 @@ impl Phases {
         let now = std::time::Instant::now();
         Self {
             started: now,
-            mark: now,
             out: Vec::new(),
         }
     }
 
-    fn lap(&mut self, phase: &str) -> f64 {
-        let ms = self.mark.elapsed().as_secs_f64() * 1000.0;
-        self.mark = std::time::Instant::now();
+    fn record(&mut self, phase: &str, ms: f64) {
         self.out.push(PhaseTiming {
             phase: phase.to_string(),
             ms,
         });
-        ms
     }
 
     fn total_ms(&self) -> f64 {
@@ -143,14 +138,184 @@ impl Phases {
     }
 }
 
+fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
+    let started = std::time::Instant::now();
+    let value = f();
+    (value, started.elapsed().as_secs_f64() * 1000.0)
+}
+
+// Below this point, creating scoped OS threads costs as much as the work they
+// save. Large reports benefit from coarse parallel groups without imposing a
+// fixed startup penalty on short recordings and unit tests.
+const PARALLEL_MIN_EVENTS: usize = 250_000;
+const PARALLEL_MIN_CPUS: usize = 4;
+
+fn parallel_worthwhile(events: usize, cpus: usize) -> bool {
+    events >= PARALLEL_MIN_EVENTS && cpus >= PARALLEL_MIN_CPUS
+}
+
+struct MetricResults {
+    quality: QualityReport,
+    warnings: Vec<String>,
+    kin: Kinematics,
+    fl: FlickReport,
+    mi: MicroReport,
+    cl: ClickReport,
+    lift: LiftReport,
+    marker_rows: Vec<MarkerRow>,
+    segments: Vec<SegmentReport>,
+    rows: Vec<SecondRow>,
+    minutes: Vec<MinuteRow>,
+    costs: MetricCosts,
+}
+
+#[derive(Default)]
+struct MetricCosts {
+    quality: f64,
+    kinematics: f64,
+    flicks: f64,
+    micro: f64,
+    clicks: f64,
+    lifts: f64,
+    markers: f64,
+    per_second: f64,
+    per_minute: f64,
+}
+
+fn compute_metrics_sequential(p: &Prepared) -> MetricResults {
+    let ((quality, warnings), quality_ms) = timed(|| {
+        let quality = quality::compute(p);
+        let warnings = quality.warnings();
+        (quality, warnings)
+    });
+    let (kin, kinematics_ms) = timed(|| kinematics::compute(p));
+    let (fl, flicks_ms) = timed(|| flicks::compute(p));
+    let ((mi, tremor), micro_ms) = timed(|| micro::compute_full(p));
+    let (cl, clicks_ms) = timed(|| clicks::compute(p));
+    let (lift, lifts_ms) = timed(|| lifts::compute(p));
+    let ((marker_rows, intervals), marker_setup_ms) = timed(|| {
+        let marker_rows = markers::rows(p);
+        let intervals = markers::intervals(p, &marker_rows);
+        (marker_rows, intervals)
+    });
+    let (segments, segment_ms) =
+        timed(|| markers::segment_reports(p, &fl.flicks, &cl, &tremor, &intervals));
+    let (rows, per_second_ms) = timed(|| per_second::compute(p, &fl.flicks, &intervals));
+    let (minutes, per_minute_ms) = timed(|| per_minute::compute(p, &rows, &fl.flicks, &tremor));
+
+    MetricResults {
+        quality,
+        warnings,
+        kin,
+        fl,
+        mi,
+        cl,
+        lift,
+        marker_rows,
+        segments,
+        rows,
+        minutes,
+        costs: MetricCosts {
+            quality: quality_ms,
+            kinematics: kinematics_ms,
+            flicks: flicks_ms,
+            micro: micro_ms,
+            clicks: clicks_ms,
+            lifts: lifts_ms,
+            markers: marker_setup_ms + segment_ms,
+            per_second: per_second_ms,
+            per_minute: per_minute_ms,
+        },
+    }
+}
+
+fn compute_metrics_parallel(p: &Prepared) -> MetricResults {
+    std::thread::scope(|scope| {
+        let quality = scope.spawn(|| {
+            timed(|| {
+                let quality = quality::compute(p);
+                let warnings = quality.warnings();
+                (quality, warnings)
+            })
+        });
+        let kin = scope.spawn(|| timed(|| kinematics::compute(p)));
+        let micro = scope.spawn(|| timed(|| micro::compute_full(p)));
+
+        // These three short event-stream passes share one worker (the scope
+        // thread) while the larger grid/quality groups run alongside it.
+        let (fl, flicks_ms) = timed(|| flicks::compute(p));
+        let (cl, clicks_ms) = timed(|| clicks::compute(p));
+        let (lift, lifts_ms) = timed(|| lifts::compute(p));
+        let ((mi, tremor), micro_ms) = micro.join().expect("micro worker panicked");
+
+        let ((marker_rows, intervals), marker_setup_ms) = timed(|| {
+            let marker_rows = markers::rows(p);
+            let intervals = markers::intervals(p, &marker_rows);
+            (marker_rows, intervals)
+        });
+        let ((segments, segment_ms), (rows, per_second_ms), (minutes, per_minute_ms)) =
+            std::thread::scope(|aggregate_scope| {
+                let segments = aggregate_scope.spawn(|| {
+                    timed(|| markers::segment_reports(p, &fl.flicks, &cl, &tremor, &intervals))
+                });
+                let (rows, per_second_ms) =
+                    timed(|| per_second::compute(p, &fl.flicks, &intervals));
+                let minutes = timed(|| per_minute::compute(p, &rows, &fl.flicks, &tremor));
+                (
+                    segments.join().expect("marker worker panicked"),
+                    (rows, per_second_ms),
+                    minutes,
+                )
+            });
+
+        // Kinematics is the longest independent phase, so joining it last
+        // lets the dependent aggregation chain overlap nearly all of its work.
+        let ((quality, warnings), quality_ms) = quality.join().expect("quality worker panicked");
+        let (kin, kinematics_ms) = kin.join().expect("kinematics worker panicked");
+
+        MetricResults {
+            quality,
+            warnings,
+            kin,
+            fl,
+            mi,
+            cl,
+            lift,
+            marker_rows,
+            segments,
+            rows,
+            minutes,
+            costs: MetricCosts {
+                quality: quality_ms,
+                kinematics: kinematics_ms,
+                flicks: flicks_ms,
+                micro: micro_ms,
+                clicks: clicks_ms,
+                lifts: lifts_ms,
+                markers: marker_setup_ms + segment_ms,
+                per_second: per_second_ms,
+                per_minute: per_minute_ms,
+            },
+        }
+    })
+}
+
 /// Run every metric group over a loaded recording.
 ///
 /// Takes the session by value — [`prepare`] moves the event vector into the
 /// prepared series rather than copying it.
 pub fn build(session: LoadedSession, params: Params) -> Report {
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let parallel = parallel_worthwhile(session.events.len(), cpus);
+    build_with_parallelism(session, params, parallel)
+}
+
+fn build_with_parallelism(session: LoadedSession, params: Params, parallel: bool) -> Report {
     let mut t = Phases::new();
-    let p = prepare(session, params);
-    let ms = t.lap("prepare");
+    let (p, ms) = timed(|| prepare(session, params));
+    t.record("prepare", ms);
     tracing::info!(
         events = p.events().len(),
         grid_cells = p.grid.len(),
@@ -160,84 +325,94 @@ pub fn build(session: LoadedSession, params: Params) -> Report {
         "prepared series"
     );
 
-    let quality = quality::compute(&p);
-    // Computed once: `warnings()` walks and formats every check, and the old
-    // code called it twice — once to log, once to put in the report.
-    let warnings = quality.warnings();
+    let MetricResults {
+        quality,
+        warnings,
+        kin,
+        fl,
+        mi,
+        cl,
+        lift,
+        marker_rows,
+        segments,
+        rows,
+        minutes,
+        costs,
+    } = if parallel {
+        compute_metrics_parallel(&p)
+    } else {
+        compute_metrics_sequential(&p)
+    };
+
+    // Computed once with quality: `warnings()` walks and formats every check,
+    // and the old code called it twice — once to log, once for the report.
     for w in &warnings {
         tracing::warn!("{w}");
     }
-    let ms = t.lap("quality");
-    tracing::info!(elapsed_ms = format_args!("{ms:.1}"), "data quality");
+    t.record("quality", costs.quality);
+    tracing::info!(
+        elapsed_ms = format_args!("{:.1}", costs.quality),
+        "data quality"
+    );
 
-    let kin = kinematics::compute(&p);
-    let ms = t.lap("kinematics");
+    t.record("kinematics", costs.kinematics);
     tracing::info!(
         segments = kin.segment_count,
         distance_m = format_args!("{:.2}", kin.total_distance_m),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.kinematics),
         "kinematics"
     );
 
-    let fl = flicks::compute(&p);
-    let ms = t.lap("flicks");
+    t.record("flicks", costs.flicks);
     tracing::info!(
         flicks = fl.count,
         median_amplitude_deg = format_args!("{:.1}", fl.amplitude_deg.median),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.flicks),
         "detected flicks"
     );
 
-    let (mi, tremor) = micro::compute_full(&p);
-    let ms = t.lap("micro");
+    t.record("micro", costs.micro);
     tracing::info!(
         corrections = mi.total_corrections,
         blocks = mi.analyzed_blocks,
         band_ratio_8_12 = format_args!("{:.2}", mi.band_ratio_8_12),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.micro),
         "sub-movements and tremor"
     );
 
-    let cl = clicks::compute(&p);
-    let ms = t.lap("clicks");
+    t.record("clicks", costs.clicks);
     tracing::info!(
         clicks = cl.total_clicks,
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.clicks),
         "trigger discipline"
     );
 
-    let lift = lifts::compute(&p);
-    let ms = t.lap("lifts");
+    t.record("lifts", costs.lifts);
     tracing::info!(
         lifts = lift.count,
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.lifts),
         "repositioning lifts"
     );
 
-    let marker_rows = markers::rows(&p);
-    let intervals = markers::intervals(&p, &marker_rows);
-    let segments = markers::segment_reports(&p, &fl.flicks, &cl, &tremor, &intervals);
-    let ms = t.lap("markers");
+    t.record("markers", costs.markers);
     tracing::info!(
         markers = marker_rows.len(),
         intervals = segments.len(),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.markers),
         "marker segmentation"
     );
 
-    let rows = per_second::compute(&p, &fl.flicks, &intervals);
-    let ms = t.lap("per_second");
+    t.record("per_second", costs.per_second);
     tracing::info!(
         rows = rows.len(),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.per_second),
         "per-second aggregates"
     );
 
-    let minutes = per_minute::compute(&p, &rows, &fl.flicks, &tremor);
-    let ms = t.lap("per_minute");
+    t.record("per_minute", costs.per_minute);
     tracing::info!(
         rows = minutes.len(),
-        elapsed_ms = format_args!("{ms:.1}"),
+        elapsed_ms = format_args!("{:.1}", costs.per_minute),
         "per-minute aggregates"
     );
 
@@ -322,6 +497,8 @@ impl Report {
     pub fn timing_table(&self) -> String {
         let mut o = String::new();
         section(&mut o, "Timing");
+        // Phase durations are measured inside their workers. Their sum can be
+        // larger than build wall time when large reports run in parallel.
         let total: f64 = self.timings.iter().map(|t| t.ms).sum();
         for t in &self.timings {
             let share = if total > 0.0 { t.ms / total } else { 0.0 };
@@ -334,7 +511,14 @@ impl Report {
                 share * 100.0
             ));
         }
-        o.push_str(&format!("  {:<16} {:>9.1} ms\n", "total", total));
+        o.push_str(&format!(
+            "  {:<16} {:>9.1} ms\n",
+            "phase elapsed sum", total
+        ));
+        o.push_str(&format!(
+            "  {:<16} {:>9.1} ms\n",
+            "build wall", self.compute_ms
+        ));
         o
     }
 
@@ -1016,6 +1200,112 @@ mod tests {
     }
 
     #[test]
+    fn parallel_and_sequential_builds_have_identical_results() {
+        let mut session = demo_session();
+        session.markers.push(marker_at(1_000, "round-2"));
+        session.total_drops = 2;
+        session.batches[0].drops_since_last = 2;
+        let sequential = build_with_parallelism(session.clone(), Params::default(), false);
+        let parallel = build_with_parallelism(session, Params::default(), true);
+
+        let mut sequential = serde_json::to_value(sequential).unwrap();
+        let mut parallel = serde_json::to_value(parallel).unwrap();
+        for report in [&mut sequential, &mut parallel] {
+            let report = report.as_object_mut().unwrap();
+            report.remove("generated_utc_us");
+            report.remove("compute_ms");
+            report.remove("timings");
+        }
+        assert_eq!(parallel, sequential);
+    }
+
+    #[test]
+    fn report_parallelism_requires_enough_work_and_cpus() {
+        assert!(!parallel_worthwhile(PARALLEL_MIN_EVENTS - 1, 32));
+        assert!(!parallel_worthwhile(
+            PARALLEL_MIN_EVENTS,
+            PARALLEL_MIN_CPUS - 1
+        ));
+        assert!(parallel_worthwhile(PARALLEL_MIN_EVENTS, PARALLEL_MIN_CPUS));
+    }
+
+    /// Release-only manual probe used by `docs/PERFORMANCE-2026-09.md`.
+    /// Kept ignored because it consumes a real, machine-local recording.
+    fn real_session_perf_probe(parallel: bool) {
+        let default = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("recordings")
+            .join("s-20260904-042856-5006.jsonl");
+        let path = std::env::var_os("TELEMOUSE_BENCH_SESSION")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(default);
+        if !path.is_file() {
+            eprintln!(
+                "skipping: benchmark recording not found at {}",
+                path.display()
+            );
+            return;
+        }
+
+        let overall_started = std::time::Instant::now();
+        let load_started = std::time::Instant::now();
+        let session = crate::load::load_session(&path).unwrap();
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let events = session.events.len();
+        let started = std::time::Instant::now();
+        let report = build_with_parallelism(session, Params::default(), parallel);
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let overall_ms = overall_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "PERF mode={} events={} load_ms={:.1} wall_ms={:.1} build_ms={:.1} overall_ms={:.1} peak_working_set_mib={:.1}",
+            if parallel { "parallel" } else { "sequential" },
+            events,
+            load_ms,
+            wall_ms,
+            report.compute_ms,
+            overall_ms,
+            peak_working_set_mib(),
+        );
+    }
+
+    #[cfg(windows)]
+    fn peak_working_set_mib() -> f64 {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: GetCurrentProcess returns a process pseudo-handle valid for
+        // this call, and `counters` is initialized with its exact byte size.
+        unsafe {
+            GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).unwrap();
+        }
+        counters.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+    }
+
+    #[cfg(not(windows))]
+    fn peak_working_set_mib() -> f64 {
+        0.0
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark over a real recording"]
+    fn real_session_sequential_perf_probe() {
+        real_session_perf_probe(false);
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark over a real recording"]
+    fn real_session_parallel_perf_probe() {
+        real_session_perf_probe(true);
+    }
+
+    #[test]
     fn the_rendered_report_reads_like_a_report() {
         let r = build(demo_session(), Params::default());
         let text = r.render();
@@ -1181,6 +1471,7 @@ mod tests {
         assert!(t.contains("prepare"), "{t}");
         assert!(t.contains("per_minute"), "{t}");
         assert!(t.contains("render"), "{t}");
-        assert!(t.contains("total"), "{t}");
+        assert!(t.contains("phase elapsed sum"), "{t}");
+        assert!(t.contains("build wall"), "{t}");
     }
 }

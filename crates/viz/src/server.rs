@@ -41,6 +41,11 @@ pub const INDEX_HTML: &str = include_str!("index.html");
 /// valid JavaScript and an unconfigured page just sees `{}`.
 const CONFIG_PLACEHOLDER: &str = "/*__TELEMOUSE_CONFIG__*/";
 
+/// Amortize filesystem reads and HTTP body polling for large replay files.
+/// `ReaderStream` otherwise defaults to 4 KiB, which leaves substantial
+/// syscall and stream-wakeup overhead on recordings hundreds of MiB large.
+const SESSION_STREAM_CAPACITY: usize = 256 * 1024;
+
 /// The two flavours of the page, rendered once at startup: the dashboard and
 /// the OBS browser-source variant. Same HTML, different injected config.
 pub struct Pages {
@@ -154,11 +159,13 @@ async fn api_sessions(State(st): State<AppState>) -> impl IntoResponse {
 ///
 /// Real sessions are hundreds of megabytes; reading one into a `String` would
 /// cost that much resident memory per request and delay the page's first line
-/// until the whole file had been read. `ReaderStream` hands the socket 8KB
-/// chunks as they come off disk, and the page parses lines as they arrive.
+/// until the whole file had been read. `ReaderStream` hands the socket bounded
+/// 256 KiB chunks as they come off disk, and the page parses lines as they
+/// arrive.
 async fn api_session(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let dir = st.recordings_dir.clone();
-    // Path resolution scans the directory: blocking I/O, off the async worker.
+    // Path resolution performs filesystem metadata I/O; keep it off the async
+    // worker even though it now looks up only the requested recording.
     let resolved = tokio::task::spawn_blocking(move || recordings::resolve_recording(&dir, &id))
         .await
         .unwrap_or(None);
@@ -186,7 +193,11 @@ async fn api_session(State(st): State<AppState>, Path(id): Path<String>) -> Resp
     {
         headers.insert(header::CONTENT_LENGTH, v);
     }
-    (headers, Body::from_stream(ReaderStream::new(file))).into_response()
+    (
+        headers,
+        Body::from_stream(ReaderStream::with_capacity(file, SESSION_STREAM_CAPACITY)),
+    )
+        .into_response()
 }
 
 /// WebSocket upgrades are exempt from CORS, so a page anywhere on the web
@@ -517,6 +528,14 @@ mod tests {
                 "page references external asset: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn index_live_buffer_defaults_are_consistent() {
+        assert!(INDEX_HTML.contains(r#"id="buf" min="10" max="200" step="5" value="35""#));
+        assert!(INDEX_HTML.contains(r#"id="bufVal">35ms"#));
+        assert!(INDEX_HTML.contains("buffer_ms: 35,"));
+        assert!(INDEX_HTML.contains("const LIVE_BUFFER_DEFAULT = 0.035;"));
     }
 
     #[test]

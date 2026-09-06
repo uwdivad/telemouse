@@ -140,11 +140,18 @@ pub struct Stats {
     pub udp_unreachable: AtomicU64,
     /// Envelopes too large for one datagram.
     pub udp_oversized: AtomicU64,
+    /// Envelopes accepted by JSONL but not successfully flush-confirmed.
+    pub jsonl_queued: AtomicU64,
+    /// JSONL envelopes dropped because its queue was full or writer had failed.
+    pub jsonl_dropped: AtomicU64,
+    /// Envelopes not written before a writer failure or shutdown timeout.
+    pub jsonl_abandoned: AtomicU64,
     /// Envelopes handed to the Kafka forwarder but not yet produced.
     pub kafka_queued: AtomicU64,
-    /// Envelopes dropped because the Kafka forwarding channel was full.
+    /// Kafka envelopes dropped because its queue was full or worker had failed.
     pub kafka_dropped: AtomicU64,
-    /// Envelopes still queued when the bounded shutdown drain gave up.
+    /// Kafka envelopes accepted but not produced due to delivery failure,
+    /// initialization failure, panic, or a bounded shutdown timeout.
     pub kafka_abandoned: AtomicU64,
     /// High-water mark of ring occupancy observed by T2.
     pub ring_high_water: AtomicU64,
@@ -227,6 +234,9 @@ impl Stats {
             kafka_errors: self.kafka_errors.load(Ordering::Relaxed),
             udp_unreachable: self.udp_unreachable.load(Ordering::Relaxed),
             udp_oversized: self.udp_oversized.load(Ordering::Relaxed),
+            jsonl_queued: self.jsonl_queued.load(Ordering::Relaxed),
+            jsonl_dropped: self.jsonl_dropped.load(Ordering::Relaxed),
+            jsonl_abandoned: self.jsonl_abandoned.load(Ordering::Relaxed),
             kafka_queued: self.kafka_queued.load(Ordering::Relaxed),
             kafka_dropped: self.kafka_dropped.load(Ordering::Relaxed),
             kafka_abandoned: self.kafka_abandoned.load(Ordering::Relaxed),
@@ -250,6 +260,9 @@ pub struct StatsSnapshot {
     pub kafka_errors: u64,
     pub udp_unreachable: u64,
     pub udp_oversized: u64,
+    pub jsonl_queued: u64,
+    pub jsonl_dropped: u64,
+    pub jsonl_abandoned: u64,
     pub kafka_queued: u64,
     pub kafka_dropped: u64,
     pub kafka_abandoned: u64,
@@ -276,6 +289,9 @@ pub struct ReportFields {
     pub kafka_errors: u64,
     pub udp_unreachable: u64,
     pub udp_oversized: u64,
+    pub jsonl_queued: u64,
+    pub jsonl_dropped: u64,
+    pub jsonl_abandoned: u64,
     pub kafka_queued: u64,
     pub kafka_dropped: u64,
     pub kafka_abandoned: u64,
@@ -321,6 +337,9 @@ pub fn compute_report(
         kafka_errors: now.kafka_errors,
         udp_unreachable: now.udp_unreachable,
         udp_oversized: now.udp_oversized,
+        jsonl_queued: now.jsonl_queued,
+        jsonl_dropped: now.jsonl_dropped,
+        jsonl_abandoned: now.jsonl_abandoned,
         kafka_queued: now.kafka_queued,
         kafka_dropped: now.kafka_dropped,
         kafka_abandoned: now.kafka_abandoned,

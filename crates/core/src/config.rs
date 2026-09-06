@@ -51,10 +51,10 @@ pub struct BatchConfig {
     /// live-viz latency floor (a batch's first event is this old when it
     /// leaves) and, with it, the batches/s that the UDP hop, the recording
     /// and every WebSocket client pay for — each batch costs ~150µs of
-    /// kernel CPU across the pipeline whatever it holds. 50 (20 batches/s)
-    /// is the default since the 2026-08-29 CPU pass; the original 25 halves
-    /// live latency for double that cost. Recording contents and analysis
-    /// do not depend on it.
+    /// kernel CPU across the pipeline whatever it holds. The 25ms default
+    /// favors responsive live visualization; use 50ms to halve the per-batch
+    /// CPU cost when throughput matters more than display latency. Recording
+    /// contents and analysis do not depend on it.
     pub window_ms: u64,
     pub max_events: usize,
     /// SPSC ring-buffer capacity in events.
@@ -194,7 +194,7 @@ impl Default for AppConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
-            window_ms: 50,
+            window_ms: 25,
             max_events: crate::wire::MAX_EVENTS_PER_BATCH,
             ring_capacity: 65_536,
             coalesce_ms: 8,
@@ -247,7 +247,7 @@ impl Default for ObsConfig {
             hud_position: "bottom-left".into(),
             scale: 1.0,
             trail_secs: 3.0,
-            buffer_ms: 55,
+            buffer_ms: 35,
             grid: true,
             legend: false,
             labels: false,
@@ -418,8 +418,8 @@ mod tests {
     #[test]
     fn defaults_match_plan() {
         let c = AppConfig::default();
-        // 2026-08-29 CPU pass: 50ms batches (20/s) and an 8ms read cadence.
-        assert_eq!(c.batch.window_ms, 50);
+        // 25ms responsive live batches and an 8ms raw-input read cadence.
+        assert_eq!(c.batch.window_ms, 25);
         assert_eq!(c.batch.coalesce_ms, 8);
         assert!(c.batch.coalesce_ms <= MAX_COALESCE_MS);
         assert!(c.udp.enabled);
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(c.mouse_cpi, 3200.0);
         assert!(c.kafka.enabled);
         assert_eq!(c.kafka.brokers, vec!["10.0.0.5:9092".to_string()]);
-        assert_eq!(c.batch.window_ms, 50); // default preserved
+        assert_eq!(c.batch.window_ms, 25); // default preserved
         let g = c.games.get("cs2.exe").unwrap();
         assert_eq!(g.sens, 1.25);
         assert_eq!(g.yaw_coeff, 0.022); // serde default

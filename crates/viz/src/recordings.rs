@@ -98,9 +98,8 @@ fn line_utc_us(line: &[u8]) -> Option<i64> {
 /// True if `id` is shaped like a session id we are willing to look up.
 ///
 /// This is the cheap first gate; [`resolve_recording`] additionally requires
-/// the id to actually appear in the directory listing, so even an id that slips
-/// past this can only ever name a `.jsonl` file that is directly in the
-/// recording directory.
+/// the derived path to be a regular `.jsonl` file directly in the recording
+/// directory.
 pub fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -164,18 +163,22 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
 /// Resolve `id` to a readable recording path, or `None` if it is not one of the
 /// files this server is willing to serve.
 ///
-/// Deliberately implemented as "must appear in the directory listing" rather
-/// than as string sanitising alone: traversal (`../evil`), absolute paths,
-/// alternate separators, and NTFS stream/short-name tricks all fail the same
-/// membership check.
+/// The strict id alphabet makes `dir.join("{id}.jsonl")` a single direct child:
+/// traversal (`../evil`), absolute paths, alternate separators, and NTFS
+/// stream/short-name tricks cannot enter the derived path. `symlink_metadata`
+/// also requires that child to be a regular file rather than following a link.
+/// This intentionally avoids listing and timestamp-probing every recording in
+/// the directory for a single download.
 pub fn resolve_recording(dir: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
         return None;
     }
-    list_recordings(dir)
-        .into_iter()
-        .find(|e| e.id == id)
-        .map(|_| dir.join(format!("{id}.jsonl")))
+    let path = dir.join(format!("{id}.jsonl"));
+    std::fs::symlink_metadata(&path)
+        .ok()?
+        .file_type()
+        .is_file()
+        .then_some(path)
 }
 
 #[cfg(test)]
@@ -353,6 +356,9 @@ mod tests {
         // Exists, but not as a .jsonl recording.
         write(tmp.path(), "notes.txt", "x");
         assert!(resolve_recording(tmp.path(), "notes").is_none());
+        // A directory with the right suffix is not a recording.
+        std::fs::create_dir(tmp.path().join("folder.jsonl")).unwrap();
+        assert!(resolve_recording(tmp.path(), "folder").is_none());
     }
 
     /// The checked-in demo recording must stay a valid `Envelope` stream:

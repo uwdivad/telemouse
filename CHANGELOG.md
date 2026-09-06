@@ -6,6 +6,21 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+- Performance/latency follow-up: 256 KiB replay streaming and direct recording
+  lookup make a 532 MB replay 7.9x faster; the live browser trims typed arrays
+  in chunks; capture/browser defaults are now 25/35 ms for a roughly 35 ms
+  live-display floor.
+- Analyzer: persistent change-sensitive recording metadata index, one timestamp
+  vector instead of two, bounded interval searches, and dependency-aware
+  scoped parallelism. On the 8-million-event audit recording, warm listing is
+  4,972 → 17–23 ms, per-minute aggregation is 83.7 → 42.5 ms, and report build
+  is 1,390 → 846 ms median with a 6.9% peak-memory increase.
+- Capture isolation: JSONL writes/one-second flushes and Kafka initialization
+  run on bounded workers. Slow storage and the five-second broker connection
+  timeout no longer stall the shipping loop or capture startup; queue/drop/
+  abandoned-work telemetry makes degradation explicit. Flush-confirmed JSONL
+  accounting and Kafka terminal-failure handling avoid silent loss counters
+  and repeated per-batch error allocation during an outage.
 - Viz aim panel: yaw is drawn unwrapped. Crossing ±180° no longer teleports
   the head to the far edge (which made the camera pan and the zoom balloon);
   the seam is a dashed line at every odd multiple of 180° and the origin axis

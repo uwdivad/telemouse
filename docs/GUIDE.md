@@ -107,7 +107,7 @@ datagram, JSONL line, Kafka message) carries one JSON-encoded record per unit:
 | Record | When | Contains |
 |---|---|---|
 | `session` | once, at start | session id, QPC frequency, QPC↔UTC anchor, mouse CPI, per-game sens table, monitors, device list |
-| `batch` | every ~50 ms while the mouse moves (`batch.window_ms`) | up to 448 `RawEvent`s (`ts_qpc, dx, dy, buttons, wheel, wheel_h, device_ix`) plus context (game, pointer-locked, cursor, drop counters, seq_no) |
+| `batch` | every ~25 ms while the mouse moves (`batch.window_ms`) | up to 448 `RawEvent`s (`ts_qpc, dx, dy, buttons, wheel, wheel_h, device_ix`) plus context (game, pointer-locked, cursor, drop counters, seq_no) |
 | `marker` | on F9 / config change / clock drift | a labelled timestamp |
 
 The capture agent runs **three threads**:
@@ -120,9 +120,9 @@ The capture agent runs **three threads**:
   `QueryPerformanceCounter`, and pushes fixed-size structs into a lock-free
   single-producer/single-consumer ring buffer. It never allocates, never
   blocks, never touches the network. If the ring is full it drops and counts.
-- **T2 (shipper)** drains the ring, groups events into 50 ms batches (`batch.window_ms`), serializes
-  each batch to JSON *once*, and hands the bytes to every enabled sink (UDP,
-  JSONL, Kafka).
+- **T2 (shipper)** drains the ring, groups events into 25 ms batches (`batch.window_ms`), serializes
+  each batch to JSON *once*, sends UDP inline, and hands JSONL/Kafka owned jobs
+  to bounded workers.
 - **T3 (context)** ticks every 250 ms and asks Windows which process is in the
   foreground, where the cursor is, and whether the cursor is "frozen while
   deltas flow" (the pointer-lock heuristic = you are in a game with raw input).
@@ -158,6 +158,7 @@ telemouse/
 │   ├── CONVENTIONS.md         workspace rules (edition 2024, tracing, no panics on degraded env…)
 │   ├── AUDIT-2026-08.md       Aug-2026 perf/observability audit and every pass since, with leftovers
 │   ├── BENCHMARKS.md          criterion numbers, the live-stack CPU table, what is left on the table
+│   ├── PERFORMANCE-2026-09.md implemented follow-up with reproducible before/after measurements
 │   ├── HANDOFF-2026-09-03-kafka.md  standing up the Kafka broker on another machine
 │   └── GUIDE.md               this file
 ├── recordings/                per-session JSONL files; demo-session.jsonl is bundled
@@ -226,7 +227,7 @@ cargo build --release --workspace
 target\release\telemouse-ctl.exe    # http://127.0.0.1:7880
 
 # tests / benches
-cargo test --workspace              # 407 tests, no mouse/admin/Kafka/browser needed (ctl's child-process tests take minutes)
+cargo test --workspace              # no mouse/admin/Kafka/browser needed (ctl's child-process tests take minutes)
 cargo bench -p telemouse-analyze    # criterion over the loader + hot math
 cargo bench -p telemouse-core       # wire encode/decode, batcher
 ```
@@ -285,7 +286,7 @@ down", not "left is held".
 
 ### 5.2 `batch.rs` — `Batch`
 
-The envelope T2 assembles every ~50 ms (`batch.window_ms`):
+The envelope T2 assembles every ~25 ms (`batch.window_ms`):
 
 | field | meaning |
 |---|---|
@@ -323,7 +324,9 @@ pub enum Envelope { Session(SessionConfig), Batch(Batch), Marker(Marker) }
 
 One JSON `Envelope` per UDP datagram / JSONL line / Kafka message. `topic()`
 maps to `mouse.sessions` / `mouse.events` / `mouse.markers`; `key()` is always
-the session id so a session lands in one Kafka partition (ordering).
+the session id for stable partition routing. Kafka produces are concurrent for
+batching throughput and the three record types use separate topics, so consumers
+use `seq_no` rather than assuming visibility order across messages or topics.
 `EnvelopeView<'a>` is the borrowing twin for the hot path — only a `Batch`
 variant exists, wrapping a `BatchView`, because session and marker envelopes
 are rare enough to serialize from the owned type.
@@ -331,8 +334,8 @@ are rare enough to serialize from the owned type.
 Two constants matter: `MAX_UDP_PAYLOAD = 60_000` bytes and
 `MAX_EVENTS_PER_BATCH = 448`. The test `full_batch_fits_in_udp_datagram`
 serializes a worst-case batch (every field at its widest value) and asserts it
-fits; this is why the cap is 448 and not a round number. At the default 50 ms
-window the cap only binds above ~9 kHz polling (~17 kHz at 25 ms).
+fits; this is why the cap is 448 and not a round number. At the default 25 ms
+window the cap only binds above ~18 kHz polling (~9 kHz at 50 ms).
 
 ### 5.5 `clock.rs` — `QpcAnchor`
 
@@ -579,7 +582,8 @@ The loop (`run`, `shipping.rs:343-510`):
    `DRAIN_BUDGET` events, pushing each into the batcher and flushing whenever
    `should_flush(ev.ts_qpc)` fires (checked per push so a batch never exceeds
    the datagram budget); drain the marker channel; time-based flush; every 1 s
-   `tick_all` the sinks (JSONL flush).
+   `tick_all` the sinks for maintenance. JSONL flush timing belongs entirely
+   to its writer worker.
 3. Park: if nothing is pending, arm the waker (`begin_park`), re-check the
    ring is empty, `park_timeout(1 s)`. If a batch is open, `park_timeout`
    for the remaining window (`park_hint`, 0.5–25 ms) *without* arming the
@@ -587,7 +591,7 @@ The loop (`run`, `shipping.rs:343-510`):
    expires. This is the second half of the CPU win: T2 wakes once per batch,
    not once per report (ring high-water ~45 instead of 1).
 
-`flush` (`shipping.rs:512`) reads the context `Arc` once per batch (~20×/s at
+`flush` (`shipping.rs:512`) reads the context `Arc` once per batch (~40×/s at
 the default window), records latency
 (`capture_to_ship` from the first event, `ship_tail` from the last),
 optionally prints, then `encode_and_deliver`: **serialize once** into a reused
@@ -616,15 +620,16 @@ change reload + validate + log a diff (`describe_config_change`) + emit a
 `config_changed` marker (a broken edit keeps the previous config); every 5 s
 compute and log the stats line (§13); on `WM_DISPLAYCHANGE` re-read monitors.
 
-`context.rs`: `SharedContext` is a `Mutex<Arc<ContextSnapshot>>` — readers
-clone an `Arc`, not strings.
+`context.rs`: `SharedContext` is an `ArcSwap<ContextSnapshot>` — readers take
+one lock-free `Arc` snapshot per flush rather than cloning strings or taking a
+mutex.
 
 ### 6.6 Sinks (`sinks.rs`, `sinks/*.rs`)
 
 ```rust
 pub trait Sink: Send {
     fn name(&self) -> &'static str;
-    fn send(&mut self, env: &Envelope, payload: &str) -> Result<()>;
+    fn send(&mut self, topic: &'static str, key: &str, payload: &str) -> Result<()>;
     fn tick(&mut self) -> Result<()> { Ok(()) }
 }
 ```
@@ -633,16 +638,27 @@ pub trait Sink: Send {
   non-blocking. `ConnectionReset`/`Refused` (viz not running — the normal
   state) are counted as `udp_unreachable` and are *not* errors; `WouldBlock`
   is a silent drop; oversized payloads count `udp_oversized`.
-- **`JsonlSink`** — `<dir>/<session_id>.jsonl`, 64 KiB `BufWriter`, flushed
-  at most once per second (on `send` or `tick`), flush time recorded as
-  `jsonl_flush_max_us`. Flushes on drop.
+- **`JsonlSink`** — T2 copies the finished line into a bounded 256-envelope
+  FIFO; a dedicated worker owns `<dir>/<session_id>.jsonl` and its 64 KiB
+  `BufWriter`. It flushes at least once per second even under sustained load,
+  records `jsonl_flush_max_us`, and drains/final-flushes on drop for up to 3 s.
+  Records remain `jsonl_queued` until an explicit flush succeeds; failure and
+  timeout races count unresolved buffered/in-flight work exactly once.
+  Saturation drops quietly without blocking T2 and is visible as
+  `jsonl_dropped` / `jsonl_abandoned`. This flush reaches the OS cache; it is
+  not a power-loss `sync_data` guarantee.
 - **`KafkaSink`** — `rskafka` (pure Rust; *not* rdkafka despite the plan).
-  `connect` has a 5 s timeout and returns `Err` (→ skipped) if no broker.
-  Creates the three topics best-effort; one `BatchProducer` per topic with
-  25 ms linger and zstd. `send` is `try_send` on a bounded (128) channel to a
-  forwarder thread `"telemouse-kafka"` running a current-thread tokio runtime
-  with a bounded `JoinSet`; a full channel drops and warns *once on the edge*
-  (and logs recovery). Drop waits up to 3 s then records `kafka_abandoned`.
+  `connect` creates a bounded channel and returns immediately; the worker owns
+  the 5 s broker/topic/producer initialization timeout, so an unavailable
+  broker cannot delay capture startup. One `BatchProducer` per topic uses
+  25 ms linger and zstd. `send` is `try_send` on the bounded (128) channel to
+  the current-thread tokio worker with a bounded `JoinSet`; a full channel
+  drops and warns *once on the edge* (and logs recovery). Drop cancels pending
+  initialization or waits up to 3 s to drain, caps runtime teardown at 100 ms,
+  and records `kafka_abandoned`. A terminal initialization failure emits one
+  causal error; later envelopes are quiet counted drops instead of repeated
+  fan-out errors. Accepted delivery failures and worker/task panics are also
+  included in abandonment/error accounting.
 
 Everything degrades: no viz, no Kafka, no writable dir → warnings, capture
 continues.
@@ -774,12 +790,12 @@ seconds (`CHECKPOINT_SEC`). `seek` restores the nearest checkpoint on backward
 moves or long forward jumps and integrates forward from there — verified
 bit-identical to full re-integration in the audit.
 
-**Play head.** Live targets `tEnd − liveBuffer` (default 55 ms, slider
+**Play head.** Live targets `tEnd − liveBuffer` (default 35 ms, slider
 10–200 ms, persisted in `localStorage["telemouse.liveBuffer"]` — the only key
 used, and never in OBS mode); if >0.75 s behind it snaps forward, otherwise it
 rate-adjusts 0.9×–2.2×. `tick` clamps `dt` to 0.25 s, consumes at most 12 000
-events per frame, and `trim`s: 20 000 events behind the cursor, 40 000 hard
-cap, trail/ring/wheel lifetimes.
+events per frame, and `trim`s: compact after 24 096 consumed events back to a
+20 000-event low-water mark, 40 000 hard cap, trail/ring/wheel lifetimes.
 
 **Drawing.** `Trail` is a fixed ring (`1<<15`) of typed arrays. `drawTrail`
 buckets segments into 14 velocity × 7 age classes and issues one `stroke()`
@@ -1032,7 +1048,7 @@ All fields optional; unknown keys are errors.
 mouse_cpi = 1600.0            # counts per inch → cm. Wrong value = wrong cm, fixable later.
 
 [batch]
-window_ms = 50                # batch window (T2): live latency floor and batches/s; 25 halves latency for 2× the per-batch CPU
+window_ms = 25                # responsive live default; use 50 to halve per-batch CPU
 max_events = 448              # ≤ MAX_EVENTS_PER_BATCH
 ring_capacity = 65536         # SPSC ring slots; ≥ max_events
 coalesce_ms = 8               # T1 drain cadence − 1 ms (0–10). 8 ≈ 0.22% of a core at 1 kHz, 2 ≈ 0.45%, 0 = exact per-report stamps ≈ 2.8%
@@ -1065,7 +1081,7 @@ hud = ["speed", "aim", "cpm"] # also eps, dist, aimdist, clicks, game, latency
 hud_position = "bottom-left"
 scale = 1.0                   # 0.5–4
 trail_secs = 3.0              # 0.3–12
-buffer_ms = 55                # 10–200
+buffer_ms = 35                # 10–200
 grid = true
 legend = false
 labels = false
@@ -1181,10 +1197,11 @@ pointer-locked spans so desktop mousing doesn't count as "aim".
 "Metrics are logs here, no metrics server" (CONVENTIONS.md). Every
 long-running loop emits a structured `tracing` line every 5 s.
 
-**Capture (`stats.rs`, T3 logs it)** — 22 structured fields: `events_per_s,
+**Capture (`stats.rs`, T3 logs it)** — 28 structured fields: `events_per_s,
 events, batches_per_s, batches, drops, drops_delta, abs_frames, markers,
 udp_errors, udp_unreachable, udp_oversized, jsonl_errors, kafka_errors,
-kafka_queued, kafka_dropped, kafka_abandoned, ring_high_water,
+jsonl_queued, jsonl_dropped, jsonl_abandoned, kafka_queued, kafka_dropped,
+kafka_abandoned, ring_high_water,
 jsonl_flush_max_us, capture_to_ship_us_p50, capture_to_ship_us_p99,
 ship_tail_us_p99, idle_for_s, game, pointer_locked, session_id`.
 
@@ -1195,7 +1212,9 @@ means the viz isn't running. `idle_for_s` distinguishes "mouse is still" from
 `capture_alive`). `capture_to_ship_us_p50` is typically ≈ half the batch
 window. The latency histogram is a zero-allocation 32-bucket log2 array of
 atomics; percentiles are the upper bound of the bucket holding the quantile
-(conservative).
+(conservative). `jsonl_queued` means accepted but not yet flush-confirmed;
+`*_abandoned` is unresolved accepted work claimed by a failure or bounded
+shutdown, while `*_dropped` was never accepted by that sink.
 
 **Viz** — `viz stats` line every 5 s (silent when idle with no clients) and
 the same numbers at `/api/stats` and pushed into the page as `viz_stats`:
@@ -1231,20 +1250,21 @@ core to 2.18%; the second (2026-08-29) took the whole stack — capture, viz
 with one browser connected, ctl being polled — from **2.57% to 0.76%**
 loaded and from 0.29% to 0.09% idle. The per-hop costs that remain are
 kernel floors (~47 µs per loopback send, ~15 µs per raw-input drain) times
-rates, which is why the defaults now trade a little live latency
-(`window_ms` 50) and in-burst timestamp resolution (`coalesce_ms` 8) for
-those rates; `docs/BENCHMARKS.md` has the table to pick other points from.
+rates. The 2026-09 latency pass changed the live default to `window_ms` 25
+while retaining the CPU-saving `coalesce_ms` 8; use 50ms when minimum CPU is
+more important than responsiveness. `docs/BENCHMARKS.md` has the measured
+tradeoffs.
 
 | Decision | Where | Why |
 |---|---|---|
 | Live stream paced by a periodic high-res timer; the queue wait only while idle | T1 | a wake *by the raw-input queue* costs ~27 µs of kernel CPU; a timer wake plus the read ~15 µs |
 | Coalesced raw-input reads (`GetRawInputBuffer` once per period) | T1 | cost is per drain, not per report: 1000/(coalesce+1) drains/s |
-| 50 ms batch window (20 batches/s) | T2/viz | every batch costs ~150 µs of kernel CPU across UDP send, UDP recv and each WebSocket send |
+| 25 ms batch window (40 batches/s) | T2/viz | responsive live default; 50ms halves the ~150 µs-per-batch kernel cost |
 | Two-tier process scan: Toolhelp enumeration every 30 s, per-PID queries per poll | ctl | the snapshot alone is ~7 ms of kernel time; sysinfo's full walk was ~16 ms |
 | Wake T2 only on empty→non-empty, then sleep out the window | T1/T2 | one wake per batch instead of per report |
 | 1 s idle park; markers/config/shutdown wake T2 explicitly | T2 | no 25 ms idle wakeups |
 | Cache-line-isolated T1 counters, relaxed stores | T1 | no false sharing, no RMWs on the hot path |
-| Serialize once, `&str` to all sinks; `Arc<str>` in Kafka channel | T2 | one JSON encode per batch |
+| Serialize once, `&str` to all sinks; owned byte buffers in worker queues | T2 | one JSON encode per batch; JSONL/Kafka each copy once to leave T2 immediately |
 | `Arc<ContextSnapshot>` read once per flush | T2/T3 | no per-iteration mutex + String clone |
 | Foreground name re-resolved only on PID change | T3 | ~14 400 handle opens/hour → ~one per alt-tab |
 | ABOVE_NORMAL T1 priority, EcoQoS opt-out | T1 | E-core parking can't starve capture |
@@ -1258,16 +1278,18 @@ those rates; `docs/BENCHMARKS.md` has the table to pick other points from.
 | High-resolution waitable timer for the cadence (`thread::sleep` only as a fallback), **no** `timeBeginPeriod` | T1 | `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` fires on time; std's sleep overshoots by ~0.5–0.8 ms and a global timer-period change would tax every process |
 
 Things measured and *left alone*: the viz bridge's ~0.45% (it's recv/send
-syscalls), a binary wire schema (the JSON seam is intact and skip-zero-fields
-bought 35% for free), and a separate JSONL thread (flush time is now measured;
-no data yet justifies it).
+syscalls) and a binary wire schema (the JSON seam is intact and
+skip-zero-fields bought 35% for free). The September pass moved JSONL onto a
+bounded worker after deliberately blocked-storage testing showed that this
+could isolate T2 without making shutdown unbounded.
 
 ---
 
 ## 15. Testing philosophy
 
-`cargo test --workspace` runs 407 tests (core 51, capture 107, viz 62, ctl 51,
-analyze 132 + 4 integration) with no mouse, admin rights, Kafka, or browser;
+`cargo test --workspace` runs 429 passing tests (core 51, capture 119, viz 63,
+ctl 51, analyze 140 + 4 integration, one doctest) with no mouse, admin rights,
+Kafka, or browser;
 CI runs the same on `windows-latest`. The rule (CONVENTIONS.md) is that every
 crate's *pure logic* is unit-tested and Win32/network side effects sit behind
 thin traits or `#[cfg(windows)]` modules exercised manually.

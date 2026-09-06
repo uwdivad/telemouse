@@ -257,8 +257,8 @@
 
   <div class="ctl" id="bufCtl" title="Live buffer: how far the play head trails the newest event. Lower = less latency, more chance of a visible stutter when a batch is late. Saved in this browser.">
     <span>buffer</span>
-    <input type="range" id="buf" min="10" max="200" step="5" value="55">
-    <span class="val" id="bufVal">55ms</span>
+    <input type="range" id="buf" min="10" max="200" step="5" value="35">
+    <span class="val" id="bufVal">35ms</span>
   </div>
   <div class="ctl">
     <span>trail</span>
@@ -384,6 +384,11 @@ const FALLBACK_SENS = { sens: 1.0, yaw_coeff: 0.022, pitch_coeff: 0.022, fallbac
 const RING_LIFE = 0.55;      // seconds a click ring stays visible
 const WHEEL_LIFE = 1.2;      // seconds a wheel tick stays visible
 const MAX_LIVE_EVENTS = 20000;
+/* Keep a low/high-water gap between compactions. Without it, once cursor
+   crossed MAX_LIVE_EVENTS every render frame shifted all retained typed-array
+   columns just to discard the handful of events consumed in that frame. */
+const LIVE_TRIM_CHUNK = 4096;
+const LIVE_TRIM_TRIGGER = MAX_LIVE_EVENTS + LIVE_TRIM_CHUNK;
 /* Absolute ceiling on the live timeline. ingest() enforces this even when
    nothing is consuming (a backgrounded tab suspends rAF but not the socket),
    which is the difference between a bounded buffer and a leak. */
@@ -462,7 +467,7 @@ function parseBg(s) {
 const OBS = OBS_MODE ? (() => {
   const d = Object.assign({
     layout: "split", background: "transparent", hud: ["speed", "aim", "cpm"],
-    hud_position: "bottom-left", scale: 1, trail_secs: 3, buffer_ms: 55,
+    hud_position: "bottom-left", scale: 1, trail_secs: 3, buffer_ms: 35,
     grid: true, legend: false, labels: false,
   }, SERVER_CFG.obs || {});
   const str = (name, dflt, allowed) => {
@@ -1348,7 +1353,9 @@ const engine = {
       still reclaims. */
   trim() {
     if (ui.mode === "live") {
-      if (this.cursor > MAX_LIVE_EVENTS) this.dropFront(this.cursor - MAX_LIVE_EVENTS);
+      if (this.cursor >= LIVE_TRIM_TRIGGER) {
+        this.dropFront(this.cursor - MAX_LIVE_EVENTS);
+      }
       if (this.ev.n > HARD_EVENT_CAP) this.dropFront(this.ev.n - MAX_LIVE_EVENTS);
       if (this.markerCursor > 256) {
         this.markers.splice(0, this.markerCursor);
@@ -1809,7 +1816,7 @@ const aimPanel = new Panel("aimCanvas", {
 
 const $ = (id) => document.getElementById(id);
 
-const LIVE_BUFFER_DEFAULT = 0.055;
+const LIVE_BUFFER_DEFAULT = 0.035;
 const LIVE_BUFFER_KEY = "telemouse.liveBuffer";
 
 const ui = {

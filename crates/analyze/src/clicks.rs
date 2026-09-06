@@ -150,7 +150,10 @@ pub fn compute(p: &Prepared) -> ClickReport {
             let slot = per_button.entry(name).or_default();
             if e.buttons & down != 0 {
                 slot.downs += 1;
-                let t = p.event_t[i];
+                // Button transitions are sparse, so converting the handful of
+                // timestamps used here is much cheaper than retaining a second
+                // 8-byte timestamp vector for every motion event.
+                let t = us as f64 / 1e6;
                 let pre = mean_speed_in_window(
                     p,
                     t - prm.pre_click_lo_ms / 1000.0,

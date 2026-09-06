@@ -18,10 +18,12 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use telemouse_core::{Envelope, GameSens, Marker, RawEvent, SessionConfig};
@@ -34,6 +36,14 @@ use telemouse_core::{Envelope, GameSens, Marker, RawEvent, SessionConfig};
 /// oversized allocation, under-reserving costs a doubling — both are cheap
 /// compared to the growth series this replaces.
 const BYTES_PER_EVENT: u64 = 71;
+
+/// Versioned, disposable metadata cache used by [`scan_dir`]. It intentionally
+/// does not end in `.jsonl`, so it can live beside recordings without ever
+/// being mistaken for one.
+const INDEX_CACHE_FILE: &str = ".telemouse-analyze-index-v1.json";
+const INDEX_CACHE_VERSION: u32 = 1;
+const SIGNATURE_SAMPLE_BYTES: u64 = 4 * 1024;
+static CACHE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -155,6 +165,38 @@ pub struct SessionIndexEntry {
     pub drops: u64,
     pub games: Vec<String>,
     pub bad_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Timestamp {
+    secs: u64,
+    nanos: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileSignature {
+    len: u64,
+    modified: Option<Timestamp>,
+    created: Option<Timestamp>,
+    /// FNV-1a over small samples at the front, middle and tail. Size and mtime
+    /// are the primary invalidators; this also catches replacement files on
+    /// filesystems with coarse timestamp precision.
+    sample_hash: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedSession {
+    /// Path relative to the directory containing the cache: the file's stable
+    /// identity for directory-listing purposes.
+    file_name: PathBuf,
+    signature: FileSignature,
+    entry: SessionIndexEntry,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct SessionIndexCache {
+    version: u32,
+    files: Vec<CachedSession>,
 }
 
 /// The batch fields the analyzer actually reads, borrowed straight out of the
@@ -400,6 +442,136 @@ pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
     })
 }
 
+fn timestamp(value: std::io::Result<SystemTime>) -> Option<Timestamp> {
+    let d = value.ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(Timestamp {
+        secs: d.as_secs(),
+        nanos: d.subsec_nanos(),
+    })
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, Option<Timestamp>, Option<Timestamp>) {
+    (
+        metadata.len(),
+        timestamp(metadata.modified()),
+        timestamp(metadata.created()),
+    )
+}
+
+/// A cheap but change-sensitive recording signature. Sampling three locations
+/// keeps a cache hit O(1) in recording size while guarding against same-size
+/// replacement files whose timestamps were rounded by the filesystem.
+fn file_signature(path: &Path) -> Result<Option<FileSignature>, LoadError> {
+    let mut file = File::open(path).map_err(|source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let before = file.metadata().map_err(|source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (len, modified, created) = metadata_identity(&before);
+
+    let sample_len = len.min(SIGNATURE_SAMPLE_BYTES);
+    let middle = len
+        .saturating_div(2)
+        .saturating_sub(sample_len.saturating_div(2));
+    let tail = len.saturating_sub(sample_len);
+    let mut offsets = [0, middle, tail];
+    offsets.sort_unstable();
+
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut previous = None;
+    let mut buf = vec![0u8; sample_len as usize];
+    for offset in offsets {
+        if previous == Some(offset) {
+            continue;
+        }
+        previous = Some(offset);
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut buf))
+            .map_err(|source| LoadError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        for byte in offset.to_le_bytes().into_iter().chain(buf.iter().copied()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    // Never cache a view taken while capture was extending or replacing the
+    // file. The current scan may still be useful, but the next invocation must
+    // inspect it again.
+    let after = file.metadata().map_err(|source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata_identity(&after) != (len, modified, created) {
+        return Ok(None);
+    }
+
+    Ok(Some(FileSignature {
+        len,
+        modified,
+        created,
+        sample_hash: hash,
+    }))
+}
+
+fn read_index_cache(dir: &Path) -> HashMap<PathBuf, CachedSession> {
+    let path = dir.join(INDEX_CACHE_FILE);
+    let Ok(file) = File::open(path) else {
+        return HashMap::new();
+    };
+    let Ok(cache) = serde_json::from_reader::<_, SessionIndexCache>(BufReader::new(file)) else {
+        return HashMap::new();
+    };
+    if cache.version != INDEX_CACHE_VERSION {
+        return HashMap::new();
+    }
+    cache
+        .files
+        .into_iter()
+        .map(|cached| (cached.file_name.clone(), cached))
+        .collect()
+}
+
+/// The cache is only an acceleration structure, so failure to update it must
+/// never turn a successful listing into an error. Write and flush a uniquely
+/// named sibling first, then atomically replace the published cache so a crash
+/// or concurrent `list` cannot expose half a JSON document.
+fn write_index_cache(dir: &Path, mut files: Vec<CachedSession>) {
+    files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let cache = SessionIndexCache {
+        version: INDEX_CACHE_VERSION,
+        files,
+    };
+    let path = dir.join(INDEX_CACHE_FILE);
+    let seq = CACHE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(
+        ".telemouse-analyze-index-{}.{}.tmp",
+        std::process::id(),
+        seq
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|file| {
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &cache).map_err(std::io::Error::other)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            fs::rename(&temp, &path)
+        });
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        tracing::debug!(path = %path.display(), %error, "could not update recording index cache");
+    }
+}
+
 /// Every `*.jsonl` in `dir`, scanned and sorted by start time (oldest first).
 /// Unreadable files are skipped with a warning rather than failing the listing.
 pub fn scan_dir(dir: &Path) -> Result<Vec<SessionIndexEntry>, LoadError> {
@@ -407,18 +579,63 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<SessionIndexEntry>, LoadError> {
         path: dir.to_path_buf(),
         source,
     })?;
+    let cached = read_index_cache(dir);
+    let cached_len = cached.len();
+    let mut next_cache = Vec::new();
     let mut out = Vec::new();
+    let mut cache_changed = false;
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        let Some(file_name) = p.file_name().map(PathBuf::from) else {
+            continue;
+        };
+        // A full signature on both sides of a cache-miss scan prevents a
+        // same-size replacement with a coarse/restored timestamp from being
+        // published under metadata parsed from the previous file.
+        let signature_before = file_signature(&p).ok().flatten();
+        if let (Some(signature), Some(hit)) = (signature_before.as_ref(), cached.get(&file_name))
+            && &hit.signature == signature
+        {
+            let mut listed = hit.entry.clone();
+            // Preserve the caller's spelling of `dir` rather than leaking the
+            // path used by whichever invocation originally populated cache.
+            listed.path = p;
+            out.push(listed.clone());
+            next_cache.push(CachedSession {
+                file_name,
+                signature: signature.clone(),
+                entry: listed,
+            });
+            continue;
+        }
+
+        cache_changed = true;
         match scan_session(&p) {
-            Ok(e) => out.push(e),
+            Ok(scanned) => {
+                // Check again after the full scan. If capture appended during
+                // it, return what we observed but do not persist a stale view.
+                if let (Some(before), Some(after)) =
+                    (signature_before, file_signature(&p).ok().flatten())
+                    && before == after
+                {
+                    next_cache.push(CachedSession {
+                        file_name,
+                        signature: after,
+                        entry: scanned.clone(),
+                    });
+                }
+                out.push(scanned);
+            }
             Err(e) => {
                 tracing::warn!(path = %p.display(), error = %e, "skipping unreadable recording")
             }
         }
+    }
+    if cache_changed || next_cache.len() != cached_len {
+        write_index_cache(dir, next_cache);
     }
     out.sort_by_key(|e| (e.started_utc_us, e.session_id.clone()));
     Ok(out)
@@ -616,6 +833,141 @@ mod tests {
         assert_eq!(list[0].session_id, "earlier");
         assert_eq!(list[1].session_id, "later");
         assert_eq!(list[0].events, 0);
+    }
+
+    #[test]
+    fn scan_dir_cache_invalidates_when_a_recording_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let first = batch_env(
+            &cfg,
+            0,
+            Some("cs2.exe"),
+            0,
+            vec![ev(cfg.anchor.qpc, 1, 0, 0)],
+        )
+        .to_json()
+        .unwrap();
+        let path = write_lines(
+            dir.path(),
+            "s-test.jsonl",
+            &[Envelope::Session(cfg.clone()).to_json().unwrap(), first],
+        );
+
+        let initial = scan_dir(dir.path()).unwrap();
+        assert_eq!(initial[0].events, 1);
+        assert!(dir.path().join(INDEX_CACHE_FILE).is_file());
+
+        let second = batch_env(
+            &cfg,
+            1,
+            Some("valorant.exe"),
+            2,
+            vec![ev(cfg.anchor.qpc + FIXTURE_FREQ, 2, 0, 0)],
+        )
+        .to_json()
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{second}").unwrap();
+        file.flush().unwrap();
+
+        let changed = scan_dir(dir.path()).unwrap();
+        assert_eq!(changed[0].events, 2);
+        assert_eq!(changed[0].drops, 2);
+        assert_eq!(changed[0].games, vec!["cs2.exe", "valorant.exe"]);
+
+        // The replacement write succeeded and contains the refreshed entry,
+        // rather than merely returning a correct uncached scan once.
+        let cache: SessionIndexCache =
+            serde_json::from_reader(File::open(dir.path().join(INDEX_CACHE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(cache.files.len(), 1);
+        assert_eq!(cache.files[0].entry.events, 2);
+        assert_eq!(cache.files[0].entry.drops, 2);
+        assert_eq!(
+            cache.files[0].signature.len,
+            std::fs::metadata(&path).unwrap().len()
+        );
+
+        let warm = scan_dir(dir.path()).unwrap();
+        assert_eq!(warm, changed);
+    }
+
+    #[test]
+    fn signature_sampling_detects_a_same_size_tail_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let header = Envelope::Session(cfg.clone()).to_json().unwrap();
+        let batch = |dx| {
+            batch_env(&cfg, 0, None, 0, vec![ev(cfg.anchor.qpc, dx, 0, 0)])
+                .to_json()
+                .unwrap()
+        };
+        let path = write_lines(dir.path(), "s-test.jsonl", &[header.clone(), batch(1)]);
+        let before = file_signature(&path).unwrap().unwrap();
+
+        write_lines(dir.path(), "s-test.jsonl", &[header, batch(2)]);
+        let after = file_signature(&path).unwrap().unwrap();
+
+        assert_eq!(before.len, after.len);
+        assert_ne!(before.sample_hash, after.sample_hash);
+    }
+
+    #[test]
+    fn scan_dir_invalidates_a_same_size_recording_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let header = Envelope::Session(cfg.clone()).to_json().unwrap();
+        let batch = |game| {
+            batch_env(&cfg, 0, Some(game), 0, vec![ev(cfg.anchor.qpc, 1, 0, 0)])
+                .to_json()
+                .unwrap()
+        };
+        let path = write_lines(
+            dir.path(),
+            "s-test.jsonl",
+            &[header.clone(), batch("game-a.exe")],
+        );
+        let initial = scan_dir(dir.path()).unwrap();
+        assert_eq!(initial[0].games, vec!["game-a.exe"]);
+        let signature_before = file_signature(&path).unwrap().unwrap();
+
+        write_lines(dir.path(), "s-test.jsonl", &[header, batch("game-b.exe")]);
+        let signature_after = file_signature(&path).unwrap().unwrap();
+        assert_eq!(signature_before.len, signature_after.len);
+        assert_ne!(signature_before.sample_hash, signature_after.sample_hash);
+
+        let replaced = scan_dir(dir.path()).unwrap();
+        assert_eq!(replaced[0].games, vec!["game-b.exe"]);
+        let cache: SessionIndexCache =
+            serde_json::from_reader(File::open(dir.path().join(INDEX_CACHE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(cache.files[0].signature, signature_after);
+        assert_eq!(cache.files[0].entry.games, vec!["game-b.exe"]);
+    }
+
+    #[test]
+    fn a_corrupt_index_cache_is_disposable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        write_lines(
+            dir.path(),
+            "s-test.jsonl",
+            &[Envelope::Session(cfg).to_json().unwrap()],
+        );
+        std::fs::write(dir.path().join(INDEX_CACHE_FILE), "not json").unwrap();
+
+        let list = scan_dir(dir.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "s-test");
+        let rebuilt: SessionIndexCache =
+            serde_json::from_reader(File::open(dir.path().join(INDEX_CACHE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(rebuilt.version, INDEX_CACHE_VERSION);
+        assert_eq!(rebuilt.files.len(), 1);
     }
 
     #[test]
