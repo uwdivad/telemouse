@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "telemouse-analyze"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "telemouse-capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "telemouse-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "serde",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "telemouse-ctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "telemouse-viz"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

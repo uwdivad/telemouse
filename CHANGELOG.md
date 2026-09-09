@@ -6,6 +6,14 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-09
+
+Hardening release from the September production-readiness audit: the
+shipped config is loopback-only, the toolchain is pinned, the viz serves
+only the overlay to other machines, and every run leaves its loss counters
+next to the recording. Windows only, as before; recordings and the wire
+format are unchanged and every older recording still loads.
+
 - **Release config split.** `telemouse.example.toml` (loopback everywhere,
   Kafka off) is what the release zip now ships as `telemouse.toml`; the
   repository's `telemouse.toml` is the development machine's own config and
