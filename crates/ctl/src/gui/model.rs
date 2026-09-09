@@ -164,6 +164,15 @@ pub fn render_text(s: &Snapshot) -> String {
         "{:<20}default {default} (telemouse.toml [recording] enabled){now_line}",
         "SAVE DATA"
     ));
+    let hotkey = if s.hotkey.is_empty() {
+        "none (telemouse.toml [ctl] hotkey)".to_string()
+    } else {
+        format!(
+            "{} → new session: (re)start capture, saving → {}",
+            s.hotkey, s.recording_dir
+        )
+    };
+    out.push(format!("{:<20}{hotkey}", "HOTKEY"));
     out.push(String::new());
     out.push("RELATED PROCESSES".into());
     if s.processes.is_empty() {
@@ -203,6 +212,9 @@ pub const MENU_STOP_VIZ: u16 = 1005;
 pub const MENU_OPEN_PANEL: u16 = 1006;
 pub const MENU_EXIT: u16 = 1007;
 pub const MENU_START_CAPTURE_NOSAVE: u16 = 1008;
+/// Stop the running capture agent and start one that saves: a fresh
+/// session file. What the hotkey does.
+pub const MENU_NEW_SESSION: u16 = 1009;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuItem {
@@ -241,25 +253,42 @@ fn service_items(
 }
 
 /// The capture entries: while running, one *Stop* that says whether data is
-/// being saved; otherwise two *Start*s — with and without saving — both
-/// greyed when the binary is missing.
+/// being saved plus *New session* (stop, then start saving); otherwise two
+/// *Start*s — with and without saving — both greyed when the binary is
+/// missing. The item the hotkey is equivalent to carries the chord as its
+/// accelerator text (after a tab, which a Win32 menu right-aligns).
 fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
+    let accel = if s.hotkey.is_empty() {
+        String::new()
+    } else {
+        format!("\t{}", s.hotkey)
+    };
     match component(s, "capture") {
-        Some(c) if c.running => vec![item(
-            MENU_STOP_CAPTURE,
-            if c.saving {
-                "Stop capture (saving data)"
-            } else {
-                "Stop capture (not saving)"
-            },
-            true,
-        )],
+        Some(c) if c.running => vec![
+            item(
+                MENU_STOP_CAPTURE,
+                if c.saving {
+                    "Stop capture (saving data)"
+                } else {
+                    "Stop capture (not saving)"
+                },
+                true,
+            ),
+            item(
+                MENU_NEW_SESSION,
+                &format!(
+                    "New session (restart capture, save data → {}){accel}",
+                    s.recording_dir
+                ),
+                true,
+            ),
+        ],
         c => {
             let ok = c.is_some_and(|c| c.bin_found);
             vec![
                 item(
                     MENU_START_CAPTURE,
-                    &format!("Start capture (save data → {})", s.recording_dir),
+                    &format!("Start capture (save data → {}){accel}", s.recording_dir),
                     ok,
                 ),
                 item(MENU_START_CAPTURE_NOSAVE, "Start capture (don't save)", ok),
@@ -395,6 +424,7 @@ mod tests {
         Snapshot {
             recording_enabled: true,
             recording_dir: "recordings".into(),
+            hotkey: "Ctrl+Alt+R".into(),
             now_unix_s: 1_000_000 + 3661,
             components: vec![
                 comp(
@@ -492,6 +522,10 @@ mod tests {
         assert!(text.contains("not built"), "a missing binary is said so");
         assert!(text.contains("SAVE DATA           default on → recordings"));
         assert!(text.contains("capture is SAVING → recordings"));
+        assert!(text.contains("HOTKEY              Ctrl+Alt+R → new session"));
+        let mut nokey = snap(true, false);
+        nokey.hotkey.clear();
+        assert!(render_text(&nokey).contains("HOTKEY              none"));
         let mut off = snap(true, false);
         off.recording_enabled = false;
         off.components[0].saving = false;
@@ -540,9 +574,41 @@ mod tests {
             labels.iter().any(|l| l == "Stop capture (saving data)"),
             "{labels:?}"
         );
+        // While running, New session is offered and wears the hotkey.
+        assert!(m.contains(&(MENU_NEW_SESSION, true)));
+        assert!(
+            labels
+                .iter()
+                .any(|l| l == "New session (restart capture, save data → recordings)\tCtrl+Alt+R"),
+            "{labels:?}"
+        );
         let both = ids(&menu(&snap(false, false), true));
         assert!(both.contains(&(MENU_START_CAPTURE, true)));
         assert!(both.contains(&(MENU_START_CAPTURE_NOSAVE, true)));
+        assert!(!both.iter().any(|(id, _)| *id == MENU_NEW_SESSION));
+        // Stopped, the hotkey is a saving start, so that item wears it.
+        let stopped_labels: Vec<String> = menu(&snap(false, false), true)
+            .into_iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i.label),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stopped_labels
+                .iter()
+                .any(|l| l == "Start capture (save data → recordings)\tCtrl+Alt+R"),
+            "{stopped_labels:?}"
+        );
+        let mut nokey = snap(false, false);
+        nokey.hotkey.clear();
+        assert!(
+            menu(&nokey, true).iter().all(|e| match e {
+                MenuEntry::Item(i) => !i.label.contains('\t'),
+                _ => true,
+            }),
+            "no accelerator text without a hotkey"
+        );
         assert!(m.contains(&(MENU_START_VIZ, true)));
         assert!(m.contains(&(MENU_OPEN_PANEL, true)));
         assert!(m.contains(&(MENU_EXIT, true)));

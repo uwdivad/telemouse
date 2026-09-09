@@ -15,13 +15,23 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # One pinned version for CI and every developer (rust-toolchain.toml
+      # is the local source of truth; keep the two in step), so a new
+      # stable's lints cannot turn the gate red on their own.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      # The viz page's script is embedded in the binary; the Rust tests run
+      # these when node is present, and this makes the requirement explicit.
+      - name: viz page syntax
+        run: node --check crates/viz/src/app.js
+      - name: viz engine tests
+        run: node --test crates/viz/js-tests/engine.test.mjs

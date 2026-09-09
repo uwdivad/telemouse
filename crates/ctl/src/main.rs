@@ -63,6 +63,7 @@ fn init_tracing(log_dir: &std::path::Path) {
 #[derive(Parser, Debug)]
 #[command(
     name = "telemouse-ctl",
+    version,
     about = "Control panel: start, stop and inspect telemouse processes"
 )]
 struct Cli {
@@ -117,6 +118,9 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("logs"))
     });
     init_tracing(&log_dir);
+    // A panic on the GUI thread or a pump task lands in ctl.log, which is
+    // the only place a tray-launched panel can be seen.
+    telemouse_core::panic_hook::install("ctl");
     let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
@@ -191,6 +195,15 @@ async fn serve(args: ServeArgs, cfg: AppConfig, log_dir: PathBuf) -> Result<()> 
 
     // The tray's Exit item ends up here too.
     let quit = Arc::new(tokio::sync::Notify::new());
+    // `validate` already rejected a bad chord at load; this only guards the
+    // defaults path.
+    let hotkey = match telemouse_core::hotkey::Hotkey::parse(&cfg.ctl.hotkey) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(error = %e, "ctl.hotkey ignored");
+            None
+        }
+    };
     let gui = if cfg!(windows) && !args.no_gui {
         gui::spawn(gui::GuiDeps {
             handle: tokio::runtime::Handle::current(),
@@ -198,6 +211,7 @@ async fn serve(args: ServeArgs, cfg: AppConfig, log_dir: PathBuf) -> Result<()> 
             scanner: state.scanner.clone(),
             http_addr: listener.local_addr().unwrap_or(http_addr),
             quit: quit.clone(),
+            hotkey,
         })
     } else {
         None

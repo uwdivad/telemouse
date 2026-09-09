@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use telemouse_core::recordings::SessionMeta;
 use telemouse_core::{Envelope, GameSens, Marker, RawEvent, SessionConfig};
 
 /// Rough serialized size of one motion event, used to size the event vector
@@ -165,6 +166,50 @@ pub struct SessionIndexEntry {
     pub drops: u64,
     pub games: Vec<String>,
     pub bad_lines: usize,
+    /// Sinks that lost envelopes during the run, as `(sink, count)`, from the
+    /// `<session_id>.meta.json` sidecar the capture agent writes when it
+    /// stops. Empty when nothing was lost — or when there is no sidecar
+    /// (recordings made before it existed, or an agent that was killed).
+    #[serde(default)]
+    pub losses: Vec<(String, u64)>,
+    /// How the run ended, from the sidecar (`interrupt`, `duration`, or one
+    /// of the thread-exit reasons). `None` without a sidecar.
+    #[serde(default)]
+    pub exit: Option<String>,
+}
+
+impl SessionIndexEntry {
+    /// Fill the sidecar-derived fields for a recording at `path`.
+    fn with_sidecar(mut self, path: &Path) -> Self {
+        if let Some(meta) = read_sidecar(path) {
+            self.losses = meta.losses();
+            self.exit = Some(meta.exit.clone()).filter(|e| !e.is_empty());
+        } else {
+            self.losses.clear();
+            self.exit = None;
+        }
+        self
+    }
+
+    /// The `LOSS` column: `-` or `kafka=400,jsonl=2`.
+    pub fn losses_text(&self) -> String {
+        if self.losses.is_empty() {
+            "-".to_string()
+        } else {
+            self.losses
+                .iter()
+                .map(|(n, k)| format!("{n}={k}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+}
+
+/// The metadata sidecar next to `recording`, if the agent wrote one.
+pub fn read_sidecar(recording: &Path) -> Option<SessionMeta> {
+    let path = recording.with_extension("meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    SessionMeta::from_json(&text).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -439,7 +484,10 @@ pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
         drops,
         games: games.into_iter().map(|(g, _)| g).collect(),
         bad_lines,
-    })
+        losses: Vec::new(),
+        exit: None,
+    }
+    .with_sidecar(path))
 }
 
 fn timestamp(value: std::io::Result<SystemTime>) -> Option<Timestamp> {
@@ -602,7 +650,11 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<SessionIndexEntry>, LoadError> {
             let mut listed = hit.entry.clone();
             // Preserve the caller's spelling of `dir` rather than leaking the
             // path used by whichever invocation originally populated cache.
-            listed.path = p;
+            listed.path = p.clone();
+            // The sidecar is written after the recording's last flush, so it
+            // can appear without the recording changing: always re-read it
+            // (one small file) rather than trusting the cached copy.
+            listed = listed.with_sidecar(&p);
             out.push(listed.clone());
             next_cache.push(CachedSession {
                 file_name,
@@ -809,6 +861,57 @@ mod tests {
         assert!(fallback, "valorant.exe has no profile in the fixture");
         assert_eq!(sens.sens, 1.0);
         assert_eq!(sens.yaw_coeff, 0.022);
+    }
+
+    #[test]
+    fn the_metadata_sidecar_puts_sink_losses_in_the_listing() {
+        use std::collections::BTreeMap;
+        use telemouse_core::recordings::{SessionMeta, SinkMeta};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let path = write_lines(
+            dir.path(),
+            "s-test.jsonl",
+            &[Envelope::Session(cfg.clone()).to_json().unwrap()],
+        );
+        // No sidecar yet: nothing to say.
+        let first = scan_dir(dir.path()).unwrap();
+        assert!(first[0].losses.is_empty());
+        assert_eq!(first[0].exit, None);
+        assert_eq!(first[0].losses_text(), "-");
+
+        // The agent stops and writes the sidecar; the recording itself is
+        // unchanged, so the cached entry is reused — and must still pick
+        // the sidecar up.
+        let mut sinks = BTreeMap::new();
+        sinks.insert(
+            "kafka".to_string(),
+            SinkMeta {
+                errors: 1,
+                dropped: 397,
+                abandoned: 3,
+            },
+        );
+        sinks.insert("jsonl".to_string(), SinkMeta::default());
+        let meta = SessionMeta {
+            session_id: "s-test".into(),
+            exit: "interrupt".into(),
+            sinks,
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("s-test.meta.json"),
+            meta.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        let second = scan_dir(dir.path()).unwrap();
+        assert_eq!(second[0].losses, vec![("kafka".to_string(), 400)]);
+        assert_eq!(second[0].exit.as_deref(), Some("interrupt"));
+        assert_eq!(second[0].losses_text(), "kafka=400");
+        assert_eq!(read_sidecar(&path).unwrap().session_id, "s-test");
+        // The sidecar is never mistaken for a recording.
+        assert_eq!(second.len(), 1);
     }
 
     #[test]

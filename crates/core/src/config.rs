@@ -110,6 +110,12 @@ pub struct VizConfig {
 /// minute is not going to.
 pub const MAX_STOP_GRACE_SECS: u64 = 60;
 
+/// Default `ctl.stop_grace_secs`. The capture agent's teardown drains its
+/// JSONL and Kafka sinks in sequence, each bounded at 3 s, plus the thread
+/// joins; 8 s covers that worst case, so a slow disk or broker at stop time
+/// costs a delay rather than a truncated recording.
+pub const DEFAULT_STOP_GRACE_SECS: u64 = 8;
+
 /// The control panel (`telemouse-ctl`): where it listens and how it finds
 /// and stops the binaries it launches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +133,11 @@ pub struct CtlConfig {
     /// when started from Explorer) and one `<component>.log` per launched
     /// component (what the child printed, kept across panel restarts).
     pub log_dir: PathBuf,
+    /// System-wide hotkey (Windows, with the tray running) that starts a new
+    /// saved session: stops the capture agent if it is running, then starts
+    /// one that records. `ctrl+alt+r` by default; `""` for none. Grammar in
+    /// [`crate::hotkey`].
+    pub hotkey: String,
 }
 
 impl Default for CtlConfig {
@@ -134,8 +145,9 @@ impl Default for CtlConfig {
         Self {
             http_addr: "127.0.0.1:7880".into(),
             bin_dir: None,
-            stop_grace_secs: 5,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             log_dir: PathBuf::from("logs"),
+            hotkey: "ctrl+alt+r".into(),
         }
     }
 }
@@ -318,6 +330,35 @@ impl ObsConfig {
     }
 }
 
+/// Whether a `kafka.brokers` entry is a usable bootstrap address: `host:port`
+/// (or `[v6]:port`) with a non-empty host and a non-zero port. A bare host
+/// is rejected rather than defaulted, because the client connects with the
+/// string as written and a port-less entry can never be reached.
+pub fn broker_is_valid(broker: &str) -> bool {
+    let s = broker.trim();
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let host = &rest[..end];
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        match rest[end + 1..].strip_prefix(':') {
+            Some(port) => (host, port),
+            None => return false,
+        }
+    } else {
+        match s.rsplit_once(':') {
+            Some((host, port)) => (host, port),
+            None => return false,
+        }
+    };
+    !host.is_empty()
+        && !host.chars().any(|c| c.is_whitespace() || c == '/')
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -380,12 +421,26 @@ impl AppConfig {
                 "kafka is enabled but no brokers are listed",
             ));
         }
+        // Checked whether or not Kafka is enabled: a broker that cannot be
+        // reached as written is a typo whenever it is written.
+        if let Some(bad) = self.kafka.brokers.iter().find(|b| !broker_is_valid(b)) {
+            return Err(invalid(
+                "kafka.brokers",
+                format!(
+                    "{bad:?} is not a host:port address (a port is required, e.g. \"{}:9092\")",
+                    bad.trim()
+                ),
+            ));
+        }
         self.viz.obs.validate()?;
         if self.ctl.stop_grace_secs > MAX_STOP_GRACE_SECS {
             return Err(invalid(
                 "ctl.stop_grace_secs",
                 format!("must be at most {MAX_STOP_GRACE_SECS}s"),
             ));
+        }
+        if let Err(reason) = crate::hotkey::Hotkey::parse(&self.ctl.hotkey) {
+            return Err(invalid("ctl.hotkey", reason));
         }
         for (game, g) in &self.games {
             if !(g.sens.is_finite() && g.sens > 0.0)
@@ -432,17 +487,23 @@ mod tests {
         let c = AppConfig::default();
         assert_eq!(c.ctl.http_addr, "127.0.0.1:7880");
         assert_eq!(c.ctl.bin_dir, None);
-        assert_eq!(c.ctl.stop_grace_secs, 5);
+        assert_eq!(c.ctl.stop_grace_secs, DEFAULT_STOP_GRACE_SECS);
+        assert!(
+            c.ctl.stop_grace_secs >= 8,
+            "the grace must cover both sink drains (3 s each) plus the joins"
+        );
         assert_eq!(c.ctl.log_dir, Path::new("logs"));
+        assert_eq!(c.ctl.hotkey, "ctrl+alt+r");
 
         let c: AppConfig = toml::from_str(
-            "[ctl]\nhttp_addr = \"127.0.0.1:9000\"\nbin_dir = \"target/release\"\nstop_grace_secs = 2\nlog_dir = \"var/log\"\n",
+            "[ctl]\nhttp_addr = \"127.0.0.1:9000\"\nbin_dir = \"target/release\"\nstop_grace_secs = 2\nlog_dir = \"var/log\"\nhotkey = \"shift+f9\"\n",
         )
         .unwrap();
         assert_eq!(c.ctl.http_addr, "127.0.0.1:9000");
         assert_eq!(c.ctl.bin_dir.as_deref(), Some(Path::new("target/release")));
         assert_eq!(c.ctl.stop_grace_secs, 2);
         assert_eq!(c.ctl.log_dir, Path::new("var/log"));
+        assert_eq!(c.ctl.hotkey, "shift+f9");
         c.validate().unwrap();
 
         let mut bad = AppConfig::default();
@@ -451,6 +512,19 @@ mod tests {
             bad.validate(),
             Err(ConfigError::Invalid {
                 field: "ctl.stop_grace_secs",
+                ..
+            })
+        ));
+
+        let mut off = AppConfig::default();
+        off.ctl.hotkey = String::new();
+        off.validate().unwrap();
+        let mut bad = AppConfig::default();
+        bad.ctl.hotkey = "ctrl+bogus".into();
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::Invalid {
+                field: "ctl.hotkey",
                 ..
             })
         ));
@@ -519,6 +593,45 @@ mod tests {
     }
 
     #[test]
+    fn broker_addresses_need_a_host_and_a_port() {
+        for ok in [
+            "127.0.0.1:9092",
+            "kafka.lan:9092",
+            "[::1]:9092",
+            " 192.168.137.67:9092 ",
+            "broker-1.internal:19092",
+        ] {
+            assert!(broker_is_valid(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "192.168.137.67",
+            "[::1]",
+            "[::1]9092",
+            "[not-v6]:9092",
+            ":9092",
+            "host:",
+            "host:0",
+            "host:65536",
+            "host:9092/path",
+            "http://host:9092",
+        ] {
+            assert!(!broker_is_valid(bad), "{bad:?} should be rejected");
+        }
+        // Disabled Kafka still has its broker list checked: the typo is the
+        // same typo whenever it gets switched on.
+        let cfg: AppConfig =
+            toml::from_str("[kafka]\nenabled = false\nbrokers = [\"10.0.0.5\"]").unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Invalid {
+                field: "kafka.brokers",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn typoed_key_is_rejected_not_ignored() {
         // "mouse_dpi" instead of "mouse_cpi" must be a hard error, otherwise
         // every cm-derived metric is silently wrong at the default CPI.
@@ -540,6 +653,14 @@ mod tests {
             ),
             ("batch.coalesce_ms", "[batch]\ncoalesce_ms = 11"),
             ("kafka.brokers", "[kafka]\nenabled = true\nbrokers = []"),
+            // A port-less broker can never be connected to as written.
+            (
+                "kafka.brokers",
+                "[kafka]\nenabled = true\nbrokers = [\"127.0.0.1:9092\", \"192.168.137.67\"]",
+            ),
+            ("kafka.brokers", "[kafka]\nbrokers = [\"broker:notaport\"]"),
+            ("kafka.brokers", "[kafka]\nbrokers = [\":9092\"]"),
+            ("kafka.brokers", "[kafka]\nbrokers = [\"host:0\"]"),
             ("games", "[games.\"a.exe\"]\nsens = -2.0"),
             ("viz.obs.layout", "[viz.obs]\nlayout = \"sideways\""),
             ("viz.obs.background", "[viz.obs]\nbackground = \"blue\""),

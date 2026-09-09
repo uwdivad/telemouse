@@ -14,10 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use telemouse_core::hotkey::Hotkey;
 use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
-use crate::manager::{ComponentState, Manager, StartRequest};
+use crate::manager::{ComponentState, Manager, StartRequest, StopError};
 use crate::procs::{ProcInfo, Scanner};
 
 /// Log lines per component in a snapshot: the window shows one log tail.
@@ -42,6 +43,9 @@ pub struct Snapshot {
     /// `recording.enabled` in the config the children are launched with.
     pub recording_enabled: bool,
     pub recording_dir: String,
+    /// The new-session hotkey as the user sees it (`Ctrl+Alt+R`); empty
+    /// when none is configured.
+    pub hotkey: String,
 }
 
 /// What the UI thread holds: the shared handles it reads and pokes.
@@ -58,11 +62,17 @@ pub struct GuiLink {
     pub visible: Arc<AtomicBool>,
     /// `http://…/` of the web panel, for the "Open web panel" item.
     pub panel_url: String,
+    /// `[ctl] hotkey`, parsed; the UI thread registers it system-wide.
+    pub hotkey: Option<Hotkey>,
+    /// A [`new_session`] is in flight (stop, then start). A second press
+    /// during the stop's grace period is ignored rather than raced.
+    pub restarting: Arc<AtomicBool>,
 }
 
 /// Take snapshots forever: every [`TICK`] while visible, every
 /// [`HIDDEN_EVERY`] ticks while hidden, and at once on `poke`. Stops when
-/// the receiver is gone.
+/// the receiver is gone. `hotkey` is copied into every snapshot for the
+/// window text and the menu.
 pub async fn run_publisher(
     manager: Arc<Manager>,
     scanner: Arc<Scanner>,
@@ -70,6 +80,7 @@ pub async fn run_publisher(
     poke: Arc<Notify>,
     visible: Arc<AtomicBool>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    hotkey: String,
 ) {
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -101,6 +112,7 @@ pub async fn run_publisher(
             processes,
             recording_enabled: rec.enabled,
             recording_dir: rec.dir,
+            hotkey: hotkey.clone(),
         };
         debug!(
             visible = vis,
@@ -134,6 +146,43 @@ pub fn start(link: &GuiLink, id: &'static str, save: Option<bool>) {
             Ok(pid) => info!(component = id, pid, save = ?save, "started from the tray"),
             Err(e) => warn!(component = id, error = %e, "tray start refused"),
         }
+        s.invalidate();
+        poke.notify_one();
+    });
+}
+
+/// A fresh recording — what the hotkey and the *New session* menu item do:
+/// stop the capture agent if it is running (gracefully, so the file it was
+/// writing is complete), then start one that saves, whatever `[recording]
+/// enabled` says. Every capture run is its own session file, so this is
+/// how a long sitting gets split. One at a time: a call while the previous
+/// one is still stopping is dropped with a log line.
+pub fn new_session(link: &GuiLink) {
+    if link.restarting.swap(true, Ordering::AcqRel) {
+        info!("new session already in progress; ignored");
+        return;
+    }
+    let (m, s, poke, busy) = (
+        link.manager.clone(),
+        link.scanner.clone(),
+        link.poke.clone(),
+        link.restarting.clone(),
+    );
+    link.handle.spawn(async move {
+        match m.stop("capture", false).await {
+            Ok(outcome) => info!(?outcome, "new session: previous capture stopped"),
+            Err(StopError::NotRunning) => {}
+            Err(e) => warn!(error = %e, "new session: stop refused"),
+        }
+        let req = StartRequest {
+            save: Some(true),
+            ..Default::default()
+        };
+        match m.start("capture", &req).await {
+            Ok(pid) => info!(pid, "new session: capture started, saving"),
+            Err(e) => warn!(error = %e, "new session: start refused"),
+        }
+        busy.store(false, Ordering::Release);
         s.invalidate();
         poke.notify_one();
     });
@@ -198,6 +247,7 @@ mod tests {
             Arc::new(move || {
                 w.fetch_add(1, Ordering::Relaxed);
             }),
+            "Ctrl+Alt+R".into(),
         ));
         Rig {
             rx,
@@ -226,6 +276,7 @@ mod tests {
         assert!(s.now_unix_s > 1_700_000_000);
         assert!(s.recording_enabled);
         assert_eq!(s.recording_dir, "recordings");
+        assert_eq!(s.hotkey, "Ctrl+Alt+R");
         assert!(r.wakes.load(Ordering::Relaxed) >= 1);
         r.task.abort();
     }
@@ -260,20 +311,26 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn tray_actions_are_refused_cleanly_and_poke_the_publisher() {
+    fn link(poke: Arc<Notify>) -> GuiLink {
         let (_tx, rx) = watch::channel(Arc::new(Snapshot::default()));
-        let poke = Arc::new(Notify::new());
-        let link = GuiLink {
+        GuiLink {
             handle: tokio::runtime::Handle::current(),
             manager: manager(),
             scanner: Arc::new(Scanner::new()),
             state: rx,
-            poke: poke.clone(),
+            poke,
             quit: Arc::new(Notify::new()),
             visible: Arc::new(AtomicBool::new(true)),
             panel_url: "http://127.0.0.1:7880/".into(),
-        };
+            hotkey: Hotkey::parse("ctrl+alt+r").unwrap(),
+            restarting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn tray_actions_are_refused_cleanly_and_poke_the_publisher() {
+        let poke = Arc::new(Notify::new());
+        let link = link(poke.clone());
         // No binaries: the start fails at spawn, the stop finds nothing running;
         // both must still poke so the UI refreshes.
         start(&link, "capture", Some(false));
@@ -285,5 +342,37 @@ mod tests {
             .await
             .unwrap();
         assert!(link.manager.snapshot(1).await.iter().all(|c| !c.running));
+    }
+
+    /// With nothing running the hotkey's action is a plain saving start; it
+    /// still pokes when that start is refused, and it releases its guard.
+    #[tokio::test]
+    async fn new_session_is_one_at_a_time_and_pokes_when_done() {
+        let poke = Arc::new(Notify::new());
+        let link = link(poke.clone());
+        new_session(&link);
+        assert!(
+            link.restarting.load(Ordering::Acquire),
+            "guard held while in flight"
+        );
+        tokio::time::timeout(Duration::from_secs(5), poke.notified())
+            .await
+            .unwrap();
+        assert!(!link.restarting.load(Ordering::Acquire), "guard released");
+        assert!(link.manager.snapshot(1).await.iter().all(|c| !c.running));
+
+        // A press while one is in flight is dropped, not queued: no second poke.
+        link.restarting.store(true, Ordering::Release);
+        new_session(&link);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), poke.notified())
+                .await
+                .is_err(),
+            "the ignored press must not spawn anything"
+        );
+        assert!(
+            link.restarting.load(Ordering::Acquire),
+            "the ignored press does not clear the guard"
+        );
     }
 }

@@ -410,6 +410,23 @@ URL (viz uses it on `/ws`). `browse_addr` / `browse_addr_str` turn a wildcard
 bind (`0.0.0.0` / `[::]`) into the loopback of the same family for anything
 that prints or links a URL, since browsers refuse `http://0.0.0.0/`; every
 other address, and anything unparseable, is returned unchanged.
+`SECURITY_HEADERS` is the list both servers stamp on every response
+(`X-Frame-Options: DENY`, `nosniff`, `no-referrer`).
+
+The viz adds one more rule of its own (`server::LAN_ROUTES`): when it is
+bound off loopback, a peer that is not this machine is served only `/obs`,
+`/ws` and `/healthz`; the dashboard, `/api/sessions` and `/api/session/{id}`
+answer `403 not served to the network`. The peer address comes from
+`ConnectInfo<server::Peer>`, attached by the `NoDelayListener`. It also caps
+live WebSocket clients at `MAX_WS_CLIENTS` (16, 503 past it), pings each one
+every 20 s so a vanished peer is dropped, and reuses a `/api/sessions`
+listing for 5 s.
+
+Recording *names* obey one rule everywhere — `telemouse_core::recordings::is_safe_id`
+(`[A-Za-z0-9_-]`, ≤ 128 chars) — used by the viz to serve, the panel to
+launch the analyzer, and the analyzer to list. That alphabet is what makes
+`dir.join("{id}.jsonl")` a direct child of the directory on every platform;
+a separator check alone let a drive-relative `C:x.jsonl` through on Windows.
 
 ---
 
@@ -1042,7 +1059,10 @@ Measured on a synthetic 3-hour / 814k-event fixture: full analysis 730 ms.
 
 ## 9. Configuration reference (`telemouse.toml`)
 
-All fields optional; unknown keys are errors.
+All fields optional; unknown keys are errors. `telemouse.example.toml` is the
+loopback sample that ships with releases (copied into the zip as
+`telemouse.toml`); the repository's `telemouse.toml` is the development
+machine's own config.
 
 ```toml
 mouse_cpi = 1600.0            # counts per inch → cm. Wrong value = wrong cm, fixable later.
@@ -1058,21 +1078,22 @@ enabled = true
 addr = "127.0.0.1:7878"       # capture → viz
 
 [kafka]
-enabled = true                # local broker via compose.yaml; capture never depends on it
-brokers = ["127.0.0.1:9092"]
+enabled = false               # local broker via compose.yaml; capture never depends on it
+brokers = ["127.0.0.1:9092"]  # host:port, always — a port-less entry is a config error
 
 [recording]
 enabled = true
 dir = "recordings"
 
 [viz]
-http_addr = "127.0.0.1:7879"  # 0.0.0.0:7879 to serve the OBS overlay to another PC on the LAN (no auth: trusted networks only)
+http_addr = "127.0.0.1:7879"  # 0.0.0.0:7879 to serve the OBS overlay to another PC on the LAN (that PC gets /obs + /ws only; no auth: trusted networks only)
 
 [ctl]
 http_addr = "127.0.0.1:7880"  # control panel; loopback — it can kill processes
 # bin_dir = "target/release"  # where the binaries are; default: next to telemouse-ctl, then PATH
-stop_grace_secs = 5           # Ctrl-Break → wait → terminate (0–60)
+stop_grace_secs = 8           # Ctrl-Break → wait → terminate (0–60); ≥ the agent's two 3 s sink drains
 log_dir = "logs"              # ctl.log + <component>.log per launched component; rotated at 8 MB
+hotkey = "ctrl+alt+r"         # system-wide, needs the tray: stop capture if running, start one that saves; "" = none
 
 [viz.obs]                     # defaults for /obs; every one overridable by URL param
 layout = "split"              # split | stack | desk | aim
@@ -1229,6 +1250,36 @@ Two kinds of loss are always kept separate: **ring drops**
 transport-side). Both are visible in the capture log, the viz tiles, and the
 analyzer's quality section.
 
+**The session metadata sidecar.** When the agent stops it writes
+`recordings/<session_id>.meta.json` (`telemouse_core::recordings::SessionMeta`,
+built by `capture::meta`): why the run ended, whether every thread joined
+cleanly, the event/batch/marker/ring-drop totals, and per enabled sink its
+`errors`, `dropped` (refused: queue full or sink already failed) and
+`abandoned` (accepted, never delivered). `telemouse-analyze list` reads it
+into a `LOSS` column and the JSON listing (`losses`, `exit`), so a Kafka
+outage that dropped batches is visible weeks later without re-deriving it
+from the JSONL. The sidecar is re-read on every listing even when the
+recording itself is cache-hit, because it lands after the recording's last
+flush.
+
+**Panics.** Every binary installs `telemouse_core::panic_hook` at startup: a
+panic on any thread is a `tracing::error!` (component, thread, location,
+message) before the default hook prints it, so it reaches `ctl.log` /
+`<component>.log` for a tray-launched process. In the agent all three worker
+threads carry an `AliveGuard`; a context-thread panic stops the run
+(`exit = context-thread-exited` in the sidecar) rather than recording a
+frozen game name for the rest of the session.
+
+**Health.** viz `/healthz` is `{ok, udp_bound, last_datagram_age_s, clients,
+uptime_s}` — 503 while the UDP listener is not bound. The panel's `/healthz`
+is still a constant `ok`: answering is its health.
+
+**Unexpected exits with a hint.** The panel reads a child's last lines when it
+exits unasked; an `unknown field` config rejection (a binary older than
+`telemouse.toml`) is reported as `code 1 (telemouse.toml has a key this
+binary does not know: rebuild the workspace)` in the log, the page and the
+tray, instead of a bare code.
+
 ---
 
 ## 14. Performance design decisions
@@ -1287,10 +1338,11 @@ could isolate T2 without making shutdown unbounded.
 
 ## 15. Testing philosophy
 
-`cargo test --workspace` runs 429 passing tests (core 51, capture 119, viz 63,
-ctl 51, analyze 140 + 4 integration, one doctest) with no mouse, admin rights,
-Kafka, or browser;
-CI runs the same on `windows-latest`. The rule (CONVENTIONS.md) is that every
+`cargo test --workspace` runs 462 passing tests (core 64, capture 124, viz 73,
+ctl 55, analyze 141 + 4 integration, one doctest) with no mouse, admin rights,
+Kafka, or browser, plus 11 Node tests over the viz page's engine when Node is
+installed; CI runs the same on `windows-latest` with the toolchain pinned in
+`rust-toolchain.toml`. The rule (CONVENTIONS.md) is that every
 crate's *pure logic* is unit-tested and Win32/network side effects sit behind
 thin traits or `#[cfg(windows)]` modules exercised manually.
 
@@ -1306,10 +1358,20 @@ thin traits or `#[cfg(windows)]` modules exercised manually.
   single `windows_reports_a_primary_screen_and_at_least_one_monitor`.
 - **viz**: tag-probe acceptance/rejection cases, late-joiner session cache,
   lagging subscribers, config injection can't escape `<script>`, page is
-  self-contained, path-traversal rejection, rebound `Host` names refused on
-  every route and foreign `Origin`s on `/ws`, `/api/session/{id}` streams
-  with a length, recording time-range probing, latency percentile behaviour,
-  the bundled demo recording is a valid envelope stream. No JS tests.
+  self-contained (the served page inlines `app.js` and references nothing),
+  path-traversal rejection, rebound `Host` names refused on every route and
+  foreign `Origin`s on `/ws`, a LAN peer refused everything but the overlay
+  routes, the WebSocket client cap, the sessions-listing cache, `/healthz`
+  reflecting the UDP bind, security headers on every response,
+  `/api/session/{id}` streams with a length, recording time-range probing,
+  latency percentile behaviour, the bundled demo recording is a valid
+  envelope stream. **JS tests** (`crates/viz/js-tests/`, `node --test`,
+  also run from `cargo test` when Node is installed): `harness.mjs` loads
+  `app.js` into a V8 context with a stub DOM; `engine.test.mjs` checks unit
+  conversion, unwrapped yaw and clamped pitch, seq-gap/ring-drop accounting,
+  the live-buffer floor, the live-mode memory cap, backward seek through a
+  checkpoint against integration from zero, marker delivery, session
+  restarts, anchoring without a session, and OBS parameter clamping.
 - **ctl**: see §19.4.
 - **analyze**: **ground-truth synthetic streams** via `testutil::StreamBuilder`
   (`move_ms`, `tremor_ms(drift, amp, hz)`, `lift(...)`, `button(bits)`,
@@ -1369,16 +1431,21 @@ Observed during this read; none are correctness bugs in normal use.
   (`markers.rs:153-154`).
 - `trend::report_for` assumes the file stem is the session id for the cache;
   a renamed recording is cached under the stem.
-- The report cache invalidates on mtime, analyzer version, and params — not on
-  `SCHEMA`, and not on content hash.
+- The report cache invalidates on mtime, analyzer version, schema, and
+  params — not on content hash.
 - The hub caches only the latest `session` frame for late joiners; no batch
   backlog (by design, but worth knowing when a client connects mid-session).
 - The plan's TimescaleDB/Parquet storage and aim/desk-space heatmaps are not
   implemented; `trend`/`--json-dir` are the intended substrate.
 - The local servers have no authentication: the `Host`/`Origin` rule (§5.9)
   and the loopback default are the whole model. Binding the viz to
-  `0.0.0.0` for a LAN OBS source exposes the live stream and every recording
-  to that network.
+  `0.0.0.0` for a LAN OBS source exposes the live overlay (`/obs` + `/ws`)
+  to that network; the dashboard and the recordings stay on this machine.
+- `mouse.sessions` is created with the broker's defaults, not compacted
+  (rskafka's `create_topic` takes no configs); compact it at the broker if
+  session records must outlive the events' retention.
+- The marker hotkey is F9, not configurable; a `[ctl] hotkey` of `f9`
+  collides with it and whichever registers second gets a warning.
 - In-game hitching traced to the dashboard tab's GPU load and the panel's
   process scan, not to capture (§14); an input drop-out while dragging the
   OBS window is still unexplained.
@@ -1434,9 +1501,9 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 |---|---|
 | `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Warns if bound to a non-loopback address. |
 | `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
-| `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink`, `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop` actions. |
-| `gui/model.rs` | Pure: `render_text` (the window body, CRLF, fixed columns), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
-| `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, and the message loop. See §19.5. |
+| `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink`, `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
+| `gui/model.rs` | Pure: `render_text` (the window body, CRLF, fixed columns), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
+| `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, and the message loop. See §19.5. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` keeps a `sysinfo::System` between scans so CPU % is per interval, refreshes only cpu/memory/cmd/exe (no per-process user lookup — that cost seconds), and serves `scan_cached(ttl)` from a 4 s cache because a full table walk was ~5% of a core when polled every poll; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
 | `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, and `stop_grace_secs`). |
@@ -1476,18 +1543,22 @@ then calls `Child::kill` (TerminateProcess). If the panel has no console
 A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
 "exited on Ctrl-Break", not as a failure.
 
-### 19.4 Tests (`cargo test -p telemouse-ctl`, 51 tests)
+### 19.4 Tests (`cargo test -p telemouse-ctl`, 55 tests)
 
 - `gui::model`: icon follows capture only; uptime formatting; tooltip names
   both services and stays under the `szTip` bound; the log focus prefers a
   running service, then recency; the text is CRLF-only and carries every
-  section; the menu offers start *or* stop per service and greys a missing
-  binary; `panel_url` swaps an unspecified bind address for loopback; the
-  icon is an opaque disc with transparent, masked corners.
-- `gui::feed`: a visible publisher delivers components, processes and a
-  wake; a hidden one skips the process scan and answers a poke at once; the
-  publisher exits when its receiver is dropped; tray start/stop over an
-  empty `bin_dir` are refused cleanly and still poke.
+  section (including the hotkey line); the menu offers start *or* stop per
+  service, greys a missing binary, offers *New session* only while capture
+  runs, and puts the chord on the item the hotkey is equivalent to;
+  `panel_url` swaps an unspecified bind address for loopback; the icon is an
+  opaque disc with transparent, masked corners.
+- `gui::feed`: a visible publisher delivers components, processes, the
+  hotkey label and a wake; a hidden one skips the process scan and answers
+  a poke at once; the publisher exits when its receiver is dropped; tray
+  start/stop over an empty `bin_dir` are refused cleanly and still poke;
+  `new_session` holds its guard while in flight, releases it and pokes when
+  done, and drops a press made while one is in flight.
 
 - `procs`: the `classify` vocabulary (case-insensitive names, cargo only
   when it names telemouse, unrelated names invisible); a live scan keeps its
@@ -1508,7 +1579,10 @@ A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
   manager errors to statuses (using an empty `bin_dir`, so tests never launch
   a real agent); kill refuses self and unrelated PIDs.
 - `core::config`: the `[ctl]` section parses, defaults, and rejects
-  `stop_grace_secs > 60`.
+  `stop_grace_secs > 60` and an unparsable `hotkey`; `core::hotkey`: chords
+  parse case- and space-insensitively, named and function keys map to their
+  VK codes, typing keys need a modifier, `""`/`none`/`off` disable, and
+  errors name the offending part.
 
 ### 19.5 Tray icon and status window (Windows)
 
@@ -1532,13 +1606,29 @@ compiler); its tooltip names both services with uptime.
 *Show/Hide window*, *Start capture (save data → dir)* and *Start capture
 (don't save)* **or** *Stop capture (saving data | not saving)* (starts greyed
 when the binary is missing; the save choice becomes `--record` /
-`--no-record` only when it differs from `[recording] enabled`), the same
-start/stop for the viz server, *Open web panel*
-(`ShellExecuteW` on the panel URL, loopback if the bind address was
-unspecified), and *Exit*. Closing or minimising the window hides it to the
-tray; Shift+close, or the tray's Exit, quits — through the same graceful
-path as Ctrl-C (`stop_all`, then the icon goes away). Doctor, the analyzers
-and process kills stay on the web page.
+`--no-record` only when it differs from `[recording] enabled`), *New session
+(restart capture, save data → dir)* while capture runs, the same start/stop
+for the viz server, *Open web panel* (`ShellExecuteW` on the panel URL,
+loopback if the bind address was unspecified), and *Exit*. Closing or
+minimising the window hides it to the tray; Shift+close, or the tray's Exit,
+quits — through the same graceful path as Ctrl-C (`stop_all`, then the icon
+goes away). Doctor, the analyzers and process kills stay on the web page.
+
+**The new-session hotkey.** `[ctl] hotkey` (default `ctrl+alt+r`, `""` for
+none; grammar in `core::hotkey`, rejected at config load) is registered
+system-wide with `RegisterHotKey` on the status window, so it works from
+inside a game without alt-tabbing. Pressing it runs `feed::new_session`:
+stop the capture agent if it is running (gracefully, so the file it was
+writing is complete), then start one with `save = true` — a fresh
+`recordings/<session>.jsonl` whatever the config default says. Presses
+during the stop's grace period are dropped (`GuiLink::restarting`), and a
+balloon on the tray icon confirms the restart, since the icon is green both
+before and after. The same action is the *New session* menu item, and the
+menu item the hotkey is equivalent to shows the chord as its accelerator
+text. The message is `WM_HOTKEY`, which only the input system generates for
+a registered chord — unlike a posted `WM_COMMAND` it cannot be forged by
+another process. If another program already owns the chord the panel warns
+and runs without it; pick another in `telemouse.toml`.
 
 **How it is wired.** The Win32 message loop must own the window's thread,
 so `gui::spawn` starts an OS thread named `ctl-gui` (`gui/win.rs`, the same

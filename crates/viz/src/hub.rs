@@ -185,6 +185,7 @@ impl Hub {
     pub fn publish_at(&self, bytes: &[u8], now_utc_us: i64) -> Result<(), RejectReason> {
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.datagrams.fetch_add(1, Relaxed);
+        self.stats.note_datagram(now_utc_us);
         match classify_datagram(bytes) {
             Ok(accepted) => {
                 if let Some(anchor) = accepted.ts_anchor_us {

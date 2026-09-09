@@ -36,11 +36,17 @@ pub struct Batch {
     pub events: Vec<RawEvent>,
 }
 
+/// Net `(dx, dy)` over a run of events, in raw counts. Shared by the owned
+/// [`Batch`] and the shipping thread's borrowed flush path.
+pub fn total_counts(events: &[RawEvent]) -> (i64, i64) {
+    events
+        .iter()
+        .fold((0i64, 0i64), |(x, y), e| (x + e.dx as i64, y + e.dy as i64))
+}
+
 impl Batch {
     pub fn total_counts(&self) -> (i64, i64) {
-        self.events
-            .iter()
-            .fold((0i64, 0i64), |(x, y), e| (x + e.dx as i64, y + e.dy as i64))
+        total_counts(&self.events)
     }
 
     /// Borrow this batch as a serialize-side [`BatchView`].
@@ -153,5 +159,7 @@ mod tests {
     #[test]
     fn total_counts_sums_deltas() {
         assert_eq!(sample().total_counts(), (2, 1));
+        assert_eq!(total_counts(&sample().events), (2, 1));
+        assert_eq!(total_counts(&[]), (0, 0));
     }
 }

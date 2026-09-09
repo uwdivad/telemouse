@@ -292,10 +292,10 @@ async fn forward(
         while let Some(result) = inflight.try_join_next() {
             observe_join(result, &state, &stats);
         }
-        if inflight.len() >= QUEUE_CAPACITY {
-            if let Some(result) = inflight.join_next().await {
-                observe_join(result, &state, &stats);
-            }
+        if inflight.len() >= QUEUE_CAPACITY
+            && let Some(result) = inflight.join_next().await
+        {
+            observe_join(result, &state, &stats);
         }
         let producers = Arc::clone(&producers);
         let stats = Arc::clone(&stats);

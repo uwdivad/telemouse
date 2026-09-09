@@ -17,9 +17,11 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use telemouse_core::recordings::id_from_file_name;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -178,6 +180,10 @@ pub struct ExitInfo {
     /// `code == STATUS_CONTROL_C_EXIT`, decided here so the page does not
     /// carry the number.
     pub ctrl_break: bool,
+    /// What an unexpected exit most likely means, when the child's last
+    /// lines say so (see [`exit_hint`]). Shown next to the exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<&'static str>,
 }
 
 impl ExitInfo {
@@ -186,8 +192,29 @@ impl ExitInfo {
             code,
             at_unix_s,
             ctrl_break: code == Some(STATUS_CONTROL_C_EXIT),
+            hint: None,
         }
     }
+
+    pub fn with_hint(mut self, hint: Option<&'static str>) -> Self {
+        self.hint = hint;
+        self
+    }
+}
+
+/// The one exit the panel can explain from the child's output alone: every
+/// config struct rejects unknown keys, so a binary built before a key was
+/// added to `telemouse.toml` exits with code 1 the moment it loads the file.
+/// Without this the symptom is "capture exited: code 1" and the cause is one
+/// line in a log nobody may open.
+pub const HINT_STALE_BINARY: &str = "telemouse.toml has a key this binary does not know: rebuild the workspace (cargo build --release --workspace)";
+
+/// A hint for an unexpected exit, read off the child's last lines.
+pub fn exit_hint(log_tail: &[String]) -> Option<&'static str> {
+    log_tail
+        .iter()
+        .any(|l| l.contains("unknown field"))
+        .then_some(HINT_STALE_BINARY)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,23 +346,68 @@ impl LogRing {
 #[derive(Default)]
 pub struct LogSink {
     ring: Mutex<LogRing>,
-    file: Mutex<Option<File>>,
+    /// The open file plus where it lives, so it can be rotated in place.
+    file: Mutex<Option<OpenLog>>,
+    /// Bytes written since the file was opened or last rotated. Rotation
+    /// used to happen only at open, so a chatty child (`--print` is ~14 MB
+    /// an hour) grew its log for the life of the panel.
+    written: AtomicU64,
     /// A failed write is reported once, not once per line.
     write_failed: AtomicBool,
 }
 
+struct OpenLog {
+    file: File,
+    dir: PathBuf,
+    id: String,
+}
+
 impl LogSink {
     fn push(&self, line: String) {
-        if let Some(f) = self.file.lock().unwrap_or_else(|p| p.into_inner()).as_mut()
-            && let Err(e) = writeln!(f, "{line}")
-            && !self.write_failed.swap(true, Ordering::Relaxed)
         {
-            warn!(error = %e, "component log file write failed; further failures are not reported");
+            let mut slot = self.file.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(open) = slot.as_mut() {
+                match writeln!(open.file, "{line}") {
+                    Ok(()) => {
+                        let n = self
+                            .written
+                            .fetch_add(line.len() as u64 + 1, Ordering::Relaxed)
+                            + line.len() as u64
+                            + 1;
+                        if n > LOG_ROTATE_BYTES {
+                            self.rotate(open);
+                        }
+                    }
+                    Err(e) => {
+                        if !self.write_failed.swap(true, Ordering::Relaxed) {
+                            warn!(error = %e, "component log file write failed; further failures are not reported");
+                        }
+                    }
+                }
+            }
         }
         self.ring
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(line);
+    }
+
+    /// Reopen through [`open_log`], which moves the full file to `.1`.
+    /// Called with the file lock held.
+    fn rotate(&self, open: &mut OpenLog) {
+        // Drop our handle first so the rename does not hit an open file.
+        let _ = open.file.flush();
+        match open_log(&open.dir, &open.id) {
+            Ok(f) => {
+                open.file = f;
+                self.written.store(0, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !self.write_failed.swap(true, Ordering::Relaxed) {
+                    warn!(error = %e, "component log rotation failed; keeping the current file");
+                }
+            }
+        }
     }
 
     fn tail(&self, n: usize) -> Vec<String> {
@@ -350,7 +422,15 @@ impl LogSink {
             return;
         }
         match open_log(dir, id) {
-            Ok(f) => *file = Some(f),
+            Ok(f) => {
+                let existing = f.metadata().map(|m| m.len()).unwrap_or(0);
+                self.written.store(existing, Ordering::Relaxed);
+                *file = Some(OpenLog {
+                    file: f,
+                    dir: dir.to_path_buf(),
+                    id: id.to_string(),
+                });
+            }
             Err(e) => {
                 if !self.write_failed.swap(true, Ordering::Relaxed) {
                     warn!(component = id, dir = %dir.display(), error = %e, "cannot open component log file; output is kept in memory only");
@@ -400,7 +480,7 @@ impl Slot {
         };
         match child.try_wait() {
             Ok(Some(status)) => {
-                let exit = ExitInfo::new(status.code(), now_unix());
+                let mut exit = ExitInfo::new(status.code(), now_unix());
                 let uptime_s = self
                     .since
                     .map(|s| exit.at_unix_s.saturating_sub(s))
@@ -410,6 +490,9 @@ impl Slot {
                 if expected {
                     info!(component = c.id, pid = self.pid, exit = %describe_exit(exit), uptime_s, "exited");
                 } else {
+                    // The pumps may still be a beat behind the exit, but a
+                    // config rejection is printed before anything else.
+                    exit = exit.with_hint(exit_hint(&self.log.tail(40)));
                     self.unexpected_exits += 1;
                     warn!(
                         component = c.id,
@@ -445,10 +528,14 @@ impl Slot {
 }
 
 pub(crate) fn describe_exit(e: ExitInfo) -> String {
-    match e.code {
-        _ if e.ctrl_break => "Ctrl-Break".into(),
+    let base = match e.code {
+        _ if e.ctrl_break => "Ctrl-Break".to_string(),
         Some(c) => format!("code {c}"),
-        None => "signal".into(),
+        None => "signal".to_string(),
+    };
+    match e.hint {
+        Some(hint) => format!("{base} ({hint})"),
+        None => base,
     }
 }
 
@@ -524,23 +611,27 @@ impl Manager {
         (PathBuf::from(&file), which(&file))
     }
 
-    /// A recording name must be a plain `*.jsonl` file name inside the
-    /// recordings directory — no separators, no traversal.
+    /// A recording name must be `<session id>.jsonl` with the id in the
+    /// workspace-wide alphabet (`telemouse_core::recordings`): that rule is
+    /// what makes the joined path a direct child of the recordings
+    /// directory on every platform — a separator check alone let a
+    /// drive-relative `C:x.jsonl` through on Windows.
     pub fn validate_session(&self, name: &str) -> Result<PathBuf, String> {
-        if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
-            return Err("must be a file name inside the recordings directory".into());
-        }
-        if !name.ends_with(".jsonl") {
-            return Err("must be a .jsonl recording".into());
-        }
-        let p = self.cfg.recordings_dir.join(name);
+        let Some(id) = id_from_file_name(name) else {
+            return Err(
+                "must be <session id>.jsonl, a recording in the recordings directory".into(),
+            );
+        };
+        let p = self.cfg.recordings_dir.join(format!("{id}.jsonl"));
         if !p.is_file() {
             return Err(format!("no such recording: {name}"));
         }
         Ok(p)
     }
 
-    /// `*.jsonl` files in the recordings directory, newest first.
+    /// `*.jsonl` files in the recordings directory, newest first. Only names
+    /// that pass [`Self::validate_session`] are listed, so the picker never
+    /// offers something the start request would then refuse.
     pub fn list_sessions(&self) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(&self.cfg.recordings_dir) else {
             return Vec::new();
@@ -549,7 +640,7 @@ impl Manager {
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".jsonl") || !e.file_type().ok()?.is_file() {
+                if id_from_file_name(&name).is_none() || !e.file_type().ok()?.is_file() {
                     return None;
                 }
                 let modified = e.metadata().ok()?.modified().unwrap_or(UNIX_EPOCH);
@@ -570,13 +661,20 @@ impl Manager {
     }
 
     pub async fn snapshot(&self, log_lines: usize) -> Vec<ComponentState> {
+        // Filesystem lookups (and a PATH walk for a missing binary) happen
+        // before the lock, not under it.
+        let bins: Vec<(PathBuf, bool)> = self
+            .components
+            .iter()
+            .map(|c| self.resolve_bin(c.bin))
+            .collect();
         let mut slots = self.slots.lock().await;
         self.components
             .iter()
-            .map(|c| {
+            .zip(bins)
+            .map(|(c, (bin_path, bin_found))| {
                 let s = slots.get_mut(c.id).expect("slot per component");
                 s.reap(c);
-                let (bin_path, bin_found) = self.resolve_bin(c.bin);
                 ComponentState {
                     id: c.id,
                     label: c.label,
@@ -1095,6 +1193,13 @@ mod tests {
             "notes.txt",
             "missing.jsonl",
             "",
+            // Drive-relative on Windows: `Path::join` yields `C:x.jsonl`,
+            // resolved against the drive's current directory, not ours.
+            "C:s-1.jsonl",
+            // NTFS alternate data stream spelling.
+            "s-1:stream.jsonl",
+            "s 1.jsonl",
+            ".s-1.jsonl",
         ] {
             let r = m.arguments(
                 &REPORTER,
@@ -1265,6 +1370,54 @@ mod tests {
         assert!(!found);
         std::fs::write(&p, "").unwrap();
         assert!(m.resolve_bin("telemouse-viz").1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_rejection_is_explained_on_the_exit() {
+        let lines = vec![
+            "Error: load config telemouse.toml".to_string(),
+            "Caused by: failed to parse telemouse.toml: TOML parse error at line 61, column 1"
+                .to_string(),
+            "unknown field `hotkey`, expected one of `http_addr`, `bin_dir`".to_string(),
+        ];
+        assert_eq!(exit_hint(&lines), Some(HINT_STALE_BINARY));
+        assert_eq!(exit_hint(&["all good".to_string()]), None);
+        assert_eq!(exit_hint(&[]), None);
+        let e = ExitInfo::new(Some(1), 1).with_hint(exit_hint(&lines));
+        assert!(describe_exit(e).starts_with("code 1 ("));
+        assert!(describe_exit(e).contains("rebuild"));
+        assert_eq!(describe_exit(ExitInfo::new(Some(1), 1)), "code 1");
+        let json = serde_json::to_value(e).unwrap();
+        assert_eq!(json["hint"], HINT_STALE_BINARY);
+        assert!(
+            serde_json::to_value(ExitInfo::new(Some(0), 1))
+                .unwrap()
+                .get("hint")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_component_log_rotates_while_the_panel_runs() {
+        let dir = tmpdir("rotate-live");
+        let sink = LogSink::default();
+        sink.ensure_file(&dir, "chatty");
+        // Pretend the file is already at the threshold: the next line tips it.
+        sink.written.store(LOG_ROTATE_BYTES, Ordering::Relaxed);
+        std::fs::File::create(dir.join("chatty.log"))
+            .unwrap()
+            .set_len(LOG_ROTATE_BYTES + 1)
+            .unwrap();
+        sink.push("tipping line".into());
+        sink.push("after rotation".into());
+        assert!(
+            dir.join("chatty.log.1").is_file(),
+            "the full file moved to .1"
+        );
+        let fresh = std::fs::read_to_string(dir.join("chatty.log")).unwrap();
+        assert_eq!(fresh, "after rotation\n");
+        assert!(sink.written.load(Ordering::Relaxed) < LOG_ROTATE_BYTES);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

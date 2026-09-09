@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicU32};
 
+use telemouse_core::hotkey::Hotkey;
 use tokio::sync::Notify;
 
 use crate::manager::Manager;
@@ -32,6 +33,8 @@ pub struct GuiDeps {
     pub http_addr: SocketAddr,
     /// Notified once when the user picks Exit; `main` stops the server.
     pub quit: Arc<Notify>,
+    /// `[ctl] hotkey`: the system-wide new-session chord, if any.
+    pub hotkey: Option<Hotkey>,
 }
 
 /// The running UI thread. [`GuiHandle::shutdown`] is the only way to end it.
@@ -88,6 +91,7 @@ pub fn spawn(deps: GuiDeps) -> Option<GuiHandle> {
             poke.clone(),
             visible.clone(),
             Arc::new(move || win::post_refresh(wake_hwnd.load(Ordering::Acquire))),
+            deps.hotkey.map(|h| h.to_string()).unwrap_or_default(),
         ));
 
         let link = feed::GuiLink {
@@ -99,6 +103,8 @@ pub fn spawn(deps: GuiDeps) -> Option<GuiHandle> {
             quit: deps.quit,
             visible,
             panel_url: model::panel_url(deps.http_addr),
+            hotkey: deps.hotkey,
+            restarting: Arc::new(AtomicBool::new(false)),
         };
         let (h, t) = (hwnd.clone(), thread_id.clone());
         let thread = std::thread::Builder::new()

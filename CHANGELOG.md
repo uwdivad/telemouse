@@ -6,6 +6,49 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+- **Release config split.** `telemouse.example.toml` (loopback everywhere,
+  Kafka off) is what the release zip now ships as `telemouse.toml`; the
+  repository's `telemouse.toml` is the development machine's own config and
+  no longer reaches a release with its LAN bind and broker addresses.
+- **Network mode is overlay-only.** When the viz is bound off loopback, a peer
+  that is not this machine is served `/obs`, `/ws` and `/healthz`; the
+  dashboard, the recording list and the recordings answer 403. Live
+  WebSocket clients are capped at 16, pinged every 20 s, and the sessions
+  listing is reused for 5 s, so a device on the LAN can no longer pin the
+  disk or a core by looping a request. Both servers add `X-Frame-Options:
+  DENY`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+- **Session metadata sidecar.** The agent writes
+  `recordings/<session>.meta.json` when it stops — why it stopped, whether
+  every thread joined cleanly, event/drop totals, and per-sink errors,
+  drops and abandoned envelopes. `telemouse-analyze list` shows a `LOSS`
+  column and the JSON listing carries `losses` and `exit`, so a Kafka outage
+  that dropped batches is visible afterwards without reconciling the JSONL.
+- **Config validation.** Every `kafka.brokers` entry must be `host:port`
+  (a port-less entry was silently unreachable). `ctl.stop_grace_secs`
+  defaults to 8 s, above the agent's two 3 s sink drains, so a slow disk or
+  broker at stop time delays the stop instead of truncating the recording.
+- **Recording names follow one rule.** `telemouse_core::recordings::is_safe_id`
+  (`[A-Za-z0-9_-]`) is now applied by the panel and the analyzer as well as
+  the viz; the panel's separator check alone let a drive-relative
+  `C:x.jsonl` resolve outside the recordings directory on Windows.
+- **Failures are louder.** Every binary installs a `tracing` panic hook; the
+  capture context thread has an alive guard (a panic there used to freeze the
+  game name for the rest of the session); viz `/healthz` answers 503 with
+  `udp_bound: false` while its listener is down and reports the seconds
+  since the last datagram; the panel explains an `unknown field` exit as a
+  binary older than the config and rotates component logs by size while it
+  runs, not only at startup.
+- **Toolchain and CI.** `rust-toolchain.toml` pins 1.98.0 for CI and
+  developers; clippy and fmt gate the release job too; every cargo step runs
+  `--locked`; the viz page's script is now `crates/viz/src/app.js`, inlined
+  at startup, syntax-checked with `node --check` in CI and in the test
+  suite, and unit-tested with Node against a stub DOM.
+- The raw-input buffer walk rounds each block up to the pointer size (the
+  `NEXTRAWINPUTBLOCK` rule) and bounds every block by the buffer.
+- Control panel: a system-wide new-session hotkey, `[ctl] hotkey` (default
+  `ctrl+alt+r`), stops the capture agent if it is running and starts one that
+  saves — a fresh recording without leaving the game. The tray menu gains the
+  same *New session* item and shows the chord; a balloon confirms each press.
 - Performance/latency follow-up: 256 KiB replay streaming and direct recording
   lookup make a 532 MB replay 7.9x faster; the live browser trims typed arrays
   in chunks; capture/browser defaults are now 25/35 ms for a roughly 35 ms

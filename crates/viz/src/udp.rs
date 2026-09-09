@@ -73,6 +73,7 @@ pub fn payload_prefix(bytes: &[u8]) -> String {
 /// (replay still works without a live feed).
 pub async fn listen(addr: SocketAddr, hub: Arc<Hub>) -> std::io::Result<()> {
     let sock = UdpSocket::bind(addr).await?;
+    hub.stats.set_udp_bound(true);
     info!(%addr, "udp listener bound");
     let mut buf = vec![0u8; RECV_BUF];
     let mut rejects = RejectLog::default();

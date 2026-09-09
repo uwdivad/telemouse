@@ -27,6 +27,7 @@ use crate::quality::{self, QualityReport};
 use crate::series::{Params, Prepared, prepare};
 use crate::stats::Summary;
 use crate::timefmt::{format_duration, format_utc_us};
+use telemouse_core::now_utc_us;
 
 /// Bumped whenever the JSON shape changes incompatibly.
 pub const SCHEMA: &str = "telemouse-analyze/2";
@@ -102,13 +103,6 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// Per-phase cost, for `--timing` and the benches.
     pub timings: Vec<PhaseTiming>,
-}
-
-fn now_utc_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 /// Times one phase, logs it, and records it for the `--timing` table.

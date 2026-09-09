@@ -1,7 +1,9 @@
-confluent-kafka>=2.5
-pyarrow>=17
-duckdb>=1.1
-orjson>=3.10
-pandas>=2.2
-jupyterlab>=4.2
-pyspark>=4.0          # spark_time_ranges.ipynb only; needs Java 17+
+# Pinned to the versions the notebooks were last run with, so a fresh venv
+# reproduces the same archive. Bump deliberately, then re-run both notebooks.
+confluent-kafka==2.15.0
+pyarrow==25.0.1
+duckdb==1.5.5
+orjson==3.12.0
+pandas==3.0.5
+jupyterlab>=4.2       # the editor only; not part of the archive's output
+pyspark==4.2.0        # spark_time_ranges.ipynb only; needs Java 17+

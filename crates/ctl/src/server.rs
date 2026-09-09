@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
-use telemouse_core::localhost::host_is_trusted;
+use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted};
 use tracing::{info, warn};
 
 use crate::manager::{Manager, StartError, StartRequest, StopError};
@@ -75,7 +75,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/components/{id}/stop", post(api_stop))
         .route("/api/processes/{pid}/kill", post(api_kill))
         .layer(middleware::from_fn(require_local_host))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Add [`SECURITY_HEADERS`] to every response. `X-Frame-Options: DENY`
+/// matters most here: an `http://` page framing the panel could otherwise
+/// position a one-click *Stop* under the user's cursor.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    for (name, value) in SECURITY_HEADERS {
+        res.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    res
 }
 
 /// Refuse any request whose `Host` is a DNS name other than `localhost`: that
@@ -549,5 +564,19 @@ mod tests {
         let (s, _, body) = call(state(), Method::GET, "/healthz", false, None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        for (uri, host) in [("/", "127.0.0.1:7880"), ("/", "evil.com")] {
+            let req = Request::builder()
+                .uri(uri)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            let res = router(state()).oneshot(req).await.unwrap();
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{host}");
+            assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{host}");
+        }
     }
 }

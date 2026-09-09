@@ -1,0 +1,8 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Telemouse: all-in-one" type="CompoundRunConfigurationType" folderName="telemouse">
+    <toRun name="capture: run" type="CargoCommandRunConfiguration" />
+    <toRun name="viz: serve" type="CargoCommandRunConfiguration" />
+    <toRun name="ctl: serve" type="CargoCommandRunConfiguration" />
+    <method v="2" />
+  </configuration>
+</component>

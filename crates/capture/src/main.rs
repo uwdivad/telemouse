@@ -14,6 +14,7 @@
 mod context;
 mod context_thread;
 mod devices;
+mod meta;
 mod platform;
 mod pointer_lock;
 mod raw_input;
@@ -90,6 +91,10 @@ fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+    // A panic on any thread reaches the same log as everything else — the
+    // control panel's capture.log when launched from there — not just a
+    // console nobody may be watching.
+    telemouse_core::panic_hook::install("capture");
 
     match Cli::parse().command {
         Command::Run(args) => cmd_run(args),
@@ -271,6 +276,9 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     if sinks.is_empty() {
         tracing::warn!("no sinks enabled; capture will only update counters");
     }
+    // Remembered for the metadata sidecar: only the sinks that ran get a row.
+    let sink_names: Vec<&'static str> = sinks.iter().map(|s| s.name()).collect();
+    let recording_dir = cfg.recording.enabled.then(|| cfg.recording.dir.clone());
 
     let (producer, consumer) = rtrb::RingBuffer::<RawEvent>::new(cfg.batch.ring_capacity);
     let (marker_tx, marker_rx) = std::sync::mpsc::channel::<MarkerSignal>();
@@ -290,6 +298,10 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     // Same watchdog for T2: a dead shipping thread would otherwise leave a
     // zombie agent capturing into a ring nobody drains.
     let shipping_alive = Arc::new(AtomicBool::new(true));
+    // And for T3: without it a context-thread panic would freeze the game
+    // name and pointer-lock state for the rest of the session, silently
+    // mislabelling every later batch.
+    let context_alive = Arc::new(AtomicBool::new(true));
     let handles = Arc::new(CaptureHandles::default());
     let waker = Arc::new(RingWaker::default());
 
@@ -336,9 +348,16 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             marker_tx,
             waker: Arc::clone(&waker),
         };
+        let (alive, guard_shutdown) = (Arc::clone(&context_alive), Arc::clone(&shutdown));
         std::thread::Builder::new()
             .name("telemouse-context".into())
-            .spawn(move || context_thread::run(ctx, stats, shutdown, ctx_args))
+            .spawn(move || {
+                let _alive = AliveGuard {
+                    flag: alive,
+                    shutdown: guard_shutdown,
+                };
+                context_thread::run(ctx, stats, shutdown, ctx_args)
+            })
             .context("spawn context thread")?
     };
 
@@ -372,30 +391,39 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         tracing::info!(secs, "will stop automatically");
     }
     // Idle here costs one wakeup per minute (or one at the deadline): the
-    // condvar is signalled by Ctrl-C and by T1 dying.
-    loop {
+    // condvar is signalled by Ctrl-C and by any worker thread dying.
+    let exit_reason = loop {
         if shutdown.is_set() {
-            break;
+            break meta::ExitReason::Interrupt;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            break;
+            break meta::ExitReason::Duration;
         }
         if !capture_alive.load(Ordering::Acquire) {
             tracing::error!("capture thread exited; shutting down so the gap is not silent");
-            break;
+            break meta::ExitReason::CaptureThreadExited;
         }
         if !shipping_alive.load(Ordering::Acquire) {
             tracing::error!(
                 "shipping thread exited; shutting down so capture does not feed a ring nobody drains"
             );
-            break;
+            break meta::ExitReason::ShippingThreadExited;
+        }
+        if !context_alive.load(Ordering::Acquire) {
+            // Capture itself is intact, but every batch from here on would
+            // carry a frozen game name and lock state. Stop rather than
+            // mislabel the rest of the session.
+            tracing::error!(
+                "context thread exited; shutting down rather than record stale game/lock state"
+            );
+            break meta::ExitReason::ContextThreadExited;
         }
         match deadline {
             Some(d) => shutdown.wait_until(d),
             None => shutdown.wait_timeout(Duration::from_secs(60)),
         };
-    }
-    tracing::info!("shutting down");
+    };
+    tracing::info!(reason = exit_reason.as_str(), "shutting down");
 
     // Ordered teardown: stop capture, let shipping drain what is left, then the
     // context thread. Every partial batch is flushed before we exit.
@@ -450,6 +478,39 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         capture_to_ship_us_p99 = final_stats.ship_latency_first.percentile_us(0.99),
         "session finished"
     );
+
+    // The same numbers, next to the recording, so a sink that lost batches
+    // is visible in `telemouse-analyze list` and the control panel later —
+    // not only in a log line that scrolled past.
+    if let Some(dir) = recording_dir {
+        let doc = meta::build(
+            &meta::RunInfo {
+                session_id: &session_id,
+                capture_version: env!("CARGO_PKG_VERSION"),
+                started_utc_us: anchor.utc_us,
+                ended_utc_us: telemouse_core::now_utc_us(),
+                exit: exit_reason,
+                clean: joined_clean,
+                sinks: &sink_names,
+            },
+            &final_stats,
+        );
+        match meta::write(&dir, &doc) {
+            Ok(path) => {
+                let losses = doc.losses();
+                if losses.is_empty() {
+                    tracing::info!(path = %path.display(), "session metadata written");
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        losses = ?losses,
+                        "session metadata written; some sinks lost envelopes"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not write session metadata"),
+        }
+    }
     if !joined_clean {
         anyhow::bail!("a worker thread panicked; see the errors above");
     }

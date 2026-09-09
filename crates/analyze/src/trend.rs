@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::report::{ANALYZER_VERSION, Report};
+use crate::report::{ANALYZER_VERSION, Report, SCHEMA};
 use crate::series::Params;
 use crate::timefmt::{format_duration, format_utc_us};
 
@@ -79,7 +79,11 @@ pub fn read_cache(
         Err(_) => return (None, CacheOutcome::Unreadable),
     };
     match serde_json::from_str::<Report>(&text) {
-        Ok(r) if r.analyzer_version != ANALYZER_VERSION => (None, CacheOutcome::VersionChanged),
+        // Either provenance stamp moving on means the numbers may not mean
+        // the same thing any more.
+        Ok(r) if r.analyzer_version != ANALYZER_VERSION || r.schema != SCHEMA => {
+            (None, CacheOutcome::VersionChanged)
+        }
         Ok(r) if r.params != params => (None, CacheOutcome::ParamsChanged),
         Ok(r) => (Some(r), CacheOutcome::Hit),
         Err(_) => (None, CacheOutcome::Unreadable),

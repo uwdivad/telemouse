@@ -55,7 +55,11 @@ carries on without it. A bundled demo recording
 
 ## Configuration
 
-[telemouse.toml](telemouse.toml) — all fields optional:
+[telemouse.example.toml](telemouse.example.toml) is the sample that ships
+with releases (as `telemouse.toml`): every server on loopback, Kafka off.
+The repository's own [telemouse.toml](telemouse.toml) is the development
+machine's config — LAN viz bind, Kafka on, its broker addresses — and is
+what the binaries read when run from this checkout. All fields optional:
 
 ```toml
 mouse_cpi = 1600.0            # your mouse's real CPI/DPI → physical cm
@@ -68,8 +72,8 @@ coalesce_ms = 8               # raw-input drain cadence (0–10); 0 = exact per-
 addr = "127.0.0.1:7878"       # capture → viz live path
 
 [kafka]
-enabled = true                # durable log; capture degrades gracefully without it
-brokers = ["127.0.0.1:9092"]
+enabled = false               # durable log; capture degrades gracefully without it
+brokers = ["127.0.0.1:9092"]  # every entry needs a port
 
 [recording]
 enabled = true                # save data: one JSONL file per session (the control panel shows and can override this per run)
@@ -77,8 +81,9 @@ dir = "recordings"            # per-session JSONL files
 
 [ctl]
 http_addr = "127.0.0.1:7880"  # control panel; keep it on loopback — it can kill processes
-stop_grace_secs = 5           # Ctrl-Break → wait this long → terminate
+stop_grace_secs = 8           # Ctrl-Break → wait this long → terminate (covers the agent's sink drains)
 log_dir = "logs"              # ctl.log + one <component>.log per launched component
+hotkey = "ctrl+alt+r"         # system-wide (tray): (re)start capture as a new saved session; "" for none
 
 # Aim-space conversion, per game: degrees = counts * sens * coeff.
 # Key = lowercase process name of the game (matched automatically).
@@ -93,6 +98,13 @@ pitch_coeff = 0.0066
 
 Raw counts stay raw on the wire; cm and degrees are derived in consumers from
 this config — so you can fix a wrong CPI or sens *after* the fact and re-analyze.
+
+**What a recording contains.** Besides the mouse deltas, every batch carries
+the name of the foreground executable, the pointer-lock state, the screen size
+and (outside games) the absolute cursor position, and the session record
+carries your monitor layout and device names. A recording is therefore also a
+timestamped log of which application had focus. Recordings are never pruned
+by telemouse; they live in `recording.dir` until you delete them.
 
 ## How capture works
 
@@ -188,7 +200,10 @@ from the gaming PC. Three things on the gaming PC (the one running capture and
 
    (or once, without touching the config: `telemouse-viz serve --http 0.0.0.0:7879`).
    Restart `telemouse-viz`; it logs a warning that it is reachable from the
-   network, which is the point.
+   network, which is the point. A peer that is not this machine is served
+   `/obs`, its live socket `/ws` and `/healthz` — nothing else: the dashboard,
+   the recording list and the recordings themselves answer `403 not served to
+   the network`, so the streaming PC gets the overlay and not the archive.
 
 2. Let the port through Windows Firewall, Private profile only, from an
    elevated PowerShell:
@@ -216,11 +231,12 @@ with the same URL parameters as above. **Use the IP literal, not the PC's
 name**: `http://GAMING-PC:7879/obs` is answered with `403 host not allowed`,
 because the server only trusts `Host`/`Origin` headers that are `localhost`
 or an IP address (its DNS-rebinding guard). Note there is no login: anyone
-who can reach the port can watch the live stream and download every
-recording, so keep the bind on a network you trust, and set `http_addr` back
-to `127.0.0.1:7879` when you do not need it. The capture → viz UDP hop stays
-on loopback either way, and `telemouse-ctl` stays on loopback (it can kill
-processes); its *viz* link still opens the local address.
+who can reach the port can watch the live overlay (the dashboard and the
+recordings are only served to this machine), so keep the bind on a network
+you trust, and set `http_addr` back to `127.0.0.1:7879` when you do not need
+it. The capture → viz UDP hop stays on loopback either way, and
+`telemouse-ctl` stays on loopback (it can kill processes); its *viz* link
+still opens the local address.
 
 Defaults live in `telemouse.toml` under `[viz.obs]`; every one of them can be
 overridden per source with URL parameters, so several sources can share one
@@ -365,7 +381,7 @@ $env:RUST_LOG = 'info,telemouse_ctl=debug'; telemouse-ctl.exe   # snapshot caden
   the `TaskbarCreated` message; give it a second.
 - Console window hidden and you want it: run from a terminal, or `--no-gui`.
 
-**Tests**: `cargo test -p telemouse-ctl` (51 tests; the child-process tests
+**Tests**: `cargo test -p telemouse-ctl` (55 tests; the child-process tests
 take about a minute) or `cargo test -p telemouse-ctl gui::` for just the GUI
 logic, which runs anywhere in well under a second.
 
@@ -440,7 +456,12 @@ docker compose down                                   # stop; "down -v" also wip
 The sink is a bounded queue in front of a forwarder thread (rskafka, zstd,
 25ms linger). If the broker stalls the queue fills and envelopes are dropped
 and counted (`kafka_dropped` in the stats line) rather than ever blocking
-capture; `--no-kafka` turns the sink off for one run.
+capture; `--no-kafka` turns the sink off for one run. The recording is the
+source of truth: when the agent stops it writes
+`recordings/<session>.meta.json` with the final counters, and
+`telemouse-analyze list` shows a `LOSS` column (`kafka=400`) for any session
+where a sink did not deliver everything, so a broker outage is visible
+afterwards without re-deriving it from the JSONL.
 
 ## Observability
 
@@ -452,12 +473,18 @@ problem doesn't exist. Latency is measured at every hop: capture→ship
 histograms in the agent, bridge p50/p99 in `telemouse-viz` (also at
 `/api/stats` and pushed live into the page), and an end-to-end latency tile
 in the browser alongside lag-behind-live and render FPS. `seq_no` gaps
-(transport loss) are tracked separately from ring drops everywhere.
+(transport loss) are tracked separately from ring drops everywhere. Every
+binary installs a panic hook that routes panics through the same log, so a
+thread dying in a tray-launched process is still written to `logs/`. The
+viz's `/healthz` answers 503 with `{"ok":false,"udp_bound":false,...}` while
+its UDP listener is not bound, and reports the seconds since the last
+datagram once it is.
 
 ## Development
 
 ```powershell
 cargo test --workspace              # no mouse, admin, Kafka, or browser needed
+node --test crates/viz/js-tests/engine.test.mjs   # the page's engine against a stub DOM (cargo test runs it too when node is installed)
 cargo bench -p telemouse-analyze    # criterion benches over the loader + hot math
 cargo bench -p telemouse-core       # wire encode/decode, batcher
 # numbers, method and what is left on the table: docs/BENCHMARKS.md

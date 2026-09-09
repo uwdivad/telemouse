@@ -271,6 +271,15 @@ impl DrainStamper {
     }
 }
 
+/// Round `addr` up to a multiple of `align` (a power of two). What the
+/// `NEXTRAWINPUTBLOCK` macro does between blocks of a `GetRawInputBuffer`
+/// result: each block starts on a pointer-sized boundary. Pure, so the walk's
+/// arithmetic is testable off Windows.
+pub fn align_up(addr: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
+}
+
 #[cfg(windows)]
 pub use win::{CaptureDeps, Hotkey, post_quit, post_thread_quit, run};
 
@@ -521,9 +530,19 @@ mod win {
                 break;
             }
             // Walk by `dwSize`: mouse reports are fixed-size, but the buffer
-            // format is variable-length by contract.
-            let mut p = buf.as_ptr() as *const u8;
+            // format is variable-length by contract, and the next block
+            // starts at the pointer-aligned boundary after this one
+            // (`NEXTRAWINPUTBLOCK`: QWORD on 64-bit, DWORD on 32-bit). Both
+            // the header read and the block itself are bounded by the
+            // buffer, so a count the API over-reports can never walk past
+            // the allocation.
+            let start = buf.as_ptr() as usize;
+            let end = start + size_of_val(buf);
+            let mut p = start;
             for i in 0..n as usize {
+                let Some(block) = (unsafe { next_block_bounds(p, end) }) else {
+                    break;
+                };
                 let raw = unsafe { &*(p as *const RAWINPUT) };
                 if raw.header.dwType == RIM_TYPEMOUSE.0 {
                     let ts = match stamping {
@@ -535,7 +554,7 @@ mod win {
                     unsafe { process_mouse(state, raw, ts) };
                 }
                 total += 1;
-                p = unsafe { p.add((raw.header.dwSize as usize).max(size_of::<RAWINPUTHEADER>())) };
+                p = block;
             }
             if (n as usize) < buf.len() {
                 break;
@@ -543,6 +562,25 @@ mod win {
             spread_from = now;
         }
         total
+    }
+
+    /// Where the block after the one at `p` starts, or `None` if the block
+    /// at `p` cannot be trusted: its header would not fit before `end`, or
+    /// its `dwSize` runs past `end`. Reads only the header.
+    ///
+    /// # Safety
+    /// `p` must point at a readable `RAWINPUTHEADER` when `p + header <= end`.
+    unsafe fn next_block_bounds(p: usize, end: usize) -> Option<usize> {
+        let header = size_of::<RAWINPUTHEADER>();
+        if p.checked_add(header)? > end {
+            return None;
+        }
+        let size = unsafe { (*(p as *const RAWINPUTHEADER)).dwSize } as usize;
+        let block_end = p.checked_add(size.max(header))?;
+        if block_end > end {
+            return None;
+        }
+        Some(super::align_up(block_end, size_of::<usize>()))
     }
 
     /// The decode+push half of the hot path. No allocation on the per-report
@@ -1002,6 +1040,17 @@ mod tests {
             panic!("expected a relative event");
         };
         assert_eq!(ev.ts_qpc, u64::MAX);
+    }
+
+    #[test]
+    fn block_boundaries_round_up_to_the_pointer_size() {
+        assert_eq!(align_up(0, 8), 0);
+        assert_eq!(align_up(1, 8), 8);
+        assert_eq!(align_up(48, 8), 48);
+        assert_eq!(align_up(49, 8), 56);
+        assert_eq!(align_up(63, 8), 64);
+        assert_eq!(align_up(4, 4), 4);
+        assert_eq!(align_up(5, 4), 8);
     }
 
     #[test]

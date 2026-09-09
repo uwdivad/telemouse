@@ -22,7 +22,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # Same pinned toolchain as CI and rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: Tag matches Cargo.toml version
@@ -32,11 +36,16 @@ jobs:
           $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ($tag -ne $ver) { throw "tag v$tag but [workspace.package] version = $ver" }
 
+      # The same gates as CI: a release is never cut from a tree CI rejects.
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       - name: Package
         shell: pwsh
@@ -44,7 +53,10 @@ jobs:
           $name = "telemouse-${{ github.ref_name }}-windows-x86_64"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $name
-          Copy-Item telemouse.toml, README.md, CHANGELOG.md $name
+          # The shipped config is the loopback sample, never the repository's
+          # own telemouse.toml (which is the development machine's).
+          Copy-Item telemouse.example.toml "$name/telemouse.toml"
+          Copy-Item README.md, CHANGELOG.md $name
           Copy-Item docs -Destination "$name/docs" -Recurse
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           Get-FileHash "$name.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $name.zip" } | Set-Content "$name.zip.sha256"

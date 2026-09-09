@@ -225,9 +225,7 @@ fn write_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if let Err(e) = flush_timed(&mut writer, stats) {
-                    return Err(e);
-                }
+                flush_timed(&mut writer, stats)?;
                 acknowledge_flush(state, stats, &mut pending_flush);
                 last_flush = Instant::now();
             }

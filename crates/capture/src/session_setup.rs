@@ -6,10 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, RandomState};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use telemouse_core::session::{GameSens, MonitorInfo};
 use telemouse_core::{QpcAnchor, SessionConfig};
+
+/// UTC microseconds since the Unix epoch, right now (the workspace-wide
+/// definition, re-exported so the anchor and the drift check use it).
+pub use telemouse_core::now_utc_us;
 
 /// Everything the platform layer contributes to a session record.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,15 +78,6 @@ pub fn drift_ppm(drift_us: i64, elapsed_us: i64) -> f64 {
         return 0.0;
     }
     drift_us as f64 * 1_000_000.0 / elapsed_us as f64
-}
-
-/// UTC microseconds since the Unix epoch, right now.
-pub fn now_utc_us() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_micros() as i64,
-        // Clock before 1970: degrade, never panic.
-        Err(e) => -(e.duration().as_micros() as i64),
-    }
 }
 
 /// `s-YYYYMMDD-HHMMSS-xxxx` where `xxxx` is 4 hex digits of randomness, so two
@@ -286,10 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn now_utc_us_is_in_a_sane_range() {
-        // Between 2020 and 2100 — catches unit mistakes (ms vs µs vs ns).
-        let now = now_utc_us();
-        assert!(now > 1_577_836_800_000_000, "{now}");
-        assert!(now < 4_102_444_800_000_000, "{now}");
+    fn generated_ids_are_safe_recording_ids() {
+        // The id becomes `recordings/<id>.jsonl`; every reader validates it
+        // against the shared rule, so the writer must produce nothing else.
+        let id = new_session_id(now_utc_us());
+        assert!(telemouse_core::recordings::is_safe_id(&id), "{id}");
+        assert!(telemouse_core::recordings::is_safe_id(&format_session_id(
+            0, 0xffff
+        )));
     }
 }

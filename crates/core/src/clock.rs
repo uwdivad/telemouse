@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+/// UTC microseconds since the Unix epoch, right now. Every binary stamps
+/// wall-clock time through this one function so the capture anchor, the
+/// bridge's latency estimate and the analyzer's report provenance agree on
+/// the unit. A clock set before 1970 degrades to a negative value rather
+/// than panicking.
+pub fn now_utc_us() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as i64,
+        Err(e) => -(e.duration().as_micros() as i64),
+    }
+}
+
 /// One QPC↔UTC anchor taken at session start.
 ///
 /// `QueryPerformanceCounter` is monotonic but has an arbitrary zero; a single
@@ -156,6 +168,14 @@ mod tests {
         // 4 ticks at 3MHz = 1.33µs → truncates to 1; -4 ticks → -1 (toward zero).
         assert_eq!(a.qpc_to_utc_us(a.qpc + 4), a.utc_us + 1);
         assert_eq!(a.qpc_to_utc_us(a.qpc - 4), a.utc_us - 1);
+    }
+
+    #[test]
+    fn now_utc_us_is_a_plausible_wall_clock() {
+        // Between 2020 and 2100, in µs: catches ms/ns unit mistakes.
+        let t = now_utc_us();
+        assert!(t > 1_577_836_800_000_000, "{t}");
+        assert!(t < 4_102_444_800_000_000, "{t}");
     }
 
     #[test]

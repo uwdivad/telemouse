@@ -243,7 +243,7 @@ function renderCards() {
     const isBusy = busy.has(c.id);
     const run = c.running;
     const exit = c.last_exit;
-    const exitText = exit ? ("exited " + (exit.ctrl_break ? "on Ctrl-Break" : exit.code === null ? "by signal" : "code " + exit.code) + " at " + clock(exit.at_unix_s)) : "";
+    const exitText = exit ? ("exited " + (exit.ctrl_break ? "on Ctrl-Break" : exit.code === null ? "by signal" : "code " + exit.code) + " at " + clock(exit.at_unix_s) + (exit.hint ? " — " + exit.hint : "")) : "";
     const exitCls = exit && exit.code !== 0 && !exit.ctrl_break ? "bad" : "";
     // Exits nobody asked for, since the panel started: a crash loop shows
     // here even when every individual exit scrolled out of the log.

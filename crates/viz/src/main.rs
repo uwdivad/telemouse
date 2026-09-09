@@ -39,6 +39,7 @@ const LOG_EVERY_PUSHES: u32 = 5;
 #[derive(Parser, Debug)]
 #[command(
     name = "telemouse-viz",
+    version,
     about = "Live mouse-telemetry visualization and replay server"
 )]
 struct Cli {
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    telemouse_core::panic_hook::install("viz");
 
     let cli = Cli::parse();
     let args = match cli.command {
@@ -112,8 +114,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid --http address {http_addr_s:?}"))?;
     if !http_addr.ip().is_loopback() {
-        // There is no authentication on the page, the stream, or the recordings.
-        warn!(%http_addr, "viz is listening on a non-loopback address; anyone who can reach it can watch the live stream and download every recording");
+        // There is no authentication. Peers that are not this machine are
+        // limited to the overlay routes (see `server::LAN_ROUTES`), but the
+        // live stream itself is visible to anyone who can reach the port.
+        warn!(
+            %http_addr,
+            served_to_network = ?server::LAN_ROUTES,
+            "viz is listening on a non-loopback address; anyone who can reach it can watch the live overlay (the dashboard and recordings stay on this machine)"
+        );
     }
 
     let hub = Arc::new(Hub::new());
@@ -138,8 +146,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         hub: hub.clone(),
         recordings_dir: recordings_dir.clone(),
         pages: Arc::new(server::Pages::render(&cfg.viz.obs)),
+        sessions: Arc::new(server::SessionsCache::default()),
     };
-    let app = server::router(state);
+    // With the peer address attached, so the network gate can tell a
+    // second PC from a browser on this one.
+    let app = server::router(state).into_make_service_with_connect_info::<server::Peer>();
 
     let listener = NoDelayListener::new(
         tokio::net::TcpListener::bind(http_addr)
@@ -190,6 +201,16 @@ impl NoDelayListener {
             inner,
             warned: false,
         }
+    }
+}
+
+/// How a request learns who connected: the accepted socket's peer address,
+/// as reported by the wrapped listener.
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
+    for server::Peer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
+        server::Peer(*stream.remote_addr())
     }
 }
 

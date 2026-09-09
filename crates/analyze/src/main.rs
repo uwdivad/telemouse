@@ -202,6 +202,7 @@ fn main() -> Result<()> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+    telemouse_core::panic_hook::install("analyze");
 
     let started = Instant::now();
     match Cli::parse().cmd {
@@ -297,27 +298,30 @@ fn main() -> Result<()> {
                 println!("no recordings in {}", dir.display());
             } else {
                 println!(
-                    "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  GAME",
-                    "SESSION", "STARTED (UTC)", "DURATION", "EVENTS", "DROPS"
+                    "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:<16}  GAME",
+                    "SESSION", "STARTED (UTC)", "DURATION", "EVENTS", "DROPS", "LOSS"
                 );
                 for e in &entries {
                     println!(
-                        "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {}",
+                        "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:<16}  {}",
                         e.session_id,
                         format_utc_us(e.started_utc_us),
                         format_duration(e.duration_s),
                         e.events,
                         e.drops,
+                        e.losses_text(),
                         e.games.first().map_or("—", |g| g.as_str()),
                     );
                 }
                 let total_events: u64 = entries.iter().map(|e| e.events).sum();
                 let total_drops: u64 = entries.iter().map(|e| e.drops).sum();
+                let lossy = entries.iter().filter(|e| !e.losses.is_empty()).count();
                 println!(
-                    "\n{} session(s), {} events, {} drops",
+                    "\n{} session(s), {} events, {} drops, {} with sink losses (LOSS = sink=envelopes not delivered, from the .meta.json sidecar)",
                     entries.len(),
                     total_events,
-                    total_drops
+                    total_drops,
+                    lossy
                 );
             }
         }

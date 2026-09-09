@@ -21,8 +21,15 @@ all members and shared `[workspace.dependencies]`; add crate-local deps with
 
 - One JSON `Envelope` (`{"type": "session" | "batch" | "marker", ...}`) per
   Kafka message, per UDP datagram, per JSONL line.
-- Topics: `mouse.events`, `mouse.sessions` (compacted), `mouse.markers`.
-  Kafka key = `session_id`.
+- Topics: `mouse.events`, `mouse.sessions`, `mouse.markers`. Kafka key =
+  `session_id`. `mouse.sessions` is *meant* to be compacted, but the client
+  creates topics with the broker's defaults (rskafka's `create_topic` takes
+  no configs), so set `cleanup.policy=compact` on it at the broker if you
+  need session records to outlive the events' retention.
+- Recording ids (`<session_id>`) obey `telemouse_core::recordings::is_safe_id`
+  everywhere a name is listed or accepted; the capture agent also writes
+  `<session_id>.meta.json` next to each recording with the run's final
+  counters (events, drops, per-sink losses).
 - Recording files: `recordings/<session_id>.jsonl`, first line always the
   `session` envelope, then `batch`/`marker` envelopes in order.
 - Raw counts on the wire, always. Consumers derive cm/degrees via

@@ -95,19 +95,15 @@ fn line_utc_us(line: &[u8]) -> Option<i64> {
     }
 }
 
-/// True if `id` is shaped like a session id we are willing to look up.
+/// True if `id` is shaped like a session id we are willing to look up: the
+/// workspace-wide rule from [`telemouse_core::recordings`], shared with the
+/// control panel and the analyzer so every server serves exactly what the
+/// others list.
 ///
 /// This is the cheap first gate; [`resolve_recording`] additionally requires
 /// the derived path to be a regular `.jsonl` file directly in the recording
 /// directory.
-pub fn is_safe_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && !id.starts_with('.')
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-}
+pub use telemouse_core::recordings::is_safe_id;
 
 /// List `*.jsonl` files directly inside `dir`, newest first.
 ///
@@ -170,10 +166,7 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
 /// This intentionally avoids listing and timestamp-probing every recording in
 /// the directory for a single download.
 pub fn resolve_recording(dir: &Path, id: &str) -> Option<PathBuf> {
-    if !is_safe_id(id) {
-        return None;
-    }
-    let path = dir.join(format!("{id}.jsonl"));
+    let path = dir.join(telemouse_core::recordings::recording_file_name(id)?);
     std::fs::symlink_metadata(&path)
         .ok()?
         .file_type()

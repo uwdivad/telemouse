@@ -23,6 +23,18 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+/// Response headers both local servers add to every response (lowercase
+/// names, as the HTTP crate wants them). `X-Frame-Options: DENY` stops an
+/// `http://` page from framing the control panel and clickjacking a one-click
+/// *Stop*; `nosniff` keeps a served recording from ever being interpreted as
+/// something other than text; `no-referrer` keeps the local URL (with its
+/// `?at=` and `?view=` state) out of any link a page might follow.
+pub const SECURITY_HEADERS: &[(&str, &str)] = &[
+    ("x-frame-options", "DENY"),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+];
+
 /// The address a browser on *this* machine should use to reach a server bound
 /// to `bind`. A wildcard bind (`0.0.0.0` / `[::]`, used to expose the viz to
 /// a LAN for an OBS source on another PC) is not a destination: browsers
@@ -152,6 +164,24 @@ mod tests {
         assert_eq!(browse_addr_str("[::1]:7879"), "[::1]:7879");
         // Unparseable input is displayed as written, never silently rewritten.
         assert_eq!(browse_addr_str("not an address"), "not an address");
+    }
+
+    #[test]
+    fn security_headers_are_lowercase_and_frame_denying() {
+        for (name, value) in SECURITY_HEADERS {
+            assert_eq!(*name, name.to_ascii_lowercase(), "{name}");
+            assert!(!value.is_empty());
+        }
+        assert!(
+            SECURITY_HEADERS
+                .iter()
+                .any(|(n, v)| *n == "x-frame-options" && *v == "DENY")
+        );
+        assert!(
+            SECURITY_HEADERS
+                .iter()
+                .any(|(n, v)| *n == "x-content-type-options" && *v == "nosniff")
+        );
     }
 
     #[test]

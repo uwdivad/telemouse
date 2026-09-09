@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use telemouse_core::batch::total_counts;
 use telemouse_core::{
     BatchView, Batcher, Envelope, EnvelopeView, Marker, QpcAnchor, RawEvent, SessionConfig,
 };
@@ -570,12 +571,6 @@ fn flush(
         );
     }
     core.finish_batch();
-}
-
-fn total_counts(events: &[RawEvent]) -> (i64, i64) {
-    events
-        .iter()
-        .fold((0i64, 0i64), |(x, y), e| (x + e.dx as i64, y + e.dy as i64))
 }
 
 /// Record how long the batch's oldest and newest events waited to be shipped.

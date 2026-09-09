@@ -9,10 +9,15 @@
 //! can actually be measured against.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::Instant;
 
 use serde::Serialize;
+
+/// Wall-clock UTC microseconds — the workspace-wide definition, so the
+/// bridge's latency estimate subtracts the same clock the capture agent
+/// stamped `ts_anchor_us` with.
+pub use telemouse_core::now_utc_us;
 
 /// Envelope tag of the stats frame pushed through the hub to the page.
 pub const VIZ_STATS_TYPE: &str = "viz_stats";
@@ -23,16 +28,6 @@ pub const LAT_BUCKET_US: u64 = 250;
 /// last bucket, but `max_us` stays exact, so a pathological outlier is still
 /// visible.
 pub const LAT_BUCKETS: usize = 1024;
-
-/// Wall-clock UTC microseconds. The capture agent stamps `ts_anchor_us` from
-/// the same clock, so the difference is an end-to-end bridge latency (modulo
-/// clock skew when capture and viz run on different machines).
-pub fn now_utc_us() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_micros() as i64,
-        Err(e) => -(e.duration().as_micros() as i64),
-    }
-}
 
 /// A fixed-bucket latency histogram. Recording is three relaxed atomic adds;
 /// reading walks 1024 atomics, which only the 5s reporter and `/api/stats` do.
@@ -177,6 +172,12 @@ pub struct Stats {
     /// periodic reporter so `/api/stats` can answer without keeping its own
     /// snapshot history.
     rate_bits: AtomicU64,
+    /// The UDP listener is bound and receiving. False until the bind
+    /// succeeds — and forever if it never does, which is what `/healthz`
+    /// exists to say.
+    udp_bound: AtomicBool,
+    /// Wall clock (UTC µs) of the most recent datagram, 0 before the first.
+    last_datagram_utc_us: AtomicI64,
     started: Instant,
 }
 
@@ -192,9 +193,25 @@ impl Default for Stats {
             latency: LatencyHist::default(),
             last_latency: Mutex::new(LatencySnapshot::default()),
             rate_bits: AtomicU64::new(0),
+            udp_bound: AtomicBool::new(false),
+            last_datagram_utc_us: AtomicI64::new(0),
             started: Instant::now(),
         }
     }
+}
+
+/// What `/healthz` returns. `ok` is false while the UDP listener is not
+/// bound: the page and replay still work, but live mode cannot, and a
+/// health check that said "ok" then would be lying about the one thing it
+/// is asked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HealthPayload {
+    pub ok: bool,
+    pub udp_bound: bool,
+    /// Seconds since the last datagram, `None` before the first one.
+    pub last_datagram_age_s: Option<f64>,
+    pub clients: i64,
+    pub uptime_s: f64,
 }
 
 /// Point-in-time copy of the [`Stats`] counters, used to compute per-interval
@@ -261,6 +278,38 @@ impl Stats {
 
     pub fn uptime_s(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
+    }
+
+    pub fn set_udp_bound(&self, bound: bool) {
+        self.udp_bound.store(bound, Ordering::Relaxed);
+    }
+
+    pub fn udp_bound(&self) -> bool {
+        self.udp_bound.load(Ordering::Relaxed)
+    }
+
+    /// A datagram arrived (parseable or not) at wall-clock `now_utc_us`.
+    pub fn note_datagram(&self, now_utc_us: i64) {
+        self.last_datagram_utc_us
+            .store(now_utc_us, Ordering::Relaxed);
+    }
+
+    /// Seconds since the last datagram, or `None` before the first.
+    pub fn last_datagram_age_s(&self, now_utc_us: i64) -> Option<f64> {
+        let last = self.last_datagram_utc_us.load(Ordering::Relaxed);
+        (last != 0).then(|| (now_utc_us - last).max(0) as f64 / 1e6)
+    }
+
+    /// The `/healthz` body at wall-clock `now_utc_us`.
+    pub fn health(&self, now_utc_us: i64) -> HealthPayload {
+        let udp_bound = self.udp_bound();
+        HealthPayload {
+            ok: udp_bound,
+            udp_bound,
+            last_datagram_age_s: self.last_datagram_age_s(now_utc_us),
+            clients: self.clients.load(Ordering::Relaxed),
+            uptime_s: self.uptime_s(),
+        }
     }
 
     /// Publish the interval rate the periodic reporter just computed.
@@ -515,10 +564,35 @@ mod tests {
     }
 
     #[test]
-    fn now_utc_us_is_a_plausible_wall_clock() {
-        // Somewhere after 2020 and before 2100, in µs.
-        let t = now_utc_us();
-        assert!(t > 1_577_836_800_000_000, "{t}");
-        assert!(t < 4_102_444_800_000_000, "{t}");
+    fn health_is_not_ok_until_udp_is_bound_and_reports_datagram_age() {
+        let s = Stats::default();
+        let now = 1_756_000_000_000_000;
+        let h = s.health(now);
+        assert!(!h.ok);
+        assert!(!h.udp_bound);
+        assert_eq!(h.last_datagram_age_s, None, "no datagram yet");
+        assert_eq!(h.clients, 0);
+
+        s.set_udp_bound(true);
+        s.note_datagram(now - 2_500_000);
+        s.client_connected();
+        let h = s.health(now);
+        assert!(h.ok && h.udp_bound);
+        assert!((h.last_datagram_age_s.unwrap() - 2.5).abs() < 1e-9);
+        assert_eq!(h.clients, 1);
+        // A datagram stamped in the future (clock skew) reads as age 0.
+        s.note_datagram(now + 1_000_000);
+        assert_eq!(s.last_datagram_age_s(now), Some(0.0));
+
+        let v: serde_json::Value = serde_json::to_value(s.health(now)).unwrap();
+        for key in [
+            "ok",
+            "udp_bound",
+            "last_datagram_age_s",
+            "clients",
+            "uptime_s",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
     }
 }

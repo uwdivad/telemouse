@@ -1,0 +1,57 @@
+# Local Kafka broker for telemouse (single node, KRaft, no ZooKeeper).
+#
+#   docker compose up -d          # start (data persists in the `kafka-data` volume)
+#   docker compose down           # stop;  add -v to wipe the data too
+#
+# The capture agent produces to it when `[kafka] enabled = true` in
+# telemouse.toml (the default broker list is 127.0.0.1:9092, which is what
+# this exposes). Capture never depends on the broker being up: if it is down
+# the sink is skipped with a warning and UDP + JSONL recording carry on.
+#
+# Peek at what lands (Ctrl-C to stop):
+#   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh `
+#     --bootstrap-server localhost:9092 --topic mouse.events --from-beginning
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: telemouse-kafka
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT is what the host (capture) connects to; CONTROLLER is
+      # KRaft-internal and never leaves the container.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker: every internal topic must be replication factor 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The capture sink creates mouse.events / mouse.sessions / mouse.markers
+      # itself (with the broker defaults — to keep session records past the
+      # events' retention, compact that topic by hand:
+      #   docker compose exec kafka /opt/kafka/bin/kafka-configs.sh \
+      #     --bootstrap-server localhost:9092 --alter --entity-type topics \
+      #     --entity-name mouse.sessions --add-config cleanup.policy=compact
+      # ); auto-creation is only a safety net for ad-hoc tools.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Mouse batches at 1kHz add up; keep a week, then let Kafka reclaim it.
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  kafka-data:
