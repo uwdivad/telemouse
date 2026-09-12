@@ -25,12 +25,9 @@ use telemouse_core::{
 use crate::context::SharedContext;
 use crate::platform;
 use crate::raw_input::RingWaker;
-use crate::sinks::{EnvelopeEncoder, Sink, fan_out, tick_all};
+use crate::sinks::{EnvelopeEncoder, Sink, fan_out, send_to, tick_all};
 use crate::stats::Stats;
 
-/// Longest the loop ever sleeps between drains: the batch window, so a partial
-/// batch is never more than one window late.
-const MAX_PARK: Duration = Duration::from_millis(25);
 /// Shortest park, so a nearly-expired window does not turn into a spin.
 const MIN_PARK: Duration = Duration::from_micros(500);
 /// Upper bound on events drained per iteration so markers and flushes still get
@@ -45,22 +42,36 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_PARK: Duration = TICK_INTERVAL;
 /// A misbehaving sink warns at most this often, with a suppressed count.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the session envelope is repeated to the live viz — and only to
+/// it (see [`resend_session`]).
+pub const SESSION_RESEND_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Longest the loop ever sleeps between drains: the configured batch window,
+/// so a partial batch is never more than one window late.
+///
+/// It follows `batch.window_ms` rather than being fixed, because both ends of
+/// the range were wrong at 25ms: a 50ms window got probed twice per batch for
+/// nothing, and a 5ms window had its deadline missed by 20ms — the window is
+/// the only deadline this loop has, so it is the only sensible park.
+pub fn max_park(window_ms: u64) -> Duration {
+    Duration::from_millis(window_ms).clamp(MIN_PARK, IDLE_PARK)
+}
 
 /// Park timeout for an empty-ring park: the two-stage idle descent.
 ///
 /// T1's `RingWaker` wake can, rarely, be lost to the relaxed-load race while
 /// this thread is on its way into `park` — the park timeout is the backstop.
 /// So the FIRST park after the ring goes empty is only the batch window
-/// ([`MAX_PARK`]): a lost wake costs at most one window. Only when that probe
+/// (`max_park`): a lost wake costs at most one window. Only when that probe
 /// park times out with the ring *still* empty (`prev_timed_out`, judged by the
 /// caller) does the loop descend to [`IDLE_PARK`]; anything arriving — a
 /// successful wake or a non-empty ring — resets the descent. Price: one extra
 /// wakeup per descent into idle.
-pub fn next_park_timeout(prev_timed_out: bool, ring_empty: bool) -> Duration {
+pub fn next_park_timeout(prev_timed_out: bool, ring_empty: bool, max_park: Duration) -> Duration {
     if prev_timed_out && ring_empty {
         IDLE_PARK
     } else {
-        MAX_PARK
+        max_park
     }
 }
 
@@ -98,9 +109,16 @@ impl DropAccountant {
 /// With no viz running, a broken sink can fail on every batch (~40/s). One
 /// warning per sink per [`WARN_INTERVAL`], carrying how many were suppressed,
 /// says the same thing without drowning the log.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WarnLimiter {
+    interval: Duration,
     entries: Vec<WarnEntry>,
+}
+
+impl Default for WarnLimiter {
+    fn default() -> Self {
+        Self::with_interval(WARN_INTERVAL)
+    }
 }
 
 #[derive(Debug)]
@@ -115,21 +133,31 @@ impl WarnLimiter {
         Self::default()
     }
 
+    /// Same, at a different cadence — for a caller whose failures are rarer
+    /// or noisier than a per-batch sink send.
+    pub fn with_interval(interval: Duration) -> Self {
+        Self {
+            interval,
+            entries: Vec::new(),
+        }
+    }
+
     /// Should this failure be logged now? `Some(suppressed)` says yes and
     /// reports how many were swallowed since the last one; `None` says no.
     pub fn allow(&mut self, sink: &'static str, now: Instant) -> Option<u64> {
+        let interval = self.interval;
         match self.entries.iter_mut().find(|e| e.sink == sink) {
             None => {
                 self.entries.push(WarnEntry {
                     sink,
-                    next_at: now + WARN_INTERVAL,
+                    next_at: now + interval,
                     suppressed: 0,
                 });
                 Some(0)
             }
             Some(entry) if now >= entry.next_at => {
                 let suppressed = std::mem::take(&mut entry.suppressed);
-                entry.next_at = now + WARN_INTERVAL;
+                entry.next_at = now + interval;
                 Some(suppressed)
             }
             Some(entry) => {
@@ -160,6 +188,7 @@ pub struct ShipperCore {
     drops: DropAccountant,
     abs_frames: DropAccountant,
     window_ticks: u64,
+    max_park: Duration,
 }
 
 impl ShipperCore {
@@ -173,11 +202,18 @@ impl ShipperCore {
             drops: DropAccountant::new(),
             abs_frames: DropAccountant::new(),
             window_ticks: anchor.ms_to_ticks(window_ms),
+            max_park: max_park(window_ms),
         }
     }
 
+    #[cfg_attr(not(feature = "observability"), allow(dead_code))]
     pub fn anchor(&self) -> QpcAnchor {
         self.anchor
+    }
+
+    /// The longest park this core's window justifies (see [`max_park`]).
+    pub fn max_park(&self) -> Duration {
+        self.max_park
     }
 
     pub fn session_id(&self) -> &str {
@@ -206,12 +242,12 @@ impl ShipperCore {
     /// With nothing pending there is no deadline, so it parks the full window.
     pub fn park_hint(&self, now_qpc: u64) -> Duration {
         let Some(first) = self.batcher.first_qpc() else {
-            return MAX_PARK;
+            return self.max_park;
         };
         let elapsed = now_qpc.saturating_sub(first);
         let remaining_ticks = self.window_ticks.saturating_sub(elapsed);
         let us = (remaining_ticks as u128 * 1_000_000 / self.anchor.qpc_freq.max(1) as u128) as u64;
-        Duration::from_micros(us).clamp(MIN_PARK, MAX_PARK)
+        Duration::from_micros(us).clamp(MIN_PARK, self.max_park)
     }
 
     /// Claim the header for the accumulated batch — sequence number, anchor
@@ -337,6 +373,11 @@ pub struct ShippingArgs {
     pub capture_stopped: Arc<AtomicBool>,
     /// T1 unparks this thread through here when the ring goes non-empty.
     pub waker: Arc<RingWaker>,
+    /// Run once at shutdown, after every sink but Kafka has been closed —
+    /// i.e. after the recording's final flush and before Kafka's bounded
+    /// drain. The sidecar is written here so a drain that runs out of time
+    /// still leaves a document whose counters match the recording on disk.
+    pub on_recording_closed: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// The T2 thread body. Returns when `capture_stopped` is set and the ring has
@@ -347,7 +388,7 @@ pub fn run(
     mut sinks: Vec<Box<dyn Sink>>,
     ctx: Arc<SharedContext>,
     stats: Arc<Stats>,
-    args: ShippingArgs,
+    mut args: ShippingArgs,
 ) {
     let capture_stopped = Arc::clone(&args.capture_stopped);
     let waker = Arc::clone(&args.waker);
@@ -364,20 +405,18 @@ pub fn run(
     let mut limiter = WarnLimiter::new();
 
     // The session record goes out first, so a recording's first line is always
-    // the session envelope.
-    encode_and_deliver(
-        &mut enc,
-        &mut sinks,
-        &stats,
-        &mut limiter,
-        &Envelope::Session(args.session.clone()),
-    );
+    // the session envelope. It is kept, because the live viz gets it again
+    // every few seconds (see `resend_session`).
+    let session_env = Envelope::Session(args.session.clone());
+    encode_and_deliver(&mut enc, &mut sinks, &stats, &mut limiter, &session_env);
 
     let mut last_tick = Instant::now();
+    let mut last_resend = Instant::now();
     // Two-stage idle descent: true once an empty-ring park has already timed
     // out with the ring still empty, i.e. the loop is confirmed idle.
     let mut idle_probe_expired = false;
     loop {
+        stats.t2_iters.fetch_add(1, Ordering::Relaxed);
         let stopping = capture_stopped.load(Ordering::Acquire);
         stats.observe_ring_slots(consumer.slots() as u64);
 
@@ -446,6 +485,13 @@ pub fn run(
             last_tick = Instant::now();
         }
 
+        // A viz started after the agent has no session record and cannot
+        // convert anything to cm or degrees until it gets one.
+        if last_resend.elapsed() >= SESSION_RESEND_INTERVAL {
+            last_resend = Instant::now();
+            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &session_env);
+        }
+
         if stopping && drained == 0 && core.pending() == 0 {
             break;
         }
@@ -467,7 +513,7 @@ pub fn run(
                     // to the RingWaker race (see its docs) then costs at most
                     // MAX_PARK, not IDLE_PARK, for one extra wakeup per
                     // descent into idle.
-                    let idle_timeout = next_park_timeout(idle_probe_expired, true);
+                    let idle_timeout = next_park_timeout(idle_probe_expired, true, core.max_park());
                     let parked_at = Instant::now();
                     std::thread::park_timeout(idle_timeout);
                     idle_probe_expired = parked_at.elapsed() >= idle_timeout && consumer.is_empty();
@@ -501,12 +547,58 @@ pub fn run(
     for failure in tick_all(&mut sinks) {
         stats.count_sink_error(failure.sink);
     }
+
+    // Close the sinks in two stages. Everything but Kafka goes first, because
+    // the JSONL writer's final flush is what makes the recording complete;
+    // the callback then writes the sidecar with the counters as they stand.
+    // Only after that does Kafka's *bounded* drain run — it can time out and
+    // abandon envelopes, and if it does, the sidecar on disk is already
+    // accurate about everything else.
+    let (kafka, rest): (Vec<_>, Vec<_>) = sinks.into_iter().partition(|s| s.name() == "kafka");
+    drop(rest);
+    if let Some(closed) = args.on_recording_closed.take() {
+        closed();
+    }
+    drop(kafka);
+
     tracing::info!(
         batches = stats.batches.load(Ordering::Relaxed),
         events = stats.events(),
         drops = stats.ring_drops(),
         "shipping thread finished"
     );
+}
+
+/// Repeat the session envelope to the live viz, and *only* to it.
+///
+/// A viz launched mid-session otherwise shows raw counts forever: the session
+/// record carries the CPI, the device names, the monitor list and the anchor.
+/// It deliberately does not go through `deliver`: a second `session` line in a
+/// recording would change what the file means, and consumers take the first
+/// session envelope of a stream anyway.
+fn resend_session(
+    enc: &mut EnvelopeEncoder,
+    sinks: &mut [Box<dyn Sink>],
+    stats: &Stats,
+    limiter: &mut WarnLimiter,
+    env: &Envelope,
+) {
+    if let Err(e) = enc.encode(env) {
+        tracing::error!(error = %format!("{e:#}"), "could not serialize the session envelope");
+        return;
+    }
+    let Some(failure) = send_to(sinks, "udp", env.topic(), env.key(), enc.payload()) else {
+        return;
+    };
+    stats.count_sink_error(failure.sink);
+    if let Some(suppressed) = limiter.allow(failure.sink, Instant::now()) {
+        tracing::warn!(
+            sink = failure.sink,
+            error = %failure.error,
+            suppressed,
+            "session re-send failed"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,7 +617,6 @@ fn flush(
         return;
     };
     stats.batches.fetch_add(1, Ordering::Relaxed);
-    record_latency(core.anchor(), stats, core.events());
     if print {
         let (dx, dy) = total_counts(core.events());
         tracing::info!(
@@ -570,10 +661,18 @@ fn flush(
             enc.payload(),
         );
     }
+    // Measured *after* the fan-out, not before it: capture→ship is supposed
+    // to include the ship. Taken before, it left out the one part of the path
+    // that can actually stall (a slow JSONL flush, a Kafka queue backing up)
+    // and reported a flattering number precisely when things were going
+    // wrong.
+    #[cfg(feature = "observability")]
+    record_latency(core.anchor(), stats, core.events());
     core.finish_batch();
 }
 
 /// Record how long the batch's oldest and newest events waited to be shipped.
+#[cfg(feature = "observability")]
 fn record_latency(anchor: QpcAnchor, stats: &Stats, events: &[RawEvent]) {
     let now = platform::qpc();
     let (Some(first), Some(last)) = (events.first(), events.last()) else {
@@ -581,10 +680,10 @@ fn record_latency(anchor: QpcAnchor, stats: &Stats, events: &[RawEvent]) {
     };
     stats
         .ship_latency_first
-        .record(anchor.ticks_to_us(first.ts_qpc, now).max(0) as u64);
+        .record_clamped(anchor.ticks_to_us(first.ts_qpc, now));
     stats
         .ship_latency_last
-        .record(anchor.ticks_to_us(last.ts_qpc, now).max(0) as u64);
+        .record_clamped(anchor.ticks_to_us(last.ts_qpc, now));
 }
 
 #[cfg(test)]
@@ -721,11 +820,26 @@ mod tests {
     }
 
     #[test]
+    fn the_longest_park_follows_the_configured_window() {
+        assert_eq!(max_park(25), Duration::from_millis(25));
+        assert_eq!(max_park(50), Duration::from_millis(50));
+        assert_eq!(max_park(5), Duration::from_millis(5));
+        // Never a spin, and never longer than the idle park is anyway.
+        assert_eq!(max_park(0), MIN_PARK);
+        assert_eq!(max_park(u64::MAX), IDLE_PARK);
+        // And the core carries the one its window justifies.
+        assert_eq!(
+            ShipperCore::new("s".into(), anchor(), 10, 50).max_park(),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
     fn the_park_hint_tracks_the_remaining_window() {
         let a = anchor();
         let mut core = ShipperCore::new("s-1".into(), a, 1_000, 25);
         // Nothing pending: park the whole window.
-        assert_eq!(core.park_hint(a.qpc), MAX_PARK);
+        assert_eq!(core.park_hint(a.qpc), Duration::from_millis(25));
 
         core.push(ev(a.qpc, 1));
         // 10ms in: 15ms of window left.
@@ -736,19 +850,32 @@ mod tests {
 
         // Taking the batch clears the deadline again.
         core.build_batch(&ctx(), 0, 0).unwrap();
-        assert_eq!(core.park_hint(a.qpc + FREQ), MAX_PARK);
+        assert_eq!(core.park_hint(a.qpc + FREQ), Duration::from_millis(25));
+
+        // A wider window parks wider: 40ms in, 10ms of a 50ms window left.
+        let mut wide = ShipperCore::new("s-1".into(), a, 1_000, 50);
+        assert_eq!(wide.park_hint(a.qpc), Duration::from_millis(50));
+        wide.push(ev(a.qpc, 1));
+        assert_eq!(
+            wide.park_hint(a.qpc + FREQ * 40 / 1000),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
     fn the_idle_descent_takes_two_stages() {
+        let window = max_park(25);
         // First empty-ring park after activity: only the batch window, so a
         // wake lost to the RingWaker race costs at most one window.
-        assert_eq!(next_park_timeout(false, true), MAX_PARK);
+        assert_eq!(next_park_timeout(false, true, window), window);
         // A probe that timed out with the ring still empty: confirmed idle.
-        assert_eq!(next_park_timeout(true, true), IDLE_PARK);
+        assert_eq!(next_park_timeout(true, true, window), IDLE_PARK);
         // Anything in the ring resets the descent, whatever the probe said.
-        assert_eq!(next_park_timeout(true, false), MAX_PARK);
-        assert_eq!(next_park_timeout(false, false), MAX_PARK);
+        assert_eq!(next_park_timeout(true, false, window), window);
+        assert_eq!(next_park_timeout(false, false, window), window);
+        // The probe is always the caller's window, not a fixed 25ms.
+        let wide = max_park(50);
+        assert_eq!(next_park_timeout(false, true, wide), wide);
     }
 
     #[test]
@@ -906,7 +1033,70 @@ mod tests {
         assert!(payloads[0].contains(r#""type":"batch""#));
 
         // The flush path recorded shipping latency for every batch.
-        let hist = stats.snapshot().ship_latency_first;
-        assert_eq!(hist.total(), 3);
+        #[cfg(feature = "observability")]
+        {
+            let snap = stats.snapshot();
+            assert_eq!(snap.ship_latency_first.total(), 3);
+            assert_eq!(snap.ship_latency_last.total(), 3);
+        }
+    }
+
+    #[test]
+    fn the_session_re_send_reaches_the_viz_and_nothing_else() {
+        let udp = RecordingSink::new("udp");
+        let jsonl = RecordingSink::new("jsonl");
+        let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(udp.clone()), Box::new(jsonl.clone())];
+        let stats = Stats::default();
+        let mut enc = EnvelopeEncoder::new();
+        let mut limiter = WarnLimiter::new();
+        let env = Envelope::Session(SessionConfig {
+            session_id: "s-1".into(),
+            mouse_cpi: 1600.0,
+            ..Default::default()
+        });
+
+        // The startup delivery goes everywhere...
+        encode_and_deliver(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+        assert_eq!((udp.count(), jsonl.count()), (1, 1));
+
+        // ...every repeat after it goes to the live viz alone, so the
+        // recording keeps exactly one session line.
+        for _ in 0..3 {
+            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+        }
+        assert_eq!(udp.count(), 4);
+        assert_eq!(jsonl.count(), 1, "the recording gained no session lines");
+        assert!(matches!(
+            udp.received.lock().unwrap().last(),
+            Some(Envelope::Session(_))
+        ));
+        assert_eq!(stats.snapshot().udp_errors, 0);
+    }
+
+    #[test]
+    fn a_failing_viz_re_send_is_counted_but_rate_limited() {
+        let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(FailingSink::new("udp"))];
+        let stats = Stats::default();
+        let mut enc = EnvelopeEncoder::new();
+        let mut limiter = WarnLimiter::new();
+        let env = Envelope::Session(SessionConfig::default());
+        for _ in 0..4 {
+            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+        }
+        assert_eq!(stats.snapshot().udp_errors, 4);
+        assert_eq!(limiter.allow("udp", Instant::now()), None);
+    }
+
+    #[test]
+    fn warn_limiters_can_run_at_a_different_cadence() {
+        let mut l = WarnLimiter::with_interval(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(l.allow("kafka", t0), Some(0));
+        assert_eq!(
+            l.allow("kafka", t0 + WARN_INTERVAL),
+            None,
+            "still inside 60s"
+        );
+        assert_eq!(l.allow("kafka", t0 + Duration::from_secs(60)), Some(1));
     }
 }

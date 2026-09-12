@@ -1,6 +1,13 @@
 //! `telemouse.toml` — one config file shared by the capture agent (which
 //! reads all of it) and the viz/analyze tools (which read the addresses and
 //! game table).
+//!
+//! **Paths in `telemouse.toml` are relative to the config file's own
+//! directory**, not to the working directory of whoever started the process
+//! (see [`AppConfig::resolve_paths`] and [`crate::paths`]): started from the
+//! tray or a shortcut, the working directory is not something the user
+//! chose, and `dir = "recordings"` has to keep meaning the folder beside the
+//! config.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,13 +23,33 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The file is not UTF-8 — almost always Notepad's "Unicode" or a
+    /// PowerShell 5.1 redirection, which writes UTF-16. Carries the fix
+    /// rather than the byte offset, because the byte offset helps nobody.
+    #[error("cannot read {path}: {hint}")]
+    Encoding { path: PathBuf, hint: String },
     #[error("failed to parse {path}: {source}")]
     Parse {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("invalid config: {field}: {reason}")]
-    Invalid { field: &'static str, reason: String },
+    /// A value the parser accepted but the pipeline cannot use. `path` is
+    /// the file it came from, when it came from a file at all.
+    #[error("{}", invalid_message(.path.as_deref(), .field, .reason))]
+    Invalid {
+        field: &'static str,
+        reason: String,
+        path: Option<PathBuf>,
+    },
+}
+
+/// `<path>: invalid config: <field>: <reason>`, or the same without the
+/// prefix for a config that was never on disk.
+fn invalid_message(path: Option<&Path>, field: &str, reason: &str) -> String {
+    match path {
+        Some(p) => format!("{}: invalid config: {field}: {reason}", p.display()),
+        None => format!("invalid config: {field}: {reason}"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +69,50 @@ pub struct AppConfig {
 /// Upper bound on `batch.coalesce_ms`: beyond this the read batching stops
 /// paying for itself and only adds latency.
 pub const MAX_COALESCE_MS: u64 = 10;
+
+/// Upper bound on `batch.window_ms`. One second of events is both a live
+/// view nobody would call live and, at 1kHz, more events than the 448-event
+/// batch cap can carry — past this the window stops being the thing that
+/// decides when a batch ships.
+pub const MAX_WINDOW_MS: u64 = 1000;
+
+/// Upper bound on `batch.ring_capacity`. 4M events is ~an hour of 1kHz
+/// capture sitting in RAM: a ring this deep no longer protects the capture
+/// thread, it just delays the moment anyone notices the shipping thread
+/// stopped.
+pub const MAX_RING_CAPACITY: usize = 4_194_304;
+
+/// The `[games]` key a process name should be written as: the bare file
+/// name, lowercased. Matching is done on `GetModuleFileNameEx`'s base name
+/// in lower case, so anything else in the table is a row that can never fire.
+pub fn normalize_game_key(key: &str) -> String {
+    let base = key.rsplit(['/', '\\']).next().unwrap_or(key);
+    base.trim().to_ascii_lowercase()
+}
+
+/// Why a `[games]` key would never match a running process, if so.
+fn game_key_problem(key: &str) -> Result<(), String> {
+    let norm = normalize_game_key(key);
+    if key.contains(['/', '\\', ':']) {
+        return Err(format!(
+            "{key:?} is a path; the key is the bare process name, e.g. {norm:?}"
+        ));
+    }
+    if key != key.to_ascii_lowercase() {
+        return Err(format!(
+            "{key:?} is matched case-sensitively against a lowercased process name \
+             and can never fire; write it as {norm:?}"
+        ));
+    }
+    if !key.ends_with(".exe") {
+        return Err(format!(
+            "{key:?} is not an executable name; the key is the process's file name, \
+             e.g. {:?}",
+            format!("{norm}.exe")
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -186,7 +257,17 @@ pub struct ObsConfig {
     pub legend: bool,
     /// Panel titles ("Desk space — hand path", grid step).
     pub labels: bool,
+    /// How long the overlay waits, in seconds, before it says there is no
+    /// feed. Short enough that a dead capture agent is visible on stream,
+    /// long enough that an idle hand is not mistaken for one. `0` turns the
+    /// indicator off, for a source that must never draw anything but the
+    /// trails.
+    pub stale_secs: f64,
 }
+
+/// Upper bound on `viz.obs.stale_secs`: past a minute the indicator would
+/// outlive the stream it is meant to warn about.
+pub const MAX_OBS_STALE_SECS: f64 = 60.0;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -263,6 +344,7 @@ impl Default for ObsConfig {
             grid: true,
             legend: false,
             labels: false,
+            stale_secs: 3.0,
         }
     }
 }
@@ -277,13 +359,18 @@ impl ObsConfig {
         matches!(hex.len(), 3 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit())
     }
 
+    /// Reject overlay settings the page cannot render.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
-            ConfigError::Invalid {
-                field,
-                reason: reason.into(),
-            }
-        }
+        self.validate_at(None)
+    }
+
+    /// Same, naming the file the values came from in the error.
+    fn validate_at(&self, path: Option<&Path>) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, reason: String| ConfigError::Invalid {
+            field,
+            reason,
+            path: path.map(Path::to_path_buf),
+        };
         if !OBS_LAYOUTS.contains(&self.layout.as_str()) {
             return Err(invalid(
                 "viz.obs.layout",
@@ -318,13 +405,25 @@ impl ObsConfig {
             ));
         }
         if !(self.scale.is_finite() && (0.5..=4.0).contains(&self.scale)) {
-            return Err(invalid("viz.obs.scale", "must be between 0.5 and 4"));
+            return Err(invalid("viz.obs.scale", "must be between 0.5 and 4".into()));
         }
         if !(self.trail_secs.is_finite() && (0.3..=12.0).contains(&self.trail_secs)) {
-            return Err(invalid("viz.obs.trail_secs", "must be between 0.3 and 12"));
+            return Err(invalid(
+                "viz.obs.trail_secs",
+                "must be between 0.3 and 12".into(),
+            ));
         }
         if !(10..=200).contains(&self.buffer_ms) {
-            return Err(invalid("viz.obs.buffer_ms", "must be between 10 and 200"));
+            return Err(invalid(
+                "viz.obs.buffer_ms",
+                "must be between 10 and 200".into(),
+            ));
+        }
+        if !(self.stale_secs.is_finite() && (0.0..=MAX_OBS_STALE_SECS).contains(&self.stale_secs)) {
+            return Err(invalid(
+                "viz.obs.stale_secs",
+                format!("must be between 0 (off) and {MAX_OBS_STALE_SECS:.0}"),
+            ));
         }
         Ok(())
     }
@@ -359,29 +458,60 @@ pub fn broker_is_valid(broker: &str) -> bool {
         && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// Decode a config file's bytes as UTF-8, turning the two ways a Windows
+/// editor gets this wrong into an error that says how to fix it.
+///
+/// A UTF-8 BOM is stripped here rather than left to the parser, so the file
+/// Notepad writes as "UTF-8 with BOM" parses like any other.
+fn decode_config(path: &Path, bytes: Vec<u8>) -> Result<String, ConfigError> {
+    let encoding = |hint: &str| ConfigError::Encoding {
+        path: path.to_path_buf(),
+        hint: hint.to_string(),
+    };
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err(encoding(
+            "the file is UTF-16 (Notepad's \"Unicode\" or PowerShell 5.1 redirection); \
+             save it as UTF-8",
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        encoding("not valid UTF-8; save it as UTF-8 (Notepad: Save As → Encoding: UTF-8)")
+    })?;
+    Ok(text
+        .strip_prefix('\u{feff}')
+        .map(str::to_string)
+        .unwrap_or(text))
+}
+
 impl AppConfig {
+    /// Read and validate `path`. Every error names the file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        let bytes = std::fs::read(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        let text = decode_config(path, bytes)?;
         let cfg: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-        cfg.validate()?;
+        cfg.validate_at(Some(path))?;
         Ok(cfg)
     }
 
     /// Reject values that would silently corrupt metrics or destabilize the
     /// pipeline. Called by [`Self::load`]; defaults always pass.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
-            ConfigError::Invalid {
-                field,
-                reason: reason.into(),
-            }
-        }
+        self.validate_at(None)
+    }
+
+    /// Same, naming the file the values came from in the error.
+    fn validate_at(&self, path: Option<&Path>) -> Result<(), ConfigError> {
+        let invalid = |field: &'static str, reason: String| ConfigError::Invalid {
+            field,
+            reason,
+            path: path.map(Path::to_path_buf),
+        };
         if !(self.mouse_cpi.is_finite() && self.mouse_cpi > 0.0) {
             return Err(invalid(
                 "mouse_cpi",
@@ -389,10 +519,19 @@ impl AppConfig {
             ));
         }
         if self.batch.window_ms == 0 {
-            return Err(invalid("batch.window_ms", "must be at least 1ms"));
+            return Err(invalid("batch.window_ms", "must be at least 1ms".into()));
+        }
+        if self.batch.window_ms > MAX_WINDOW_MS {
+            return Err(invalid(
+                "batch.window_ms",
+                format!(
+                    "must be at most {MAX_WINDOW_MS}ms; it is the live-viz latency floor, \
+                     and a window this long buffers more events than one batch can carry"
+                ),
+            ));
         }
         if self.batch.max_events == 0 {
-            return Err(invalid("batch.max_events", "must be at least 1"));
+            return Err(invalid("batch.max_events", "must be at least 1".into()));
         }
         if self.batch.max_events > crate::wire::MAX_EVENTS_PER_BATCH {
             return Err(invalid(
@@ -406,7 +545,17 @@ impl AppConfig {
         if self.batch.ring_capacity < self.batch.max_events {
             return Err(invalid(
                 "batch.ring_capacity",
-                "must be at least batch.max_events",
+                "must be at least batch.max_events".into(),
+            ));
+        }
+        if self.batch.ring_capacity > MAX_RING_CAPACITY {
+            return Err(invalid(
+                "batch.ring_capacity",
+                format!(
+                    "must be at most {MAX_RING_CAPACITY} events (~{} MB of locked ring); \
+                     a ring this deep hides a stalled shipping thread instead of dropping",
+                    MAX_RING_CAPACITY * size_of::<crate::RawEvent>() / (1024 * 1024)
+                ),
             ));
         }
         if self.batch.coalesce_ms > MAX_COALESCE_MS {
@@ -418,7 +567,7 @@ impl AppConfig {
         if self.kafka.enabled && self.kafka.brokers.is_empty() {
             return Err(invalid(
                 "kafka.brokers",
-                "kafka is enabled but no brokers are listed",
+                "kafka is enabled but no brokers are listed".into(),
             ));
         }
         // Checked whether or not Kafka is enabled: a broker that cannot be
@@ -432,7 +581,7 @@ impl AppConfig {
                 ),
             ));
         }
-        self.viz.obs.validate()?;
+        self.viz.obs.validate_at(path)?;
         if self.ctl.stop_grace_secs > MAX_STOP_GRACE_SECS {
             return Err(invalid(
                 "ctl.stop_grace_secs",
@@ -443,6 +592,9 @@ impl AppConfig {
             return Err(invalid("ctl.hotkey", reason));
         }
         for (game, g) in &self.games {
+            if let Err(reason) = game_key_problem(game) {
+                return Err(invalid("games", reason));
+            }
             if !(g.sens.is_finite() && g.sens > 0.0)
                 || !(g.yaw_coeff.is_finite() && g.yaw_coeff > 0.0)
                 || !(g.pitch_coeff.is_finite() && g.pitch_coeff > 0.0)
@@ -454,6 +606,102 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+
+    /// Make `recording.dir`, `ctl.log_dir` and `ctl.bin_dir` absolute against
+    /// `base` — the config file's own directory (see [`crate::paths`]).
+    ///
+    /// Call this once after loading. Without it, a relative `recordings`
+    /// means "wherever this process happened to be started from", which for
+    /// anything launched by the tray or a shortcut is not a place the user
+    /// picked, and a recording written there is a recording nobody finds.
+    pub fn resolve_paths(&mut self, base: &Path) {
+        fn absolutize(p: &Path, base: &Path) -> PathBuf {
+            if p.is_absolute() || p.as_os_str().is_empty() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            }
+        }
+        self.recording.dir = absolutize(&self.recording.dir, base);
+        self.ctl.log_dir = absolutize(&self.ctl.log_dir, base);
+        if let Some(dir) = &self.ctl.bin_dir {
+            self.ctl.bin_dir = Some(absolutize(dir, base));
+        }
+    }
+
+    /// Every scalar setting that differs from the defaults, as
+    /// `(field, value)` pairs — the startup banner's job is to say what is
+    /// *not* standard, so a support question starts from five lines instead
+    /// of the whole file. `games` appears as a count, since the table itself
+    /// is not a banner's business.
+    pub fn non_default_fields(&self) -> Vec<(&'static str, String)> {
+        let d = AppConfig::default();
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        let mut add = |name: &'static str, v: String| out.push((name, v));
+
+        if self.mouse_cpi != d.mouse_cpi {
+            add("mouse_cpi", self.mouse_cpi.to_string());
+        }
+        if self.batch.window_ms != d.batch.window_ms {
+            add("batch.window_ms", self.batch.window_ms.to_string());
+        }
+        if self.batch.max_events != d.batch.max_events {
+            add("batch.max_events", self.batch.max_events.to_string());
+        }
+        if self.batch.ring_capacity != d.batch.ring_capacity {
+            add("batch.ring_capacity", self.batch.ring_capacity.to_string());
+        }
+        if self.batch.coalesce_ms != d.batch.coalesce_ms {
+            add("batch.coalesce_ms", self.batch.coalesce_ms.to_string());
+        }
+        if self.udp.enabled != d.udp.enabled {
+            add("udp.enabled", self.udp.enabled.to_string());
+        }
+        if self.udp.addr != d.udp.addr {
+            add("udp.addr", self.udp.addr.clone());
+        }
+        if self.kafka.enabled != d.kafka.enabled {
+            add("kafka.enabled", self.kafka.enabled.to_string());
+        }
+        if self.kafka.brokers != d.kafka.brokers {
+            add("kafka.brokers", self.kafka.brokers.join(", "));
+        }
+        if self.recording.enabled != d.recording.enabled {
+            add("recording.enabled", self.recording.enabled.to_string());
+        }
+        if self.recording.dir != d.recording.dir {
+            add("recording.dir", self.recording.dir.display().to_string());
+        }
+        if self.viz.http_addr != d.viz.http_addr {
+            add("viz.http_addr", self.viz.http_addr.clone());
+        }
+        if self.ctl.http_addr != d.ctl.http_addr {
+            add("ctl.http_addr", self.ctl.http_addr.clone());
+        }
+        if self.ctl.bin_dir != d.ctl.bin_dir {
+            add(
+                "ctl.bin_dir",
+                self.ctl
+                    .bin_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        if self.ctl.stop_grace_secs != d.ctl.stop_grace_secs {
+            add("ctl.stop_grace_secs", self.ctl.stop_grace_secs.to_string());
+        }
+        if self.ctl.log_dir != d.ctl.log_dir {
+            add("ctl.log_dir", self.ctl.log_dir.display().to_string());
+        }
+        if self.ctl.hotkey != d.ctl.hotkey {
+            add("ctl.hotkey", self.ctl.hotkey.clone());
+        }
+        if !self.games.is_empty() {
+            add("games", format!("{} entries", self.games.len()));
+        }
+        out
     }
 
     /// Load from `path` if it exists, otherwise defaults.
@@ -673,6 +921,13 @@ mod tests {
             ("viz.obs.scale", "[viz.obs]\nscale = 0.1"),
             ("viz.obs.trail_secs", "[viz.obs]\ntrail_secs = 60"),
             ("viz.obs.buffer_ms", "[viz.obs]\nbuffer_ms = 5"),
+            ("viz.obs.stale_secs", "[viz.obs]\nstale_secs = -1.0"),
+            ("viz.obs.stale_secs", "[viz.obs]\nstale_secs = 61.0"),
+            ("batch.window_ms", "[batch]\nwindow_ms = 1001"),
+            ("batch.ring_capacity", "[batch]\nring_capacity = 4194305"),
+            ("games", "[games.\"CS2.EXE\"]\nsens = 1.0"),
+            ("games", "[games.\"cs2\"]\nsens = 1.0"),
+            ("games", "[games.\"c:/games/cs2.exe\"]\nsens = 1.0"),
         ];
         for (field, toml_text) in cases {
             let cfg: AppConfig = toml::from_str(toml_text).unwrap();
@@ -682,5 +937,151 @@ mod tests {
                 "expected Invalid({field}), got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn game_keys_must_be_the_bare_lowercase_exe_name() {
+        assert_eq!(normalize_game_key("CS2.EXE"), "cs2.exe");
+        assert_eq!(normalize_game_key(r"C:\Games\CS2.exe"), "cs2.exe");
+        assert_eq!(normalize_game_key("/opt/games/cs2.exe"), "cs2.exe");
+        assert_eq!(normalize_game_key(" cs2.exe "), "cs2.exe");
+        assert!(game_key_problem("cs2.exe").is_ok());
+        // The message names both what was written and what to write.
+        let err = game_key_problem("CS2.EXE").unwrap_err();
+        assert!(
+            err.contains("\"CS2.EXE\"") && err.contains("\"cs2.exe\""),
+            "{err}"
+        );
+        let err = game_key_problem("cs2").unwrap_err();
+        assert!(err.contains("\"cs2.exe\""), "{err}");
+        let err = game_key_problem(r"C:\Games\cs2.exe").unwrap_err();
+        assert!(err.contains("path") && err.contains("\"cs2.exe\""), "{err}");
+    }
+
+    #[test]
+    fn an_error_from_a_file_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemouse.toml");
+        std::fs::write(&path, "mouse_cpi = 0.0\n").unwrap();
+        let err = AppConfig::load(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("invalid config: mouse_cpi"), "{text}");
+        // The same value validated in memory has no file to name.
+        let cfg: AppConfig = toml::from_str("mouse_cpi = 0.0").unwrap();
+        let text = cfg.validate().unwrap_err().to_string();
+        assert!(text.starts_with("invalid config: mouse_cpi"), "{text}");
+    }
+
+    #[test]
+    fn utf16_and_other_non_utf8_files_say_how_to_fix_them() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // What Notepad's "Unicode" and `... > telemouse.toml` in PowerShell
+        // 5.1 produce: UTF-16 LE with a BOM.
+        let path = dir.path().join("utf16.toml");
+        let mut bytes = vec![0xFF, 0xFE];
+        for b in "mouse_cpi = 1600.0\n".bytes() {
+            bytes.extend_from_slice(&[b, 0]);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let err = AppConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Encoding { .. }), "{err}");
+        assert!(err.to_string().contains("UTF-16"), "{err}");
+
+        // Big-endian too.
+        let path = dir.path().join("utf16be.toml");
+        std::fs::write(&path, [0xFE, 0xFF, 0x00, b'a']).unwrap();
+        assert!(matches!(
+            AppConfig::load(&path),
+            Err(ConfigError::Encoding { .. })
+        ));
+
+        // Anything else that is not UTF-8 (a stray Latin-1 byte).
+        let path = dir.path().join("latin1.toml");
+        std::fs::write(&path, b"mouse_cpi = 1600.0 # caf\xe9\n").unwrap();
+        let err = AppConfig::load(&path).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn a_utf8_bom_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.toml");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"mouse_cpi = 3200.0\n");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(AppConfig::load(&path).unwrap().mouse_cpi, 3200.0);
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_config_directory() {
+        let base = Path::new("/opt/telemouse");
+        let mut cfg = AppConfig::default();
+        cfg.ctl.bin_dir = Some(PathBuf::from("bin"));
+        cfg.resolve_paths(base);
+        assert_eq!(cfg.recording.dir, base.join("recordings"));
+        assert_eq!(cfg.ctl.log_dir, base.join("logs"));
+        assert_eq!(cfg.ctl.bin_dir, Some(base.join("bin")));
+
+        // Absolute paths and an unset bin_dir are left alone.
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"D:\recordings")
+        } else {
+            PathBuf::from("/srv/recordings")
+        };
+        let mut cfg = AppConfig::default();
+        cfg.recording.dir = absolute.clone();
+        cfg.resolve_paths(base);
+        assert_eq!(cfg.recording.dir, absolute);
+        assert_eq!(cfg.ctl.bin_dir, None);
+    }
+
+    #[test]
+    fn only_non_default_fields_are_listed() {
+        assert!(AppConfig::default().non_default_fields().is_empty());
+
+        let cfg: AppConfig = toml::from_str(
+            r#"
+            mouse_cpi = 3200.0
+            [kafka]
+            enabled = true
+            [viz]
+            http_addr = "0.0.0.0:7879"
+            [games."cs2.exe"]
+            sens = 1.0
+            "#,
+        )
+        .unwrap();
+        let fields = cfg.non_default_fields();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec!["mouse_cpi", "kafka.enabled", "viz.http_addr", "games"]
+        );
+        assert_eq!(fields[2].1, "0.0.0.0:7879");
+        assert_eq!(fields[3].1, "1 entries");
+    }
+
+    /// The shipped sample is the defaults written down. If a default moves
+    /// and the sample does not, a fresh install silently runs on different
+    /// numbers than a build from source.
+    #[test]
+    fn the_shipped_sample_is_exactly_the_defaults() {
+        let text = include_str!("../../../telemouse.example.toml");
+        let sample: AppConfig = toml::from_str(text).expect("the sample must parse");
+        sample.validate().expect("the sample must validate");
+        assert!(
+            !sample.games.is_empty(),
+            "the sample carries example [games] entries"
+        );
+        let expected = AppConfig {
+            games: sample.games.clone(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            sample, expected,
+            "telemouse.example.toml has drifted from AppConfig::default()"
+        );
     }
 }

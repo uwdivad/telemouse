@@ -7,10 +7,18 @@
 use std::net::SocketAddr;
 
 use crate::gui::feed::Snapshot;
-use crate::manager::{ComponentState, Kind, describe_exit};
+use crate::manager::{ComponentState, Kind, clip, describe_exit, short_hint};
 
 /// `NOTIFYICONDATAW.szTip` is 128 UTF-16 units including the terminator.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
+
+/// Width of the "last exit" column in the status window's component table.
+/// A hint is far longer than this, so the cell is clipped and the full text
+/// goes on its own line below the table.
+const LAST_COL: usize = 18;
+
+/// Width of the label column of the key/value block (`SAVE DATA`, `CONFIG`…).
+const LABEL_COL: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconState {
@@ -18,6 +26,13 @@ pub enum IconState {
     Idle,
     /// The capture agent is running: the icon goes green.
     CaptureRunning,
+    /// It is running, but something it reports is wrong — a sink dropping,
+    /// events lost, or a mouse that has not moved in a minute. Amber.
+    ///
+    /// Only ever chosen in a build with the `observability` feature, which
+    /// is what reads the agent's stats line; the state itself is always
+    /// defined so the icon table and this enum cannot fall out of step.
+    Degraded,
 }
 
 impl IconState {
@@ -26,8 +41,12 @@ impl IconState {
         match self {
             Self::Idle => 0,
             Self::CaptureRunning => 1,
+            Self::Degraded => 2,
         }
     }
+
+    /// How many icons `win.rs` has to draw.
+    pub const COUNT: usize = 3;
 }
 
 fn component<'a>(s: &'a Snapshot, id: &str) -> Option<&'a ComponentState> {
@@ -35,11 +54,15 @@ fn component<'a>(s: &'a Snapshot, id: &str) -> Option<&'a ComponentState> {
 }
 
 pub fn icon_state(s: &Snapshot) -> IconState {
-    if component(s, "capture").is_some_and(|c| c.running) {
-        IconState::CaptureRunning
-    } else {
-        IconState::Idle
+    let Some(c) = component(s, "capture").filter(|c| c.running) else {
+        return IconState::Idle;
+    };
+    #[cfg(feature = "observability")]
+    if c.stats.as_ref().is_some_and(|st| st.degraded()) {
+        return IconState::Degraded;
     }
+    let _ = c;
+    IconState::CaptureRunning
 }
 
 /// `h:mm:ss` since `since`, clamped at zero.
@@ -70,15 +93,53 @@ fn saving_note(c: Option<&ComponentState>) -> &'static str {
     }
 }
 
+/// The live numbers for the capture agent, short enough for a tooltip.
+/// Empty in a build without `observability`, or before the agent has
+/// printed its first report.
+fn capture_note(c: Option<&ComponentState>) -> String {
+    #[cfg(feature = "observability")]
+    if let Some(c) = c.filter(|c| c.running) {
+        return c
+            .stats
+            .as_ref()
+            .map(|s| s.tooltip_note())
+            .unwrap_or_default();
+    }
+    let _ = c;
+    String::new()
+}
+
+/// The most recent failure worth a word in the tooltip: the short form of
+/// the hint on a component that exited badly and is not running.
+fn failure_note(s: &Snapshot) -> String {
+    s.components
+        .iter()
+        .filter(|c| !c.running)
+        .filter_map(|c| c.last_exit.as_ref().filter(|e| e.failed()).map(|e| (c, e)))
+        .max_by_key(|(_, e)| e.at_unix_s)
+        .map(|(c, e)| match &e.hint {
+            Some(h) => format!("{}: {}", c.id, short_hint(h, 40)),
+            None => format!("{} failed", c.id),
+        })
+        .unwrap_or_default()
+}
+
 /// Tray tooltip, never longer than [`TOOLTIP_MAX_CHARS`].
 pub fn tooltip(s: &Snapshot) -> String {
     let cap = component(s, "capture");
-    let text = format!(
+    let mut text = format!(
         "telemouse-ctl — capture: {}{}, viz: {}",
         service_status(cap, s.now_unix_s),
         saving_note(cap),
         service_status(component(s, "viz"), s.now_unix_s),
     );
+    for extra in [capture_note(cap), failure_note(s)] {
+        if !extra.is_empty() {
+            text.push_str(" — ");
+            text.push_str(&extra);
+            break;
+        }
+    }
     text.chars().take(TOOLTIP_MAX_CHARS).collect()
 }
 
@@ -93,7 +154,9 @@ pub fn focus_component(components: &[ComponentState]) -> Option<&ComponentState>
     components
         .iter()
         .filter_map(|c| {
-            let t = c.since_unix_s.or(c.last_exit.map(|e| e.at_unix_s))?;
+            let t = c
+                .since_unix_s
+                .or(c.last_exit.as_ref().map(|e| e.at_unix_s))?;
             Some((t, c))
         })
         .max_by_key(|(t, _)| *t)
@@ -109,12 +172,50 @@ fn hms_utc(unix_s: u64) -> String {
     )
 }
 
+/// One row of the component table's "last exit" cell, clipped to the
+/// column. The untruncated hint goes on a NOTES line of its own.
+fn last_exit_cell(c: &ComponentState) -> String {
+    let text = match &c.last_exit {
+        None => "last: -".to_string(),
+        Some(e) => format!("last: {}", describe_exit(e)),
+    };
+    clip(&text, LAST_COL)
+}
+
+/// The header every other section is read against: where the panel is,
+/// which config it obeys, where it writes, and what it is.
+fn header(s: &Snapshot) -> Vec<String> {
+    let p = &s.places;
+    let logs = if p.logs.is_empty() {
+        "logging off (this build writes no log files)".to_string()
+    } else {
+        p.logs.clone()
+    };
+    /// `-` rather than an empty column, so a missing value is visible
+    /// instead of looking like a rendering bug.
+    fn or_dash(s: &str) -> &str {
+        if s.is_empty() { "-" } else { s }
+    }
+    vec![
+        format!(
+            "{:<LABEL_COL$}{} (tray → Open web panel)",
+            "PANEL",
+            or_dash(&p.panel_url)
+        ),
+        format!("{:<LABEL_COL$}{}", "CONFIG", or_dash(&p.config)),
+        format!("{:<LABEL_COL$}{logs}", "LOGS"),
+        format!("{:<LABEL_COL$}{}", "VERSION", or_dash(&p.version)),
+        String::new(),
+    ]
+}
+
 /// The whole body of the status window. CRLF line endings: a Win32 `EDIT`
 /// control silently drops bare `\n`. Fixed-width columns for a monospace
 /// font.
 pub fn render_text(s: &Snapshot) -> String {
     let now = s.now_unix_s;
     let mut out: Vec<String> = Vec::with_capacity(64);
+    out.extend(header(s));
     out.push(format!(
         "COMPONENTS                                              refreshed {} UTC",
         hms_utc(now)
@@ -135,18 +236,26 @@ pub fn render_text(s: &Snapshot) -> String {
             (true, Some(since)) => format!("up {}", format_uptime(now, since)),
             _ => "-".into(),
         };
-        let last = c
-            .last_exit
-            .map(|e| format!("last: {}", describe_exit(e)))
-            .unwrap_or_else(|| "last: -".into());
         let kind = match c.kind {
             Kind::Service => "service",
             Kind::Task => "task",
         };
         out.push(format!(
-            "{:<17} {:<8} {:<10} {:<11} {:<12} {:<18} {}",
-            c.label, kind, state, pid, up, last, c.summary
+            "{:<17} {:<8} {:<10} {:<11} {:<12} {:<LAST_COL$} {}",
+            c.label,
+            kind,
+            state,
+            pid,
+            up,
+            last_exit_cell(c),
+            c.summary
         ));
+    }
+    // The clipped cells above lose the part that says what to do about it.
+    for c in &s.components {
+        for line in exit_notes(c) {
+            out.push(format!("  ! {} {line}", c.label));
+        }
     }
     out.push(String::new());
     let cap = component(s, "capture");
@@ -161,18 +270,26 @@ pub fn render_text(s: &Snapshot) -> String {
         _ => String::new(),
     };
     out.push(format!(
-        "{:<20}default {default} (telemouse.toml [recording] enabled){now_line}",
+        "{:<LABEL_COL$}default {default} (telemouse.toml [recording] enabled){now_line}",
         "SAVE DATA"
     ));
+    for line in capture_lines(cap) {
+        out.push(format!("{:<LABEL_COL$}{line}", "CAPTURE"));
+    }
     let hotkey = if s.hotkey.is_empty() {
         "none (telemouse.toml [ctl] hotkey)".to_string()
+    } else if s.hotkey_registered == Some(false) {
+        format!(
+            "{} — NOT REGISTERED (another program holds it; change [ctl] hotkey)",
+            s.hotkey
+        )
     } else {
         format!(
             "{} → new session: (re)start capture, saving → {}",
             s.hotkey, s.recording_dir
         )
     };
-    out.push(format!("{:<20}{hotkey}", "HOTKEY"));
+    out.push(format!("{:<LABEL_COL$}{hotkey}", "HOTKEY"));
     out.push(String::new());
     out.push("RELATED PROCESSES".into());
     if s.processes.is_empty() {
@@ -204,6 +321,44 @@ pub fn render_text(s: &Snapshot) -> String {
     text
 }
 
+/// The full hint and the child's own last line, for a component whose last
+/// exit was a failure. Empty otherwise.
+fn exit_notes(c: &ComponentState) -> Vec<String> {
+    let Some(e) = c.last_exit.as_ref().filter(|e| e.failed()) else {
+        return Vec::new();
+    };
+    #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
+    let mut out = Vec::new();
+    if let Some(h) = &e.hint {
+        out.push(h.clone());
+    }
+    if let Some(l) = &e.last_line {
+        out.push(format!("last line: {l}"));
+    }
+    out
+}
+
+/// What the capture agent itself reports: its rate and, while it saves, the
+/// recording and the disk. Empty in a build without `observability`.
+fn capture_lines(c: Option<&ComponentState>) -> Vec<String> {
+    #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
+    let mut out = Vec::new();
+    #[cfg(feature = "observability")]
+    if let Some(c) = c.filter(|c| c.running) {
+        if let Some(st) = c.stats.as_ref() {
+            let s = st.summary();
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        if let Some(r) = c.recording.as_ref() {
+            out.push(r.summary());
+        }
+    }
+    let _ = c;
+    out
+}
+
 pub const MENU_TOGGLE_WINDOW: u16 = 1001;
 pub const MENU_START_CAPTURE: u16 = 1002;
 pub const MENU_STOP_CAPTURE: u16 = 1003;
@@ -215,6 +370,10 @@ pub const MENU_START_CAPTURE_NOSAVE: u16 = 1008;
 /// Stop the running capture agent and start one that saves: a fresh
 /// session file. What the hotkey does.
 pub const MENU_NEW_SESSION: u16 = 1009;
+pub const MENU_OPEN_LOGS: u16 = 1010;
+pub const MENU_OPEN_RECORDINGS: u16 = 1011;
+pub const MENU_EDIT_CONFIG: u16 = 1012;
+pub const MENU_OPEN_DOCS: u16 = 1013;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuItem {
@@ -256,9 +415,11 @@ fn service_items(
 /// being saved plus *New session* (stop, then start saving); otherwise two
 /// *Start*s — with and without saving — both greyed when the binary is
 /// missing. The item the hotkey is equivalent to carries the chord as its
-/// accelerator text (after a tab, which a Win32 menu right-aligns).
+/// accelerator text (after a tab, which a Win32 menu right-aligns) — but
+/// only while the chord is actually registered: an accelerator that does
+/// nothing is worse than none.
 fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
-    let accel = if s.hotkey.is_empty() {
+    let accel = if s.hotkey.is_empty() || s.hotkey_registered == Some(false) {
         String::new()
     } else {
         format!("\t{}", s.hotkey)
@@ -320,10 +481,41 @@ pub fn menu(s: &Snapshot, window_visible: bool) -> Vec<MenuEntry> {
         ),
         MenuEntry::Separator,
         item(MENU_OPEN_PANEL, "Open web panel", true),
+        // Everything a support question ends up asking for, one click away.
+        item(
+            MENU_OPEN_LOGS,
+            "Open logs folder",
+            !s.places.logs.is_empty(),
+        ),
+        item(
+            MENU_OPEN_RECORDINGS,
+            "Open recordings folder",
+            !s.recording_dir.is_empty(),
+        ),
+        item(
+            MENU_EDIT_CONFIG,
+            "Edit telemouse.toml",
+            !s.places.config.is_empty(),
+        ),
+        item(MENU_OPEN_DOCS, "Open docs", !s.places.docs.is_empty()),
         MenuEntry::Separator,
         item(MENU_EXIT, "Exit (stops what the panel started)", true),
     ]);
     v
+}
+
+/// What a menu item opens, when it opens something. `None` for the items
+/// that do something instead.
+pub fn menu_target(s: &Snapshot, id: u16) -> Option<&str> {
+    match id {
+        MENU_OPEN_PANEL => Some(s.places.panel_url.as_str()),
+        MENU_OPEN_LOGS => Some(s.places.logs.as_str()),
+        MENU_OPEN_RECORDINGS => Some(s.recording_dir.as_str()),
+        MENU_EDIT_CONFIG => Some(s.places.config.as_str()),
+        MENU_OPEN_DOCS => Some(s.places.docs.as_str()),
+        _ => None,
+    }
+    .filter(|t| !t.is_empty())
 }
 
 /// Where a browser reaches the panel. An unspecified bind address
@@ -353,11 +545,13 @@ impl IconPixels {
 }
 
 /// A filled disc with a darker 1-px ring: grey when idle, green while the
-/// capture agent runs.
+/// capture agent runs, amber while it runs but reports trouble.
 pub fn icon_bitmap(state: IconState, size: u32) -> IconPixels {
     let (fill, ring) = match state {
         IconState::Idle => (0xFF80_8080u32, 0xFF50_5050u32),
         IconState::CaptureRunning => (0xFF2E_A043u32, 0xFF1F_6F2Eu32),
+        // BGRA: amber is a lot of blue-channel-zero, so this is 0xFFB02E RGB.
+        IconState::Degraded => (0xFF2E_B0FFu32, 0xFF1F_78B0u32),
     };
     let n = size as usize;
     let stride = IconPixels::mask_stride(size);
@@ -389,7 +583,15 @@ pub fn icon_bitmap(state: IconState, size: u32) -> IconPixels {
 mod tests {
     use super::*;
     use crate::manager::{ExitInfo, Flag};
+    use crate::places::Places;
     use crate::procs::{ProcInfo, ProcKind};
+
+    /// The key/value lines are padded to a fixed label column; building the
+    /// expectation the same way keeps these assertions from being a
+    /// space-counting exercise.
+    fn labelled(label: &str, value: &str) -> String {
+        format!("{label:<LABEL_COL$}{value}")
+    }
 
     fn comp(
         id: &'static str,
@@ -417,6 +619,23 @@ mod tests {
             args: Vec::new(),
             saving: running && id == "capture",
             log: vec!["line one".into(), "line two".into()],
+            log_seq: 2,
+            #[cfg(feature = "observability")]
+            stats: None,
+            #[cfg(feature = "observability")]
+            recording: None,
+        }
+    }
+
+    fn places() -> Places {
+        Places {
+            version: "0.1.1".into(),
+            panel_url: "http://127.0.0.1:7880/".into(),
+            config: "C:\\tm\\telemouse.toml".into(),
+            logs: "C:\\tm\\logs".into(),
+            bin_dir: "C:\\tm".into(),
+            docs: "C:\\tm\\docs".into(),
+            releases: crate::places::RELEASES_URL.into(),
         }
     }
 
@@ -425,7 +644,9 @@ mod tests {
             recording_enabled: true,
             recording_dir: "recordings".into(),
             hotkey: "Ctrl+Alt+R".into(),
+            hotkey_registered: Some(true),
             now_unix_s: 1_000_000 + 3661,
+            places: places(),
             components: vec![
                 comp(
                     "capture",
@@ -457,7 +678,68 @@ mod tests {
         assert_eq!(icon_state(&snap(false, true)), IconState::Idle);
         assert_eq!(icon_state(&snap(true, false)), IconState::CaptureRunning);
         assert_eq!(icon_state(&Snapshot::default()), IconState::Idle);
-        assert_ne!(IconState::Idle.index(), IconState::CaptureRunning.index());
+        let indices: Vec<usize> = [
+            IconState::Idle,
+            IconState::CaptureRunning,
+            IconState::Degraded,
+        ]
+        .iter()
+        .map(|s| s.index())
+        .collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(IconState::COUNT, 3);
+    }
+
+    /// The amber state: capture is running, and what it reports is not fine.
+    #[cfg(feature = "observability")]
+    #[test]
+    fn a_dropping_capture_turns_the_icon_amber() {
+        let mut s = snap(true, false);
+        s.components[0].stats = Some(crate::stats::ChildStats {
+            events_per_s: Some(1000.0),
+            drops: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(icon_state(&s), IconState::CaptureRunning);
+        s.components[0].stats = Some(crate::stats::ChildStats {
+            events_per_s: Some(1000.0),
+            jsonl_dropped: Some(12),
+            ..Default::default()
+        });
+        assert_eq!(icon_state(&s), IconState::Degraded);
+        assert!(
+            tooltip(&s).contains("recording dropping"),
+            "{}",
+            tooltip(&s)
+        );
+        assert!(render_text(&s).contains("recording dropping"));
+        // Degraded only counts while it is actually running.
+        s.components[0].running = false;
+        assert_eq!(icon_state(&s), IconState::Idle);
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn the_window_shows_the_recording_and_what_the_disk_has_left() {
+        let mut s = snap(true, false);
+        s.components[0].stats = Some(crate::stats::ChildStats {
+            events_per_s: Some(998.0),
+            session: Some("s-1".into()),
+            ..Default::default()
+        });
+        s.components[0].recording = Some(crate::stats::RecordingLive {
+            session: "s-1".into(),
+            file: "C:\\tm\\recordings\\s-1.jsonl".into(),
+            size_bytes: Some(12_900_000),
+            free_bytes: Some(463_000_000_000),
+        });
+        let t = render_text(&s);
+        assert!(t.contains(&labelled("CAPTURE", "998 ev/s")), "{t}");
+        assert!(
+            t.contains("recording → s-1.jsonl · 12.3 MB · 431 GB free"),
+            "{t}"
+        );
+        assert!(tooltip(&s).contains("998 ev/s"));
     }
 
     #[test]
@@ -493,6 +775,23 @@ mod tests {
         assert!(tooltip(&nb).ends_with("viz: not built"));
     }
 
+    /// A component that died carries its reason into the tooltip, short.
+    #[test]
+    fn a_failure_reaches_the_tooltip_in_short_form() {
+        let mut s = snap(false, false);
+        s.components[1].last_exit = Some(
+            ExitInfo::new(Some(1), 900).with_hint(Some(crate::manager::HINT_PORT_IN_USE.into())),
+        );
+        let t = tooltip(&s);
+        assert!(t.contains("viz: port already in use"), "{t}");
+        assert!(t.chars().count() <= TOOLTIP_MAX_CHARS);
+        // A clean exit adds no failure note (the status itself still names viz).
+        s.components[1].last_exit = Some(ExitInfo::new(Some(0), 900));
+        let t = tooltip(&s);
+        assert!(!t.contains(" — viz"), "{t}");
+        assert!(!t.contains("port already in use"), "{t}");
+    }
+
     #[test]
     fn focus_prefers_running_services_then_recency() {
         let s = snap(true, true);
@@ -504,6 +803,41 @@ mod tests {
         s.components[2].last_exit = Some(ExitInfo::new(Some(0), 500));
         s.components[1].last_exit = Some(ExitInfo::new(Some(1), 900));
         assert_eq!(focus_component(&s.components).unwrap().id, "viz");
+    }
+
+    /// The block at the top says where everything is. A support question
+    /// starts here, so it must be present even before anything has run.
+    #[test]
+    fn the_header_names_the_panel_config_logs_and_version() {
+        let t = render_text(&snap(false, false));
+        assert!(
+            t.starts_with(&labelled(
+                "PANEL",
+                "http://127.0.0.1:7880/ (tray → Open web panel)"
+            )),
+            "{}",
+            &t[..120.min(t.len())]
+        );
+        assert!(
+            t.contains(&labelled("CONFIG", "C:\\tm\\telemouse.toml")),
+            "{t}"
+        );
+        assert!(t.contains(&labelled("LOGS", "C:\\tm\\logs")), "{t}");
+        assert!(t.contains(&labelled("VERSION", "0.1.1")), "{t}");
+
+        // A build with no logging says so rather than showing a path that
+        // will never hold a file.
+        let mut off = snap(false, false);
+        off.places.logs.clear();
+        assert!(
+            render_text(&off).contains(&labelled("LOGS", "logging off")),
+            "{}",
+            render_text(&off)
+        );
+        // An empty snapshot renders without panicking and without lying.
+        let empty = render_text(&Snapshot::default());
+        assert!(empty.contains(&labelled("PANEL", "-")));
+        assert!(empty.contains(&labelled("VERSION", "-")));
     }
 
     #[test]
@@ -520,12 +854,12 @@ mod tests {
         assert!(text.contains("pid 4242"));
         assert!(text.contains("up 1:01:01"));
         assert!(text.contains("not built"), "a missing binary is said so");
-        assert!(text.contains("SAVE DATA           default on → recordings"));
+        assert!(text.contains(&labelled("SAVE DATA", "default on → recordings")));
         assert!(text.contains("capture is SAVING → recordings"));
-        assert!(text.contains("HOTKEY              Ctrl+Alt+R → new session"));
+        assert!(text.contains(&labelled("HOTKEY", "Ctrl+Alt+R → new session")));
         let mut nokey = snap(true, false);
         nokey.hotkey.clear();
-        assert!(render_text(&nokey).contains("HOTKEY              none"));
+        assert!(render_text(&nokey).contains(&labelled("HOTKEY", "none")));
         let mut off = snap(true, false);
         off.recording_enabled = false;
         off.components[0].saving = false;
@@ -544,6 +878,68 @@ mod tests {
         let empty = render_text(&Snapshot::default());
         assert!(empty.contains("(none)"));
         assert!(empty.contains("nothing has run yet"));
+    }
+
+    /// A chord another program already owns must not be presented as if it
+    /// worked — neither in the window nor as a menu accelerator.
+    #[test]
+    fn an_unregistered_hotkey_says_so_and_loses_its_accelerator() {
+        let mut s = snap(false, false);
+        s.hotkey_registered = Some(false);
+        let t = render_text(&s);
+        assert!(
+            t.contains(&labelled(
+                "HOTKEY",
+                "Ctrl+Alt+R — NOT REGISTERED (another program holds it; change [ctl] hotkey)"
+            )),
+            "{t}"
+        );
+        assert!(
+            menu(&s, true).iter().all(|e| match e {
+                MenuEntry::Item(i) => !i.label.contains('\t'),
+                _ => true,
+            }),
+            "a dead chord must not be shown as an accelerator"
+        );
+        // Not yet attempted: neither claim is made.
+        s.hotkey_registered = None;
+        assert!(render_text(&s).contains(&labelled("HOTKEY", "Ctrl+Alt+R → new session")));
+    }
+
+    /// The exit column is fixed width; the explanation goes underneath it.
+    #[test]
+    fn a_long_hint_is_clipped_in_the_table_and_spelled_out_below() {
+        let mut s = snap(false, false);
+        s.components[1].last_exit = Some(
+            ExitInfo::new(Some(1), 900)
+                .with_hint(Some(crate::manager::HINT_PORT_IN_USE.into()))
+                .with_last_line(Some("Error: failed to bind http 127.0.0.1:7879".into())),
+        );
+        let t = render_text(&s);
+        let row = t
+            .lines()
+            .find(|l| l.starts_with("Viz server"))
+            .expect("the viz row");
+        assert!(
+            row.contains(&clip(
+                &format!("last: code 1 ({})", crate::manager::HINT_PORT_IN_USE),
+                LAST_COL
+            )),
+            "the cell is clipped: {row:?}"
+        );
+        assert!(row.contains('…'), "something was clipped: {row:?}");
+        assert!(
+            row.ends_with("summary"),
+            "the summary column still lines up: {row:?}"
+        );
+        assert!(t.contains(crate::manager::HINT_PORT_IN_USE), "{t}");
+        assert!(
+            t.contains("  ! Viz server last line: Error: failed to bind http 127.0.0.1:7879"),
+            "{t}"
+        );
+        // A clean exit gets no note.
+        s.components[1].last_exit = Some(ExitInfo::new(Some(0), 900));
+        assert!(!render_text(&s).contains("  ! Viz server"));
     }
 
     #[test]
@@ -641,6 +1037,47 @@ mod tests {
         assert_eq!(all.len(), dedup.len(), "menu ids are unique");
     }
 
+    /// The four *Open …* items and what each of them opens.
+    #[test]
+    fn the_menu_opens_every_place_the_panel_writes_to() {
+        let s = snap(false, false);
+        let enabled = |id: u16| {
+            menu(&s, true).iter().any(|e| match e {
+                MenuEntry::Item(i) => i.id == id && i.enabled,
+                _ => false,
+            })
+        };
+        for id in [
+            MENU_OPEN_LOGS,
+            MENU_OPEN_RECORDINGS,
+            MENU_EDIT_CONFIG,
+            MENU_OPEN_DOCS,
+        ] {
+            assert!(enabled(id), "{id} should be offered");
+        }
+        assert_eq!(menu_target(&s, MENU_OPEN_LOGS), Some("C:\\tm\\logs"));
+        assert_eq!(menu_target(&s, MENU_OPEN_RECORDINGS), Some("recordings"));
+        assert_eq!(
+            menu_target(&s, MENU_EDIT_CONFIG),
+            Some("C:\\tm\\telemouse.toml")
+        );
+        assert_eq!(menu_target(&s, MENU_OPEN_DOCS), Some("C:\\tm\\docs"));
+        assert_eq!(
+            menu_target(&s, MENU_OPEN_PANEL),
+            Some("http://127.0.0.1:7880/")
+        );
+        assert_eq!(menu_target(&s, MENU_EXIT), None);
+
+        // A build that writes no logs does not offer to open the folder.
+        let mut nolog = s.clone();
+        nolog.places.logs.clear();
+        assert!(menu(&nolog, true).iter().any(|e| match e {
+            MenuEntry::Item(i) => i.id == MENU_OPEN_LOGS && !i.enabled,
+            _ => false,
+        }));
+        assert_eq!(menu_target(&nolog, MENU_OPEN_LOGS), None);
+    }
+
     #[test]
     fn panel_url_replaces_an_unspecified_bind_address() {
         assert_eq!(
@@ -663,7 +1100,11 @@ mod tests {
 
     #[test]
     fn icon_is_a_disc_with_transparent_corners() {
-        for state in [IconState::Idle, IconState::CaptureRunning] {
+        for state in [
+            IconState::Idle,
+            IconState::CaptureRunning,
+            IconState::Degraded,
+        ] {
             for size in [16u32, 32] {
                 let px = icon_bitmap(state, size);
                 let n = size as usize;
@@ -687,9 +1128,17 @@ mod tests {
         }
         assert_eq!(IconPixels::mask_stride(16), 2);
         assert_eq!(IconPixels::mask_stride(20), 4);
-        assert_ne!(
-            icon_bitmap(IconState::Idle, 16).bgra,
-            icon_bitmap(IconState::CaptureRunning, 16).bgra
-        );
+        // Every state is visibly a different colour.
+        let mut seen: Vec<u32> = [
+            IconState::Idle,
+            IconState::CaptureRunning,
+            IconState::Degraded,
+        ]
+        .iter()
+        .map(|s| icon_bitmap(*s, 16).bgra[8 * 16 + 8])
+        .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), IconState::COUNT);
     }
 }

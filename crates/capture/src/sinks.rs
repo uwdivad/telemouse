@@ -10,12 +10,14 @@
 //! alongside the typed envelope and never re-encode it.
 
 pub mod jsonl;
+#[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod udp;
 
 use anyhow::{Context, Result};
 
 pub use jsonl::JsonlSink;
+#[cfg(feature = "kafka")]
 pub use kafka::KafkaSink;
 pub use udp::UdpSink;
 
@@ -115,6 +117,32 @@ pub fn fan_out(
         }
     }
     failures
+}
+
+/// Deliver one envelope to exactly one sink, by name.
+///
+/// The session envelope is re-sent to the live viz every few seconds so a viz
+/// started after the agent still learns the CPI, the device names and the
+/// anchor. It must not reach the others: a second `session` line in a
+/// recording would change what the file means, and a second one on
+/// `mouse.sessions` is a record nobody asked for. `None` when the sink is not
+/// present (disabled, or it failed to start) or when it accepted the
+/// envelope.
+pub fn send_to(
+    sinks: &mut [Box<dyn Sink>],
+    name: &str,
+    topic: &'static str,
+    key: &str,
+    payload: &str,
+) -> Option<SinkFailure> {
+    let sink = sinks.iter_mut().find(|s| s.name() == name)?;
+    match sink.send(topic, key, payload) {
+        Ok(()) => None,
+        Err(e) => Some(SinkFailure {
+            sink: sink.name(),
+            error: format!("{e:#}"),
+        }),
+    }
 }
 
 /// Housekeeping pass over every sink, same isolation rules.
@@ -274,6 +302,27 @@ mod tests {
         assert_eq!(snap.kafka_errors, 1);
         assert_eq!(snap.udp_errors, 1);
         assert_eq!(snap.jsonl_errors, 0);
+    }
+
+    #[test]
+    fn a_targeted_send_reaches_one_sink_and_no_other() {
+        let udp = RecordingSink::new("udp");
+        let jsonl = RecordingSink::new("jsonl");
+        let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(udp.clone()), Box::new(jsonl.clone())];
+        let e = env();
+        assert!(send_to(&mut sinks, "udp", e.topic(), e.key(), "{}").is_none());
+        assert_eq!(udp.count(), 1);
+        assert_eq!(jsonl.count(), 0, "the recording must not see it");
+
+        // A sink that is not running is not an error: there is nobody to tell.
+        assert!(send_to(&mut sinks, "kafka", e.topic(), e.key(), "{}").is_none());
+
+        // A failure is reported, and still reaches nobody else.
+        let mut sinks: Vec<Box<dyn Sink>> =
+            vec![Box::new(FailingSink::new("udp")), Box::new(jsonl.clone())];
+        let failure = send_to(&mut sinks, "udp", e.topic(), e.key(), "{}").unwrap();
+        assert_eq!(failure.sink, "udp");
+        assert_eq!(jsonl.count(), 0);
     }
 
     #[test]

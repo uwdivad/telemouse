@@ -112,9 +112,9 @@ pub struct FlickReport {
 /// correct even on a recording with a timestamp inversion in it.
 pub(crate) fn click_times_us(p: &Prepared) -> Vec<i64> {
     let mut v: Vec<i64> = p
-        .events()
+        .analysed_events()
         .iter()
-        .zip(&p.event_us)
+        .zip(p.analysed_event_us())
         .filter(|(e, _)| e.buttons & buttons::ANY_DOWN != 0)
         .map(|(_, us)| *us)
         .collect();
@@ -313,17 +313,17 @@ fn summarize(p: &Prepared, flicks: Vec<Flick>) -> FlickReport {
         },
         count: flicks.len(),
         per_minute: flicks.len() as f64 / p.minutes(),
-        amplitude_deg: Summary::of(&amp),
-        peak_velocity_deg_s: Summary::of(&pv),
-        duration_ms: Summary::of(&dur),
-        overshoot_ratio: Summary::of(&os),
-        settle_ms: Summary::of(&st),
-        time_to_click_ms: Summary::of(&ttc),
+        amplitude_deg: Summary::of_vec(amp),
+        peak_velocity_deg_s: Summary::of_vec(pv),
+        duration_ms: Summary::of_vec(dur),
+        overshoot_ratio: Summary::of_vec(os),
+        settle_ms: Summary::of_vec(st),
         clicked_fraction: if flicks.is_empty() {
             0.0
         } else {
             ttc.len() as f64 / flicks.len() as f64
         },
+        time_to_click_ms: Summary::of_vec(ttc),
         flicks,
     }
 }

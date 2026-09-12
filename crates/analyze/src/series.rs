@@ -35,8 +35,17 @@
 use serde::{Deserialize, Serialize};
 use telemouse_core::{GameSens, RawEvent, event::buttons, units};
 
-use crate::load::LoadedSession;
+use crate::load::{GameCounts, LoadedSession};
 use crate::savgol::SavGol;
+
+/// Hard ceiling on the *span* the grid may cover, independent of
+/// [`Params::max_grid_cells`].
+///
+/// Pass one allocates one bit per cell of span, so this is the guard against a
+/// single corrupt timestamp claiming a session that lasted years. 500 M cells
+/// is 5.8 days at 1 ms and costs a 62 MB bitmap; no real recording comes near
+/// it, and `max_grid_cells` is what bounds the analysis of the ones that do.
+pub const MAX_SPAN_CELLS: usize = 500_000_000;
 
 /// Every tunable in one place; the CLI overrides a subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -74,7 +83,14 @@ pub struct Params {
     /// filter's spectral nulls at 5/10/15 Hz, so the 8–12 Hz tremor band passes
     /// into the residual essentially unattenuated.
     pub tremor_baseline_ms: usize,
-    /// Safety valve against corrupt timestamps producing an enormous grid.
+    /// Cap on the cells the grid actually *materializes* — the sum of its run
+    /// lengths, not the span it covers. The grid is sparse (see the module
+    /// docs), so this bounds memory (~56 B a cell, so the default is ~1.8 GB
+    /// worst case) rather than session length: an eight-hour recording of a
+    /// hand that moved for twenty minutes stores twenty minutes. Runs past the
+    /// cap are dropped from the end and the analysis stops there; every rate
+    /// is then divided by the span that was analysed. The separate
+    /// [`MAX_SPAN_CELLS`] guard rejects corrupt timestamps.
     pub max_grid_cells: usize,
 
     /// Restrict aim-space (degree-valued) metrics to spans the capture agent
@@ -119,7 +135,10 @@ impl Default for Params {
             min_segment_ms: 3,
             min_reversal_ms: 4,
             tremor_baseline_ms: 200,
-            max_grid_cells: 32_000_000, // ~8.9 h at 1 ms
+            // Stored cells, so ~8.9 h of *continuous movement* at 1 ms — a
+            // real session with its idle stretches runs far longer before it
+            // reaches this. ~1.8 GB of lanes at the limit.
+            max_grid_cells: 32_000_000,
             locked_only: false,
             split_by_marker: false,
             lift_drift_min_ms: 120,
@@ -581,6 +600,12 @@ pub struct Prepared {
     /// every degree-valued metric is then uncalibrated.
     pub aim_fallback: bool,
     pub game: Option<String>,
+    /// Share of attributed events that belong to [`Prepared::game`]. Zero when
+    /// no batch named a process.
+    pub dominant_game_share: f64,
+    /// Events per foreground process, tallied once here rather than by every
+    /// caller that wants "the game".
+    pub game_event_counts: GameCounts,
     /// Microseconds since `t0_utc_us`, one per event.
     ///
     /// Integer, deliberately: at 1 kHz the interval histogram and the click
@@ -592,8 +617,17 @@ pub struct Prepared {
     /// Grid cell width in microseconds.
     pub grid_dt_us: i64,
     pub grid: Grid,
-    /// Set when the grid hit `Params::max_grid_cells` and was truncated.
+    /// Set when the grid hit `Params::max_grid_cells` (or [`MAX_SPAN_CELLS`])
+    /// and was truncated.
     pub grid_truncated: bool,
+    /// Events that fall inside the analysed span — `events().len()` unless the
+    /// grid was truncated.
+    ///
+    /// Every rate in this crate divides by [`Prepared::minutes`], which is the
+    /// analysed span; its numerator must therefore count the same span. A
+    /// truncated three-hour session whose first ten minutes were analysed used
+    /// to divide three hours of events by ten minutes of time.
+    pub events_in_grid: usize,
     /// Movement segments at the still-speed threshold, computed once.
     pub segments: Vec<Segment>,
     /// Event index ranges `[a, b)` captured while the pointer was locked.
@@ -606,6 +640,17 @@ impl Prepared {
     /// The recording's events.
     pub fn events(&self) -> &[RawEvent] {
         &self.session.events
+    }
+
+    /// The events the analysis actually covers — the prefix inside the grid.
+    /// Anything that feeds a per-minute rate counts these, not [`Self::events`].
+    pub fn analysed_events(&self) -> &[RawEvent] {
+        &self.session.events[..self.events_in_grid]
+    }
+
+    /// [`Self::analysed_events`]' timestamps, µs since session start.
+    pub fn analysed_event_us(&self) -> &[i64] {
+        &self.event_us[..self.events_in_grid]
     }
 
     /// Degrees per count, horizontal and vertical.
@@ -753,6 +798,35 @@ impl CellBits {
     }
 }
 
+/// Hold the padded spans to `cap` materialized cells, dropping runs from the
+/// end until they fit and clipping the one that straddles the limit.
+///
+/// The cap is about memory, and memory is spent on cells the grid stores — so
+/// it is applied here, to the run lengths, rather than to the session's span.
+/// A sparse eight-hour recording materializes a fraction of its span and is no
+/// longer refused for being long.
+fn cap_runs(spans: Vec<(usize, usize)>, cap: usize) -> (Vec<(usize, usize)>, bool) {
+    let total: usize = spans.iter().map(|&(lo, hi)| hi - lo).sum();
+    if total <= cap {
+        return (spans, false);
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut budget = cap;
+    for (lo, hi) in spans {
+        let len = hi - lo;
+        if len <= budget {
+            budget -= len;
+            out.push((lo, hi));
+            continue;
+        }
+        if budget > 0 {
+            out.push((lo, lo + budget));
+        }
+        break;
+    }
+    (out, true)
+}
+
 /// Apply a Savitzky–Golay operator to one run so the result is bit-identical
 /// to applying it to the equivalent dense grid.
 ///
@@ -814,7 +888,14 @@ pub(crate) fn sg_run_into<'s>(
 /// cloning it to hand the metrics a copy is the single largest avoidable
 /// allocation in the pipeline.
 pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
-    let (game, aim, aim_fallback) = session.resolve_aim();
+    // One tally of events-per-process for the whole pipeline: the dominant
+    // game, its share, and the aim profile all fall out of it, and the quality
+    // report reads it off `Prepared` instead of walking the batches again.
+    let game_event_counts = session.game_event_counts();
+    let dominant = crate::load::dominant_game(&game_event_counts);
+    let game = dominant.as_ref().map(|(name, _)| name.to_string());
+    let dominant_game_share = dominant.as_ref().map_or(0.0, |(_, share)| *share);
+    let (aim, aim_fallback) = crate::load::resolve_aim(&session.config, game.as_deref());
     let anchor = session.config.anchor;
 
     let n_ev = session.events.len();
@@ -838,31 +919,52 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
     } else {
         (duration_us / grid_dt_us) as usize + 1
     };
-    let grid_truncated = wanted > params.max_grid_cells;
-    let n = wanted.min(params.max_grid_cells);
-    let analysis_duration_s = if grid_truncated {
-        (n as f64) * dt
-    } else {
-        duration_s
-    };
+    // The span guard is about the bitmap below, which is one bit per cell of
+    // *span*; the cell cap proper is applied to the runs after pass one,
+    // because those are what the grid materializes.
+    let span_truncated = wanted > MAX_SPAN_CELLS;
+    let span_cells = wanted.min(MAX_SPAN_CELLS);
 
     // Padding that makes the sparse grid numerically identical to a dense one:
     // wide enough for both the SG window and the tremor boxcar baseline.
     let pad = params.sg_half.max(params.tremor_baseline_ms / 2).max(1);
 
     // Pass 1: which cells carry anything.
-    let mut bits = CellBits::new(n);
+    let mut bits = CellBits::new(span_cells);
     for &us in &event_us {
         if us < 0 {
             continue;
         }
         let idx = (us / grid_dt_us) as usize;
-        if idx < n {
+        if idx < span_cells {
             bits.set(idx);
         }
     }
-    let spans = bits.spans(n, pad);
+    let spans = bits.spans(span_cells, pad);
     drop(bits);
+
+    let (spans, cap_truncated) = cap_runs(spans, params.max_grid_cells);
+    let grid_truncated = span_truncated || cap_truncated;
+    // A truncated analysis ends where its last run does; everything past that
+    // was never looked at and must not appear in any denominator.
+    let n = if grid_truncated {
+        spans.last().map_or(0, |&(_, hi)| hi)
+    } else {
+        span_cells
+    };
+    let analysis_duration_s = if grid_truncated {
+        (n as f64) * dt
+    } else {
+        duration_s
+    };
+    // `event_us` is ascending apart from the monotonicity violations the
+    // quality report counts, so the prefix inside the grid is a partition.
+    let events_in_grid = if grid_truncated {
+        let analysed_us = n as i64 * grid_dt_us;
+        event_us.partition_point(|&us| us < analysed_us)
+    } else {
+        n_ev
+    };
 
     // Pass 2: bin the counts into the runs.
     let mut runs: Vec<Run> = spans
@@ -939,10 +1041,13 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
         aim,
         aim_fallback,
         game,
+        dominant_game_share,
+        game_event_counts,
         event_us,
         grid_dt_us,
         grid,
         grid_truncated,
+        events_in_grid,
         segments,
         locked_events,
         locked_cells,

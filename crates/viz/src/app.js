@@ -96,6 +96,11 @@ const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
 
 const SERVER_CFG = (typeof window.TELEMOUSE_CONFIG === "object" && window.TELEMOUSE_CONFIG) || {};
 const OBS_MODE = QUERY.get("obs") === "1" || SERVER_CFG.obs_route === true;
+/* Where the bridge is listening for the capture agent. Injected by the
+   server; empty when the page is opened straight off disk. The page says it
+   out loud while it waits, because "nothing is moving" and "the agent is
+   shipping to a different port" look identical otherwise. */
+const UDP_ADDR = typeof SERVER_CFG.udp_addr === "string" ? SERVER_CFG.udp_addr : "";
 
 const HUD_ITEMS = {
   speed:   { k: "speed",     unit: "cm/s" },
@@ -107,7 +112,59 @@ const HUD_ITEMS = {
   clicks:  { k: "clicks" },
   game:    { k: "game", text: true },
   latency: { k: "latency",   unit: "ms" },
+  status:  { k: "feed", text: true },
 };
+
+/* Upper bound on the OBS stale timer, matching `MAX_OBS_STALE_SECS` in
+   telemouse-core's config validator: past a minute the indicator would
+   outlive the stream it is meant to warn about. */
+const OBS_STALE_MAX = 60;
+/* How long the dashboard's connection pill waits before it stops saying
+   "live". Not configurable: the pill is a diagnostic, not stream content. */
+const NO_DATA_SECS = 3;
+
+/** Seconds on the page's own monotonic clock. */
+function nowSec() {
+  return performance.now() / 1000;
+}
+
+/**
+ * One rule for "is anything actually arriving", shared by the dashboard's
+ * connection pill and the OBS stale indicator.
+ *
+ *   down     — the socket is not open
+ *   waiting  — open, but no batch has ever arrived (capture agent not running)
+ *   stale    — batches were arriving and stopped
+ *   live     — a batch arrived within `staleAfter`
+ *
+ * `age` is measured from the last batch, or from when the socket opened when
+ * there has never been one. `staleAfter <= 0` disables the stale verdict.
+ */
+function feedState(o) {
+  const since = o.lastBatchAt || o.since || 0;
+  const age = since ? Math.max(0, o.now - since) : 0;
+  if (!o.connected) return { kind: "down", age: age };
+  if (!o.lastBatchAt) return { kind: "waiting", age: age };
+  if (o.staleAfter > 0 && age > o.staleAfter) return { kind: "stale", age: age };
+  return { kind: "live", age: age };
+}
+
+/** Whether the overlay should show its "no feed" state for `st`. */
+function feedIsStale(st, staleAfter) {
+  if (!(staleAfter > 0)) return false;
+  return st.kind === "down" || st.kind === "stale" ||
+         (st.kind === "waiting" && st.age > staleAfter);
+}
+
+/** Connection-pill text for a feed state: class, and what it says. */
+function connPillState(st, udpAddr) {
+  switch (st.kind) {
+    case "live":    return { cls: "ok", text: "live" };
+    case "waiting": return { cls: "warn", text: "waiting for capture on udp " + (udpAddr || "?") };
+    case "stale":   return { cls: "warn", text: "no data for " + Math.round(st.age) + "s" };
+    default:        return { cls: "err", text: "disconnected" };
+  }
+}
 
 /** "transparent" | "rrggbb" | "#rrggbbaa" | "rgb" → { css, alpha }. */
 function parseBg(s) {
@@ -125,7 +182,7 @@ const OBS = OBS_MODE ? (() => {
   const d = Object.assign({
     layout: "split", background: "transparent", hud: ["speed", "aim", "cpm"],
     hud_position: "bottom-left", scale: 1, trail_secs: 3, buffer_ms: 35,
-    grid: true, legend: false, labels: false,
+    grid: true, legend: false, labels: false, stale_secs: 3,
   }, SERVER_CFG.obs || {});
   const str = (name, dflt, allowed) => {
     const v = QUERY.get(name);
@@ -159,6 +216,10 @@ const OBS = OBS_MODE ? (() => {
     grid: bool("grid", d.grid),
     legend: bool("legend", d.legend),
     labels: bool("labels", d.labels),
+    /* Seconds of silence before the overlay says there is no feed; `0` turns
+       the indicator off for a source that must never draw anything but the
+       trails. Clamped to the same 0..60 the config validator enforces. */
+    stale: num("stale", d.stale_secs, 0, OBS_STALE_MAX),
   };
 })() : null;
 
@@ -615,6 +676,11 @@ const engine = {
     }
 
     if (type !== "batch") return;
+
+    /* A batch — of any size, including empty — is the feed being alive.
+       Everything that says "waiting for capture" or "no feed" hangs off this
+       one timestamp. */
+    ui.onBatch();
 
     /* Data-quality accounting happens even for an empty batch. */
     const drops = env.drops_since_last | 0;
@@ -1473,6 +1539,27 @@ const aimPanel = new Panel("aimCanvas", {
 
 const $ = (id) => document.getElementById(id);
 
+/* ---------- rate-limited console reporting ----------
+   A page fed at 1kHz can produce thousands of identical complaints a second,
+   and a console with a thousand identical lines in it is a console nobody
+   reads. Each kind is loud the first time and then at most once every
+   WARN_EVERY seconds; the counters in the stats bar carry the rest. */
+const WARN_EVERY = 30;
+const warnedAt = Object.create(null);
+
+/** Report `kind` (with optional detail) at most once per WARN_EVERY.
+    Returns whether it was actually logged — which the tests read. */
+function warn(kind, detail) {
+  const now = nowSec();
+  const last = warnedAt[kind];
+  if (last !== undefined && now - last < WARN_EVERY) return false;
+  warnedAt[kind] = now;
+  try {
+    console.warn("[telemouse] " + kind + (detail === undefined || detail === null ? "" : ": " + detail));
+  } catch (e) { /* no console (some OBS builds) */ }
+  return true;
+}
+
 const LIVE_BUFFER_DEFAULT = 0.035;
 const LIVE_BUFFER_KEY = "telemouse.liveBuffer";
 
@@ -1497,11 +1584,57 @@ const ui = {
   bridge: null,
   bridgeAt: 0,
   lossToastShown: false,
+  /* Live-feed bookkeeping (see `feedState`). `wsOpen` is the socket, not the
+     data: an open socket with nothing coming down it is exactly the case the
+     "waiting for capture" state exists for. */
+  wsOpen: false,
+  lastBatchAt: 0,
+  feedSince: 0,
+  udpAddr: UDP_ADDR,
+  /* Frames the page could not use: unparseable WebSocket messages and bad
+     replay lines. Shown in the stats bar next to the bridge's own parse
+     errors, which count the datagrams the *bridge* could not use. */
+  badFrames: 0,
 
   setConn(cls, text) {
+    const name = "pill" + (cls ? " " + cls : "");
     const p = $("connPill");
-    p.className = "pill" + (cls ? " " + cls : "");
-    $("connText").textContent = text;
+    if (p.className !== name) p.className = name;
+    const t = $("connText");
+    if (t.textContent !== text) t.textContent = text;
+  },
+
+  /** A batch arrived. */
+  onBatch() {
+    this.lastBatchAt = nowSec();
+    /* Recovery is instant rather than "within the next 100ms repaint": an
+       overlay that stays dimmed for a tenth of a second after the feed comes
+       back is a visible flicker on stream. */
+    if (OBS && staleView.on) updateStale();
+  },
+
+  /** The pill's live-mode states. The socket's own states (connecting,
+      disconnected, retrying) are written where they happen and win: this
+      only speaks while the socket is up. */
+  refreshConn() {
+    if (this.mode !== "live" || !this.wsOpen) return;
+    const p = connPillState(
+      feedState({
+        connected: true,
+        lastBatchAt: this.lastBatchAt,
+        since: this.feedSince,
+        now: nowSec(),
+        staleAfter: NO_DATA_SECS,
+      }),
+      this.udpAddr
+    );
+    this.setConn(p.cls, p.text);
+  },
+
+  /** A frame the page could not use. Counted always, logged rarely. */
+  noteBad(kind, detail) {
+    this.badFrames++;
+    warn(kind, detail);
   },
 
   setMode(mode) {
@@ -1551,27 +1684,39 @@ const ui = {
     const url = proto + "//" + location.host + "/ws";
     this.setConn("warn", "connecting");
     let ws;
-    try { ws = new WebSocket(url); } catch (e) { this.scheduleReconnect(); return; }
+    try { ws = new WebSocket(url); } catch (e) { warn("ws open", e && e.message); this.scheduleReconnect(); return; }
     this.ws = ws;
     ws.onopen = () => {
       this.wsRetry = 0;
-      this.setConn("ok", "live");
+      this.wsOpen = true;
+      /* A fresh socket has seen nothing yet: the feed age starts here, not
+         at whatever the last session left behind. */
+      this.lastBatchAt = 0;
+      this.feedSince = nowSec();
+      this.refreshConn();
     };
     ws.onmessage = (m) => {
       let env;
-      try { env = JSON.parse(m.data); } catch (e) { return; }
+      try { env = JSON.parse(m.data); } catch (e) {
+        this.noteBad("ws parse", e && e.message);
+        return;
+      }
       ingest(env);
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.wsOpen = false;
       if (this.mode === "live") { this.setConn("err", "disconnected"); this.scheduleReconnect(); }
     };
-    ws.onerror = () => { /* onclose follows */ };
+    /* `onclose` always follows, and carries the retry; this is only here so
+       the reason shows up once in the console instead of never. */
+    ws.onerror = () => { warn("ws error", url); };
   },
 
   disconnect() {
     clearTimeout(this.wsTimer);
+    this.wsOpen = false;
     if (this.ws) { const w = this.ws; this.ws = null; try { w.close(); } catch (e) {} }
   },
 
@@ -1967,15 +2112,43 @@ let fpsEma = 60;
 let refreshEst = 60;
 let latEma = null;
 
+/* Every element the stats bar writes, looked up once. This runs ten times a
+   second over ~25 ids; getElementById is cheap but not free, and the lookups
+   were most of what the function did. */
+const SE = {};
+for (const id of [
+  "sSpeedCm", "sSpeedDeg", "sDistM", "sDistDeg", "sCpm", "sClicks", "sEps",
+  "sLat", "statLat", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
+  "sDrops", "statDrops", "sLost", "statLost", "sAbs", "statAbs",
+  "sBad", "statBad", "statBridge", "sBridge", "sBridgeSub",
+  "sLocked", "sCpi", "gameText", "sProf",
+]) SE[id] = $(id);
+
+/** Write only when the text actually changed: an unchanged textContent write
+    still dirties layout for the node. */
+function setText(el, v) {
+  if (el && el.textContent !== v) el.textContent = v;
+}
+
+/** Same for a tooltip, which is a much longer string. */
+function setTitle(el, v) {
+  if (el && el.title !== v) el.title = v;
+}
+
+/* Tooltip inputs, so the two long strings below are rebuilt when something
+   in them changes rather than ten times a second. */
+let cpiTipKey = null;
+let bridgeTipKey = null;
+
 function paintStats(now) {
   const e = engine;
-  $("sSpeedCm").textContent = e.speedCm.toFixed(e.speedCm < 100 ? 1 : 0);
-  $("sSpeedDeg").textContent = Math.round(e.speedDeg).toLocaleString();
-  $("sDistM").textContent = (e.totalCm / 100).toFixed(2);
-  $("sDistDeg").textContent = Math.round(e.totalDeg).toLocaleString();
-  $("sCpm").textContent = Math.round(e.clickRate.total(e.playT));
-  $("sClicks").textContent = e.totalClicks + " total";
-  $("sEps").textContent = Math.round(e.eventRate.perSecond(e.playT)).toLocaleString();
+  setText(SE.sSpeedCm, e.speedCm.toFixed(e.speedCm < 100 ? 1 : 0));
+  setText(SE.sSpeedDeg, Math.round(e.speedDeg).toLocaleString());
+  setText(SE.sDistM, (e.totalCm / 100).toFixed(2));
+  setText(SE.sDistDeg, Math.round(e.totalDeg).toLocaleString());
+  setText(SE.sCpm, String(Math.round(e.clickRate.total(e.playT))));
+  setText(SE.sClicks, e.totalClicks + " total");
+  setText(SE.sEps, Math.round(e.eventRate.perSecond(e.playT)).toLocaleString());
 
   /* Latency and lag are both about keeping up with a live feed. In replay
      the "newest event" is hours old and the play head is wherever you put
@@ -1984,85 +2157,178 @@ function paintStats(now) {
   const capturedUs = live ? e.newestUtcUs() : null;
   if (capturedUs === null) {
     latEma = null;
-    $("sLat").textContent = "—";
-    $("statLat").classList.remove("alert", "warn");
-    $("statLat").classList.toggle("dim", !live);
+    setText(SE.sLat, "—");
+    SE.statLat.classList.remove("alert", "warn");
+    SE.statLat.classList.toggle("dim", !live);
   } else {
-    $("statLat").classList.remove("dim");
+    SE.statLat.classList.remove("dim");
     const ms = (Date.now() * 1000 - capturedUs) / 1000;
     latEma = latEma === null ? ms : latEma + (ms - latEma) * 0.25;
-    $("sLat").textContent = latEma.toFixed(1);
-    $("statLat").classList.toggle("alert", latEma > 25);
-    $("statLat").classList.toggle("warn", latEma > 10 && latEma <= 25);
+    setText(SE.sLat, latEma.toFixed(1));
+    SE.statLat.classList.toggle("alert", latEma > 25);
+    SE.statLat.classList.toggle("warn", latEma > 10 && latEma <= 25);
   }
 
   if (!live) {
-    $("sLag").textContent = "—";
-    $("statLag").classList.remove("alert");
-    $("statLag").classList.add("dim");
+    setText(SE.sLag, "—");
+    SE.statLag.classList.remove("alert");
+    SE.statLag.classList.add("dim");
   } else {
     const lagMs = e.haveTimeline ? Math.max(0, (e.tEnd - e.playT) * 1000) : 0;
-    $("sLag").textContent = Math.round(lagMs).toLocaleString();
-    $("statLag").classList.remove("dim");
-    $("statLag").classList.toggle("alert", lagMs > 250);
+    setText(SE.sLag, Math.round(lagMs).toLocaleString());
+    SE.statLag.classList.remove("dim");
+    SE.statLag.classList.toggle("alert", lagMs > 250);
   }
 
-  $("sFps").textContent = Math.round(fpsEma);
-  $("sFpsRef").textContent = "/ ~" + Math.round(refreshEst) + "Hz";
-  $("statFps").classList.toggle("alert", fpsEma < 0.8 * refreshEst);
+  setText(SE.sFps, String(Math.round(fpsEma)));
+  setText(SE.sFpsRef, "/ ~" + Math.round(refreshEst) + "Hz");
+  SE.statFps.classList.toggle("alert", fpsEma < 0.8 * refreshEst);
 
-  $("sDrops").textContent = e.drops.toLocaleString();
-  $("statDrops").classList.toggle("alert", e.drops > 0);
-  $("sLost").textContent = e.lostBatches.toLocaleString();
-  $("statLost").classList.toggle("alert", e.lostBatches > 0);
-  $("sAbs").textContent = e.absFrames.toLocaleString();
-  $("statAbs").classList.toggle("dim", e.absFrames === 0);
+  setText(SE.sDrops, e.drops.toLocaleString());
+  SE.statDrops.classList.toggle("alert", e.drops > 0);
+  setText(SE.sLost, e.lostBatches.toLocaleString());
+  SE.statLost.classList.toggle("alert", e.lostBatches > 0);
+  setText(SE.sAbs, e.absFrames.toLocaleString());
+  SE.statAbs.classList.toggle("dim", e.absFrames === 0);
+  setText(SE.sBad, ui.badFrames.toLocaleString());
+  SE.statBad.classList.toggle("dim", ui.badFrames === 0);
+  SE.statBad.classList.toggle("alert", ui.badFrames > 0);
 
   paintBridge(now);
 
-  $("sLocked").textContent = e.pointerLocked ? "locked" : "desktop";
+  setText(SE.sLocked, e.pointerLocked ? "locked" : "desktop");
   const s = e.sens;
-  $("sCpi").textContent = Math.round(e.cpi) + " / " +
-    (s ? s.sens.toFixed(2) : "—") + (s && s.fallback ? "*" : "");
-  $("sCpi").title = s
-    ? "cpi " + e.cpi + ", sens " + s.sens + ", yaw " + s.yaw_coeff + "°/count, pitch " + s.pitch_coeff +
-      (e.anchorUncertaintyUs === null ? "" : ", anchor ±" + e.anchorUncertaintyUs + "µs")
+  setText(SE.sCpi, Math.round(e.cpi) + " / " +
+    (s ? s.sens.toFixed(2) : "—") + (s && s.fallback ? "*" : ""));
+  const cpiKey = s
+    ? e.cpi + "|" + s.sens + "|" + s.yaw_coeff + "|" + s.pitch_coeff + "|" + e.anchorUncertaintyUs
     : "";
-  $("gameText").textContent = e.game || "no game";
+  if (cpiKey !== cpiTipKey) {
+    cpiTipKey = cpiKey;
+    setTitle(SE.sCpi, s
+      ? "cpi " + e.cpi + ", sens " + s.sens + ", yaw " + s.yaw_coeff + "°/count, pitch " + s.pitch_coeff +
+        (e.anchorUncertaintyUs === null ? "" : ", anchor ±" + e.anchorUncertaintyUs + "µs")
+      : "");
+  }
+  setText(SE.gameText, e.game || "no game");
 
-  if (PROFILE) $("sProf").textContent = prof.text;
+  if (PROFILE) setText(SE.sProf, prof.text);
   ui.refreshSensHint();
 }
 
-/** Bridge-side health, pushed by the server once a second — no polling. */
+/** Bridge-side health, pushed by the server once a second — no polling.
+    A bridge built without the `observability` feature never pushes, which is
+    a tile that reads "n/a", not an error. */
 function paintBridge(now) {
   const b = ui.bridge;
-  const tile = $("statBridge");
+  const tile = SE.statBridge;
   if (!b) {
-    $("sBridge").textContent = "—";
-    $("sBridgeSub").textContent = "";
+    setText(SE.sBridge, "n/a");
+    setText(SE.sBridgeSub, "");
     tile.classList.add("dim");
     tile.classList.remove("alert");
+    if (bridgeTipKey !== "none") {
+      bridgeTipKey = "none";
+      setTitle(tile, "the bridge is not reporting stats (built without the observability feature, or not connected yet)");
+    }
     return;
   }
   const stale = now - ui.bridgeAt > 5;
   const p50 = (b.latency && b.latency.p50_us) || 0;
   const p99 = (b.latency && b.latency.p99_us) || 0;
-  $("sBridge").textContent = Math.round(b.datagrams_per_s || 0).toLocaleString();
-  $("sBridgeSub").textContent = "/s · p50 " + (p50 / 1000).toFixed(1) + "ms";
+  setText(SE.sBridge, Math.round(b.datagrams_per_s || 0).toLocaleString());
+  setText(SE.sBridgeSub, "/s · p50 " + (p50 / 1000).toFixed(1) + "ms");
   tile.classList.toggle("dim", stale);
   tile.classList.toggle("alert", !stale && (b.parse_errors > 0 || b.lag_drops > 0));
-  tile.title =
+
+  /* The whole tooltip in one key: it is ~15 numbers, and the push that
+     changes them arrives once a second, not ten times. */
+  const key = (b.uptime_s || 0) + "|" + stale + "|" + (b.seq_gaps || 0) + "|" + (b.queue_depth || 0);
+  if (key === bridgeTipKey) return;
+  bridgeTipKey = key;
+  setTitle(tile,
     "bridge: " + Math.round(b.datagrams_per_s || 0) + " datagrams/s, " +
+    (b.kb_per_s || 0).toFixed(1) + " KB/s, " +
     (b.forwarded || 0) + " forwarded, " +
     (b.parse_errors || 0) + " parse errors, " +
+    (b.seq_gaps || 0) + " seq gaps, " +
     (b.lag_drops || 0) + " lag drops (" + (b.lag_disconnects || 0) + " disconnects), " +
-    (b.clients || 0) + " ws clients\n" +
+    (b.clients || 0) + " ws clients, queue " + (b.queue_depth || 0) +
+    " (max " + (b.queue_depth_max || 0) + ")\n" +
     "bridge latency p50 " + (p50 / 1000).toFixed(1) + "ms, p99 " + (p99 / 1000).toFixed(1) +
     "ms over " + ((b.latency && b.latency.samples) || 0) + " batches" +
     (b.latency && b.latency.negative ? " (" + b.latency.negative + " negative — clock skew)" : "") +
-    (stale ? "\n(stale: no update in the last 5s)" : "");
+    "\ndatagram gap p99 " + (b.gap_p99_ms || 0).toFixed(1) + "ms, max " + (b.gap_max_ms || 0).toFixed(1) + "ms" +
+    (stale ? "\n(stale: no update in the last 5s)" : ""));
 }
+
+/* =====================================================================
+   Feed indicator (OBS) and source visibility
+
+   On stream, a dead capture agent looks exactly like a still hand: the
+   trails simply stop moving. The overlay dims its panels and says so, after
+   `?stale=` seconds (0 turns it off), and recovers the instant data returns.
+
+   Visibility is the other half: OBS keeps a hidden browser source's page
+   running — script, socket and all — so the only way a source that is not on
+   screen costs nothing is to keep ticking (the timeline must stay exact) and
+   stop drawing. The events are OBS's own; `document.visibilityState` is the
+   fallback in a plain browser, and a page with neither is unchanged.
+   ===================================================================== */
+
+const staleView = { on: false, age: 0 };
+
+function updateStale() {
+  if (!OBS) return;
+  const st = feedState({
+    connected: ui.wsOpen,
+    lastBatchAt: ui.lastBatchAt,
+    since: ui.feedSince,
+    now: nowSec(),
+    staleAfter: OBS.stale,
+  });
+  staleView.age = st.age;
+  const on = feedIsStale(st, OBS.stale);
+  if (on !== staleView.on) {
+    staleView.on = on;
+    document.body.classList.toggle("stale", on);
+    engine.dirty = true;
+  }
+}
+
+/* Each channel is tracked separately: OBS reports "this source is hidden"
+   and "the scene it is in is not active" independently, and either one means
+   nobody is looking. */
+const visibility = { source: true, active: true, page: true };
+
+function isVisible() {
+  return visibility.source && visibility.active && visibility.page;
+}
+
+function setVisible(channel, on) {
+  on = !!on;
+  if (visibility[channel] === on) return;
+  const was = isVisible();
+  visibility[channel] = on;
+  /* Coming back: one repaint, so the panels are not a frozen picture from
+     however long ago the source was hidden. */
+  if (!was && isVisible()) engine.dirty = true;
+}
+
+(function watchVisibility() {
+  const detail = (e) => (e && e.detail) || {};
+  if (typeof window.obsstudio === "object" && window.obsstudio !== null) {
+    visibility.obs = true;
+    window.addEventListener("obsSourceVisibleChanged", (e) => setVisible("source", detail(e).visible));
+    window.addEventListener("obsSourceActiveChanged", (e) => setVisible("active", detail(e).active));
+    return;
+  }
+  if (typeof document.visibilityState === "string") {
+    const sync = () => setVisible("page", document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", sync);
+    sync();
+  }
+})();
 
 /* =====================================================================
    OBS HUD — the stats bar's stream-facing replacement. Built once from the
@@ -2125,6 +2391,8 @@ function hudValue(key, e) {
       latEma = latEma === null ? ms : latEma + (ms - latEma) * 0.25;
       return latEma.toFixed(1);
     }
+    case "status":
+      return staleView.on ? "no feed (" + Math.round(staleView.age) + "s)" : "live";
   }
   return "—";
 }

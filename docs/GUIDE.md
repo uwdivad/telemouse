@@ -233,16 +233,39 @@ cargo bench -p telemouse-core       # wire encode/decode, batcher
 ```
 
 Logging everywhere is `tracing` with `RUST_LOG` (default `info`), e.g.
-`$env:RUST_LOG="debug"; cargo run -p telemouse-capture -- run`.
+`$env:RUST_LOG="debug"; cargo run -p telemouse-capture -- run`. Colour is
+emitted only when stderr is a terminal (and `NO_COLOR` is unset); the
+subscriber is always set up through `telemouse_core::logging::init`, which
+can also write a size-rotated `<log_dir>/<component>.log`.
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -- -D warnings` and the tests on
-`windows-latest` for every push, so the tree must stay rustfmt-clean at
-default settings. A release is a tag: bump `version` in the root `Cargo.toml`,
-add a `## [X.Y.Z]` section to `CHANGELOG.md`, commit, tag `vX.Y.Z`, push the
-tag; `release.yml` builds and tests in release mode and publishes a GitHub
-Release (`telemouse-vX.Y.Z-windows-x86_64.zip` + SHA-256) whose notes are that
-changelog section.
+**Build flavours.** Logging, Kafka and observability are Cargo features,
+on by default and compiled out of the minimal release zip:
+
+| Feature | Crates | Adds |
+|---|---|---|
+| `logging` | capture, viz, analyze, ctl | the `tracing` subscriber (stderr + rotated log files) |
+| `observability` | capture, viz, ctl | 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the feed/stall fields of `/healthz`, child health on the panel |
+| `kafka` | capture | the Kafka sink; without it `[kafka] enabled = true` is ignored with a warning |
+| `quiet` | capture, viz, ctl | `tracing/release_max_level_off`: every `tracing` call compiled out |
+
+```powershell
+cargo build --release --workspace                  # everything (the developer build)
+cargo build --release -p telemouse-capture -p telemouse-viz -p telemouse-ctl `
+  --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet
+```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, clippy
+with `-D warnings` and the tests for both flavours on `windows-latest` for
+every push, plus a dependency advisory scan, so the tree must stay
+rustfmt-clean at default settings and must build with `--no-default-features`.
+A release is a tag: bump `version` in the root `Cargo.toml`, add a
+`## [X.Y.Z]` section to `CHANGELOG.md`, commit, tag `vX.Y.Z`, push the tag;
+`release.yml` builds and tests both flavours in release mode and publishes a
+GitHub Release with two zips (`telemouse-vX.Y.Z-windows-x86_64.zip`, the
+minimal capture + viz + panel, and `…-full.zip` with everything including
+`telemouse-analyze`), each with a SHA-256 and a build-provenance attestation,
+whose notes are that changelog section. Every zip carries the loopback sample
+as `telemouse.toml`, the license, this guide, and the demo recording.
 
 A good first hands-on exercise: run `telemouse-viz`, open the page, pick
 `demo-session` in the replay dropdown, and scrub. Then run
@@ -1061,8 +1084,18 @@ Measured on a synthetic 3-hour / 814k-event fixture: full analysis 730 ms.
 
 All fields optional; unknown keys are errors. `telemouse.example.toml` is the
 loopback sample that ships with releases (copied into the zip as
-`telemouse.toml`); the repository's `telemouse.toml` is the development
-machine's own config.
+`telemouse.toml`) and that `telemouse-ctl` writes as `telemouse.toml` on
+first start when none exists; the repository's `telemouse.toml` is the
+development machine's own config.
+
+Every binary looks for the file with `telemouse_core::paths::locate_config`:
+the path given (default `telemouse.toml`) in the working directory first,
+then next to the executable. Relative paths inside the file (`recording.dir`,
+`ctl.log_dir`, `ctl.bin_dir`) are relative to the file's own directory. A
+file that exists but does not parse is refused by every binary; only a
+missing file means defaults. Game keys must be the lowercase executable name
+and end in `.exe`, or the config is refused: a key that never matched would
+silently turn every degree-valued metric into a guess.
 
 ```toml
 mouse_cpi = 1600.0            # counts per inch → cm. Wrong value = wrong cm, fixable later.
@@ -1103,6 +1136,7 @@ hud_position = "bottom-left"
 scale = 1.0                   # 0.5–4
 trail_secs = 3.0              # 0.3–12
 buffer_ms = 35                # 10–200
+stale_secs = 3.0              # 0–60; seconds without data before the overlay dims and says "no feed" (0 = never)
 grid = true
 legend = false
 labels = false
@@ -1216,7 +1250,14 @@ pointer-locked spans so desktop mousing doesn't count as "aim".
 ## 13. Observability: what the logs tell you
 
 "Metrics are logs here, no metrics server" (CONVENTIONS.md). Every
-long-running loop emits a structured `tracing` line every 5 s.
+long-running loop emits a structured `tracing` line every 5 s. All of this
+chapter is the `logging` and `observability` features (§4): the minimal
+release zip has none of it, the developer build has all of it. Anything that
+stays wrong is repeated as a `warn` once a minute — a sink that is dead or
+dropping, a ring overflow, no input for a minute — so a problem is never only
+a number in the stats line. Every binary opens with one line naming its
+version, build profile, features, the config file it read and whether the
+file existed, and the values that differ from the defaults.
 
 **Capture (`stats.rs`, T3 logs it)** — 28 structured fields: `events_per_s,
 events, batches_per_s, batches, drops, drops_delta, abs_frames, markers,
@@ -1504,9 +1545,11 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink`, `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
 | `gui/model.rs` | Pure: `render_text` (the window body, CRLF, fixed columns), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
 | `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, and the message loop. See §19.5. |
-| `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` keeps a `sysinfo::System` between scans so CPU % is per interval, refreshes only cpu/memory/cmd/exe (no per-process user lookup — that cost seconds), and serves `scan_cached(ttl)` from a 4 s cache because a full table walk was ~5% of a core when polled every poll; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
+| `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` takes one Toolhelp snapshot every 30 s and answers in between with per-PID queries (about 20 µs each) for the few matching names; a process whose handle cannot be opened (an elevated one) is judged alive or gone from the `OpenProcess` error, not from a table walk; `scan_cached(ttl)` serves a short cache; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
-| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, and `stop_grace_secs`). |
+| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, `stop_grace_secs`, the build's features and the absolute `Places`). `/api/state` carries `version`, `config` (path, found, seeded, mtime) and `places`, and accepts `?log_since=<n>` to send only new log lines. |
+| `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases — decided once at startup so the status-window header, the tray's *Open …* items and the page cannot disagree. |
+| `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
 | `index.html` | Self-contained page: polls `/api/state` + `/api/sessions` every 2 s (10 s while the tab is hidden), re-renders only when something structural changed and patches the live numbers otherwise, two-click kill (no modal dialogs). |
 
 ### 19.2 The API

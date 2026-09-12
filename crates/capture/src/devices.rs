@@ -187,26 +187,53 @@ pub fn enumerate_mice() -> Vec<(isize, String)> {
     Vec::new()
 }
 
-/// Resolve `handle` to an index, learning it if this is a device we have not
-/// seen (one OS query per new handle, then never again).
-pub fn index_for(table: &mut DeviceTable, handle: isize) -> u8 {
+/// What resolving a handle turned out to be.
+///
+/// The `Added` case is the interesting one: a mouse plugged in mid-session is
+/// not in `SessionConfig.devices`, so a consumer reading only the session
+/// record would resolve its `device_ix` to the wrong name — or to nothing.
+/// The caller turns it into a marker, which is the schema-stable side channel
+/// for exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// Already in the table at this index.
+    Known(u8),
+    /// Named and appended just now, at this index.
+    Added(u8),
+    /// Not nameable (or the table is full): events say `device_ix = 0`.
+    Unknown,
+}
+
+impl Resolved {
+    /// The index to put on the event.
+    pub fn index(self) -> u8 {
+        match self {
+            Resolved::Known(ix) | Resolved::Added(ix) => ix,
+            Resolved::Unknown => 0,
+        }
+    }
+}
+
+/// Resolve `handle`, learning it if this is a device we have not seen (one OS
+/// query per new handle, then never again).
+pub fn resolve_index(table: &mut DeviceTable, handle: isize) -> Resolved {
     if let Some(ix) = table.index_of(handle) {
-        return ix;
+        return Resolved::Known(ix);
     }
     if handle == 0 || table.is_unresolved(handle) {
-        return 0;
+        return Resolved::Unknown;
     }
     match resolve_name(handle) {
-        Some(name) => {
-            let ix = table.append(handle, name);
-            if ix == 0 {
+        Some(name) => match table.append(handle, name) {
+            0 => {
                 tracing::warn!(handle, "device table full; events attributed to index 0");
+                Resolved::Unknown
             }
-            ix
-        }
+            ix => Resolved::Added(ix),
+        },
         None => {
             table.mark_unresolved(handle);
-            0
+            Resolved::Unknown
         }
     }
 }
@@ -257,21 +284,39 @@ mod tests {
         let mut t = table();
         // Off Windows `resolve_name` always fails, which is the "cannot name
         // this device" path we want: it must map to 0 and be remembered.
-        assert_eq!(index_for(&mut t, 0x44), 0);
+        assert_eq!(resolve_index(&mut t, 0x44), Resolved::Unknown);
         assert!(t.is_unresolved(0x44));
-        assert_eq!(index_for(&mut t, 0x44), 0);
+        assert_eq!(resolve_index(&mut t, 0x44), Resolved::Unknown);
         assert_eq!(t.len(), 3, "a failed lookup must not grow the table");
         // A null handle never costs a query at all.
-        assert_eq!(index_for(&mut t, 0), 0);
+        assert_eq!(resolve_index(&mut t, 0), Resolved::Unknown);
         assert!(!t.is_unresolved(0));
     }
 
     #[test]
     fn known_handles_resolve_without_touching_the_os() {
         let mut t = table();
-        assert_eq!(index_for(&mut t, 0x22), 2);
-        assert_eq!(index_for(&mut t, 0x11), 1);
+        assert_eq!(resolve_index(&mut t, 0x22), Resolved::Known(2));
+        assert_eq!(resolve_index(&mut t, 0x11), Resolved::Known(1));
         assert!(t.unresolved.is_empty());
+    }
+
+    #[test]
+    fn a_device_learned_mid_session_is_reported_as_new_exactly_once() {
+        let mut t = table();
+        // `resolve_name` is the OS; append directly to stand in for a
+        // successful late query, then check the table's own bookkeeping.
+        assert_eq!(t.append(0x33, "late-mouse".into()), 3);
+        assert_eq!(resolve_index(&mut t, 0x33), Resolved::Known(3));
+        assert_eq!(t.names()[3], "late-mouse");
+
+        // A handle the OS cannot name is not "new", it is unknown, and it
+        // costs one query rather than one per event.
+        assert_eq!(resolve_index(&mut t, 0x44), Resolved::Unknown);
+        assert_eq!(resolve_index(&mut t, 0x44), Resolved::Unknown);
+        assert_eq!(Resolved::Unknown.index(), 0);
+        assert_eq!(Resolved::Added(7).index(), 7);
+        assert_eq!(Resolved::Known(2).index(), 2);
     }
 
     #[test]

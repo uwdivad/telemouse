@@ -44,6 +44,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_SHIFT,
@@ -56,19 +57,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
     GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW,
-    IDI_APPLICATION, LoadCursorW, LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow,
-    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
-    SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
+    IDI_APPLICATION, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MB_TOPMOST, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SW_HIDE, SW_SHOW,
+    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW,
+    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+    WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
     WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
-use super::feed::{self, GuiLink};
+use super::feed::{self, GuiLink, HOTKEY_FAILED, HOTKEY_OK};
 use super::model::{self, IconState, MenuEntry};
 
 const CLASS_NAME: PCWSTR = w!("TelemouseCtlWindow");
@@ -97,7 +99,7 @@ struct UiState {
     edit: HWND,
     font: HFONT,
     /// Indexed by `IconState::index()`.
-    icons: [HICON; 2],
+    icons: [HICON; IconState::COUNT],
     tray_added: bool,
     icon_state: IconState,
     tooltip: String,
@@ -110,6 +112,9 @@ struct UiState {
     swallow_up: bool,
     /// The new-session hotkey is registered (so teardown unregisters it).
     hotkey_registered: bool,
+    /// Windows announced the end of the session and the children have been
+    /// stopped once; the second message (WM_ENDSESSION) must not do it again.
+    session_ending: bool,
 }
 
 /// Wake the UI thread: a snapshot is ready. No-op before the window exists.
@@ -285,6 +290,7 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         let icons = [
             make_icon(IconState::Idle),
             make_icon(IconState::CaptureRunning),
+            make_icon(IconState::Degraded),
         ];
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
 
@@ -305,6 +311,7 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             exiting: false,
             swallow_up: false,
             hotkey_registered: false,
+            session_ending: false,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
@@ -457,13 +464,21 @@ unsafe fn register_hotkey(s: *mut UiState) {
         match RegisterHotKey(Some((*s).hwnd), HOTKEY_ID, mods, u32::from(hk.vk)) {
             Ok(()) => {
                 (*s).hotkey_registered = true;
+                (*s).link.hotkey_status.store(HOTKEY_OK, Ordering::Release);
                 info!(hotkey = %hk, "new-session hotkey registered (stops capture if running, starts one that saves)");
             }
-            Err(e) => warn!(
-                hotkey = %hk,
-                error = %e,
-                "could not register the new-session hotkey (another program holds it?); change [ctl] hotkey in telemouse.toml"
-            ),
+            Err(e) => {
+                // The window and the menu say so too (see model): a chord
+                // that silently does nothing is worse than none.
+                (*s).link
+                    .hotkey_status
+                    .store(HOTKEY_FAILED, Ordering::Release);
+                warn!(
+                    hotkey = %hk,
+                    error = %e,
+                    "could not register the new-session hotkey (another program holds it?); change [ctl] hotkey in telemouse.toml"
+                )
+            }
         }
     }
 }
@@ -684,23 +699,75 @@ unsafe fn request_exit(s: *mut UiState) {
     }
 }
 
-unsafe fn open_panel(s: *mut UiState) {
-    // SAFETY: `s` is live; the wide URL outlives the call.
-    unsafe {
-        let url = wide(&(*s).link.panel_url);
-        let r = ShellExecuteW(
+/// Open a URL, a folder or a file with the shell's default handler: the
+/// browser for the panel, Explorer for the logs, the editor for the config.
+pub fn shell_open(target: &str) -> bool {
+    let t = wide(target);
+    // SAFETY: the wide string outlives the call; no window is required.
+    let r = unsafe {
+        ShellExecuteW(
             None,
             w!("open"),
-            PCWSTR(url.as_ptr()),
+            PCWSTR(t.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
             SW_SHOWNORMAL,
+        )
+    };
+    if r.0 as usize > 32 {
+        info!(target, "opened");
+        true
+    } else {
+        warn!(target, code = r.0 as usize, "ShellExecuteW refused");
+        false
+    }
+}
+
+/// A modal error box, for the moments the console is already hidden.
+pub fn alert(title: &str, text: &str) {
+    let (t, x) = (wide(title), wide(text));
+    // SAFETY: both wide strings outlive the call; a null owner is allowed.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(x.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
         );
-        if r.0 as usize > 32 {
-            info!(url = %(*s).link.panel_url, "opened the web panel");
-        } else {
-            warn!(url = %(*s).link.panel_url, code = r.0 as usize, "ShellExecuteW could not open the web panel");
+    }
+}
+
+/// The menu items that open something: the target comes from the model so
+/// the header, the menu and the page name the same places.
+unsafe fn open_target(s: *mut UiState, id: u16) {
+    // SAFETY: `s` is live; the snapshot borrow ends before the shell call.
+    unsafe {
+        let target = model::menu_target(&(*s).link.state.borrow(), id).map(str::to_owned);
+        match target {
+            Some(t) => {
+                shell_open(&t);
+            }
+            None => debug!(id, "nothing to open"),
         }
+    }
+}
+
+/// Windows is ending the session (logoff, shutdown, restart). Stop the
+/// children now, while the block reason holds the session open, so the
+/// recording's tail and its sidecar reach the disk; then let `main` exit.
+unsafe fn end_session(s: *mut UiState) {
+    // SAFETY: `s` is live; the block reason is tied to our window.
+    unsafe {
+        if (*s).session_ending {
+            return;
+        }
+        (*s).session_ending = true;
+        info!("windows is ending the session; stopping managed components first");
+        let _ = ShutdownBlockReasonCreate((*s).hwnd, w!("telemouse is finishing the recording"));
+        (*s).link.stop_all_fast_blocking();
+        let _ = ShutdownBlockReasonDestroy((*s).hwnd);
+        (*s).exiting = true;
+        (*s).link.quit.notify_one();
     }
 }
 
@@ -716,7 +783,11 @@ unsafe fn command(s: *mut UiState, id: u16) {
             model::MENU_NEW_SESSION => feed::new_session(&(*s).link),
             model::MENU_START_VIZ => feed::start(&(*s).link, "viz", None),
             model::MENU_STOP_VIZ => feed::stop(&(*s).link, "viz"),
-            model::MENU_OPEN_PANEL => open_panel(s),
+            model::MENU_OPEN_PANEL
+            | model::MENU_OPEN_LOGS
+            | model::MENU_OPEN_RECORDINGS
+            | model::MENU_EDIT_CONFIG
+            | model::MENU_OPEN_DOCS => open_target(s, id),
             model::MENU_EXIT => request_exit(s),
             other => debug!(id = other, "unknown menu command"),
         }
@@ -766,6 +837,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_APP_REFRESH => {
                 refresh(s);
+                LRESULT(0)
+            }
+            // Logoff / shutdown: TRUE means "go ahead", and by then the
+            // children are stopped. WM_ENDSESSION with wParam = TRUE follows
+            // (or arrives alone on a forced shutdown); `end_session` runs once.
+            WM_QUERYENDSESSION => {
+                end_session(s);
+                LRESULT(1)
+            }
+            WM_ENDSESSION if wparam.0 != 0 => {
+                end_session(s);
                 LRESULT(0)
             }
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID && !(*s).exiting => {

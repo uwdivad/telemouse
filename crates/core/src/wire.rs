@@ -171,8 +171,13 @@ mod tests {
 
     #[test]
     fn full_batch_fits_in_udp_datagram() {
-        // Worst-case-ish events: large negative values everywhere.
+        // Worst case at every knob, not just the events: the longest session
+        // id the recording rules allow and the longest game name a process
+        // can have, both of which ride along in every batch.
         let mut b = batch();
+        b.session_id = "s".repeat(crate::recordings::MAX_ID_LEN);
+        b.game = Some(format!("{}.exe", "g".repeat(251)));
+        assert_eq!(b.game.as_deref().map(str::len), Some(255));
         b.events = (0..MAX_EVENTS_PER_BATCH)
             .map(|i| RawEvent {
                 ts_qpc: u64::MAX - i as u64,
@@ -184,7 +189,6 @@ mod tests {
                 device_ix: u8::MAX,
             })
             .collect();
-        b.game = Some("some-long-process-name.exe".into());
         let s = Envelope::Batch(b).to_json().unwrap();
         assert!(
             s.len() < MAX_UDP_PAYLOAD,
@@ -311,6 +315,7 @@ mod tests {
             monitors: vec![],
             capture_version: "t".into(),
             coalesce_ms: 2,
+            ..Default::default()
         };
         let m = Marker {
             session_id: "s-1".into(),

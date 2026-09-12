@@ -153,7 +153,16 @@ impl Summary {
     /// its right partition are exactly the two order statistics the linear
     /// interpolation in [`percentile_sorted`] reads.
     pub fn of(xs: &[f64]) -> Self {
-        let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+        Self::of_vec(xs.iter().copied().filter(|x| x.is_finite()).collect())
+    }
+
+    /// [`Summary::of`] for a sample the caller owns: the quantile selection
+    /// partitions `v` in place instead of copying it first. The kinematics and
+    /// click passes build their sample vectors and never look at them again,
+    /// so the copy was pure duplication — several million `f64`s on a long
+    /// session.
+    pub fn of_vec(mut v: Vec<f64>) -> Self {
+        v.retain(|x| x.is_finite());
         if v.is_empty() {
             return Self::of_sorted(&v);
         }
@@ -272,6 +281,18 @@ mod tests {
                     <= 1e-9 * via_sort.stddev.abs().max(1.0)
             );
         }
+    }
+
+    /// The in-place form must be the same summary, not merely a similar one.
+    #[test]
+    fn of_vec_matches_of_on_the_same_sample() {
+        let xs: Vec<f64> = (0..1001)
+            .map(|i| ((i * 7919) % 997) as f64 * 0.5)
+            .chain([f64::NAN, f64::INFINITY])
+            .collect();
+        assert_eq!(Summary::of_vec(xs.clone()), Summary::of(&xs));
+        assert_eq!(Summary::of_vec(Vec::new()), Summary::of(&[]));
+        assert_eq!(Summary::of_vec(vec![f64::NAN]), Summary::of(&[]));
     }
 
     #[test]

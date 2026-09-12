@@ -3,6 +3,10 @@
 # This is the development machine's config (LAN viz bind, Kafka on, its own
 # broker addresses). The sample that ships with releases is
 # telemouse.example.toml, which keeps everything on loopback.
+#
+# Relative paths (recording.dir, ctl.log_dir, ctl.bin_dir) are resolved
+# against this file's own directory, not the working directory of whatever
+# started the process.
 
 # Your mouse's real CPI (a.k.a. DPI). Used by consumers to derive physical cm.
 mouse_cpi = 1600.0
@@ -87,6 +91,8 @@ buffer_ms = 35
 grid = true
 legend = false
 labels = false
+# Seconds without a batch before the overlay says there is no feed; 0 = off.
+stale_secs = 3.0
 
 # Per-game aim conversion: degrees = counts * sens * coeff.
 # Key = lowercase process name.

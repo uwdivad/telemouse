@@ -8,12 +8,16 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::load::file_signature;
 use crate::report::{ANALYZER_VERSION, Report, SCHEMA};
 use crate::series::Params;
 use crate::timefmt::{format_duration, format_utc_us};
+
+static CACHE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Why a session's report was (or was not) recomputed. Logged so a surprising
 /// `trend` runtime is explainable.
@@ -29,6 +33,8 @@ pub enum CacheOutcome {
     ParamsChanged,
     /// The recording has been modified since the cache was written.
     Stale,
+    /// The cached report is about a different recording.
+    Mismatch,
     /// The cache file existed but could not be read or parsed.
     Unreadable,
 }
@@ -40,7 +46,8 @@ impl CacheOutcome {
             CacheOutcome::Missing => "missing",
             CacheOutcome::VersionChanged => "version-changed",
             CacheOutcome::ParamsChanged => "params-changed",
-            CacheOutcome::Stale => "recording-newer",
+            CacheOutcome::Stale => "recording-changed",
+            CacheOutcome::Mismatch => "different-recording",
             CacheOutcome::Unreadable => "unreadable",
         }
     }
@@ -53,11 +60,18 @@ pub fn cache_path(dir: &Path, session_id: &str) -> PathBuf {
 
 /// Read a cached report if it is still valid for `recording` and `params`.
 ///
-/// Valid means: it parses, its `analyzer_version` matches this build, it was
-/// computed with the same detector parameters, and the recording has not been
-/// modified since the cache was written. Anything else recomputes — a stale
-/// cache silently answering with the wrong thresholds is exactly the failure
-/// this is meant to prevent.
+/// Valid means: it parses, its `analyzer_version` and schema match this build,
+/// it was computed with the same detector parameters, it is *about this
+/// recording* (session id and file name), and the recording's
+/// [`FileSignature`] still matches the one stamped into the cache. Anything
+/// else recomputes — a stale cache silently answering with the wrong
+/// thresholds is exactly the failure this is meant to prevent.
+///
+/// The signature is what makes the check sound. Modification time alone misses
+/// a restored backup, a file copied back with its timestamp, and a
+/// same-size replacement on a filesystem with coarse timestamps; it is kept as
+/// the cheap first test, and as the only test for a cache written before
+/// signatures were stamped.
 pub fn read_cache(
     cache: &Path,
     recording: &Path,
@@ -78,16 +92,64 @@ pub fn read_cache(
         Ok(t) => t,
         Err(_) => return (None, CacheOutcome::Unreadable),
     };
-    match serde_json::from_str::<Report>(&text) {
-        // Either provenance stamp moving on means the numbers may not mean
-        // the same thing any more.
-        Ok(r) if r.analyzer_version != ANALYZER_VERSION || r.schema != SCHEMA => {
-            (None, CacheOutcome::VersionChanged)
-        }
-        Ok(r) if r.params != params => (None, CacheOutcome::ParamsChanged),
-        Ok(r) => (Some(r), CacheOutcome::Hit),
-        Err(_) => (None, CacheOutcome::Unreadable),
+    let report = match serde_json::from_str::<Report>(&text) {
+        Ok(r) => r,
+        Err(_) => return (None, CacheOutcome::Unreadable),
+    };
+    // Either provenance stamp moving on means the numbers may not mean the
+    // same thing any more.
+    if report.analyzer_version != ANALYZER_VERSION || report.schema != SCHEMA {
+        return (None, CacheOutcome::VersionChanged);
     }
+    if report.params != params {
+        return (None, CacheOutcome::ParamsChanged);
+    }
+    if !describes(&report, recording) {
+        return (None, CacheOutcome::Mismatch);
+    }
+    match (&report.recording_signature, file_signature(recording)) {
+        (Some(stamped), Ok(Some(now))) if *stamped != now => (None, CacheOutcome::Stale),
+        // Unreadable or actively-growing recording: fall back to the mtime
+        // test already done above rather than refusing to use a cache that is
+        // probably fine.
+        _ => (Some(report), CacheOutcome::Hit),
+    }
+}
+
+/// Whether a cached report is about `recording` at all — a cache directory
+/// shared between recording directories, or a renamed file, must not answer
+/// for the wrong session.
+fn describes(report: &Report, recording: &Path) -> bool {
+    let stem_ok = recording
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_none_or(|stem| stem == report.session.session_id);
+    // Compared by file name, not by the whole path: the same recording is
+    // legitimately reached as `recordings/x.jsonl` and `C:\...\x.jsonl`.
+    let name_ok = Path::new(&report.session.path)
+        .file_name()
+        .is_none_or(|name| Some(name) == recording.file_name());
+    stem_ok && name_ok
+}
+
+/// Publish a report into the cache atomically: a reader either sees the
+/// previous document or this one, never a half-written one, even if two
+/// analyzers race on the same session.
+fn write_cache(path: &Path, report: &Report) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = CACHE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        report.write_json(&temp)?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Load `recording`, reusing `json_dir`'s cached report when it is current.
@@ -118,9 +180,22 @@ pub fn report_for(
                 check = why.as_str(),
                 "recomputing report"
             );
+            let before = file_signature(recording).ok().flatten();
             let loaded = crate::load::load_session(recording)?;
-            let report = crate::report::build(loaded, params);
-            report.write_json(&path)?;
+            let mut report = crate::report::build(loaded, params);
+            // A signature on both sides of the read: a recording capture was
+            // still appending to is analyzed and returned, but never published
+            // under an identity that does not describe what was read.
+            match (before, file_signature(recording).ok().flatten()) {
+                (Some(a), Some(b)) if a == b => {
+                    report.recording_signature = Some(a);
+                    write_cache(&path, &report)?;
+                }
+                _ => tracing::debug!(
+                    session = %stem,
+                    "recording changed while it was being read; not caching the report"
+                ),
+            }
             return Ok((report, why));
         }
     }
@@ -148,6 +223,10 @@ pub struct TrendRow {
     pub clicks_per_min: f64,
     pub distance_m: f64,
     pub lifts: usize,
+    /// Centimetres per 360° turn — the column that says whether two sessions
+    /// are even comparable. `None` without a usable CPI or aim profile.
+    #[serde(default)]
+    pub cm_per_360: Option<f64>,
     /// Whether this row came out of the cache.
     pub from_cache: bool,
     /// Extra metrics requested with `--metric`, in the order they were asked
@@ -157,9 +236,28 @@ pub struct TrendRow {
 }
 
 /// Resolve a dotted path such as `micro.band_ratio_8_12` in a report.
+///
+/// Serializing the report to a `Value` is the expensive half — a three-hour
+/// session's report is tens of megabytes of `per_second` rows — so a caller
+/// with several metrics should use [`metrics_at`], which does it once.
 pub fn metric_at(report: &Report, path: &str) -> Option<f64> {
-    let v = serde_json::to_value(report).ok()?;
-    let mut cur = &v;
+    lookup(&serde_json::to_value(report).ok()?, path)
+}
+
+/// Resolve several dotted paths against one serialization of `report`.
+pub fn metrics_at(report: &Report, paths: &[String]) -> Vec<(String, Option<f64>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let value = serde_json::to_value(report).ok();
+    paths
+        .iter()
+        .map(|p| (p.clone(), value.as_ref().and_then(|v| lookup(v, p))))
+        .collect()
+}
+
+fn lookup(value: &serde_json::Value, path: &str) -> Option<f64> {
+    let mut cur = value;
     for part in path.split('.') {
         cur = match part.parse::<usize>() {
             Ok(i) => cur.get(i)?,
@@ -189,11 +287,9 @@ pub fn row(report: &Report, from_cache: bool, metrics: &[String]) -> TrendRow {
         clicks_per_min: report.clicks.clicks_per_min,
         distance_m: report.kinematics.total_distance_m,
         lifts: report.lifts.count,
+        cm_per_360: report.session.cm_per_360,
         from_cache,
-        extra: metrics
-            .iter()
-            .map(|m| (m.clone(), metric_at(report, m)))
-            .collect(),
+        extra: metrics_at(report, metrics),
     }
 }
 
@@ -231,7 +327,7 @@ pub fn write_csv<W: Write>(w: &mut W, rows: &[TrendRow]) -> io::Result<()> {
         w,
         "session_id,started_utc,started_utc_us,duration_s,events,drops,game,flicks,\
 flicks_per_min,overshoot_median,settle_median_ms,tremor_rms_counts_s,path_efficiency,\
-clicks_per_min,distance_m,lifts"
+clicks_per_min,distance_m,lifts,cm_per_360"
     )?;
     for k in &extra {
         write!(w, ",{}", crate::per_second::csv_field(k))?;
@@ -259,6 +355,10 @@ clicks_per_min,distance_m,lifts"
             r.distance_m,
             r.lifts,
         )?;
+        match r.cm_per_360 {
+            Some(cm) => write!(w, ",{cm:.2}")?,
+            None => write!(w, ",")?,
+        }
         for (_, v) in &r.extra {
             match v {
                 Some(x) => write!(w, ",{x}")?,
@@ -284,7 +384,7 @@ pub fn render(rows: &[TrendRow]) -> String {
     }
     let extra: Vec<&str> = rows[0].extra.iter().map(|(k, _)| k.as_str()).collect();
     o.push_str(&format!(
-        "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9} {:>9} {:>8} {:>8}",
+        "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9} {:>9} {:>8} {:>8} {:>9}",
         "SESSION",
         "STARTED (UTC)",
         "DURATION",
@@ -294,7 +394,8 @@ pub fn render(rows: &[TrendRow]) -> String {
         "OVERSHOOT",
         "SETTLE ms",
         "TREMOR",
-        "PATH EFF"
+        "PATH EFF",
+        "cm/360°"
     ));
     for k in &extra {
         o.push_str(&format!(" {k:>14}"));
@@ -302,7 +403,7 @@ pub fn render(rows: &[TrendRow]) -> String {
     o.push('\n');
     for r in rows {
         o.push_str(&format!(
-            "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9.4} {:>9.1} {:>8.0} {:>8.3}",
+            "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9.4} {:>9.1} {:>8.0} {:>8.3} {:>9}",
             truncate(&r.session_id, 22),
             &r.started_utc[..19.min(r.started_utc.len())],
             format_duration(r.duration_s),
@@ -313,6 +414,8 @@ pub fn render(rows: &[TrendRow]) -> String {
             r.settle_median_ms,
             r.tremor_rms_counts_s,
             r.path_efficiency,
+            r.cm_per_360
+                .map_or("—".to_string(), |cm| format!("{cm:.1}")),
         ));
         for (_, v) in &r.extra {
             match v {

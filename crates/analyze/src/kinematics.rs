@@ -125,17 +125,19 @@ pub fn compute(p: &Prepared) -> Kinematics {
     // rather than re-summarized (`Summary::scaled`). `counts_to_cm` is linear
     // in counts.
     let cm_per_count = p.counts_to_cm(1.0);
-    let speed_summary = Summary::of(&speeds);
-    let accel_summary = Summary::of(&accel);
-    let jerk_summary = Summary::of(&jerk);
+    let speed_summary = Summary::of_vec(speeds);
+    let accel_summary = Summary::of_vec(accel);
+    let jerk_summary = Summary::of_vec(jerk);
 
     // Distances from the raw events, so the totals are exact counts rather
-    // than a re-integration of the grid.
+    // than a re-integration of the grid — over the events the grid covers,
+    // so `distance_*_per_min` below divides like with like. On an untruncated
+    // session that is every event.
     let mut dist_counts = 0.0;
     let mut dist_deg = 0.0;
     let mut net_x = 0i64;
     let mut net_y = 0i64;
-    for (i, e) in p.events().iter().enumerate() {
+    for (i, e) in p.analysed_events().iter().enumerate() {
         let (dx, dy) = (e.dx as f64, e.dy as f64);
         dist_counts += dx.hypot(dy);
         if p.aim_event_ok(i) {
@@ -171,7 +173,7 @@ pub fn compute(p: &Prepared) -> Kinematics {
     Kinematics {
         speed_counts_per_s: speed_summary,
         speed_cm_per_s: speed_summary.scaled(cm_per_count),
-        speed_deg_per_s: Summary::of(&speeds_deg),
+        speed_deg_per_s: Summary::of_vec(speeds_deg),
         accel_counts_per_s2: accel_summary,
         accel_cm_per_s2: accel_summary.scaled(cm_per_count),
         accel_deg_per_s2: accel_summary.scaled(kx),
@@ -194,7 +196,7 @@ pub fn compute(p: &Prepared) -> Kinematics {
             0.0
         },
         segment_count: segs.len(),
-        path_efficiency: Summary::of(&effs),
+        path_efficiency: Summary::of_vec(effs),
         path_efficiency_weighted: if sum_path > 0.0 {
             sum_net / sum_path
         } else {
@@ -439,10 +441,10 @@ mod tests {
         assert!(!all.degrees_locked_only);
     }
 
-    /// A truncated grid must divide its rates by what it analyzed, not by a
-    /// session span it never looked at.
+    /// A truncated grid must divide its rates by what it analyzed — and count
+    /// only what it analyzed. Both halves of the fraction, or neither.
     #[test]
-    fn truncation_clamps_the_rate_denominators_to_grid_coverage() {
+    fn truncation_clamps_both_sides_of_every_rate() {
         use crate::series::Params;
 
         let mut b = StreamBuilder::new();
@@ -451,20 +453,33 @@ mod tests {
 
         let full = compute(&prep(evs.clone()));
         let cut = compute(&crate::testutil::prepared_with(
-            evs,
+            evs.clone(),
             Some("cs2.exe"),
             Params {
                 max_grid_cells: 2000, // only the first 2 s
                 ..Default::default()
             },
         ));
+        // The first half of the same session, analyzed whole.
+        let prefix = compute(&prep(evs[..2000].to_vec()));
 
         // Half the session analyzed, so half the distance...
-        assert!((cut.total_distance_counts / full.total_distance_counts - 1.0).abs() < 1e-9);
-        // ...but the *rate* is per analyzed minute, so it does not halve: the
-        // distance total still covers every event, and dividing it by the full
-        // four seconds would understate the pace of what was actually read.
-        assert!(cut.distance_cm_per_min > full.distance_cm_per_min * 1.9);
+        assert!(
+            (cut.total_distance_counts / full.total_distance_counts - 0.5).abs() < 1e-9,
+            "{} vs {}",
+            cut.total_distance_counts,
+            full.total_distance_counts
+        );
+        // ...and the *rate* is the rate of that half, which is the rate of the
+        // untruncated prefix — the numbers a truncated session reports are the
+        // numbers of the span it actually read.
+        assert!(
+            (cut.distance_cm_per_min / prefix.distance_cm_per_min - 1.0).abs() < 1e-3,
+            "{} vs {}",
+            cut.distance_cm_per_min,
+            prefix.distance_cm_per_min
+        );
+        assert!((cut.distance_cm_per_min / full.distance_cm_per_min - 1.0).abs() < 1e-3);
         // And the moving fraction stays a fraction rather than exceeding 1.
         assert!(cut.moving_fraction <= 1.0, "{}", cut.moving_fraction);
         assert!(cut.moving_fraction > 0.9, "{}", cut.moving_fraction);

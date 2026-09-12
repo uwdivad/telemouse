@@ -8,6 +8,7 @@
 //! quietly biasing the metrics.
 
 use serde::{Deserialize, Serialize};
+use telemouse_core::recordings::SessionMeta;
 
 use crate::series::Prepared;
 use crate::stats::{self, Summary};
@@ -20,6 +21,173 @@ pub const GAP_MS: f64 = 10.0;
 pub const MIN_DOMINANT_GAME_SHARE: f64 = 0.8;
 /// Below this share of pointer-locked events, degree metrics are suspect.
 pub const MIN_LOCKED_FRACTION: f64 = 0.9;
+/// Under this much analysed data, every per-minute number is an extrapolation.
+pub const MIN_ANALYSIS_S: f64 = 1.0;
+
+/// Intervals above this are the hand resting, not the mouse reporting, so the
+/// polling-rate estimate ignores them.
+const POLL_MAX_MS: f64 = 20.0;
+/// Interval histogram resolution for the polling estimate. 0.125 ms separates
+/// every rate a mouse actually runs at (8000/4000/2000/1000/500/250/125 Hz)
+/// while staying coarse enough that USB jitter does not smear the mode.
+const POLL_BUCKET_MS: f64 = 0.125;
+/// `POLL_MAX_MS / POLL_BUCKET_MS`, plus the bucket that holds exactly 20 ms.
+const POLL_BUCKETS: usize = 161;
+/// An interval counts as "at the polling rate" within this much of the mode.
+const POLL_TOLERANCE: f64 = 0.10;
+/// Minutes with fewer qualifying intervals than this do not get their own
+/// rate: a minute the hand spent still says nothing about the mouse.
+const POLL_MIN_MINUTE_SAMPLES: usize = 100;
+
+/// What the capture agent's `<session_id>.meta.json` says about the run that
+/// produced this recording — the half of the story the JSONL cannot tell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SidecarSummary {
+    /// How the run ended, as [`telemouse_core::recordings::ExitReason`].
+    pub exit: String,
+    /// The run never wrote a final reason: it was killed, or is still going.
+    pub unfinished: bool,
+    /// Every worker thread joined without panicking.
+    pub clean: bool,
+    /// `debug` or `release` — a debug capture drops events a release one does
+    /// not, which is the first thing a surprising drop count needs ruled out.
+    pub capture_profile: String,
+    /// Report rate the agent measured, Hz.
+    pub poll_hz: Option<f64>,
+    /// Events the agent counted. Compared against what the file holds.
+    pub events: u64,
+}
+
+impl SidecarSummary {
+    fn of(meta: &SessionMeta) -> Self {
+        Self {
+            exit: meta.exit.clone(),
+            unfinished: meta.is_unfinished(),
+            clean: meta.clean,
+            capture_profile: meta.capture_profile.clone(),
+            poll_hz: meta.poll_hz,
+            events: meta.events,
+        }
+    }
+}
+
+/// The mouse's report rate, estimated from the inter-event intervals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Polling {
+    /// Modal interval, as a rate. `None` when nothing moved.
+    pub hz: Option<f64>,
+    /// Share of qualifying intervals within ±10% of the mode: 1.0 is a mouse
+    /// reporting like a metronome, 0.5 is one that is not.
+    pub stability: f64,
+    /// Lowest and highest per-minute modal rate, over the minutes that carried
+    /// enough movement to have one. A 1000 Hz mouse that spends a minute at
+    /// 500 Hz is throttling, and the session median hides it.
+    pub hz_min: Option<f64>,
+    pub hz_max: Option<f64>,
+    /// Intervals the estimate is based on (those at or under 20 ms).
+    pub samples: usize,
+}
+
+/// Fixed-width interval histogram over `[0, POLL_MAX_MS]`, keeping each
+/// bucket's sum so the mode can be reported as the mean of its members rather
+/// than as a bucket edge.
+#[derive(Debug, Clone)]
+struct PollHist {
+    counts: Vec<u32>,
+    sums: Vec<f64>,
+    n: usize,
+}
+
+impl PollHist {
+    fn new() -> Self {
+        Self {
+            counts: vec![0; POLL_BUCKETS],
+            sums: vec![0.0; POLL_BUCKETS],
+            n: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, ms: f64) {
+        let b = ((ms / POLL_BUCKET_MS) as usize).min(POLL_BUCKETS - 1);
+        self.counts[b] += 1;
+        self.sums[b] += ms;
+        self.n += 1;
+    }
+
+    /// Mean interval of the fullest bucket, ms. Ties go to the shorter
+    /// interval, so a mouse split evenly between two buckets reads as the
+    /// faster of the two rather than by iteration order.
+    fn mode_ms(&self) -> Option<f64> {
+        let (b, &count) = self
+            .counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(i, &c)| (c, std::cmp::Reverse(i)))?;
+        (count > 0).then(|| self.sums[b] / count as f64)
+    }
+
+    fn mode_hz(&self) -> Option<f64> {
+        self.mode_ms().filter(|ms| *ms > 0.0).map(|ms| 1000.0 / ms)
+    }
+}
+
+/// Estimate the report rate from `event_us` (µs since session start, ascending
+/// apart from counted violations).
+fn polling_stats(event_us: &[i64]) -> Polling {
+    let mut session = PollHist::new();
+    let mut minutes: Vec<PollHist> = Vec::new();
+    for w in event_us.windows(2) {
+        let d = w[1] - w[0];
+        if d <= 0 {
+            continue;
+        }
+        let ms = d as f64 / 1000.0;
+        if ms > POLL_MAX_MS {
+            continue;
+        }
+        session.push(ms);
+        let m = (w[0].max(0) / 60_000_000) as usize;
+        if minutes.len() <= m {
+            minutes.resize_with(m + 1, PollHist::new);
+        }
+        minutes[m].push(ms);
+    }
+
+    let Some(modal_ms) = session.mode_ms().filter(|ms| *ms > 0.0) else {
+        return Polling::default();
+    };
+    // Stability is defined on the intervals themselves, not on the buckets,
+    // so it takes a second look rather than a sum of neighbouring counts.
+    let (lo, hi) = (
+        modal_ms * (1.0 - POLL_TOLERANCE),
+        modal_ms * (1.0 + POLL_TOLERANCE),
+    );
+    let mut within = 0usize;
+    for w in event_us.windows(2) {
+        let d = w[1] - w[0];
+        if d <= 0 {
+            continue;
+        }
+        let ms = d as f64 / 1000.0;
+        if ms <= POLL_MAX_MS && ms >= lo && ms <= hi {
+            within += 1;
+        }
+    }
+
+    let rates: Vec<f64> = minutes
+        .iter()
+        .filter(|h| h.n >= POLL_MIN_MINUTE_SAMPLES)
+        .filter_map(PollHist::mode_hz)
+        .collect();
+    Polling {
+        hz: Some(1000.0 / modal_ms),
+        stability: within as f64 / session.n as f64,
+        hz_min: rates.iter().copied().reduce(f64::min),
+        hz_max: rates.iter().copied().reduce(f64::max),
+        samples: session.n,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntervalBucket {
@@ -33,6 +201,9 @@ pub struct IntervalBucket {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QualityReport {
     pub event_count: usize,
+    /// Events inside the analysed span — `event_count` unless the grid was
+    /// truncated. This, not `event_count`, is what `events_per_s` divides.
+    pub events_analyzed: usize,
     pub batch_count: usize,
     pub duration_s: f64,
     /// Span the grid actually covers; differs from `duration_s` only when the
@@ -54,6 +225,14 @@ pub struct QualityReport {
     pub monotonicity_violations: usize,
     /// JSONL lines that failed to parse.
     pub bad_lines: usize,
+    /// 1-based file line numbers of the first and last unparseable line, and
+    /// whether they are confined to the tail (a killed agent) rather than
+    /// reaching into the body of the recording (corruption).
+    pub bad_line_first: Option<u64>,
+    pub bad_line_last: Option<u64>,
+    pub bad_lines_tail_only: bool,
+    /// What the parser said about the first one.
+    pub bad_line_error: Option<String>,
     /// Absolute-motion `WM_INPUT` frames the agent saw and discarded.
     pub abs_frames: u64,
 
@@ -65,8 +244,14 @@ pub struct QualityReport {
     pub median_interval_ms: f64,
     pub p99_interval_ms: f64,
     pub max_interval_ms: f64,
-    /// Share of intervals at or under 1 ms — 1 kHz polling health.
+    /// Share of intervals at or under 1 ms. This is *not* a polling-rate
+    /// measurement: a still hand reports nothing, so a long idle stretch drags
+    /// it down, and an 8000 Hz mouse pushes it to 100% while moving. Read it
+    /// as "how much of this recording came in at 1 kHz or better"; read
+    /// [`QualityReport::polling`] for the rate itself.
     pub pct_within_1ms: f64,
+    /// The mouse's report rate, estimated from the intervals it did produce.
+    pub polling: Polling,
     pub gaps_over_10ms: usize,
 
     /// Process that owned the most events, and its share of all of them.
@@ -90,11 +275,36 @@ pub struct QualityReport {
     pub aim_profile_missing: bool,
     /// The 1 ms grid hit its size cap and the tail was dropped.
     pub grid_truncated: bool,
+    /// The capture agent's metadata sidecar, when it wrote one.
+    pub sidecar: Option<SidecarSummary>,
     /// Whether anything above warrants a second look.
     pub clean: bool,
 }
 
 impl QualityReport {
+    /// How to read the numbers, when there is too little data for them to
+    /// mean much: no events at all, or under [`MIN_ANALYSIS_S`]. These are
+    /// not defects in the recording (a ten-second smoke test is a valid
+    /// recording), so they do not make the session unclean; they are printed
+    /// above the notes so a zero is not mistaken for a result.
+    pub fn caveats(&self) -> Vec<String> {
+        let mut c = Vec::new();
+        if self.event_count == 0 {
+            c.push(
+                "this recording contains no events — there is nothing to measure, and every \
+                 number below is a zero, not a result"
+                    .to_string(),
+            );
+        } else if self.analysis_duration_s < MIN_ANALYSIS_S {
+            c.push(format!(
+                "only {:.2}s of data was analyzed — every per-minute number here is \
+                 extrapolated from less than a second of it",
+                self.analysis_duration_s
+            ));
+        }
+        c
+    }
+
     /// Human-readable problems, ready to log at `warn` and print in the report.
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
@@ -118,9 +328,23 @@ impl QualityReport {
             ));
         }
         if self.bad_lines > 0 {
+            let where_ = match (self.bad_line_first, self.bad_line_last) {
+                (Some(a), Some(b)) if a == b => format!(" at line {a}"),
+                (Some(a), Some(b)) => format!(" between lines {a} and {b}"),
+                _ => String::new(),
+            };
             w.push(format!(
-                "{} unparseable JSONL lines (truncated or corrupt recording)",
-                self.bad_lines
+                "{} unparseable JSONL lines{where_} ({}){}",
+                self.bad_lines,
+                if self.bad_lines_tail_only {
+                    "a truncated tail — the agent was killed mid-write"
+                } else {
+                    "corruption reaching into the body of the recording, not just its tail"
+                },
+                match &self.bad_line_error {
+                    Some(e) => format!(": {e}"),
+                    None => String::new(),
+                }
             ));
         }
         if self.dominant_game.is_some() && self.dominant_game_share < MIN_DOMINANT_GAME_SHARE {
@@ -147,7 +371,9 @@ impl QualityReport {
                 self.devices
             ));
         }
-        if self.aim_profile_missing {
+        // With no events there is nothing to convert, so a missing profile
+        // is not a problem yet.
+        if self.aim_profile_missing && self.event_count > 0 {
             w.push(
                 "no per-game sensitivity profile matched; degree-valued metrics use the \
                  fallback sens 1.0 / 0.022 and are not comparable across sessions"
@@ -157,9 +383,29 @@ impl QualityReport {
         if self.grid_truncated {
             w.push(format!(
                 "session exceeded the analysis grid cap: only the first {:.0}s of {:.0}s was \
-                 analyzed, and every rate here is divided by the analyzed span, not the recording",
-                self.analysis_duration_s, self.duration_s
+                 analyzed. Every rate here counts the {} events inside that span and divides \
+                 them by it, so the numbers describe the analyzed prefix rather than the \
+                 whole recording",
+                self.analysis_duration_s, self.duration_s, self.events_analyzed
             ));
+        }
+        if let Some(s) = &self.sidecar {
+            if s.unfinished {
+                w.push(format!(
+                    "unfinished: the run did not stop cleanly (exit {:?}) — the recording ends \
+                     wherever the agent stopped and the sidecar's counters are not final",
+                    s.exit
+                ));
+            }
+            if s.events > 0 && s.events != self.event_count as u64 {
+                w.push(format!(
+                    "the capture agent counted {} events but the recording holds {} ({:+}) — \
+                     envelopes were lost between the agent and this file",
+                    s.events,
+                    self.event_count,
+                    self.event_count as i64 - s.events as i64
+                ));
+            }
         }
         // Gaps are *not* a warning: raw input is silent while the hand is
         // still, so any real session is full of them. The count and the
@@ -223,14 +469,17 @@ pub fn compute(p: &Prepared) -> QualityReport {
     let gaps = intervals.iter().filter(|&&d| d > GAP_MS).count();
     let within_1ms = intervals.iter().filter(|&&d| d <= 1.0).count();
     let histogram = histogram(&intervals);
-    // One sort for all three order statistics. The old code called `median`
-    // and `percentile` separately, each of which sorted its own copy — two
-    // full sorts of an 8 M-element vector for two numbers.
-    let sorted = stats::sorted_finite(&intervals);
-    let median_interval_ms = stats::percentile_sorted(&sorted, 0.5).unwrap_or(0.0);
-    let p99_interval_ms = stats::percentile_sorted(&sorted, 0.99).unwrap_or(0.0);
-    let max_interval_ms = sorted.last().copied().unwrap_or(0.0);
-    drop(sorted);
+    let polling = polling_stats(p.analysed_event_us());
+    // One sort for all three order statistics, in place: the intervals are
+    // owned here and already finite (they come off the integer µs timeline),
+    // so `sorted_finite`'s filtered copy was a second 64 MB allocation on an
+    // 8 M-event session for nothing.
+    let n_intervals = intervals.len();
+    intervals.sort_unstable_by(f64::total_cmp);
+    let median_interval_ms = stats::percentile_sorted(&intervals, 0.5).unwrap_or(0.0);
+    let p99_interval_ms = stats::percentile_sorted(&intervals, 0.99).unwrap_or(0.0);
+    let max_interval_ms = intervals.last().copied().unwrap_or(0.0);
+    drop(intervals);
 
     let batches_with_drops = session
         .batches
@@ -260,19 +509,19 @@ pub fn compute(p: &Prepared) -> QualityReport {
         })
         .collect();
 
-    let (dominant_game, dominant_game_share) = match session.dominant_game_share() {
-        Some((g, s)) => (Some(g), s),
-        None => (None, 0.0),
-    };
-
     let span = p.analysis_duration_s;
+    let bad = &session.bad_lines;
     let report = QualityReport {
         event_count: p.events().len(),
+        events_analyzed: p.events_in_grid,
         batch_count: session.batches.len(),
         duration_s: p.duration_s,
         analysis_duration_s: span,
+        // Numerator and denominator must cover the same span: on a truncated
+        // grid the whole recording's events over the analysed seconds was a
+        // rate no part of this session ever ran at.
         events_per_s: if span > 0.0 {
-            p.events().len() as f64 / span
+            p.events_in_grid as f64 / span
         } else {
             0.0
         },
@@ -286,21 +535,26 @@ pub fn compute(p: &Prepared) -> QualityReport {
         lost_batches,
         seq_gaps,
         monotonicity_violations: violations,
-        bad_lines: session.bad_lines,
+        bad_lines: bad.count,
+        bad_line_first: bad.first_line,
+        bad_line_last: bad.last_line,
+        bad_lines_tail_only: bad.tail_only,
+        bad_line_error: bad.first_error.clone(),
         abs_frames: session.total_abs_frames,
-        batch_latency_ms: Summary::of(&latencies),
+        batch_latency_ms: Summary::of_vec(latencies),
         median_interval_ms,
         p99_interval_ms,
         max_interval_ms,
-        pct_within_1ms: if intervals.is_empty() {
+        pct_within_1ms: if n_intervals == 0 {
             0.0
         } else {
-            100.0 * within_1ms as f64 / intervals.len() as f64
+            100.0 * within_1ms as f64 / n_intervals as f64
         },
+        polling,
         gaps_over_10ms: gaps,
         interval_histogram: histogram,
-        dominant_game,
-        dominant_game_share,
+        dominant_game: p.game.clone(),
+        dominant_game_share: p.dominant_game_share,
         locked_fraction: p.locked_fraction(),
         locked_only: p.params.locked_only,
         devices: session.config.devices.clone(),
@@ -308,6 +562,9 @@ pub fn compute(p: &Prepared) -> QualityReport {
         anchor_uncertainty_us: session.config.anchor_uncertainty_us,
         aim_profile_missing: p.aim_fallback,
         grid_truncated: p.grid_truncated,
+        sidecar: crate::load::read_sidecar(&session.path)
+            .as_ref()
+            .map(SidecarSummary::of),
         clean: false,
     };
     QualityReport {
@@ -408,7 +665,7 @@ mod tests {
         let mut session = loaded_from(b.into_events(), Some("valorant.exe"));
         session.total_drops = 17;
         session.batches[0].drops_since_last = 17;
-        session.bad_lines = 2;
+        session.bad_lines.count = 2;
 
         let q = analyze(session);
         assert_eq!(q.ring_drops, 17);
@@ -430,7 +687,7 @@ mod tests {
         assert_eq!(q.events_per_s, 0.0);
         assert_eq!(q.pct_within_1ms, 0.0);
         assert_eq!(q.max_interval_ms, 0.0);
-        assert!(q.clean);
+        assert!(q.clean, "{:?}", q.warnings());
     }
 
     /// A jump in `seq_no` means whole batches never made it to disk.

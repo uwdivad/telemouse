@@ -61,6 +61,7 @@ pub fn session_cfg() -> SessionConfig {
         }],
         capture_version: "test".into(),
         coalesce_ms: 0,
+        ..Default::default()
     }
 }
 
@@ -165,7 +166,9 @@ pub fn loaded_from(events: Vec<RawEvent>, game: Option<&str>) -> LoadedSession {
         markers: Vec::new(),
         total_drops: 0,
         total_abs_frames: 0,
-        bad_lines: 0,
+        bad_lines: crate::load::BadLines::default(),
+        bytes: 0,
+        load_ms: 0.0,
     }
 }
 
@@ -181,7 +184,9 @@ pub fn loaded_with_batches(events: Vec<RawEvent>, batches: Vec<BatchMeta>) -> Lo
         markers: Vec::new(),
         total_drops: 0,
         total_abs_frames: 0,
-        bad_lines: 0,
+        bad_lines: crate::load::BadLines::default(),
+        bytes: 0,
+        load_ms: 0.0,
     }
 }
 

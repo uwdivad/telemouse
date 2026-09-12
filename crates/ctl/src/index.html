@@ -34,6 +34,9 @@
   .card .sum { color: var(--fg-dim); font-size: 12px; }
   .card .meta { font: 12px var(--mono); color: var(--fg-dim); display: flex; gap: 14px; flex-wrap: wrap; }
   .card .meta .bad { color: var(--bad); }
+  .places div { font: 12px var(--mono); color: var(--fg-dim); padding: 3px 0; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .places b { color: var(--fg); min-width: 90px; font-weight: 600; }
+  .places code { user-select: all; }
   .opts { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
   .opts label { display: inline-flex; align-items: center; gap: 5px; color: var(--fg-dim); cursor: pointer; }
   .opts label:hover { color: var(--fg); }
@@ -80,6 +83,9 @@
   <div class="pill" id="connPill"><span class="dot"></span><span id="connText">connecting</span></div>
   <div class="pill" id="recPill" title="telemouse.toml → [recording] enabled; the capture card can override it per run"><span class="dot"></span><span id="recText">save data: ?</span></div>
   <div class="spacer"></div>
+  <span class="pill" id="verPill" title="this build"><span id="verText">v?</span></span>
+  <a id="relLink" href="#" target="_blank" rel="noopener" title="newer builds">releases ↗</a>
+  <a id="docsLink" href="#" target="_blank" rel="noopener">docs ↗</a>
   <a id="vizLink" href="#" target="_blank" rel="noopener">open viz dashboard ↗</a>
 </div>
 
@@ -92,6 +98,11 @@
   <section>
     <h2>Related processes <small id="procNote">every process on this machine whose executable is a telemouse binary, or a cargo run of one</small></h2>
     <div class="tablewrap" id="procs"></div>
+  </section>
+
+  <section>
+    <h2>Where things are <small>absolute paths; a browser cannot open folders, so copy them</small></h2>
+    <div class="places" id="places"></div>
   </section>
 </main>
 <div id="toasts"></div>
@@ -117,6 +128,44 @@ const SAVE_FLAGS = new Set(["--record", "--no-record"]);
 let cardsKey = "", procsKey = ""; // what the DOM currently shows; re-render only on change
 
 $("vizLink").href = "http://" + (CFG.viz_http || "127.0.0.1:7879") + "/";
+const PLACES = CFG.places || {};
+$("verText").textContent = "v" + (PLACES.version || "?") + (CFG.features ? " · " + CFG.features : "");
+$("verPill").title = "telemouse-ctl " + (PLACES.version || "?") + " built with: " + (CFG.features || "?");
+$("relLink").href = PLACES.releases || "https://github.com/uwdivad/telemouse/releases";
+if (PLACES.docs) { $("docsLink").href = /^https?:/.test(PLACES.docs) ? PLACES.docs : "file:///" + PLACES.docs.replace(/\\/g, "/"); }
+/* The agent's last stats line, as the card shows it. Fields an older or
+   minimal capture build does not print are simply absent. */
+function statsText(st) {
+  const parts = [];
+  if (st.events_per_s !== undefined) parts.push(Math.round(st.events_per_s) + " ev/s");
+  if (st.poll_hz !== undefined) parts.push(Math.round(st.poll_hz) + " Hz");
+  if (st.game !== undefined) parts.push(st.game);
+  if (st.idle_for_s !== undefined && st.idle_for_s >= 5) parts.push("idle " + Math.round(st.idle_for_s) + "s");
+  const bad = [];
+  if (st.drops) bad.push("ring drops " + st.drops);
+  if (st.jsonl_dropped) bad.push("recording dropped " + st.jsonl_dropped);
+  if (st.kafka_dropped) bad.push("kafka dropped " + st.kafka_dropped);
+  if (st.udp_unreachable) bad.push("no viz listening");
+  return { text: parts.join(" · "), bad: bad.join(" · ") };
+}
+function recText(r) {
+  let s = "recording → " + r.session + ".jsonl";
+  if (r.size_bytes !== undefined) s += " · " + (r.size_bytes / 1048576).toFixed(1) + " MB";
+  if (r.free_bytes !== undefined) s += " · " + Math.round(r.free_bytes / 1073741824) + " GB free";
+  return { text: s, bad: r.free_bytes !== undefined && r.free_bytes < 2 * 1073741824 };
+}
+function renderPlaces() {
+  const cfgNote = state.config ? (state.config.status + (state.config.found ? "" : " (no file; built-in defaults)")) : "";
+  const rows = [
+    ["config", (state.config && state.config.path) || PLACES.config, cfgNote],
+    ["recordings", state.recording && state.recording.dir, ""],
+    ["logs", PLACES.logs || "(this build writes no log files)", ""],
+    ["binaries", PLACES.bin_dir, ""],
+  ];
+  $("places").innerHTML = rows.map(([k, v, note]) =>
+    "<div><b>" + esc(k) + "</b> <code>" + esc(v || "—") + "</code> " + (note ? "<small>" + esc(note) + "</small>" : "") + "</div>"
+  ).join("");
+}
 
 /* ---------- helpers ---------- */
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -215,12 +264,13 @@ function render() {
   if (!state) return;
   renderCards();
   renderProcs();
+  renderPlaces();
 }
 
 function renderCards() {
   const host = $("cards");
   const key = JSON.stringify([
-    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.saving, c.last_exit, c.unexpected_exits, c.log.length, c.log[c.log.length - 1]]),
+    state.components.map((c) => [c.id, c.running, c.pid, c.bin_found, c.saving, c.last_exit, c.unexpected_exits, c.log.length, c.log[c.log.length - 1], c.stats, c.recording]),
     sessions, [...busy], [...openLogs], state.recording,
   ]);
   if (key === cardsKey) {
@@ -248,6 +298,17 @@ function renderCards() {
     // Exits nobody asked for, since the panel started: a crash loop shows
     // here even when every individual exit scrolled out of the log.
     const crashText = c.unexpected_exits ? `<span class="bad" title="exits without a stop since the panel started (${c.exits} exits in all)">unexpected exits: ${c.unexpected_exits}</span>` : "";
+    // Live health from the agent's own 5-second stats line (full builds).
+    let liveText = "";
+    if (run && c.stats) {
+      const st = statsText(c.stats);
+      if (st.text) liveText += `<span title="from the agent's stats line">${esc(st.text)}</span>`;
+      if (st.bad) liveText += `<span class="bad">${esc(st.bad)}</span>`;
+    }
+    if (run && c.recording) {
+      const r = recText(c.recording);
+      liveText += `<span class="${r.bad ? "bad" : ""}">${esc(r.text)}</span>`;
+    }
 
     // The recording switch is one checkbox, not two raw flags: it defaults
     // to telemouse.toml and only sends --record / --no-record when it disagrees.
@@ -279,7 +340,7 @@ function renderCards() {
         <span class="pill ${run ? "on" : ""}"><span class="dot"></span><span data-uptime="${c.id}">${run ? "running · pid " + c.pid + " · " + ago(c.since_unix_s) : (c.kind === "task" ? "idle" : "stopped")}</span></span>${saveNow}
       </div>
       <div class="sum">${esc(c.summary)}</div>
-      <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}${crashText}</div>
+      <div class="meta"><span class="${c.bin_found ? "" : "bad"}" title="${esc(c.bin_path)}">${c.bin_found ? "✓ " : "✗ "}${esc(c.bin)}</span>${exitText ? `<span class="${exitCls}">${esc(exitText)}</span>` : ""}${crashText}${liveText}</div>
       ${flags || saveCtl ? `<div class="opts">${saveCtl}${flags}</div>` : ""}
       <div class="row">${sessionSel}${buttons}</div>
       <details ${openLogs.has(c.id) ? "open" : ""} data-log="${c.id}"><summary>output (${c.log.length} lines)</summary><pre class="log">${esc(c.log.join("\n")) || "—"}</pre></details>

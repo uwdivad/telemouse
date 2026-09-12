@@ -29,6 +29,14 @@ pub struct SessionEnv {
     pub capture_version: String,
     /// `batch.coalesce_ms` the agent is running with.
     pub coalesce_ms: u64,
+    /// `batch.window_ms` and `batch.max_events`: between them they explain
+    /// every batch boundary in the recording, so a replay can reproduce the
+    /// live view's timing and a short batch reads as "capped", not "a gap".
+    pub window_ms: u64,
+    pub max_events: usize,
+    /// The host OS, e.g. `Windows 10.0.19045`; `None` when it could not be
+    /// determined.
+    pub os: Option<String>,
 }
 
 /// Build an anchor from a QPC/UTC/QPC sandwich.
@@ -110,6 +118,9 @@ pub fn build_session_config(session_id: String, env: SessionEnv) -> SessionConfi
         monitors: env.monitors,
         capture_version: env.capture_version,
         coalesce_ms: env.coalesce_ms,
+        window_ms: env.window_ms,
+        max_events: env.max_events,
+        os: env.os,
     }
 }
 
@@ -148,6 +159,9 @@ mod tests {
             }],
             capture_version: "0.1.0".into(),
             coalesce_ms: 2,
+            window_ms: 50,
+            max_events: 448,
+            os: Some("Windows 10.0.19045".into()),
         }
     }
 
@@ -192,6 +206,32 @@ mod tests {
         assert_eq!(cfg.devices[0], crate::devices::UNKNOWN_DEVICE);
         assert!(cfg.devices[1].contains("VID_1532"));
         assert_eq!(cfg.anchor_uncertainty_us, Some(3));
+        // The batching a replay needs to reproduce the live view's timing,
+        // and the host it was recorded on.
+        assert_eq!((cfg.window_ms, cfg.max_events), (50, 448));
+        assert_eq!(cfg.coalesce_ms, 2);
+        assert_eq!(cfg.os.as_deref(), Some("Windows 10.0.19045"));
+    }
+
+    #[test]
+    fn an_unknown_os_is_absent_rather_than_guessed() {
+        let cfg = build_session_config(
+            "s".into(),
+            SessionEnv {
+                os: None,
+                ..fake_env()
+            },
+        );
+        assert_eq!(cfg.os, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_live_environment_names_the_host_os() {
+        assert!(
+            crate::platform::os_version().is_some_and(|v| v.starts_with("Windows ")),
+            "the session record should say what it was captured on"
+        );
     }
 
     #[test]

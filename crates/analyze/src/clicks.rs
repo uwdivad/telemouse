@@ -140,8 +140,9 @@ pub fn compute(p: &Prepared) -> ClickReport {
     let mut per_button: BTreeMap<Button, Tally> = BTreeMap::new();
 
     // Durations come off the integer µs timeline so a 40 ms hold reports as
-    // 40.0, not 40.000000000000036.
-    for (i, e) in p.events().iter().enumerate() {
+    // 40.0, not 40.000000000000036. Only the events inside the analysed span
+    // are counted, because `clicks_per_min` divides by that span.
+    for (i, e) in p.analysed_events().iter().enumerate() {
         if e.buttons & buttons::MASK == 0 {
             continue;
         }
@@ -210,26 +211,27 @@ pub fn compute(p: &Prepared) -> ClickReport {
             button: name,
             downs: v.downs,
             ups: v.ups,
-            hold_ms: Summary::of(&v.holds_ms),
-            double_click_interval_ms: Summary::of(&v.double_gaps_ms),
             double_clicks: v.double_gaps_ms.len(),
+            hold_ms: Summary::of_vec(v.holds_ms),
+            double_click_interval_ms: Summary::of_vec(v.double_gaps_ms),
         })
         .collect();
 
+    let double_clicks = dbl.len();
     ClickReport {
         total_clicks: clicks.len(),
         clicks_per_min: clicks.len() as f64 / p.minutes(),
-        pre_click_speed_counts_s: Summary::of(&pre),
-        pre_click_speed_cm_s: Summary::of(&pre_cm),
+        pre_click_speed_counts_s: Summary::of_vec(pre),
+        pre_click_speed_cm_s: Summary::of_vec(pre_cm),
         still_click_fraction: if clicks.is_empty() {
             0.0
         } else {
             still as f64 / clicks.len() as f64
         },
-        click_to_still_ms: Summary::of(&cts),
-        hold_ms: Summary::of(&holds),
-        double_click_interval_ms: Summary::of(&dbl),
-        double_clicks: dbl.len(),
+        click_to_still_ms: Summary::of_vec(cts),
+        hold_ms: Summary::of_vec(holds),
+        double_click_interval_ms: Summary::of_vec(dbl),
+        double_clicks,
         unmatched_downs: pending.len(),
         per_button,
         clicks,

@@ -45,7 +45,23 @@ all members and shared `[workspace.dependencies]`; add crate-local deps with
 - Logging/observability: `tracing` everywhere (`tracing-subscriber` with
   `EnvFilter`, default `info`, env var `RUST_LOG`). Every long-running loop
   emits periodic stats at `info` (rates, drops, queue depths, errors) —
-  metrics are logs here, no metrics server.
+  metrics are logs here, no metrics server. Anything that stays wrong is
+  repeated as a `warn` once a minute, never only as a number in the stats
+  line.
+- Build flavours: `logging`, `observability` and (capture only) `kafka` are
+  Cargo features, on by default, off in the minimal release zip; `quiet`
+  compiles `tracing` calls out. New code that logs to a file, reports
+  stats, or talks to Kafka goes behind the matching feature; the pipeline
+  itself (capture → UDP → viz, JSONL recording, the pages) never does. Every
+  crate must build and pass tests with `--no-default-features` as well as
+  with defaults; CI runs both, plus the `quiet` variant with clippy. The
+  subscriber is only ever set up through `telemouse_core::logging::init`
+  (terminal detection, `NO_COLOR`, rotated files), never directly.
+- Paths: every binary finds `telemouse.toml` with
+  `telemouse_core::paths::locate_config` (CWD first, then next to the exe)
+  and resolves relative paths in it against the file's directory with
+  `AppConfig::resolve_paths`; a config that exists but does not parse is
+  refused, never silently replaced by defaults.
 - Config: `telemouse.toml` at repo root via `telemouse_core::config::AppConfig`.
   CLI (clap, derive) may override specific fields; don't invent parallel config.
 - Tests: every crate has unit tests for its pure logic (`cargo test -p <crate>`

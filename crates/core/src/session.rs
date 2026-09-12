@@ -32,7 +32,7 @@ pub struct MonitorInfo {
 /// Produced once per session to the compacted `mouse.sessions` topic (and the
 /// local recording). Everything a consumer needs to reconstruct physical cm
 /// and aim-space degrees from raw counts, later.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub session_id: String,
     /// UTC µs when the session started (equals `anchor.utc_us`).
@@ -61,12 +61,41 @@ pub struct SessionConfig {
     /// report was stamped at its own wake.
     #[serde(default)]
     pub coalesce_ms: u64,
+    /// Batch window the agent ran with, in ms. A replay can only reproduce
+    /// the live view's timing if it knows how long a batch was allowed to
+    /// accumulate; 0 means a recording made before this was written down.
+    #[serde(default)]
+    pub window_ms: u64,
+    /// Event cap per batch the agent ran with. With `window_ms` it explains
+    /// every batch boundary in the recording: a short batch was capped, not
+    /// a gap in the input.
+    #[serde(default)]
+    pub max_events: usize,
+    /// The OS the capture ran on, e.g. `"Windows 10.0.19045"`. Absent for
+    /// recordings made before this was collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
 }
 
 impl SessionConfig {
     /// Look up aim conversion for a process name (case-insensitive).
     pub fn sens_for(&self, process: &str) -> Option<&GameSens> {
         self.games.get(&process.to_ascii_lowercase())
+    }
+
+    /// Record the batching the agent is running with. Builder-shaped so a
+    /// caller that builds the rest of the struct by hand can add these two
+    /// without naming every other field.
+    pub fn with_batch(mut self, window_ms: u64, max_events: usize) -> Self {
+        self.window_ms = window_ms;
+        self.max_events = max_events;
+        self
+    }
+
+    /// Record the host OS.
+    pub fn with_os(mut self, os: impl Into<String>) -> Self {
+        self.os = Some(os.into());
+        self
     }
 }
 
@@ -117,6 +146,9 @@ mod tests {
             }],
             capture_version: "0.1.0".into(),
             coalesce_ms: 2,
+            window_ms: 25,
+            max_events: 448,
+            os: Some("Windows 10.0.19045".into()),
         }
     }
 
@@ -141,6 +173,41 @@ mod tests {
         v.as_object_mut().unwrap().remove("coalesce_ms");
         let back: SessionConfig = serde_json::from_value(v).unwrap();
         assert_eq!(back.coalesce_ms, 0);
+    }
+
+    /// A recording from an agent that knew nothing about the batching fields
+    /// still loads: they default, they do not fail the line.
+    #[test]
+    fn session_json_without_the_batching_fields_still_parses() {
+        let mut v: serde_json::Value = serde_json::to_value(cfg()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for key in ["window_ms", "max_events", "os"] {
+            obj.remove(key);
+        }
+        let back: SessionConfig = serde_json::from_value(v).unwrap();
+        assert_eq!((back.window_ms, back.max_events), (0, 0));
+        assert_eq!(back.os, None);
+    }
+
+    #[test]
+    fn an_unset_os_is_left_out_of_the_json() {
+        let c = SessionConfig { os: None, ..cfg() };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(!s.contains("\"os\""), "{s}");
+        assert!(s.contains("\"window_ms\""));
+    }
+
+    #[test]
+    fn builders_fill_in_the_run_parameters() {
+        let c = SessionConfig {
+            session_id: "s-2".into(),
+            ..Default::default()
+        }
+        .with_batch(50, 448)
+        .with_os("Windows 10.0.19045");
+        assert_eq!(c.session_id, "s-2");
+        assert_eq!((c.window_ms, c.max_events), (50, 448));
+        assert_eq!(c.os.as_deref(), Some("Windows 10.0.19045"));
     }
 
     #[test]

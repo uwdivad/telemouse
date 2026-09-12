@@ -1,0 +1,8 @@
+# Link the C runtime statically on the MSVC target so the shipped executables
+# do not import VCRUNTIME140.dll: a clean Windows install without the Visual
+# C++ Redistributable then runs them (the release zip is unzip-and-run). Costs
+# about 200 KB per binary; CRT security fixes arrive with a rebuild instead of
+# through Windows Update. Applies to every cargo invocation in this checkout,
+# including `cargo test`, so what CI tests is what ships.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -2,6 +2,10 @@
 name = "telemouse-analyze"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "telemouse_analyze"
@@ -11,11 +15,18 @@ path = "src/lib.rs"
 name = "telemouse-analyze"
 path = "src/main.rs"
 
+# The packaged build is the default here too: `logging` is the only feature,
+# and it buys exactly one thing — `core::logging::init`, and with it
+# `tracing-subscriber`. Without it the crate still emits `tracing` events;
+# nothing subscribes to them.
+[features]
+default = ["logging"]
+logging = ["telemouse-core/logging"]
+
 [dependencies]
 telemouse-core = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

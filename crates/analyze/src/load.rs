@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use telemouse_core::recordings::SessionMeta;
@@ -46,9 +46,23 @@ const INDEX_CACHE_VERSION: u32 = 1;
 const SIGNATURE_SAMPLE_BYTES: u64 = 4 * 1024;
 static CACHE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Longest parse error kept from a corrupt line. A type mismatch quotes the
+/// offending value, so a 64 KB field would otherwise land whole in a warning,
+/// a JSON report, and the listing cache.
+const MAX_BAD_LINE_ERROR: usize = 200;
+
+/// Progress is logged at whichever comes first: this much wall time, or
+/// [`PROGRESS_BYTE_SHARE`] of the file.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_BYTE_SHARE: u64 = 10;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("failed to read {path}: {source}")]
+    // The message must not repeat `{source}`: `thiserror` already chains a
+    // field named `source`, and every caller (anyhow, tracing) prints the
+    // chain — so spelling it here produced "failed to read x: no such file:
+    // no such file".
+    #[error("failed to read {path}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -57,6 +71,78 @@ pub enum LoadError {
     Empty { path: PathBuf },
     #[error("{path}: first line is not a session envelope ({detail})")]
     NoSessionHeader { path: PathBuf, detail: String },
+}
+
+/// `e` plus every source beneath it, joined by `: `.
+///
+/// `tracing`'s `%` fields print `Display` only, which for a `#[source]`-chained
+/// error is just the outer message. Anything that logs a [`LoadError`] rather
+/// than returning it goes through here so the cause survives.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
+}
+
+/// What the loader saw of a recording's unparseable lines.
+///
+/// The count alone cannot answer the question that matters — *was the tail
+/// truncated, or is the middle of the file corrupt?* A killed capture agent
+/// costs the last line; anything else means events are missing from the
+/// interior and every rate over the session is understated.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BadLines {
+    pub count: usize,
+    /// 1-based line numbers, as a text editor counts them.
+    pub first_line: Option<u64>,
+    pub last_line: Option<u64>,
+    /// True when no line parsed *after* the first bad one — the signature of
+    /// a truncated tail rather than interior corruption. Vacuously true when
+    /// there are no bad lines at all.
+    pub tail_only: bool,
+    /// The first parse error, capped at [`MAX_BAD_LINE_ERROR`] characters.
+    pub first_error: Option<String>,
+}
+
+impl BadLines {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Note one unparseable line at 1-based `line_no`.
+    fn record(&mut self, line_no: u64, error: &serde_json::Error) {
+        self.count += 1;
+        self.first_line.get_or_insert(line_no);
+        self.last_line = Some(line_no);
+        if self.first_error.is_none() {
+            let text = error.to_string();
+            self.first_error = Some(match text.char_indices().nth(MAX_BAD_LINE_ERROR) {
+                Some((cut, _)) => format!("{}…", &text[..cut]),
+                None => text,
+            });
+        }
+    }
+
+    /// Called once at the end of a pass: `last_good_line` is the last line
+    /// number that parsed.
+    fn seal(&mut self, last_good_line: u64) {
+        self.tail_only = self.first_line.is_none_or(|first| first > last_good_line);
+    }
+
+    /// The `BAD` column: `-`, `12` for a truncated tail, `12!` when the
+    /// corruption reaches into the body of the recording.
+    pub fn flag(&self) -> String {
+        match (self.count, self.tail_only) {
+            (0, _) => "-".to_string(),
+            (n, true) => n.to_string(),
+            (n, false) => format!("{n}!"),
+        }
+    }
 }
 
 /// Per-batch bookkeeping kept after the events are flattened.
@@ -89,38 +175,77 @@ pub struct LoadedSession {
     /// Sum of `abs_frames_since_last` across batches.
     pub total_abs_frames: u64,
     /// Lines that failed to parse (truncated tail, corruption).
-    pub bad_lines: usize,
+    pub bad_lines: BadLines,
+    /// Bytes read off disk, and how long that took — reported as the `load`
+    /// phase of `--timing`, which is otherwise invisible next to `compute_ms`.
+    pub bytes: u64,
+    pub load_ms: f64,
+}
+
+/// Events per foreground process, batch-attributed.
+///
+/// Keyed by the interned `Arc<str>` the loader already holds — names are
+/// lower-cased at intern time, so this is a pointer-keyed tally rather than
+/// one `to_ascii_lowercase` allocation per batch. [`GameCounts::dominant`]
+/// breaks ties the same way the old `BTreeMap` version did (highest count,
+/// then the name that sorts first).
+pub type GameCounts = HashMap<Arc<str>, usize>;
+
+/// The per-process tally, computed once and shared by every caller that needs
+/// "the game" ([`crate::series::prepare`] stores the result on `Prepared`).
+pub fn game_event_counts(batches: &[BatchMeta]) -> GameCounts {
+    let mut m: GameCounts = HashMap::new();
+    for b in batches {
+        if let Some(g) = &b.game {
+            *m.entry(Arc::clone(g)).or_insert(0) += b.event_count;
+        }
+    }
+    m
+}
+
+/// The process that owned the most events, and its share of all attributed
+/// events. A session where the "game" only covers half the events is really
+/// two sessions.
+pub fn dominant_game(counts: &GameCounts) -> Option<(Arc<str>, f64)> {
+    let total: usize = counts.values().sum();
+    let (name, n) = counts
+        .iter()
+        .max_by(|(a_name, a), (b_name, b)| a.cmp(b).then_with(|| b_name.cmp(a_name)))?;
+    (total > 0).then(|| (Arc::clone(name), *n as f64 / total as f64))
+}
+
+/// Aim-space conversion for `game`, plus whether we had to fall back. The
+/// fallback (`sens 1.0`, Source-style `0.022` coefficients) keeps degree-valued
+/// metrics computable but not comparable across sessions, so it is flagged all
+/// the way out to the report.
+pub fn resolve_aim(config: &SessionConfig, game: Option<&str>) -> (GameSens, bool) {
+    match game.and_then(|g| config.sens_for(g)) {
+        Some(g) => (*g, false),
+        None => (
+            GameSens {
+                sens: 1.0,
+                yaw_coeff: 0.022,
+                pitch_coeff: 0.022,
+            },
+            true,
+        ),
+    }
 }
 
 impl LoadedSession {
     /// Events per foreground process name, batch-attributed.
-    pub fn game_event_counts(&self) -> BTreeMap<String, usize> {
-        let mut m = BTreeMap::new();
-        for b in &self.batches {
-            if let Some(g) = &b.game {
-                *m.entry(g.to_ascii_lowercase()).or_insert(0) += b.event_count;
-            }
-        }
-        m
+    pub fn game_event_counts(&self) -> GameCounts {
+        game_event_counts(&self.batches)
     }
 
     /// The process that owned the most events — the session's "the game".
     pub fn dominant_game(&self) -> Option<String> {
-        self.game_event_counts()
-            .into_iter()
-            .max_by_key(|(name, n)| (*n, std::cmp::Reverse(name.clone())))
-            .map(|(name, _)| name)
+        dominant_game(&self.game_event_counts()).map(|(name, _)| name.to_string())
     }
 
-    /// Dominant process plus its share of all attributed events. A session
-    /// where the "game" only covers half the events is really two sessions.
+    /// Dominant process plus its share of all attributed events.
     pub fn dominant_game_share(&self) -> Option<(String, f64)> {
-        let counts = self.game_event_counts();
-        let total: usize = counts.values().sum();
-        let (name, n) = counts
-            .into_iter()
-            .max_by_key(|(name, n)| (*n, std::cmp::Reverse(name.clone())))?;
-        (total > 0).then(|| (name, n as f64 / total as f64))
+        dominant_game(&self.game_event_counts()).map(|(name, share)| (name.to_string(), share))
     }
 
     /// Distinct `device_ix` values seen in the events.
@@ -132,25 +257,11 @@ impl LoadedSession {
         (0..=255u8).filter(|&i| seen[i as usize]).collect()
     }
 
-    /// Aim-space conversion for the dominant game, plus whether we had to fall
-    /// back. The fallback (`sens 1.0`, Source-style `0.022` coefficients) keeps
-    /// degree-valued metrics computable but not comparable across sessions, so
-    /// it is flagged all the way out to the report.
+    /// Aim-space conversion for the dominant game.
     pub fn resolve_aim(&self) -> (Option<String>, GameSens, bool) {
         let game = self.dominant_game();
-        let sens = game.as_deref().and_then(|g| self.config.sens_for(g));
-        match sens {
-            Some(g) => (game, *g, false),
-            None => (
-                game,
-                GameSens {
-                    sens: 1.0,
-                    yaw_coeff: 0.022,
-                    pitch_coeff: 0.022,
-                },
-                true,
-            ),
-        }
+        let (sens, fallback) = resolve_aim(&self.config, game.as_deref());
+        (game, sens, fallback)
     }
 }
 
@@ -165,7 +276,12 @@ pub struct SessionIndexEntry {
     pub events: u64,
     pub drops: u64,
     pub games: Vec<String>,
-    pub bad_lines: usize,
+    /// Unparseable lines, with enough detail to tell a truncated tail from a
+    /// corrupt interior. Older index caches stored a bare count under the same
+    /// name; they fail to parse and are rebuilt, which is what the cache is
+    /// for.
+    #[serde(default)]
+    pub bad_lines: BadLines,
     /// Sinks that lost envelopes during the run, as `(sink, count)`, from the
     /// `<session_id>.meta.json` sidecar the capture agent writes when it
     /// stops. Empty when nothing was lost — or when there is no sidecar
@@ -191,6 +307,17 @@ impl SessionIndexEntry {
         self
     }
 
+    /// The `EXIT` column: how the run ended, `-` without a sidecar.
+    pub fn exit_text(&self) -> &str {
+        self.exit.as_deref().unwrap_or("-")
+    }
+
+    /// True when the sidecar still says `running`: the agent never wrote a
+    /// final reason, so the recording stops wherever it stopped.
+    pub fn unfinished(&self) -> bool {
+        self.exit.as_deref() == Some(telemouse_core::recordings::ExitReason::Running.as_str())
+    }
+
     /// The `LOSS` column: `-` or `kafka=400,jsonl=2`.
     pub fn losses_text(&self) -> String {
         if self.losses.is_empty() {
@@ -213,20 +340,25 @@ pub fn read_sidecar(recording: &Path) -> Option<SessionMeta> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Timestamp {
-    secs: u64,
-    nanos: u32,
+pub struct Timestamp {
+    pub secs: u64,
+    pub nanos: u32,
 }
 
+/// A recording's identity for cache validation: size, timestamps, and content
+/// samples. Used by the listing cache here and by the per-session report cache
+/// in [`crate::trend`], which needs the same question answered — *is this
+/// cached artifact still about this file?* — and cannot answer it with mtime
+/// alone.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct FileSignature {
-    len: u64,
-    modified: Option<Timestamp>,
-    created: Option<Timestamp>,
+pub struct FileSignature {
+    pub len: u64,
+    pub modified: Option<Timestamp>,
+    pub created: Option<Timestamp>,
     /// FNV-1a over small samples at the front, middle and tail. Size and mtime
     /// are the primary invalidators; this also catches replacement files on
     /// filesystems with coarse timestamp precision.
-    sample_hash: u64,
+    pub sample_hash: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -269,6 +401,11 @@ const MARKER_TAG: &str = "{\"type\":\"marker\"";
 const SESSION_TAG: &str = "{\"type\":\"session\"";
 
 /// Interns process names so a long session holds one copy of each.
+///
+/// Every interned name is lower-cased, so the per-process tally can be keyed
+/// by the `Arc` directly instead of re-lowercasing a name per batch. Both
+/// spellings map to the same `Arc`, so a recording that switches between
+/// `CS2.exe` and `cs2.exe` still costs one allocation and one tally entry.
 #[derive(Default)]
 struct GameInterner(HashMap<String, Arc<str>>);
 
@@ -277,9 +414,87 @@ impl GameInterner {
         if let Some(v) = self.0.get(s) {
             return Arc::clone(v);
         }
-        let v: Arc<str> = Arc::from(s);
+        let lower = s.to_ascii_lowercase();
+        let v = match self.0.get(lower.as_str()) {
+            Some(v) => Arc::clone(v),
+            None => {
+                let v: Arc<str> = Arc::from(lower.as_str());
+                self.0.insert(lower.clone(), Arc::clone(&v));
+                v
+            }
+        };
         self.0.insert(s.to_string(), Arc::clone(&v));
         v
+    }
+}
+
+/// Logs what a long load is doing, so an eight-minute read of a 570 MB
+/// recording is not a silent terminal.
+struct LoadProgress {
+    total: u64,
+    read: u64,
+    started: Instant,
+    last_log: Instant,
+    next_bytes: u64,
+    step: u64,
+}
+
+impl LoadProgress {
+    fn start(path: &Path, total: u64) -> Self {
+        tracing::info!(
+            path = %path.display(),
+            mb = format_args!("{:.1}", total as f64 / (1024.0 * 1024.0)),
+            "loading recording"
+        );
+        let step = (total / PROGRESS_BYTE_SHARE).max(1);
+        let now = Instant::now();
+        Self {
+            total,
+            read: 0,
+            started: now,
+            last_log: now,
+            next_bytes: step,
+            step,
+        }
+    }
+
+    /// One line of `n` bytes consumed.
+    #[inline]
+    fn advance(&mut self, n: usize, events: usize) {
+        self.read += n as u64;
+        if self.read < self.next_bytes {
+            // The clock is only read on the byte milestones: `Instant::now()`
+            // per line would be a syscall-ish cost per event batch.
+            return;
+        }
+        self.next_bytes = self.read + self.step;
+        let now = Instant::now();
+        if now.duration_since(self.last_log) < PROGRESS_INTERVAL && self.read < self.total {
+            return;
+        }
+        self.last_log = now;
+        tracing::info!(
+            pct = format_args!("{:.0}", 100.0 * self.read as f64 / self.total.max(1) as f64),
+            mb = format_args!("{:.1}", self.read as f64 / (1024.0 * 1024.0)),
+            events,
+            elapsed_s = format_args!("{:.1}", now.duration_since(self.started).as_secs_f64()),
+            "loading"
+        );
+    }
+
+    /// Milliseconds the read took, logged with its throughput.
+    fn finish(self, path: &Path, events: usize) -> f64 {
+        let secs = self.started.elapsed().as_secs_f64();
+        let mb = self.read as f64 / (1024.0 * 1024.0);
+        tracing::info!(
+            path = %path.display(),
+            events,
+            mb = format_args!("{mb:.1}"),
+            elapsed_ms = format_args!("{:.1}", secs * 1000.0),
+            mb_per_s = format_args!("{:.1}", if secs > 0.0 { mb / secs } else { 0.0 }),
+            "loaded recording"
+        );
+        secs * 1000.0
     }
 }
 
@@ -292,34 +507,45 @@ fn open(path: &Path) -> Result<(BufReader<File>, u64), LoadError> {
     Ok((BufReader::with_capacity(1 << 20, file), size))
 }
 
-/// Read one line into `buf`, stripping the trailing newline. `Ok(false)` at EOF.
-fn next_line(path: &Path, r: &mut BufReader<File>, buf: &mut String) -> Result<bool, LoadError> {
+/// Read one line into `buf`, stripping the trailing newline. Returns the bytes
+/// consumed *including* the line terminator, so the caller can report progress
+/// against the file length; `Ok(0)` at EOF.
+fn next_line(path: &Path, r: &mut BufReader<File>, buf: &mut String) -> Result<usize, LoadError> {
     buf.clear();
     let n = r.read_line(buf).map_err(|source| LoadError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     if n == 0 {
-        return Ok(false);
+        return Ok(0);
     }
     while buf.ends_with('\n') || buf.ends_with('\r') {
         buf.pop();
     }
-    Ok(true)
+    Ok(n)
 }
 
-/// Parse the session header from the first non-empty line.
+/// Parse the session header from the first non-empty line, and report how many
+/// lines and bytes that consumed so the body's line numbers are the file's.
 fn read_header(
     path: &Path,
     r: &mut BufReader<File>,
     buf: &mut String,
-) -> Result<SessionConfig, LoadError> {
-    while next_line(path, r, buf)? {
+) -> Result<(SessionConfig, u64, u64), LoadError> {
+    let mut lines = 0u64;
+    let mut bytes = 0u64;
+    loop {
+        let n = next_line(path, r, buf)?;
+        if n == 0 {
+            break;
+        }
+        lines += 1;
+        bytes += n as u64;
         if buf.trim().is_empty() {
             continue;
         }
         return match Envelope::from_json(buf) {
-            Ok(Envelope::Session(cfg)) => Ok(cfg),
+            Ok(Envelope::Session(cfg)) => Ok((cfg, lines, bytes)),
             Ok(other) => Err(LoadError::NoSessionHeader {
                 path: path.to_path_buf(),
                 detail: format!("found a {} envelope", envelope_kind(&other)),
@@ -346,24 +572,34 @@ fn envelope_kind(e: &Envelope) -> &'static str {
 /// Load a recording fully into memory.
 pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
     let (mut reader, size) = open(path)?;
+    let mut progress = LoadProgress::start(path, size);
     let mut line = String::with_capacity(64 * 1024);
-    let config = read_header(path, &mut reader, &mut line)?;
+    let (config, mut line_no, header_bytes) = read_header(path, &mut reader, &mut line)?;
+    progress.advance(header_bytes as usize, 0);
 
     let mut events: Vec<RawEvent> = Vec::with_capacity((size / BYTES_PER_EVENT) as usize);
     let mut markers = Vec::new();
     let mut batches: Vec<BatchMeta> = Vec::new();
     let mut total_drops = 0u64;
     let mut total_abs_frames = 0u64;
-    let mut bad_lines = 0usize;
+    let mut bad_lines = BadLines::default();
+    let mut last_good_line = line_no;
     let mut games = GameInterner::default();
 
-    while next_line(path, &mut reader, &mut line)? {
+    loop {
+        let n = next_line(path, &mut reader, &mut line)?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+        progress.advance(n, events.len());
         if line.trim().is_empty() {
             continue;
         }
         if line.starts_with(BATCH_TAG) {
             match serde_json::from_str::<BatchRef>(&line) {
                 Ok(mut b) => {
+                    last_good_line = line_no;
                     total_drops += b.drops_since_last as u64;
                     total_abs_frames += b.abs_frames_since_last as u64;
                     batches.push(BatchMeta {
@@ -378,26 +614,31 @@ pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
                     });
                     events.append(&mut b.events);
                 }
-                Err(_) => bad_lines += 1,
+                Err(e) => bad_lines.record(line_no, &e),
             }
             continue;
         }
         if line.starts_with(MARKER_TAG) {
             match serde_json::from_str::<Marker>(&line) {
-                Ok(m) => markers.push(m),
-                Err(_) => bad_lines += 1,
+                Ok(m) => {
+                    last_good_line = line_no;
+                    markers.push(m);
+                }
+                Err(e) => bad_lines.record(line_no, &e),
             }
             continue;
         }
         // A second session envelope mid-file (topic compaction replay, an
         // appended session) is informational, not fatal.
         if line.starts_with(SESSION_TAG) {
+            last_good_line = line_no;
             continue;
         }
         // Anything whose tag is not where we expect it still gets the general
         // path before being written off as corrupt.
         match Envelope::from_json(&line) {
             Ok(Envelope::Batch(b)) => {
+                last_good_line = line_no;
                 total_drops += b.drops_since_last as u64;
                 total_abs_frames += b.abs_frames_since_last as u64;
                 batches.push(BatchMeta {
@@ -412,11 +653,17 @@ pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
                 });
                 events.extend_from_slice(&b.events);
             }
-            Ok(Envelope::Marker(m)) => markers.push(m),
-            Ok(Envelope::Session(_)) => {}
-            Err(_) => bad_lines += 1,
+            Ok(Envelope::Marker(m)) => {
+                last_good_line = line_no;
+                markers.push(m);
+            }
+            Ok(Envelope::Session(_)) => last_good_line = line_no,
+            Err(e) => bad_lines.record(line_no, &e),
         }
     }
+    bad_lines.seal(last_good_line);
+    warn_bad_lines(path, &bad_lines);
+    let load_ms = progress.finish(path, events.len());
 
     Ok(LoadedSession {
         path: path.to_path_buf(),
@@ -427,31 +674,59 @@ pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
         total_drops,
         total_abs_frames,
         bad_lines,
+        bytes: size,
+        load_ms,
     })
+}
+
+/// One warning per load, with what a person needs to decide whether the
+/// recording is usable: where the damage starts, where it ends, whether it is
+/// only the tail, and what the parser actually said.
+fn warn_bad_lines(path: &Path, bad: &BadLines) {
+    if bad.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        path = %path.display(),
+        lines = bad.count,
+        first_line = bad.first_line.unwrap_or(0),
+        last_line = bad.last_line.unwrap_or(0),
+        tail_only = bad.tail_only,
+        error = bad.first_error.as_deref().unwrap_or(""),
+        "unparseable JSONL lines — events from them are missing from this analysis"
+    );
 }
 
 /// Scan a recording for the listing table without retaining its events.
 pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
     let (mut reader, _) = open(path)?;
     let mut line = String::with_capacity(64 * 1024);
-    let config = read_header(path, &mut reader, &mut line)?;
+    let (config, mut line_no, _) = read_header(path, &mut reader, &mut line)?;
 
     let mut events = 0u64;
     let mut drops = 0u64;
-    let mut bad_lines = 0usize;
+    let mut bad_lines = BadLines::default();
+    let mut last_good_line = line_no;
     let mut first_qpc: Option<u64> = None;
     let mut last_qpc: Option<u64> = None;
     let mut games: BTreeMap<String, usize> = BTreeMap::new();
 
-    while next_line(path, &mut reader, &mut line)? {
+    loop {
+        let n = next_line(path, &mut reader, &mut line)?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
         if line.trim().is_empty() {
             continue;
         }
         if line.starts_with(MARKER_TAG) || line.starts_with(SESSION_TAG) {
+            last_good_line = line_no;
             continue;
         }
         match serde_json::from_str::<BatchRef>(&line) {
             Ok(b) => {
+                last_good_line = line_no;
                 drops += b.drops_since_last as u64;
                 events += b.events.len() as u64;
                 if let Some(g) = &b.game {
@@ -464,9 +739,10 @@ pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
                     last_qpc = Some(e.ts_qpc);
                 }
             }
-            Err(_) => bad_lines += 1,
+            Err(e) => bad_lines.record(line_no, &e),
         }
     }
+    bad_lines.seal(last_good_line);
 
     let duration_s = match (first_qpc, last_qpc) {
         (Some(a), Some(b)) => config.anchor.ticks_to_us(a, b) as f64 / 1e6,
@@ -509,7 +785,11 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, Option<Timestamp>, O
 /// A cheap but change-sensitive recording signature. Sampling three locations
 /// keeps a cache hit O(1) in recording size while guarding against same-size
 /// replacement files whose timestamps were rounded by the filesystem.
-fn file_signature(path: &Path) -> Result<Option<FileSignature>, LoadError> {
+///
+/// `Ok(None)` means the file changed *while* it was being sampled (capture is
+/// still appending): the current read may still be useful, but nothing about
+/// it may be cached.
+pub fn file_signature(path: &Path) -> Result<Option<FileSignature>, LoadError> {
     let mut file = File::open(path).map_err(|source| LoadError::Io {
         path: path.to_path_buf(),
         source,
@@ -682,7 +962,11 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<SessionIndexEntry>, LoadError> {
                 out.push(scanned);
             }
             Err(e) => {
-                tracing::warn!(path = %p.display(), error = %e, "skipping unreadable recording")
+                tracing::warn!(
+                    path = %p.display(),
+                    error = %error_chain(&e),
+                    "skipping unreadable recording"
+                )
             }
         }
     }
@@ -760,7 +1044,11 @@ mod tests {
         assert_eq!(s.batches.len(), 2);
         // Drops accumulate across batches.
         assert_eq!(s.total_drops, 7);
-        assert_eq!(s.bad_lines, 0);
+        assert!(s.bad_lines.is_empty());
+        assert!(s.bad_lines.tail_only, "nothing bad is vacuously tail-only");
+        assert_eq!(s.bad_lines.flag(), "-");
+        assert!(s.bytes > 0);
+        assert!(s.load_ms >= 0.0);
         assert_eq!(s.dominant_game().as_deref(), Some("cs2.exe"));
         let (game, sens, fallback) = s.resolve_aim();
         assert_eq!(game.as_deref(), Some("cs2.exe"));
@@ -813,7 +1101,76 @@ mod tests {
         let path = write_lines(dir.path(), "s-test.jsonl", &lines);
         let s = load_session(&path).unwrap();
         assert_eq!(s.events.len(), 1);
-        assert_eq!(s.bad_lines, 1);
+        assert_eq!(s.bad_lines.count, 1);
+        assert_eq!(s.bad_lines.first_line, Some(3));
+        assert_eq!(s.bad_lines.last_line, Some(3));
+        assert!(s.bad_lines.tail_only, "a killed agent costs the last line");
+        assert!(s.bad_lines.first_error.is_some());
+        assert_eq!(s.bad_lines.flag(), "1");
+    }
+
+    /// Corruption in the *body* of a recording is a different failure from a
+    /// truncated tail: events are missing from the middle of the timeline.
+    #[test]
+    fn interior_corruption_is_distinguished_from_a_truncated_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let good = |seq| {
+            batch_env(
+                &cfg,
+                seq,
+                Some("cs2.exe"),
+                0,
+                vec![ev(cfg.anchor.qpc + seq * FIXTURE_FREQ / 1000, 1, 1, 0)],
+            )
+            .to_json()
+            .unwrap()
+        };
+        let lines = vec![
+            Envelope::Session(cfg.clone()).to_json().unwrap(),
+            good(0),
+            r#"{"type":"batch","session_id":"s-t"#.to_string(), // line 3
+            good(2),                                            // line 4: a good line *after* it
+            r#"{"type":"batch","truncated"#.to_string(),        // line 5
+        ];
+        let path = write_lines(dir.path(), "s-test.jsonl", &lines);
+
+        let s = load_session(&path).unwrap();
+        assert_eq!(s.events.len(), 2);
+        assert_eq!(s.bad_lines.count, 2);
+        assert_eq!(s.bad_lines.first_line, Some(3));
+        assert_eq!(s.bad_lines.last_line, Some(5));
+        assert!(!s.bad_lines.tail_only, "line 4 parsed after line 3 did not");
+        assert_eq!(s.bad_lines.flag(), "2!");
+
+        // The listing scan agrees with the full load.
+        let scanned = scan_session(&path).unwrap();
+        assert_eq!(scanned.bad_lines, s.bad_lines);
+    }
+
+    /// A long parse error is capped before it reaches a warning, the report
+    /// JSON and the listing cache.
+    #[test]
+    fn the_kept_parse_error_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        // A type mismatch, so serde's message quotes the whole 4 KB value.
+        let junk = format!(
+            "{{\"type\":\"batch\",\"seq_no\":\"{}\",\"ts_anchor_us\":0,\"events\":[]}}",
+            "z".repeat(4096)
+        );
+        let path = write_lines(
+            dir.path(),
+            "s-test.jsonl",
+            &[Envelope::Session(cfg).to_json().unwrap(), junk],
+        );
+        let s = load_session(&path).unwrap();
+        let error = s.bad_lines.first_error.unwrap();
+        assert!(
+            error.chars().count() <= MAX_BAD_LINE_ERROR + 1,
+            "{} chars",
+            error.chars().count()
+        );
     }
 
     #[test]
@@ -1141,7 +1498,7 @@ mod tests {
             ],
         );
         let s = load_session(&path).unwrap();
-        assert_eq!(s.bad_lines, 0);
+        assert!(s.bad_lines.is_empty());
         assert_eq!(s.events.len(), 2);
         assert_eq!(s.events[0].wheel_h, -120);
         assert_eq!(s.events[0].device_ix, 2);

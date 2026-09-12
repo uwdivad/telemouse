@@ -345,7 +345,9 @@ mod sys {
     use windows::Wdk::System::Threading::{
         NtQueryInformationProcess, ProcessCommandLineInformation,
     };
-    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, UNICODE_STRING};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, UNICODE_STRING,
+    };
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -489,11 +491,46 @@ mod sys {
         }
     }
 
-    /// Is there a process with this PID right now? (For one that refused
-    /// the limited-query handle.) One snapshot walk, so only used when
-    /// `details` failed — the elevated-process case.
+    /// The Win32 error behind a `windows::core::Error`, undoing the
+    /// `HRESULT_FROM_WIN32` wrapping the crate applies.
+    fn win32_code(e: &windows::core::Error) -> u32 {
+        let c = e.code().0 as u32;
+        if c & 0xFFFF_0000 == 0x8007_0000 {
+            c & 0xFFFF
+        } else {
+            c
+        }
+    }
+
+    /// Is there a process with this PID right now? Asked only when
+    /// `details` failed, which is the elevated-process case.
+    ///
+    /// `OpenProcess` already answers this: *access denied* means a process
+    /// is there and is not ours to query, *invalid parameter* means the PID
+    /// names nothing. Both are a single syscall; the full snapshot walk
+    /// (~7 ms, because the kernel walks every thread to build it) is kept
+    /// only for an error neither of those covers.
     pub fn exists(pid: u32) -> bool {
-        enumerate().iter().any(|e| e.pid == pid)
+        // SAFETY: OpenProcess takes integers and returns a handle we close
+        // immediately; nothing is read from the target.
+        unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) => {
+                    let _ = CloseHandle(h);
+                    true
+                }
+                Err(e) => {
+                    let code = win32_code(&e);
+                    if code == ERROR_ACCESS_DENIED.0 {
+                        true
+                    } else if code == ERROR_INVALID_PARAMETER.0 {
+                        false
+                    } else {
+                        enumerate().iter().any(|e| e.pid == pid)
+                    }
+                }
+            }
+        }
     }
 
     pub fn terminate(pid: u32) -> bool {
@@ -749,6 +786,21 @@ mod tests {
         assert!(!d.exited);
         assert!(sys::exists(me));
         assert!(!sys::exists(u32::MAX - 7));
+        // A process that exists but refuses the query handle still reads as
+        // alive (Windows' System process, PID 4, is the standing example),
+        // and the answer comes from OpenProcess alone.
+        if cfg!(windows) {
+            let t0 = Instant::now();
+            for _ in 0..50 {
+                let _ = sys::exists(me);
+                let _ = sys::exists(u32::MAX - 7);
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "sys::exists must not walk the process table: {:?}",
+                t0.elapsed()
+            );
+        }
         // The whole point of the rewrite: a scan between enumerations is a
         // handful of per-process queries, not a walk of the process table.
         // Generous bounds for CI boxes.

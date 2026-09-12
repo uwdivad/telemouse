@@ -15,23 +15,37 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # One pinned version for CI and every developer (rust-toolchain.toml
-      # is the local source of truth; keep the two in step), so a new
-      # stable's lints cannot turn the gate red on their own.
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml is the single source of truth for the version;
+      # the explicit input keeps the action from ever picking a newer stable
+      # whose lints would turn the gate red on their own.
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: clippy (full, default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
+      # The minimal flavour is what the release zip ships: no logging, no
+      # Kafka, no observability. It must build and pass its tests too.
+      - name: clippy (minimal)
+        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
+      - name: test (full)
         run: cargo test --workspace --locked
+      - name: test (minimal)
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
       # The viz page's script is embedded in the binary; the Rust tests run
       # these when node is present, and this makes the requirement explicit.
       - name: viz page syntax
         run: node --check crates/viz/src/app.js
       - name: viz engine tests
         run: node --test crates/viz/js-tests/engine.test.mjs
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

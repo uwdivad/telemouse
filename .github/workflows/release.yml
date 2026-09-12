@@ -1,9 +1,14 @@
 name: release
 
-# Pushing a `v*` tag builds the four binaries in release mode on Windows,
-# packages them with the sample config and docs, and attaches the zip to a
-# GitHub Release for that tag. Release notes are the matching section of
-# CHANGELOG.md.
+# Pushing a `v*` tag builds two flavours on Windows and attaches both to a
+# GitHub Release for that tag. Release notes are the matching CHANGELOG.md
+# section.
+#
+#   telemouse-vX.Y.Z-windows-x86_64.zip       minimal: capture, viz, control
+#                                             panel; no logging, no Kafka, no
+#                                             observability compiled in
+#   telemouse-vX.Y.Z-windows-x86_64-full.zip  everything: the four binaries
+#                                             with default features
 #
 #   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 
@@ -13,6 +18,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,8 +29,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # Same pinned toolchain as CI and rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml is the single source of truth for the version.
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
@@ -39,27 +46,49 @@ jobs:
       # The same gates as CI: a release is never cut from a tree CI rejects.
       - name: fmt
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: clippy (full)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test
+      - name: clippy (minimal)
+        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
+      - name: Test (full)
         run: cargo test --workspace --locked
+      - name: Test (minimal)
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
 
-      - name: Build
+      - name: Build (full)
         run: cargo build --release --workspace --locked
+      - name: Build (minimal)
+        run: cargo build --release --locked -p telemouse-capture -p telemouse-viz -p telemouse-ctl --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet --target-dir target/minimal
 
       - name: Package
         shell: pwsh
         run: |
-          $name = "telemouse-${{ github.ref_name }}-windows-x86_64"
-          New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $name
-          # The shipped config is the loopback sample, never the repository's
-          # own telemouse.toml (which is the development machine's).
-          Copy-Item telemouse.example.toml "$name/telemouse.toml"
-          Copy-Item README.md, CHANGELOG.md $name
-          Copy-Item docs -Destination "$name/docs" -Recurse
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          Get-FileHash "$name.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $name.zip" } | Set-Content "$name.zip.sha256"
+          $base = "telemouse-${{ github.ref_name }}-windows-x86_64"
+          # What every zip carries: the loopback sample as telemouse.toml
+          # (never the repository's own dev config), the license, the two
+          # user-facing docs, the plan the GUIDE links to, and the demo
+          # recording the README tells people to try first.
+          function Common($dir) {
+            New-Item -ItemType Directory "$dir/docs", "$dir/recordings" | Out-Null
+            Copy-Item telemouse.example.toml "$dir/telemouse.toml"
+            Copy-Item LICENSE, README.md, CHANGELOG.md, mouse-telemetry-plan.md $dir
+            Copy-Item docs/GUIDE.md, docs/CONVENTIONS.md "$dir/docs"
+            Copy-Item recordings/demo-session.jsonl "$dir/recordings"
+          }
+          function Zip($dir) {
+            Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+            Get-FileHash "$dir.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $dir.zip" } | Set-Content "$dir.zip.sha256"
+          }
+          $min = $base
+          New-Item -ItemType Directory $min | Out-Null
+          Copy-Item target/minimal/release/telemouse.exe, target/minimal/release/telemouse-viz.exe, target/minimal/release/telemouse-ctl.exe $min
+          Common $min
+          Zip $min
+          $full = "$base-full"
+          New-Item -ItemType Directory $full | Out-Null
+          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $full
+          Common $full
+          Zip $full
 
       - name: Release notes from CHANGELOG.md
         shell: pwsh
@@ -70,8 +99,17 @@ jobs:
           if (-not $start) { throw "CHANGELOG.md has no '## [$ver]' section" }
           $rest = $lines[$start..($lines.Count - 1)]
           $end = ($rest | Select-String -Pattern '^## \[').LineNumber
-          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          $body = if ($end -gt 1) { $rest[0..($end - 2)] } elseif ($end -eq 1) { @() } else { $rest }
           $body | Set-Content notes.md
+
+      # A signed statement that these exact zips were built by this workflow
+      # from this commit: the trust signal that stands in for a code
+      # signature until the binaries are signed.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            telemouse-${{ github.ref_name }}-windows-x86_64.zip
+            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -80,3 +118,5 @@ jobs:
           files: |
             telemouse-${{ github.ref_name }}-windows-x86_64.zip
             telemouse-${{ github.ref_name }}-windows-x86_64.zip.sha256
+            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip
+            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip.sha256

@@ -1,10 +1,17 @@
 # telemouse configuration — the sample shipped with every release.
 #
-# Copy this file to `telemouse.toml` next to the binaries (the release zip
-# already does) and edit it. Every field is optional; the values below are
-# the defaults, chosen so a fresh install talks to nobody but itself: both
-# servers on loopback, no Kafka. `telemouse-capture doctor` prints the
-# resolved configuration.
+# This is `telemouse.toml` next to the binaries: the release zip ships it
+# under that name, and `telemouse-ctl` writes it there on first start when
+# none exists. Every field is optional; the values below are the defaults,
+# apart from the two example [games] entries — a test in telemouse-core
+# compares this file against them field by field, so it cannot drift. The
+# defaults are chosen so a fresh install talks to nobody but itself: both
+# servers on loopback, no Kafka. Set `mouse_cpi` and your games;
+# `telemouse doctor` prints the resolved configuration.
+#
+# Relative paths (recording.dir, ctl.log_dir, ctl.bin_dir) are resolved
+# against this file's own directory, not the working directory of whatever
+# started the process.
 
 # Your mouse's real CPI (a.k.a. DPI). Used by consumers to derive physical cm.
 mouse_cpi = 1600.0
@@ -14,9 +21,9 @@ mouse_cpi = 1600.0
 # for (~150us of kernel CPU per batch across capture, bridge and each
 # browser). 25 = 40 batches/s for responsive live visualization; use 50 to
 # halve that per-batch CPU cost. Recordings and analysis are unchanged.
-window_ms = 25
+window_ms = 25              # max 1000
 max_events = 448
-ring_capacity = 65536
+ring_capacity = 65536       # max 4194304
 # Raw-input reads are batched: the capture thread wakes on the first report
 # of a burst, then drains the queue every (coalesce_ms + 1) ms on a timer for
 # as long as reports keep coming. 0 = one read per report, exact stamps,
@@ -83,6 +90,8 @@ buffer_ms = 35
 grid = true
 legend = false
 labels = false
+# Seconds without a batch before the overlay says there is no feed; 0 = off.
+stale_secs = 3.0
 
 # Per-game aim conversion: degrees = counts * sens * coeff.
 # Key = lowercase process name of the game (matched automatically).

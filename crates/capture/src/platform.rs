@@ -21,11 +21,13 @@ pub fn basename_lower(path: &str) -> Option<String> {
 #[cfg(windows)]
 mod imp {
     use telemouse_core::session::MonitorInfo;
-    use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT};
+    use windows::Win32::Foundation::{CloseHandle, HMODULE, LPARAM, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
         DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW,
         GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
+    use windows::Win32::System::Console::GetConsoleProcessList;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentThread, OpenProcess, PROCESS_NAME_WIN32,
@@ -34,13 +36,84 @@ mod imp {
         QueryFullProcessImageNameW, SetProcessInformation, SetThreadPriority,
         THREAD_PRIORITY_ABOVE_NORMAL,
     };
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
         SM_CYSCREEN,
     };
-    use windows::core::PWSTR;
+    use windows::core::{PWSTR, s, w};
 
     const MONITORINFOF_PRIMARY: u32 = 1;
+
+    /// Tell Windows this process reads real pixels.
+    ///
+    /// Without it a display-scaled desktop hands back *virtualised*
+    /// coordinates: `SM_CXSCREEN` on a 150%-scaled 2560×1440 monitor reports
+    /// 1707×960, and so do the cursor position and the monitor rectangles.
+    /// Every one of those numbers ends up in the session record and in every
+    /// batch, where a consumer converting counts to screen space would be
+    /// quietly wrong by the scaling factor. Failure is ignored: it means the
+    /// awareness was already set (by a manifest, or by a second call), which
+    /// is the outcome we wanted anyway.
+    pub fn set_dpi_awareness() {
+        // SAFETY: no arguments beyond a well-known constant; the call only
+        // ever changes this process's own DPI mode.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+
+    /// True when this process is the only one attached to its console — i.e.
+    /// the window was opened *for* it, by Explorer or a shortcut, and closes
+    /// with it. Started from a shell, the shell is attached too.
+    pub fn owns_console() -> bool {
+        let mut pids = [0u32; 4];
+        // SAFETY: a plain array; the call reports how many processes fit.
+        unsafe { GetConsoleProcessList(&mut pids) == 1 }
+    }
+
+    /// `OSVERSIONINFOW`, declared here rather than pulled from a metadata
+    /// feature: the one function that reports the truth on Windows 10+ lives
+    /// in ntdll and is resolved by name below.
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        csd_version: [u16; 128],
+    }
+
+    /// `Windows <major>.<minor>.<build>`, e.g. `Windows 10.0.19045`.
+    ///
+    /// `GetVersionExW` has lied since Windows 8.1 unless the executable
+    /// carries a compatibility manifest — it reports 6.2 for everything —
+    /// so the build number, the only part that identifies what the machine
+    /// actually is, comes from `RtlGetVersion`, which is not manifest-gated.
+    pub fn os_version() -> Option<String> {
+        type RtlGetVersion = unsafe extern "system" fn(*mut OsVersionInfoW) -> i32;
+        // SAFETY: ntdll is mapped into every Win32 process, `RtlGetVersion`
+        // has the signature above, and the struct is the documented layout
+        // with its size filled in.
+        unsafe {
+            let ntdll: HMODULE = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+            let proc = GetProcAddress(ntdll, s!("RtlGetVersion"))?;
+            let rtl_get_version =
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, RtlGetVersion>(proc);
+            let mut info: OsVersionInfoW = std::mem::zeroed();
+            info.size = size_of::<OsVersionInfoW>() as u32;
+            if rtl_get_version(&mut info) != 0 {
+                return None;
+            }
+            Some(format!(
+                "Windows {}.{}.{}",
+                info.major, info.minor, info.build
+            ))
+        }
+    }
 
     pub fn qpc() -> u64 {
         let mut v = 0i64;
@@ -263,6 +336,16 @@ mod imp {
 
     pub fn disable_power_throttling() {}
 
+    pub fn set_dpi_awareness() {}
+
+    pub fn owns_console() -> bool {
+        false
+    }
+
+    pub fn os_version() -> Option<String> {
+        None
+    }
+
     pub fn monitors() -> Vec<MonitorInfo> {
         Vec::new()
     }
@@ -301,6 +384,24 @@ pub fn raise_capture_thread_priority() {
 /// Opt the process out of EcoQoS power throttling. No-op off Windows.
 pub fn disable_power_throttling() {
     imp::disable_power_throttling();
+}
+
+/// Declare per-monitor DPI awareness, so screen, monitor and cursor geometry
+/// are real pixels rather than scaled ones. No-op off Windows.
+pub fn set_dpi_awareness() {
+    imp::set_dpi_awareness();
+}
+
+/// True when this process is the only one attached to its console, i.e. the
+/// window will vanish with it. Always false off Windows.
+pub fn owns_console() -> bool {
+    imp::owns_console()
+}
+
+/// The host OS as it goes into the session record, e.g.
+/// `Windows 10.0.19045`. `None` when it cannot be determined.
+pub fn os_version() -> Option<String> {
+    imp::os_version()
 }
 
 pub fn monitors() -> Vec<MonitorInfo> {
@@ -428,6 +529,30 @@ mod tests {
             1,
             "a failed lookup must not be retried every tick"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_itself_with_a_build_number() {
+        let v = os_version().expect("RtlGetVersion is in every Win32 process");
+        assert!(
+            v.starts_with("Windows 10.") || v.starts_with("Windows 11."),
+            "{v}"
+        );
+        // Three dot-separated numbers, the last one the build.
+        let parts: Vec<&str> = v.trim_start_matches("Windows ").split('.').collect();
+        assert_eq!(parts.len(), 3, "{v}");
+        assert!(parts[2].parse::<u32>().unwrap() > 0, "{v}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpi_awareness_and_console_ownership_are_safe_to_ask_about() {
+        // Both are best-effort facts about the process: they must never
+        // panic, and calling twice must be as harmless as calling once.
+        set_dpi_awareness();
+        set_dpi_awareness();
+        let _ = owns_console();
     }
 
     #[cfg(windows)]

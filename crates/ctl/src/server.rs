@@ -27,6 +27,7 @@ use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted};
 use tracing::{info, warn};
 
 use crate::manager::{Manager, StartError, StartRequest, StopError};
+use crate::places::Places;
 use crate::procs::{KillError, Scanner};
 
 /// The single-file browser app. No external assets, no CDN.
@@ -49,6 +50,8 @@ pub struct AppState {
     pub manager: Arc<Manager>,
     pub scanner: Arc<Scanner>,
     pub page: Arc<String>,
+    /// Version, config, logs and docs, as absolute strings the page shows.
+    pub places: Arc<Places>,
 }
 
 /// What the page needs to know at load: links and limits, not secrets.
@@ -56,6 +59,10 @@ pub struct AppState {
 pub struct PageConfig {
     pub viz_http: String,
     pub stop_grace_secs: u64,
+    /// The features this panel was built with (`logging,observability`,
+    /// `minimal`, ...): shown next to the version.
+    pub features: String,
+    pub places: Places,
 }
 
 pub fn render_page(cfg: &PageConfig) -> String {
@@ -138,8 +145,17 @@ fn guard(headers: &HeaderMap) -> Option<Response> {
     }
 }
 
-async fn api_state(State(st): State<AppState>) -> Response {
-    let components = st.manager.snapshot(LOG_LINES).await;
+/// `?log_since=<n>`: only log lines newer than that cursor per component.
+#[derive(Debug, Default, Deserialize)]
+struct StateQuery {
+    log_since: Option<u64>,
+}
+
+async fn api_state(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<StateQuery>,
+) -> Response {
+    let components = st.manager.snapshot_since(LOG_LINES, q.log_since).await;
     // The process table is blocking I/O (and on Windows, a fair amount of it).
     let scanner = st.scanner.clone();
     let processes = tokio::task::spawn_blocking(move || scanner.scan_cached(SCAN_TTL))
@@ -148,6 +164,9 @@ async fn api_state(State(st): State<AppState>) -> Response {
     axum::Json(json!({
         "self_pid": st.scanner.self_pid(),
         "now_unix_s": crate::manager::now_unix(),
+        "version": crate::places::VERSION,
+        "config": st.manager.config_info(),
+        "places": &*st.places,
         "recording": st.manager.recording(),
         "components": components,
         "processes": processes,
@@ -270,6 +289,7 @@ mod tests {
                     config_path: PathBuf::from("telemouse.toml"),
                     recordings_dir: PathBuf::from("recordings"),
                     recording_enabled: true,
+                    config_status: crate::manager::ConfigStatus::Defaults,
                     grace: Duration::from_secs(1),
                     log_dir: None,
                 },
@@ -278,7 +298,14 @@ mod tests {
             page: Arc::new(render_page(&PageConfig {
                 viz_http: "127.0.0.1:7879".into(),
                 stop_grace_secs: 5,
+                features: "test".into(),
+                places: Places {
+                    version: "0.0.0-test".into(),
+                    panel_url: "http://127.0.0.1:7880/".into(),
+                    ..Default::default()
+                },
             })),
+            places: Arc::new(Places::default()),
         }
     }
 
@@ -340,6 +367,11 @@ mod tests {
         let html = render_page(&PageConfig {
             viz_http: "</script><script>alert(1)</script>".into(),
             stop_grace_secs: 1,
+            features: "</script>".into(),
+            places: Places {
+                docs: "</script><script>alert(2)</script>".into(),
+                ..Default::default()
+            },
         });
         assert!(!html.contains("</script><script>alert"));
     }

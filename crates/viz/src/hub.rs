@@ -77,17 +77,28 @@ impl std::fmt::Display for RejectReason {
 
 /// The only fields the bridge itself needs off a datagram. Everything else
 /// rides through untouched.
+///
+/// `session_id` and `seq_no` are here for the seq-gap counter: the page counts
+/// its own gaps over what reached the socket, and comparing the two says
+/// whether an envelope was lost on the wire into this process or on the way
+/// out of it.
 #[derive(Debug, Deserialize)]
 struct TagProbe<'a> {
     #[serde(rename = "type", borrow)]
     kind: Cow<'a, str>,
     #[serde(default)]
     ts_anchor_us: Option<i64>,
+    #[serde(default, borrow)]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(default)]
+    seq_no: Option<i64>,
 }
 
 /// A datagram that passed validation and should be broadcast verbatim.
+/// Borrows the caller's buffer for the identifiers; the payload itself is the
+/// one owned copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Accepted {
+pub struct Accepted<'a> {
     /// The original JSON text (trimmed of surrounding whitespace only),
     /// already in the shared [`Frame`] representation: the one payload copy
     /// per datagram happens here, and every later hop clones the handle.
@@ -97,6 +108,10 @@ pub struct Accepted {
     /// `ts_anchor_us` of a `batch`, for the latency estimator. `None` on
     /// non-batches and on batches from a capture agent that omitted it.
     pub ts_anchor_us: Option<i64>,
+    /// The envelope's session, for the seq-gap counter's reset rule.
+    pub session_id: Option<Cow<'a, str>>,
+    /// The envelope's sequence number, when it carries one.
+    pub seq_no: Option<i64>,
 }
 
 /// Decide whether a raw UDP datagram should be broadcast to WebSocket clients.
@@ -109,7 +124,7 @@ pub struct Accepted {
 /// object is enough. A batch with a field the bridge has never heard of, or
 /// with a field missing, is the page's problem (it defaults everything) and
 /// not a reason to drop telemetry on the floor.
-pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted, RejectReason> {
+pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted<'_>, RejectReason> {
     let text = std::str::from_utf8(bytes).map_err(|_| RejectReason::NotUtf8)?;
     let text = text.trim();
     if text.is_empty() {
@@ -131,7 +146,43 @@ pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted, RejectReason> {
         text: Frame::from(text),
         is_session,
         ts_anchor_us,
+        session_id: probe.session_id,
+        seq_no: probe.seq_no,
     })
+}
+
+/// Seq-gap accounting, mirroring what the page does with the same numbers:
+/// a jump forward in `seq_no` is that many lost envelopes, a number that goes
+/// backwards is a late arrival rather than a new gap, and a different
+/// `session_id` means the capture agent restarted its numbering — so the
+/// sequence starts over instead of reporting the whole old count as lost.
+///
+/// Pure, so the rule is tested without a socket.
+#[cfg(feature = "observability")]
+#[derive(Debug, Default)]
+pub struct SeqTracker {
+    session: Option<String>,
+    last: Option<i64>,
+}
+
+#[cfg(feature = "observability")]
+impl SeqTracker {
+    /// Record one envelope; returns how many were missing before it.
+    pub fn observe(&mut self, session_id: Option<&str>, seq_no: Option<i64>) -> u64 {
+        let Some(seq) = seq_no else { return 0 };
+        if self.session.as_deref() != session_id {
+            self.session = session_id.map(str::to_owned);
+            self.last = None;
+        }
+        let missing = match self.last {
+            Some(last) if seq > last + 1 => (seq - last - 1) as u64,
+            _ => 0,
+        };
+        if self.last.is_none_or(|last| seq > last) {
+            self.last = Some(seq);
+        }
+        missing
+    }
 }
 
 /// Frames to push to a WebSocket client the instant it connects.
@@ -155,6 +206,8 @@ pub const BROADCAST_CAPACITY: usize = 256;
 pub struct Hub {
     tx: broadcast::Sender<Frame>,
     session: Mutex<Option<Frame>>,
+    #[cfg(feature = "observability")]
+    seq: Mutex<SeqTracker>,
     pub stats: Stats,
 }
 
@@ -168,8 +221,17 @@ impl Hub {
         Self {
             tx,
             session: Mutex::new(None),
+            #[cfg(feature = "observability")]
+            seq: Mutex::new(SeqTracker::default()),
             stats: Stats::default(),
         }
+    }
+
+    /// Envelopes sitting in the broadcast channel — the backlog the slowest
+    /// connected client has not drained yet. A depth that keeps climbing is
+    /// the shape of a client about to be dropped for lagging.
+    pub fn queued(&self) -> usize {
+        self.tx.len()
     }
 
     /// Ingest one datagram. Returns `Ok` if it was accepted (and therefore
@@ -185,7 +247,10 @@ impl Hub {
     pub fn publish_at(&self, bytes: &[u8], now_utc_us: i64) -> Result<(), RejectReason> {
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.datagrams.fetch_add(1, Relaxed);
-        self.stats.note_datagram(now_utc_us);
+        if let Some(gap_us) = self.stats.note_datagram(now_utc_us) {
+            // How evenly the agent's batches arrive, independent of how many.
+            self.stats.record_gap(gap_us);
+        }
         match classify_datagram(bytes) {
             Ok(accepted) => {
                 if let Some(anchor) = accepted.ts_anchor_us {
@@ -194,6 +259,18 @@ impl Hub {
                     // (~25ms window) plus the loopback hop.
                     self.stats.record_latency(now_utc_us - anchor);
                 }
+                #[cfg(feature = "observability")]
+                {
+                    let missing = self
+                        .seq
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .observe(accepted.session_id.as_deref(), accepted.seq_no);
+                    if missing > 0 {
+                        self.stats.note_seq_gap(missing);
+                    }
+                }
+                self.stats.note_bytes(accepted.text.len() as u64);
                 // `accepted.text` already is the shared frame — caching and
                 // broadcasting it are refcount bumps, not copies.
                 if accepted.is_session {
@@ -205,6 +282,7 @@ impl Hub {
                 // for a browser that connects later.
                 let _ = self.tx.send(accepted.text);
                 self.stats.forwarded.fetch_add(1, Relaxed);
+                self.stats.note_queue_depth(self.queued() as u64);
                 Ok(())
             }
             Err(reason) => {
@@ -215,12 +293,17 @@ impl Hub {
     }
 
     /// Push a frame the hub generated itself (the periodic `viz_stats` frame)
-    /// to every connected client. Not counted as forwarded telemetry.
+    /// to every connected client. Not counted as forwarded telemetry — and
+    /// with `observability` off there is no such frame to push.
+    #[cfg(feature = "observability")]
     pub fn broadcast(&self, frame: Frame) {
         let _ = self.tx.send(frame);
     }
 
-    /// The cached `session` envelope JSON, if one has been seen.
+    /// The cached `session` envelope JSON, if one has been seen. Maintained
+    /// either way (it is what a late-joining page is sent); only the stats
+    /// payload *reports* whether there is one.
+    #[cfg_attr(not(feature = "observability"), allow(dead_code))]
     pub fn cached_session(&self) -> Option<Frame> {
         self.session
             .lock()
@@ -279,6 +362,7 @@ mod tests {
             monitors: vec![],
             capture_version: "0.1.0".into(),
             coalesce_ms: 0,
+            ..Default::default()
         };
         Envelope::Session(cfg).to_json().unwrap()
     }
@@ -317,11 +401,14 @@ mod tests {
         assert_eq!(a.text, json);
         assert!(!a.is_session);
         assert_eq!(a.ts_anchor_us, Some(1_756_000_000_000_000));
+        assert_eq!(a.session_id.as_deref(), Some("s-1"));
+        assert_eq!(a.seq_no, Some(1));
     }
 
     #[test]
     fn session_datagram_is_flagged() {
-        let a = classify_datagram(session_json().as_bytes()).unwrap();
+        let json = session_json();
+        let a = classify_datagram(json.as_bytes()).unwrap();
         assert!(a.is_session);
         assert_eq!(a.ts_anchor_us, None, "only batches carry a latency anchor");
     }
@@ -454,6 +541,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(feature = "observability")]
     #[test]
     fn publish_feeds_the_latency_estimator_from_batches_only() {
         let hub = Hub::new();
@@ -467,20 +555,81 @@ mod tests {
         hub.publish_at(session_json().as_bytes(), anchor + 999_000)
             .unwrap();
 
-        let lat = hub.stats.latency.snapshot();
+        let lat = hub.stats.latency_snapshot();
         assert_eq!(lat.samples, 3);
         assert_eq!(lat.max_us, 6_000);
         assert_eq!(lat.mean_us, 4_000);
         assert_eq!(lat.negative, 0);
     }
 
+    #[cfg(feature = "observability")]
     #[test]
     fn clock_skew_shows_up_as_negative_samples() {
         let hub = Hub::new();
         let anchor = 1_756_000_000_000_000;
         hub.publish_at(batch_at(anchor).as_bytes(), anchor - 3_000)
             .unwrap();
-        assert_eq!(hub.stats.latency.snapshot().negative, 1);
+        assert_eq!(hub.stats.latency_snapshot().negative, 1);
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn publish_records_gaps_bytes_and_queue_depth() {
+        let hub = Hub::new();
+        let (_frames, _rx) = hub.subscribe();
+        let t0 = 1_756_000_000_000_000;
+        let json = batch_json();
+        hub.publish_at(json.as_bytes(), t0).unwrap();
+        hub.publish_at(json.as_bytes(), t0 + 25_000).unwrap();
+        hub.publish_at(json.as_bytes(), t0 + 75_000).unwrap();
+
+        // The first datagram has no predecessor, so two gaps: 25ms and 50ms.
+        let gaps = hub.stats.gap_snapshot();
+        assert_eq!(gaps.samples, 2);
+        assert_eq!(gaps.max_us, 50_000);
+        assert_eq!(hub.stats.bytes_forwarded(), 3 * json.len() as u64);
+        // Nothing drained the subscriber, so all three are still queued.
+        assert_eq!(hub.queued(), 3);
+        assert_eq!(hub.stats.queue_depth(), 3);
+        assert_eq!(hub.stats.take_queue_depth_max(), 3);
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn publish_counts_seq_gaps_the_way_the_page_does() {
+        let hub = Hub::new();
+        let batch = |seq: u64| {
+            format!(r#"{{"type":"batch","session_id":"s-1","seq_no":{seq},"events":[]}}"#)
+        };
+        for seq in [0, 1, 5, 4, 6] {
+            hub.publish(batch(seq).as_bytes()).unwrap();
+        }
+        assert_eq!(hub.stats.seq_gaps(), 3, "2, 3 and 4 never arrived");
+
+        // A restarted capture agent renumbers from zero; that is not a loss
+        // of every envelope it ever sent.
+        hub.publish(br#"{"type":"session","session_id":"s-2"}"#)
+            .unwrap();
+        hub.publish(br#"{"type":"batch","session_id":"s-2","seq_no":0}"#)
+            .unwrap();
+        assert_eq!(hub.stats.seq_gaps(), 3);
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn the_seq_tracker_resets_per_session_and_ignores_late_arrivals() {
+        let mut t = SeqTracker::default();
+        assert_eq!(t.observe(Some("a"), Some(0)), 0, "the first is never lost");
+        assert_eq!(t.observe(Some("a"), Some(1)), 0);
+        assert_eq!(t.observe(Some("a"), Some(5)), 3);
+        assert_eq!(t.observe(Some("a"), Some(4)), 0, "late, not a new gap");
+        assert_eq!(t.observe(Some("a"), Some(6)), 0);
+        // A new session starts over.
+        assert_eq!(t.observe(Some("b"), Some(0)), 0);
+        assert_eq!(t.observe(Some("b"), Some(2)), 1);
+        // An envelope with no sequence number contributes nothing.
+        assert_eq!(t.observe(Some("b"), None), 0);
+        assert_eq!(t.observe(Some("b"), Some(3)), 0);
     }
 
     #[test]
@@ -530,6 +679,7 @@ mod tests {
         assert_eq!(hub.stats.snapshot().forwarded, 1);
     }
 
+    #[cfg(feature = "observability")]
     #[test]
     fn hub_generated_frames_reach_clients_without_counting_as_telemetry() {
         let hub = Hub::new();

@@ -62,16 +62,11 @@ impl Batcher {
         }
     }
 
-    /// Take the accumulated events, resetting for the next batch.
-    pub fn take(&mut self) -> Vec<RawEvent> {
-        self.first_qpc = None;
-        std::mem::replace(&mut self.events, Vec::with_capacity(self.max_events))
-    }
-
     /// The accumulated events, borrowed. Together with [`Self::reset`] this is
-    /// the zero-realloc flush path: serialize a [`crate::batch::BatchView`]
-    /// over this slice, then `reset()` — the `Vec` and its capacity are never
-    /// surrendered, unlike [`Self::take`].
+    /// the flush path, and the only one: serialize a
+    /// [`crate::batch::BatchView`] over this slice, then `reset()` — the
+    /// `Vec` and its capacity are never surrendered, so a steady-state flush
+    /// allocates nothing.
     pub fn events(&self) -> &[RawEvent] {
         &self.events
     }
@@ -124,21 +119,6 @@ mod tests {
         assert!(!b.should_flush(2));
         b.push(ev(3));
         assert!(b.should_flush(3));
-    }
-
-    #[test]
-    fn take_resets_window_and_contents() {
-        let mut b = Batcher::new(100, 250);
-        b.push(ev(1000));
-        assert!(b.should_flush(2000));
-        let taken = b.take();
-        assert_eq!(taken.len(), 1);
-        assert!(b.is_empty());
-        assert!(!b.should_flush(u64::MAX));
-        // Next batch's window starts from its own first event.
-        b.push(ev(5000));
-        assert!(!b.should_flush(5249));
-        assert!(b.should_flush(5250));
     }
 
     #[test]

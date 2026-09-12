@@ -15,7 +15,7 @@ no in-game overlay.
 
 | Binary | Crate | Role |
 |---|---|---|
-| `telemouse` | `crates/capture` | Capture agent: raw input → 25ms batches → UDP + asynchronous JSONL recording + optional Kafka |
+| `telemouse` | `crates/capture` | Capture agent: raw input → 25ms batches → UDP + asynchronous JSONL recording + optional Kafka (full build) |
 | `telemouse-viz` | `crates/viz` | Live browser visualization + session replay (UDP→WebSocket bridge, single-file page) |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions |
 | `telemouse-ctl` | `crates/ctl` | Control panel: start/stop the others, run the tools, see and kill telemouse processes |
@@ -24,9 +24,33 @@ no in-game overlay.
 ## Quick start
 
 Prebuilt binaries: each [GitHub release](https://github.com/uwdivad/telemouse/releases)
-ships `telemouse-vX.Y.Z-windows-x86_64.zip` (the four executables,
-`telemouse.toml`, docs) with a SHA-256 alongside. Unzip, edit
-`telemouse.toml`, run `telemouse-ctl.exe`. From source:
+ships two zips, each with a SHA-256 alongside:
+
+| Zip | Contents | For |
+|---|---|---|
+| `telemouse-vX.Y.Z-windows-x86_64.zip` | capture agent, live viz, control panel. Built minimal: no log files, no Kafka, no stats reporting compiled in. | playing and watching |
+| `telemouse-vX.Y.Z-windows-x86_64-full.zip` | the four executables with everything enabled: logs, Kafka, the 5-second stats lines, session sidecars, and `telemouse-analyze`. | digging into the data |
+
+Both carry `telemouse.toml` (loopback only, Kafka off), the docs, and a demo
+recording. Needs Windows 10 or later, nothing else: the C runtime is linked
+in, so no Visual C++ Redistributable. Then:
+
+1. Right-click the zip → *Properties* → tick **Unblock** (so Windows does
+   not mark every extracted file as downloaded), and unzip anywhere.
+   To verify the download: `Get-FileHash .\telemouse-*.zip -Algorithm SHA256`
+   in PowerShell against the `.sha256` file.
+2. Run `telemouse-ctl.exe`. The binaries are not code-signed yet, so
+   SmartScreen warns the first time: *More info → Run anyway*. Some
+   antivirus products flag unsigned programs that read raw input; the
+   release page carries a build-provenance attestation you can check.
+3. A tray icon appears, the status window shows the panel's address, and the
+   panel opens at `http://127.0.0.1:7880`. Nothing needs editing first: if
+   no `telemouse.toml` is next to the binaries the panel writes the sample
+   one on first start. Set `mouse_cpi` and your games in it when you get to
+   it, then restart the panel.
+
+The dashboard is tested in Chrome and Edge; the OBS overlay in OBS 28 and
+later (its embedded Chromium). From source:
 
 ```powershell
 # 0. One-time: check your environment (QPC clock, monitors, UDP, Kafka reachability)
@@ -53,10 +77,26 @@ Kafka is on in the repo config and expects the local broker from `compose.yaml`
 carries on without it. A bundled demo recording
 (`recordings/demo-session.jsonl`) lets you try replay and analysis immediately.
 
+Rust users can install straight from the repository (one command per binary;
+the workspace has four binary crates, so `cargo install --git` needs a name):
+
+```powershell
+cargo install --git https://github.com/uwdivad/telemouse telemouse-ctl
+cargo install --git https://github.com/uwdivad/telemouse telemouse-capture
+cargo install --git https://github.com/uwdivad/telemouse telemouse-viz
+cargo install --git https://github.com/uwdivad/telemouse telemouse-analyze
+```
+
+Needs Rust 1.98 or later (the version `rust-toolchain.toml` pins). `telemouse.toml`,
+`logs/` and `recordings/` then live next to `telemouse-ctl.exe` (see
+*What it writes* below).
+
 ## Configuration
 
 [telemouse.example.toml](telemouse.example.toml) is the sample that ships
-with releases (as `telemouse.toml`): every server on loopback, Kafka off.
+with releases (as `telemouse.toml`) and that `telemouse-ctl` writes as
+`telemouse.toml` on first start when none exists: every server on loopback,
+Kafka off.
 The repository's own [telemouse.toml](telemouse.toml) is the development
 machine's config — LAN viz bind, Kafka on, its broker addresses — and is
 what the binaries read when run from this checkout. All fields optional:
@@ -91,10 +131,18 @@ hotkey = "ctrl+alt+r"         # system-wide (tray): (re)start capture as a new s
 sens = 1.0
 yaw_coeff = 0.022             # Source/Quake/Apex: 0.022
 [games."cod.exe"]
-sens = 6.0
+sens = 1.0                    # set to your in-game sensitivity
 yaw_coeff = 0.0066            # modern CoD (and Overwatch): 0.0066; Valorant: 0.07
 pitch_coeff = 0.0066
 ```
+
+Game keys must be the lowercase executable name (`cs2.exe`, not `CS2.exe`);
+the config is refused otherwise, because a key that never matches would
+silently turn every aim metric into a guess. Relative paths in the file
+(`recording.dir`, `ctl.log_dir`, `ctl.bin_dir`) are relative to the file's
+own directory. Every binary looks for `telemouse.toml` in the current
+directory first and next to its own executable second, and refuses to start
+on a file it cannot parse rather than silently running on defaults.
 
 Raw counts stay raw on the wire; cm and degrees are derived in consumers from
 this config — so you can fix a wrong CPI or sens *after* the fact and re-analyze.
@@ -250,9 +298,10 @@ config and still differ:
 | `hudpos` | `bottom-left`, `top-left`, `top-right`, `bottom-right` | `bottom-left` |
 | `scale` | 0.5–4 — stroke, marker and HUD size, for small sources on a 1080p canvas | `1` |
 | `trail` | 0.3–12 s of trail decay | `3` |
-| `buffer` | 10–200 ms live buffer (lower = less latency, more stutter risk) | `55` |
+| `buffer` | 10–200 ms live buffer (lower = less latency, more stutter risk) | `35` |
 | `grid`, `legend`, `labels` | `0`/`1` | `1`, `0`, `0` |
 | `fps` | 5–400 — draw-rate cap; OBS composites at its own rate, so match it | `60` |
+| `stale` | 0–60 s without data before the overlay dims and shows *no feed*; `0` never | `3` |
 
 e.g. an aim-only overlay in a corner: `/obs?layout=aim&hud=aim,cpm&scale=1.6&grid=0`.
 `?obs=1` on the dashboard URL does the same thing. In this mode the page
@@ -463,22 +512,75 @@ source of truth: when the agent stops it writes
 where a sink did not deliver everything, so a broker outage is visible
 afterwards without re-deriving it from the JSONL.
 
+## Build flavours
+
+Logging, Kafka and observability are Cargo features, on by default and
+compiled out of the minimal release zip:
+
+| Feature | Crates | What it adds |
+|---|---|---|
+| `logging` | capture, viz, analyze, ctl | the `tracing` subscriber: stderr (colour only on a terminal, `NO_COLOR` honoured) plus `logs/<component>.log`, size-rotated |
+| `observability` | capture, viz, ctl | the 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the stall flag in `/healthz`, child health on the panel cards and tray |
+| `kafka` | capture | the Kafka sink (`rskafka`, zstd); without it `[kafka] enabled = true` is ignored with a warning |
+| `quiet` | capture, viz, ctl | compiles every `tracing` call out (`release_max_level_off`) |
+
+```powershell
+cargo build --release --workspace                      # everything (what you want on your own machine)
+cargo build --release -p telemouse-capture -p telemouse-viz -p telemouse-ctl `
+  --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet
+                                                        # the minimal zip: tracking and visuals only
+```
+
+The panel starts children with whatever features it was built with; mixing
+flavours works (the wire format is the same), you just get less telemetry.
+
 ## Observability
 
-Everything logs through `tracing` (`RUST_LOG` to adjust, default `info`).
-Every long-running loop emits a structured stats line every 5s — events/s,
-ring drops *and* ring high-water, capture→ship latency p50/p99, per-sink
-errors, idle-vs-broken heartbeat, current game — so a silent data-quality
-problem doesn't exist. Latency is measured at every hop: capture→ship
-histograms in the agent, bridge p50/p99 in `telemouse-viz` (also at
-`/api/stats` and pushed live into the page), and an end-to-end latency tile
-in the browser alongside lag-behind-live and render FPS. `seq_no` gaps
-(transport loss) are tracked separately from ring drops everywhere. Every
-binary installs a panic hook that routes panics through the same log, so a
-thread dying in a tray-launched process is still written to `logs/`. The
-viz's `/healthz` answers 503 with `{"ok":false,"udp_bound":false,...}` while
-its UDP listener is not bound, and reports the seconds since the last
-datagram once it is.
+In the full build everything logs through `tracing` (`RUST_LOG` to adjust,
+default `info`, Kafka client chatter at `warn`). Every binary opens with one
+line naming its version, build profile, the config file it read and whether
+that file existed, and the values that differ from the defaults. Every
+long-running loop emits a structured stats line every 5s — events/s, ring
+drops *and* ring high-water, capture→ship latency percentiles, per-sink
+errors, polling-rate estimate, current game — and anything that stays wrong
+is repeated as a warning once a minute: a sink that is dead or dropping, a
+ring overflow, no input for a minute. Latency is measured on one shared
+250 µs histogram at every hop, so the agent's and the bridge's percentiles
+subtract: capture→ship in the agent (recorded after the send), bridge
+p50/p99 in `telemouse-viz` (also at `/api/stats` and pushed live into the
+page), and an end-to-end latency tile in the browser. `seq_no` gaps
+(transport loss) are counted in the bridge as well as the page, separately
+from ring drops. Every binary installs a panic hook that routes panics
+through the same log, so a thread dying in a tray-launched process is still
+written to `logs/`. The viz's `/healthz` answers 503 with
+`{"ok":false,"udp_bound":false,...}` while its UDP listener is not bound and
+carries `"feed":"live|stalled|never"` once it is. The agent rewrites
+`recordings/<session>.meta.json` every 5 seconds with `"exit":"running"`
+until it stops cleanly, so a session that ended in a crash or a forced
+shutdown is recognisable afterwards; console close, logoff and Windows
+shutdown all stop the agent gracefully.
+
+## What it writes, and how to remove it
+
+Everything lives next to `telemouse-ctl.exe` (or wherever `telemouse.toml`
+points): `telemouse.toml` itself, `recordings/*.jsonl` with a
+`*.meta.json` sidecar each and the analyzer's `.telemouse-analyze-index-v1.json`
+cache, `logs/ctl.log` and `logs/<component>.log` (full build only), and any
+`*.report.json` you asked `telemouse-analyze` to cache. The dashboard keeps
+one `localStorage` entry in your browser for its slider positions. Nothing
+is installed, registered or scheduled: delete the folder and it is gone.
+Recordings are never pruned; they grow at roughly 150 MB per hour of active
+play at 1 kHz. If you added the firewall rule for a second-PC OBS overlay,
+`Remove-NetFirewallRule -DisplayName "telemouse-viz (LAN)"` removes it.
+
+## Reporting problems
+
+Open an [issue](https://github.com/uwdivad/telemouse/issues) with the
+version (shown in the panel's top bar and status window, or `--version`),
+what you ran, and `logs/ctl.log` plus `logs/capture.log` from the full
+build if you have them. `telemouse doctor` prints the resolved config and
+environment checks; note it lists your mouse's device strings and the
+process in the foreground, so trim anything you would rather not post.
 
 ## Development
 
@@ -508,10 +610,19 @@ git push origin master vX.Y.Z
 ```
 
 `release.yml` refuses a tag that does not match the Cargo version, builds and
-tests in release mode, zips the binaries with the config and docs, and publishes
-a GitHub Release whose notes are that changelog section.
+tests both flavours in release mode, zips them with the sample config, the
+license, the user docs and the demo recording, attaches a build-provenance
+attestation, and publishes a GitHub Release whose notes are that changelog
+section.
 
 Win32 code is isolated behind `#[cfg(windows)]`; all metric math, batching,
 clock mapping and wire logic is pure and unit-tested (flick detection is tested
 against synthetic streams with known ground truth). Workspace conventions:
-[docs/CONVENTIONS.md](docs/CONVENTIONS.md).
+[docs/CONVENTIONS.md](docs/CONVENTIONS.md). The `tools/` directory holds
+optional extras (a CPU harness, Kafka-to-Parquet notebooks) that nothing
+else depends on; `mouse-telemetry-plan.md` is the original design document,
+of which storage landed as JSONL rather than TimescaleDB.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

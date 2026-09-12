@@ -11,7 +11,7 @@
 //! are tested wherever `cargo test` runs.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use telemouse_core::hotkey::Hotkey;
@@ -19,6 +19,7 @@ use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
 use crate::manager::{ComponentState, Manager, StartRequest, StopError};
+use crate::places::Places;
 use crate::procs::{ProcInfo, Scanner};
 
 /// Log lines per component in a snapshot: the window shows one log tail.
@@ -28,10 +29,32 @@ pub const TICK: Duration = Duration::from_secs(1);
 /// While the window is hidden only every n-th tick publishes (the tray only
 /// needs to know whether capture is running), and no process scan runs.
 pub const HIDDEN_EVERY: u32 = 5;
+/// Hidden *and* nothing running: the publisher stops ticking altogether and
+/// waits to be told something happened, with this as the longest it will
+/// sleep through. The cadence is what it always was (`TICK * HIDDEN_EVERY`),
+/// but an idle panel now wakes once instead of five times to reach it.
+pub const IDLE_WAIT: Duration = Duration::from_secs(5);
 /// How old a process scan may be and still be shown. The page uses 4 s; the
 /// window refreshes every second, so it gets a fresher one at the same cost
 /// per scan (~100 µs, see `procs.rs`).
 const SCAN_TTL: Duration = Duration::from_secs(2);
+
+/// The hotkey has not been registered yet (or there is none to register).
+pub const HOTKEY_UNKNOWN: u8 = 0;
+/// `RegisterHotKey` succeeded: the chord is ours system-wide.
+pub const HOTKEY_OK: u8 = 1;
+/// `RegisterHotKey` was refused — another program holds the chord.
+pub const HOTKEY_FAILED: u8 = 2;
+
+/// `None` while nothing has been attempted, so the window does not accuse a
+/// hotkey of failing before the UI thread has had a chance to register it.
+pub fn hotkey_registered(status: u8) -> Option<bool> {
+    match status {
+        HOTKEY_OK => Some(true),
+        HOTKEY_FAILED => Some(false),
+        _ => None,
+    }
+}
 
 /// Everything the window and the tray render.
 #[derive(Debug, Clone, Default)]
@@ -46,6 +69,11 @@ pub struct Snapshot {
     /// The new-session hotkey as the user sees it (`Ctrl+Alt+R`); empty
     /// when none is configured.
     pub hotkey: String,
+    /// Whether that chord is actually registered. `None` until the UI
+    /// thread has tried.
+    pub hotkey_registered: Option<bool>,
+    /// Version, panel URL and the absolute paths the menu can open.
+    pub places: Places,
 }
 
 /// What the UI thread holds: the shared handles it reads and pokes.
@@ -60,71 +88,110 @@ pub struct GuiLink {
     pub quit: Arc<Notify>,
     /// Whether the window is on screen — decides the publisher's cadence.
     pub visible: Arc<AtomicBool>,
-    /// `http://…/` of the web panel, for the "Open web panel" item.
-    pub panel_url: String,
+
     /// `[ctl] hotkey`, parsed; the UI thread registers it system-wide.
     pub hotkey: Option<Hotkey>,
+    /// Set by the UI thread once it knows whether the chord is ours.
+    pub hotkey_status: Arc<AtomicU8>,
     /// A [`new_session`] is in flight (stop, then start). A second press
     /// during the stop's grace period is ignored rather than raced.
     pub restarting: Arc<AtomicBool>,
 }
 
+impl GuiLink {
+    /// Stop every managed child with the grace clamped, blocking this
+    /// thread until it is done. Called from the UI thread while Windows
+    /// holds the session open (`WM_QUERYENDSESSION`), which is the one
+    /// place a blocking call there is the correct thing to do: the
+    /// alternative is the children being killed mid-recording.
+    pub fn stop_all_fast_blocking(&self) {
+        let m = self.manager.clone();
+        self.handle.block_on(async move { m.stop_all_fast().await });
+    }
+}
+
+/// Everything [`run_publisher`] needs. A struct rather than nine
+/// positional arguments.
+pub struct Publisher {
+    pub manager: Arc<Manager>,
+    pub scanner: Arc<Scanner>,
+    pub tx: watch::Sender<Arc<Snapshot>>,
+    pub poke: Arc<Notify>,
+    pub visible: Arc<AtomicBool>,
+    pub wake: Arc<dyn Fn() + Send + Sync>,
+    /// `[ctl] hotkey` as the user wrote it; empty when there is none.
+    pub hotkey: String,
+    pub hotkey_status: Arc<AtomicU8>,
+    pub places: Places,
+}
+
 /// Take snapshots forever: every [`TICK`] while visible, every
-/// [`HIDDEN_EVERY`] ticks while hidden, and at once on `poke`. Stops when
-/// the receiver is gone. `hotkey` is copied into every snapshot for the
-/// window text and the menu.
-pub async fn run_publisher(
-    manager: Arc<Manager>,
-    scanner: Arc<Scanner>,
-    tx: watch::Sender<Arc<Snapshot>>,
-    poke: Arc<Notify>,
-    visible: Arc<AtomicBool>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-    hotkey: String,
-) {
+/// [`HIDDEN_EVERY`] ticks while hidden, at once on `poke` — and, when the
+/// window is hidden *and* nothing is running, only when something happens
+/// or [`IDLE_WAIT`] passes. Stops when the receiver is gone.
+pub async fn run_publisher(p: Publisher) {
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut tick: u32 = 0;
+    // Nothing has been observed yet, so start on the normal cadence.
+    let mut idle = false;
     loop {
-        let poked = tokio::select! {
-            _ = interval.tick() => false,
-            _ = poke.notified() => true,
+        let poked = if idle && !p.visible.load(Ordering::Relaxed) {
+            // An idle panel with no window has nothing to recompute. Wait
+            // for a start or a stop (from the tray *or* the web page, which
+            // is why the manager's own notify is in here), for the window
+            // to come back, or for the long fallback.
+            tokio::select! {
+                _ = p.poke.notified() => {}
+                _ = p.manager.work().notified() => {}
+                _ = tokio::time::sleep(IDLE_WAIT) => {}
+            }
+            true
+        } else {
+            tokio::select! {
+                _ = interval.tick() => false,
+                _ = p.poke.notified() => true,
+            }
         };
         tick = tick.wrapping_add(1);
-        let vis = visible.load(Ordering::Relaxed);
+        let vis = p.visible.load(Ordering::Relaxed);
         if !poked && !vis && !tick.is_multiple_of(HIDDEN_EVERY) {
             continue;
         }
-        let rec = manager.recording();
+        let rec = p.manager.recording();
         let (components, processes) = if vis {
-            let components = manager.snapshot(GUI_LOG_LINES).await;
-            let sc = scanner.clone();
+            let components = p.manager.snapshot(GUI_LOG_LINES).await;
+            let sc = p.scanner.clone();
             let processes = tokio::task::spawn_blocking(move || sc.scan_cached(SCAN_TTL))
                 .await
                 .unwrap_or_default();
             (components, processes)
         } else {
-            (manager.snapshot(0).await, Vec::new())
+            (p.manager.snapshot(0).await, Vec::new())
         };
+        idle = !components.iter().any(|c| c.running);
         let snap = Snapshot {
             now_unix_s: crate::manager::now_unix(),
             components,
             processes,
             recording_enabled: rec.enabled,
             recording_dir: rec.dir,
-            hotkey: hotkey.clone(),
+            hotkey: p.hotkey.clone(),
+            hotkey_registered: hotkey_registered(p.hotkey_status.load(Ordering::Relaxed)),
+            places: p.places.clone(),
         };
         debug!(
             visible = vis,
             poked,
+            idle,
             processes = snap.processes.len(),
             "gui snapshot"
         );
-        if tx.send(Arc::new(snap)).is_err() {
+        if p.tx.send(Arc::new(snap)).is_err() {
             debug!("gui snapshot receiver gone; publisher exiting");
             return;
         }
-        wake();
+        (p.wake)();
     }
 }
 
@@ -208,6 +275,7 @@ pub fn stop(link: &GuiLink, id: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::{ConfigStatus, ManagerConfig};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
@@ -215,11 +283,12 @@ mod tests {
     fn manager() -> Arc<Manager> {
         Arc::new(Manager::new(
             crate::manager::COMPONENTS,
-            crate::manager::ManagerConfig {
+            ManagerConfig {
                 bin_dir: Some(std::env::temp_dir().join("telemouse-ctl-gui-no-bins")),
                 config_path: PathBuf::from("telemouse.toml"),
                 recordings_dir: PathBuf::from("recordings"),
                 recording_enabled: true,
+                config_status: ConfigStatus::Defaults,
                 grace: Duration::from_secs(1),
                 log_dir: None,
             },
@@ -238,17 +307,23 @@ mod tests {
         let poke = Arc::new(Notify::new());
         let wakes = Arc::new(AtomicUsize::new(0));
         let w = wakes.clone();
-        let task = tokio::spawn(run_publisher(
-            manager(),
-            Arc::new(Scanner::new()),
+        let task = tokio::spawn(run_publisher(Publisher {
+            manager: manager(),
+            scanner: Arc::new(Scanner::new()),
             tx,
-            poke.clone(),
-            Arc::new(AtomicBool::new(visible)),
-            Arc::new(move || {
+            poke: poke.clone(),
+            visible: Arc::new(AtomicBool::new(visible)),
+            wake: Arc::new(move || {
                 w.fetch_add(1, Ordering::Relaxed);
             }),
-            "Ctrl+Alt+R".into(),
-        ));
+            hotkey: "Ctrl+Alt+R".into(),
+            hotkey_status: Arc::new(AtomicU8::new(HOTKEY_OK)),
+            places: Places {
+                version: "9.9.9".into(),
+                panel_url: "http://127.0.0.1:7880/".into(),
+                ..Default::default()
+            },
+        }));
         Rig {
             rx,
             poke,
@@ -277,6 +352,8 @@ mod tests {
         assert!(s.recording_enabled);
         assert_eq!(s.recording_dir, "recordings");
         assert_eq!(s.hotkey, "Ctrl+Alt+R");
+        assert_eq!(s.hotkey_registered, Some(true));
+        assert_eq!(s.places.version, "9.9.9");
         assert!(r.wakes.load(Ordering::Relaxed) >= 1);
         r.task.abort();
     }
@@ -301,6 +378,32 @@ mod tests {
         r.task.abort();
     }
 
+    /// With the window hidden and nothing running, the publisher parks: it
+    /// must still answer a poke immediately, and must not have spun in the
+    /// meantime.
+    #[tokio::test]
+    async fn a_hidden_idle_publisher_parks_but_still_answers() {
+        let mut r = rig(false);
+        r.poke.notify_one();
+        let _ = next(&mut r.rx).await;
+        let after_first = r.wakes.load(Ordering::Relaxed);
+        // Well under IDLE_WAIT: a parked publisher publishes nothing.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            r.wakes.load(Ordering::Relaxed),
+            after_first,
+            "a parked publisher must not tick"
+        );
+        let t0 = std::time::Instant::now();
+        r.poke.notify_one();
+        let _ = next(&mut r.rx).await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "a poke still wakes it"
+        );
+        r.task.abort();
+    }
+
     #[tokio::test]
     async fn publisher_exits_when_the_receiver_is_dropped() {
         let r = rig(true);
@@ -309,6 +412,13 @@ mod tests {
             .await
             .expect("publisher must stop once nobody listens")
             .unwrap();
+    }
+
+    #[test]
+    fn a_hotkey_is_only_accused_once_it_has_been_tried() {
+        assert_eq!(hotkey_registered(HOTKEY_UNKNOWN), None);
+        assert_eq!(hotkey_registered(HOTKEY_OK), Some(true));
+        assert_eq!(hotkey_registered(HOTKEY_FAILED), Some(false));
     }
 
     fn link(poke: Arc<Notify>) -> GuiLink {
@@ -321,8 +431,8 @@ mod tests {
             poke,
             quit: Arc::new(Notify::new()),
             visible: Arc::new(AtomicBool::new(true)),
-            panel_url: "http://127.0.0.1:7880/".into(),
             hotkey: Hotkey::parse("ctrl+alt+r").unwrap(),
+            hotkey_status: Arc::new(AtomicU8::new(HOTKEY_UNKNOWN)),
             restarting: Arc::new(AtomicBool::new(false)),
         }
     }

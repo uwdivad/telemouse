@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
 use telemouse_analyze::{
     load,
@@ -18,6 +17,20 @@ use telemouse_analyze::{
     timefmt::{format_duration, format_utc_us},
     trend,
 };
+
+/// Install the shared subscriber, when this build has one.
+///
+/// Without the `logging` feature the crate still emits `tracing` events and
+/// nothing subscribes to them — which is what a packaged build wants, and is
+/// the only difference the feature makes.
+fn init_logging() {
+    #[cfg(feature = "logging")]
+    telemouse_core::logging::init(telemouse_core::logging::LogOptions {
+        component: "analyze",
+        log_dir: None,
+        default_filter: "info",
+    });
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -195,13 +208,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    init_logging();
     telemouse_core::panic_hook::install("analyze");
 
     let started = Instant::now();
@@ -298,30 +305,47 @@ fn main() -> Result<()> {
                 println!("no recordings in {}", dir.display());
             } else {
                 println!(
-                    "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:<16}  GAME",
-                    "SESSION", "STARTED (UTC)", "DURATION", "EVENTS", "DROPS", "LOSS"
+                    "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:>5}  {:<16}  {:<12}  GAME",
+                    "SESSION",
+                    "STARTED (UTC)",
+                    "DURATION",
+                    "EVENTS",
+                    "DROPS",
+                    "BAD",
+                    "LOSS",
+                    "EXIT"
                 );
                 for e in &entries {
                     println!(
-                        "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:<16}  {}",
+                        "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:>5}  {:<16}  {:<12}  {}",
                         e.session_id,
                         format_utc_us(e.started_utc_us),
                         format_duration(e.duration_s),
                         e.events,
                         e.drops,
+                        e.bad_lines.flag(),
                         e.losses_text(),
+                        e.exit_text(),
                         e.games.first().map_or("—", |g| g.as_str()),
                     );
                 }
                 let total_events: u64 = entries.iter().map(|e| e.events).sum();
                 let total_drops: u64 = entries.iter().map(|e| e.drops).sum();
                 let lossy = entries.iter().filter(|e| !e.losses.is_empty()).count();
+                let unfinished = entries
+                    .iter()
+                    .filter(|e| e.exit.as_deref() == Some("running"))
+                    .count();
                 println!(
-                    "\n{} session(s), {} events, {} drops, {} with sink losses (LOSS = sink=envelopes not delivered, from the .meta.json sidecar)",
+                    "\n{} session(s), {} events, {} drops, {} with sink losses, {} unfinished\n\
+                     BAD = unparseable JSONL lines (a bare count is a cut-off tail; ! means corruption inside the file); \
+                     LOSS = sink=envelopes not delivered and EXIT = how the run ended, both from the .meta.json sidecar \
+                     (\"running\" = it never stopped cleanly)",
                     entries.len(),
                     total_events,
                     total_drops,
-                    lossy
+                    lossy,
+                    unfinished
                 );
             }
         }

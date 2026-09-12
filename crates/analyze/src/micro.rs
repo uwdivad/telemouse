@@ -412,7 +412,7 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
         .map_or(0.0, |b| b.hz);
 
     let report = MicroReport {
-        corrections_per_segment: Summary::of(&corr_counts),
+        corrections_per_segment: Summary::of_vec(corr_counts),
         total_corrections,
         clean_segment_fraction: if segs.is_empty() {
             0.0
@@ -439,7 +439,7 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
         analyzed_blocks: blocks,
         spectrum_fs_hz: fs_dec,
         micro_adjustments: histogram(p, &amps_counts),
-        segment_amplitude_deg: Summary::of(&amps_deg),
+        segment_amplitude_deg: Summary::of_vec(amps_deg),
     };
     (report, tremor)
 }

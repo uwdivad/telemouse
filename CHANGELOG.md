@@ -6,6 +6,104 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-09-12
+
+Field-audit release: what the tools tell you when something goes wrong, a
+few numbers that were degenerate or inflated, and the last mile to a
+stranger's PC. Logging, Kafka and observability became Cargo features so the
+download can be minimal while the developer build keeps everything.
+
+- **Two release flavours.** `telemouse-vX.Y.Z-windows-x86_64.zip` is now the
+  minimal build (capture, viz, control panel; no log files, no Kafka, no
+  stats reporting compiled in) and `…-full.zip` has the four binaries with
+  every feature. Both carry the loopback sample as `telemouse.toml`, the
+  license, the user docs, and the demo recording the README points at (it
+  was missing from the zip). Internal audit and hand-off notes no longer
+  ship. Release assets carry a build-provenance attestation. CI builds and
+  tests both flavours and runs a dependency advisory scan.
+- **Features.** `logging` (the `tracing` subscriber: stderr, colour only on
+  a terminal and `NO_COLOR` honoured, plus size-rotated `logs/<component>.log`),
+  `observability` (the 5-second stats lines, latency histograms, session
+  sidecars, `/api/stats`, the feed/stall fields of `/healthz`, child health on
+  the panel), `kafka` (capture's sink) and `quiet` (compiles `tracing` calls
+  out). All on by default. `CONVENTIONS.md` says where new code goes.
+- **License and metadata.** MIT `LICENSE`; `license`, `repository`,
+  `description` and `rust-version` on every crate.
+- **Static C runtime.** `.cargo/config.toml` links the MSVC CRT statically,
+  so the executables no longer import `VCRUNTIME140.dll` and run on a
+  Windows install without the Visual C++ Redistributable.
+- **Loss is loud.** Capture repeats a warning once a minute while a sink is
+  dead or dropping, on ring overflow, and when no input arrives for a
+  minute (with a note when it resumes). The panel parses the agent's stats
+  line into the capture card, the tray tooltip and `/api/state`, turns the
+  tray icon amber while something is wrong, and shows the recording's size
+  and the disk's free space.
+- **The sidecar survives a crash.** `recordings/<session>.meta.json` is
+  written on the first stats tick with `"exit":"running"` and rewritten
+  atomically every 5 seconds, so a session that ended in a kill, a reboot
+  or a shutdown is recognisable afterwards. New fields: `capture_profile`,
+  `qpc_freq`, `anchor_uncertainty_us`, `max_anchor_drift_us`, `window_ms`,
+  `coalesce_ms`, `poll_hz`. `telemouse-analyze report` reads it and flags an
+  unfinished run and an event-count mismatch; `list` gains `EXIT` and `BAD`
+  columns.
+- **Shutdown, logoff and console close stop everything gracefully.** Capture
+  and the panel register a console control handler that holds the terminal
+  event until the recording is flushed and the sidecar written; the tray
+  window answers `WM_QUERYENDSESSION` with a shutdown-block reason while the
+  children are stopped with a 3-second grace. Every exit path logs its
+  reason.
+- **Latency percentiles mean something.** Capture and viz share one 250 µs
+  histogram in `telemouse-core` (the log2 one printed a constant 32767 at
+  the default window), capture records after the send, an overflow prints
+  as `>=…`. Capture also reports the mouse's observed polling rate
+  (`poll_hz`, `drains_per_s`), UDP `WouldBlock` drops, a mouse plugged in
+  mid-session (as a marker), and re-sends the session envelope over UDP
+  every 5 seconds so a dashboard opened after capture is calibrated. T1's
+  timer wait is finite and its read errors are counted; a hung shipping or
+  context thread ends the run as `*-thread-stalled` instead of writing
+  mislabelled batches.
+- **Analyzer correctness.** On a grid-truncated session the rate numerators
+  used the whole recording while the denominator was the analyzed span,
+  inflating `events_per_s`, `distance_*_per_min` and `clicks_per_min` by up
+  to 3.3× on day-long recordings; the grid cap now counts stored cells, not
+  span cells. New: polling-rate estimate and stability, cm/360 in the header
+  and `trend`, load timing and progress, bad-line locations, and a note
+  (not a warning) when there is under a second of data.
+- **Viz.** A dashboard pill that says *waiting for capture on udp …* and
+  *no data for N s* instead of a green *live* with nothing behind it; the
+  OBS overlay dims and shows *no feed* after `stale_secs` (`[viz.obs]`,
+  `?stale=` on the URL, default 3 s, 0 = never) and skips drawing while its
+  source is hidden; the two 403 pages explain the remedy (an IP literal, or
+  `/obs`); the bridge counts `seq_no` gaps, bytes, queue depth and
+  inter-arrival jitter, logs WebSocket peers, and `/healthz` reports
+  `feed: live|stalled|never`.
+- **Config.** `telemouse.toml` is looked for in the working directory, then
+  next to the executable, and relative paths in it resolve against the
+  file's directory (a shortcut's working directory no longer scatters
+  `logs/` and `recordings/`). viz and the panel refuse a file that does not
+  parse instead of silently running on defaults. Game keys must be lowercase
+  `.exe` names. Validation errors name the file; a UTF-16 file gets a hint
+  to save as UTF-8; `window_ms` and `ring_capacity` have ceilings. Every
+  binary logs its version, profile, features and config on start.
+- **Control panel.** A taken port is reported (and the running panel
+  opened) instead of a silent exit; the status window shows the panel URL,
+  config path, log folder and version; tray items open the logs and
+  recordings folders, the config file and the docs; the page shows the
+  version, a releases link and the absolute paths; a hotkey another program
+  owns is shown as *not registered*; config edits are picked up; more exit
+  hints (port in use, access denied, invalid config); per-monitor DPI
+  awareness; process-table walks no longer repeat for elevated processes.
+- **Zero-edit first run.** When `telemouse-ctl` finds no `telemouse.toml` it
+  writes the shipped sample there (loopback only, Kafka off) before reading
+  it, so a bare `telemouse-ctl.exe` — the release zip's exes copied
+  anywhere, or a `cargo install` — comes up on the first double-click. An
+  existing file is never touched; tests pin the sample to the compiled
+  defaults and to loopback.
+- **Repository.** Notebook outputs stripped (they published app usage,
+  session times and LAN addresses), `tools/README.md`, `.gitattributes`,
+  the IDE folder untracked, README rewritten for the two flavours with
+  unblock, checksum, install, what-it-writes and reporting sections.
+
 ## [0.1.1] — 2026-09-09
 
 Hardening release from the September production-readiness audit: the

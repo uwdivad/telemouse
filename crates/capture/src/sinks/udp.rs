@@ -45,7 +45,10 @@ impl UdpSink {
 /// not an error" rule is testable without a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
-    /// The local socket buffer is full. Best-effort path: drop it silently.
+    /// The local socket buffer is full. Best-effort path: the datagram is
+    /// dropped rather than blocking the shipping thread — but it is counted,
+    /// because unlike [`Self::Unreachable`] it means a viz *is* listening and
+    /// is missing frames.
     WouldBlock,
     /// Nothing is listening. On a *connected* UDP socket Windows surfaces the
     /// ICMP port-unreachable from a previous datagram as `WSAECONNRESET` on a
@@ -78,15 +81,32 @@ impl Sink for UdpSink {
         }
         match self.socket.send(payload.as_bytes()) {
             Ok(_) => Ok(()),
-            Err(e) => match classify(e.kind()) {
-                SendOutcome::WouldBlock => Ok(()),
-                SendOutcome::Unreachable => {
-                    self.stats.udp_unreachable.fetch_add(1, Ordering::Relaxed);
+            Err(e) => {
+                if account(&self.stats, classify(e.kind())) {
+                    Err(e).context("udp send")
+                } else {
                     Ok(())
                 }
-                SendOutcome::Failed => Err(e).context("udp send"),
-            },
+            }
         }
+    }
+}
+
+/// Put a failed send on the right counter. Returns true when the caller
+/// should report it as a sink error — only a genuine socket failure is one.
+/// Split out from [`UdpSink::send`] so the accounting is testable without
+/// arranging for the OS to fill a socket buffer.
+pub fn account(stats: &Stats, outcome: SendOutcome) -> bool {
+    match outcome {
+        SendOutcome::WouldBlock => {
+            stats.udp_would_block.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        SendOutcome::Unreachable => {
+            stats.udp_unreachable.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        SendOutcome::Failed => true,
     }
 }
 
@@ -139,6 +159,24 @@ mod tests {
         );
         assert_eq!(classify(ErrorKind::WouldBlock), SendOutcome::WouldBlock);
         assert_eq!(classify(ErrorKind::PermissionDenied), SendOutcome::Failed);
+    }
+
+    #[test]
+    fn a_full_socket_buffer_is_counted_but_is_not_an_error() {
+        let stats = Stats::default();
+        assert!(!account(&stats, SendOutcome::WouldBlock));
+        assert!(!account(&stats, SendOutcome::WouldBlock));
+        assert!(!account(&stats, SendOutcome::Unreachable));
+        assert!(
+            account(&stats, SendOutcome::Failed),
+            "a real failure is one"
+        );
+        let snap = stats.snapshot();
+        assert_eq!(snap.udp_would_block, 2);
+        assert_eq!(snap.udp_unreachable, 1);
+        // Nothing here bumps the error counter: that is the caller's job,
+        // and only for `Failed`.
+        assert_eq!(snap.udp_errors, 0);
     }
 
     #[test]

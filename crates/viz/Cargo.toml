@@ -2,16 +2,35 @@
 name = "telemouse-viz"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "telemouse-viz"
 path = "src/main.rs"
 
+# The packaged build is the default. `--no-default-features` is the lean
+# bridge: no subscriber, no stats task, no `/api/stats`, no per-client
+# accounting — just UDP in, WebSocket out, the page, and a minimal `/healthz`.
+[features]
+default = ["logging", "observability"]
+# The process-wide subscriber (`telemouse_core::logging::init`, which is what
+# pulls `tracing-subscriber` in). Without it the binary still emits `tracing`
+# events; nothing is subscribed, so nothing is printed.
+logging = ["telemouse-core/logging"]
+# The 5 s stats line, `/api/stats`, the `viz_stats` push, seq-gap / queue-depth
+# / byte accounting, ws connect-disconnect detail, and the feed fields of
+# `/healthz`. The page renders correctly when the push never arrives.
+observability = []
+# Compile every `tracing` macro below `error` out of a release build.
+quiet = ["tracing/release_max_level_off"]
+
 [dependencies]
 telemouse-core = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 # Explicit features, not "full": this process is one UDP socket, one HTTP
 # listener and a couple of WebSockets — it has no use for process/signal/io-std
 # machinery, and the runtime is pinned to 2 workers in main.rs.

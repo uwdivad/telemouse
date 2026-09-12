@@ -61,7 +61,7 @@ fn full_pipeline_over_a_written_recording() {
     assert!(session.batches.iter().all(|b| b.event_count <= 448));
     assert_eq!(session.total_drops, 0);
     assert_eq!(session.total_abs_frames, 0);
-    assert_eq!(session.bad_lines, 0);
+    assert!(session.bad_lines.is_empty());
     assert_eq!(session.dominant_game().as_deref(), Some("cs2.exe"));
     assert!(session.batches[0].first_event_qpc.is_some());
 

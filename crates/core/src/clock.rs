@@ -18,7 +18,7 @@ pub fn now_utc_us() -> i64 {
 /// anchor per session maps any captured QPC value onto the UTC timeline for
 /// storage and replay. All math is pure integer arithmetic so it is exactly
 /// reproducible in any consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QpcAnchor {
     /// QPC reading at the anchor instant.
     pub qpc: u64,

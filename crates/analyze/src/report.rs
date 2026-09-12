@@ -29,8 +29,11 @@ use crate::stats::Summary;
 use crate::timefmt::{format_duration, format_utc_us};
 use telemouse_core::now_utc_us;
 
-/// Bumped whenever the JSON shape changes incompatibly.
-pub const SCHEMA: &str = "telemouse-analyze/2";
+/// Bumped whenever the JSON shape changes. `/3` added the load timing, the
+/// polling-rate estimate, the sidecar summary, cm/360 and the unparseable-line
+/// detail; every addition is a new field, but a cached `/2` document has none
+/// of them, so it is recomputed rather than deserialized with defaults.
+pub const SCHEMA: &str = "telemouse-analyze/3";
 /// The build that produced a report. Cached reports are recomputed when this
 /// no longer matches.
 pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -67,7 +70,18 @@ pub struct SessionSummary {
     pub pitch_coeff: f64,
     /// `sens * yaw_coeff` — the number every degree metric is scaled by.
     pub deg_per_count: f64,
+    /// Centimetres of mousepad for a 360° turn: the number players actually
+    /// compare sensitivities with. `None` when it cannot be computed (no CPI,
+    /// or a degrees-per-count of zero); uncalibrated when
+    /// `aim_profile_missing`, because it is derived from the same fallback.
+    pub cm_per_360: Option<f64>,
     pub aim_profile_missing: bool,
+}
+
+/// `360 / deg_per_count` counts of travel, converted to centimetres.
+fn cm_per_360(deg_per_count: f64, cpi: f64) -> Option<f64> {
+    (deg_per_count.is_finite() && deg_per_count > 0.0 && cpi.is_finite() && cpi > 0.0)
+        .then(|| 360.0 / deg_per_count / cpi * 2.54)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,6 +93,18 @@ pub struct Report {
     pub generated_utc_us: i64,
     /// Wall-clock cost of [`build`], milliseconds.
     pub compute_ms: f64,
+    /// Wall-clock cost of reading the recording off disk, milliseconds —
+    /// measured by the loader, because on a 570 MB recording it is the larger
+    /// half of the wait and used to be invisible.
+    pub load_ms: f64,
+    /// `load_ms + compute_ms`: what the user actually waited for.
+    pub total_ms: f64,
+    /// Identity of the recording this was computed from, stamped when the
+    /// report is published to a cache directory. [`crate::trend`] refuses a
+    /// cached report whose recording no longer matches this — mtime alone
+    /// cannot tell a restored backup from the file it was computed from.
+    #[serde(default)]
+    pub recording_signature: Option<crate::load::FileSignature>,
     /// Grid geometry the metrics were computed on.
     pub grid_cells: usize,
     /// Cells the sparse grid actually materialized.
@@ -308,6 +334,10 @@ pub fn build(session: LoadedSession, params: Params) -> Report {
 
 fn build_with_parallelism(session: LoadedSession, params: Params, parallel: bool) -> Report {
     let mut t = Phases::new();
+    // The load happened before `build` was called; the loader timed it, and
+    // the timing table is the one place a user compares the two.
+    let load_ms = session.load_ms;
+    t.record("load", load_ms);
     let (p, ms) = timed(|| prepare(session, params));
     t.record("prepare", ms);
     tracing::info!(
@@ -410,11 +440,15 @@ fn build_with_parallelism(session: LoadedSession, params: Params, parallel: bool
         "per-minute aggregates"
     );
 
+    let compute_ms = t.total_ms();
     Report {
         schema: SCHEMA.to_string(),
         analyzer_version: ANALYZER_VERSION.to_string(),
         generated_utc_us: now_utc_us(),
-        compute_ms: t.total_ms(),
+        compute_ms,
+        load_ms,
+        total_ms: load_ms + compute_ms,
+        recording_signature: None,
         grid_cells: p.grid.len(),
         grid_stored_cells: p.grid.stored_cells(),
         grid_dt_us: p.grid_dt_us,
@@ -454,6 +488,7 @@ fn summary(p: &Prepared) -> SessionSummary {
         yaw_coeff: p.aim.yaw_coeff,
         pitch_coeff: p.aim.pitch_coeff,
         deg_per_count: p.aim_scale().0,
+        cm_per_360: cm_per_360(p.aim_scale().0, c.mouse_cpi),
         aim_profile_missing: p.aim_fallback,
     }
 }
@@ -512,6 +547,12 @@ impl Report {
         o.push_str(&format!(
             "  {:<16} {:>9.1} ms\n",
             "build wall", self.compute_ms
+        ));
+        // What the user waited for: the load is not part of build wall, and on
+        // a large recording it is the larger half.
+        o.push_str(&format!(
+            "  {:<16} {:>9.1} ms\n",
+            "load + build", self.total_ms
         ));
         o
     }
@@ -602,7 +643,18 @@ impl Report {
                 }
             ),
         );
-        kv(o, "mouse", &format!("{:.0} CPI", s.mouse_cpi));
+        kv(
+            o,
+            "mouse",
+            &format!(
+                "{:.0} CPI{}",
+                s.mouse_cpi,
+                match s.cm_per_360 {
+                    Some(cm) => format!("   {cm:.1} cm/360°"),
+                    None => String::new(),
+                }
+            ),
+        );
         kv(
             o,
             "events",
@@ -617,10 +669,11 @@ impl Report {
             o,
             "analyzer",
             &format!(
-                "v{}   {} grid cells ({} stored)   {:.0} ms",
+                "v{}   {} grid cells ({} stored)   {:.0} ms load + {:.0} ms compute",
                 self.analyzer_version,
                 commas(self.grid_cells as u64),
                 commas(self.grid_stored_cells as u64),
+                self.load_ms,
                 self.compute_ms
             ),
         );
@@ -633,9 +686,25 @@ impl Report {
             o,
             "inter-event intervals",
             &format!(
-                "{:.1}% ≤1ms   median {:.2}ms   p99 {:.2}ms",
-                q.pct_within_1ms, q.median_interval_ms, q.p99_interval_ms
+                "median {:.2}ms   p99 {:.2}ms   {:.1}% of them ≤1ms",
+                q.median_interval_ms, q.p99_interval_ms, q.pct_within_1ms
             ),
+        );
+        kv(
+            o,
+            "polling rate",
+            &match q.polling.hz {
+                Some(hz) => format!(
+                    "{hz:.0} Hz   {:.0}% steady{}",
+                    q.polling.stability * 100.0,
+                    match (q.polling.hz_min, q.polling.hz_max) {
+                        (Some(lo), Some(hi)) if hi - lo >= 1.0 =>
+                            format!("   per minute {lo:.0}–{hi:.0} Hz"),
+                        _ => String::new(),
+                    }
+                ),
+                None => "—  (nothing moved)".to_string(),
+            },
         );
         kv(
             o,
@@ -653,7 +722,31 @@ impl Report {
             "monotonicity violations",
             &flag(q.monotonicity_violations as u64),
         );
-        kv(o, "unparseable lines", &flag(q.bad_lines as u64));
+        kv(
+            o,
+            "unparseable lines",
+            &format!(
+                "{}{}",
+                flag(q.bad_lines as u64),
+                match (q.bad_lines, q.bad_line_first, q.bad_line_last) {
+                    (0, _, _) => String::new(),
+                    (_, Some(a), Some(b)) => format!(
+                        "   {} {}",
+                        if a == b {
+                            format!("line {a}")
+                        } else {
+                            format!("lines {a}–{b}")
+                        },
+                        if q.bad_lines_tail_only {
+                            "(truncated tail)"
+                        } else {
+                            "(corrupt body)"
+                        }
+                    ),
+                    _ => String::new(),
+                }
+            ),
+        );
         kv(o, "absolute-motion frames", &flag(q.abs_frames));
         kv(
             o,
@@ -706,6 +799,43 @@ impl Report {
                 }
             ),
         );
+        if let Some(s) = &q.sidecar {
+            kv(
+                o,
+                "capture run",
+                &format!(
+                    "exit {}{}   {} build{}",
+                    s.exit,
+                    if s.unfinished {
+                        "   ← unfinished: the run did not stop cleanly"
+                    } else {
+                        ""
+                    },
+                    if s.capture_profile.is_empty() {
+                        "unknown"
+                    } else {
+                        &s.capture_profile
+                    },
+                    match s.poll_hz {
+                        Some(hz) => format!("   mouse reported {hz:.0} Hz"),
+                        None => String::new(),
+                    }
+                ),
+            );
+            kv(
+                o,
+                "events (agent vs file)",
+                &if s.events == q.event_count as u64 {
+                    format!("{}   (match)", commas(s.events))
+                } else {
+                    format!(
+                        "{} vs {}   ← problem",
+                        commas(s.events),
+                        commas(q.event_count as u64)
+                    )
+                },
+            );
+        }
         o.push('\n');
         for b in &q.interval_histogram {
             if b.count == 0 {
@@ -1053,8 +1183,17 @@ impl Report {
 
     fn render_warnings(&self, o: &mut String) {
         section(o, "Notes");
+        for c in self.quality.caveats() {
+            for (i, line) in wrap(&c, WIDTH - 6).into_iter().enumerate() {
+                o.push_str(&format!("  {} {line}\n", if i == 0 { "i" } else { " " }));
+            }
+        }
         if self.warnings.is_empty() {
-            o.push_str("  no data-quality problems detected\n");
+            o.push_str(if self.quality.event_count == 0 {
+                "  no events to judge data quality on\n"
+            } else {
+                "  no data-quality problems detected\n"
+            });
         } else {
             for w in &self.warnings {
                 for (i, line) in wrap(w, WIDTH - 6).into_iter().enumerate() {
@@ -1208,9 +1347,22 @@ mod tests {
             let report = report.as_object_mut().unwrap();
             report.remove("generated_utc_us");
             report.remove("compute_ms");
+            report.remove("total_ms");
             report.remove("timings");
         }
-        assert_eq!(parallel, sequential);
+        // Section by section, so a mismatch names the section instead of
+        // dumping two whole reports.
+        let (p, s) = (
+            parallel.as_object().unwrap(),
+            sequential.as_object().unwrap(),
+        );
+        assert_eq!(p.keys().collect::<Vec<_>>(), s.keys().collect::<Vec<_>>());
+        for (k, pv) in p {
+            assert_eq!(
+                pv, &s[k],
+                "section {k} differs between parallel and sequential"
+            );
+        }
     }
 
     #[test]

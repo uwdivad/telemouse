@@ -2,10 +2,31 @@
 name = "telemouse-capture"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "telemouse"
 path = "src/main.rs"
+
+# What a build pays for. The default is the developer build; a packaged agent
+# that only has to record can drop every one of them.
+#
+# * `logging` installs the `tracing-subscriber` (the macros stay either way —
+#   with no subscriber they compile to a relaxed load and a branch).
+# * `observability` is the 5s report line, the latency histograms' recording,
+#   the polling-rate counters and the `<session>.meta.json` sidecar.
+# * `kafka` is the Kafka sink and, with it, `rskafka` + `tokio`. Without it
+#   `[kafka] enabled = true` warns once and the run continues.
+# * `quiet` compiles every `debug!`/`info!` out of a release build.
+[features]
+default = ["logging", "observability", "kafka"]
+logging = ["telemouse-core/logging"]
+observability = []
+kafka = ["dep:rskafka", "dep:tokio"]
+quiet = ["tracing/release_max_level_off"]
 
 [dependencies]
 telemouse-core = { workspace = true }
@@ -13,19 +34,23 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 rtrb = "0.4.0"
-ctrlc = "3.5.2"
 # Lock-free context snapshot swap: T2 reads the snapshot per flush and must
 # never contend with T3's 4/s publisher.
 arc-swap = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # zstd on the wire: at 1KHz these batches compress hard, and the BatchProducer
-# needs `rt` on tokio for its linger tasks.
-rskafka = { version = "0.6.0", features = ["compression-zstd"] }
-tokio = { version = "1.53.1", features = ["rt", "time", "net", "sync", "macros"] }
+# needs `rt` on tokio for its linger tasks. Both are the Kafka sink's alone.
+rskafka = { version = "0.6.0", features = ["compression-zstd"], optional = true }
+tokio = { version = "1.53.1", features = [
+    "rt",
+    "time",
+    "net",
+    "sync",
+    "macros",
+], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
@@ -36,7 +61,11 @@ windows = { version = "0.62.2", features = [
     # Win32_Security only gates CreateWaitableTimerExW's SECURITY_ATTRIBUTES
     # parameter (the coalesce timer); no actual security API is used.
     "Win32_Security",
+    # GetConsoleProcessList: "was this window opened just for me?".
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

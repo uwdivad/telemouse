@@ -221,8 +221,11 @@ impl DrainStamper {
         }
     }
 
-    /// Current report-interval estimate, in ticks.
-    #[cfg(test)]
+    /// Current report-interval estimate, in ticks. Published per drain as
+    /// `T1Counters::report_interval_us`, which is where the reported polling
+    /// rate comes from: a "1000Hz" mouse actually reporting at 125Hz is the
+    /// explanation for a suspiciously smooth recording.
+    #[cfg_attr(not(feature = "observability"), allow(dead_code))]
     pub fn step(&self) -> u64 {
         self.step
     }
@@ -289,7 +292,7 @@ mod win {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::Sender;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
     use telemouse_core::RawEvent;
@@ -319,10 +322,10 @@ mod win {
 
     use super::{CaptureHandles, Decoded, DrainStamper, RingWaker, decode_mouse};
     use crate::context::SharedContext;
-    use crate::devices::{self, DeviceTable};
+    use crate::devices::{self, DeviceTable, Resolved};
     use crate::platform;
     use crate::shipping::MarkerSignal;
-    use crate::stats::Stats;
+    use crate::stats::{Stats, Throttle};
 
     /// HID usage page 0x01 (generic desktop), usage 0x02 (mouse).
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
@@ -342,6 +345,14 @@ mod win {
     /// report of the next drain has arrived by the time the timer fires and
     /// drains stay the same size as with wake-then-window.
     const CADENCE_SLACK: Duration = Duration::from_millis(1);
+    /// Slack on every waitable-timer wait. The waits are finite rather than
+    /// `INFINITE`: a timer handle the OS has quietly stopped honouring would
+    /// otherwise park T1 forever while the ring fills behind it, which reads
+    /// downstream as "the mouse stopped" and is unrecoverable without a
+    /// restart. A healthy timer never comes near this.
+    const TIMER_WAIT_SLACK: Duration = Duration::from_millis(50);
+    /// A timer wait that keeps failing warns at most this often.
+    const TIMER_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
     /// Which hotkey to register for markers.
     #[derive(Debug, Clone, Copy)]
@@ -393,6 +404,7 @@ mod win {
         events: u64,
         ring_drops: u32,
         abs_frames: u32,
+        raw_read_errors: u32,
     }
 
     /// Ask the capture thread (identified by the HWND it published) to stop.
@@ -526,7 +538,20 @@ mod win {
                     size_of::<RAWINPUTHEADER>() as u32,
                 )
             };
-            if n == 0 || n == u32::MAX {
+            if n == u32::MAX {
+                // An error, not an empty queue: a buffer the API refused (too
+                // small, a bad header size) would otherwise be indistinguishable
+                // from a still mouse and silently drop every report.
+                state.raw_read_errors = state.raw_read_errors.wrapping_add(1);
+                state
+                    .stats
+                    .t1
+                    .raw_read_errors
+                    .store(state.raw_read_errors, Ordering::Relaxed);
+                break;
+            }
+            if n == 0 {
+                // Nothing queued: the hand stopped.
                 break;
             }
             // Walk by `dwSize`: mouse reports are fixed-size, but the buffer
@@ -591,7 +616,20 @@ mod win {
         let buttons = unsafe { mouse.Anonymous.Anonymous };
         // Linear scan over a handful of handles; only a device we have never
         // seen costs an OS query, and only once.
-        let device_ix = devices::index_for(&mut state.devices, raw.header.hDevice.0 as isize);
+        let resolved = devices::resolve_index(&mut state.devices, raw.header.hDevice.0 as isize);
+        if let Resolved::Added(ix) = resolved {
+            // A mouse plugged in mid-session is not in the session record, so
+            // its name goes into the stream as a marker instead — once, on the
+            // first report from it.
+            let name = state.devices.names()[ix as usize].clone();
+            tracing::info!(device_ix = ix, name = %name, "pointing device added");
+            let _ = state.marker_tx.send(MarkerSignal {
+                ts_qpc,
+                label: format!("device_added ix={ix} name={name}"),
+            });
+            state.waker.wake();
+        }
+        let device_ix = resolved.index();
         match decode_mouse(
             mouse.usFlags.0,
             buttons.usButtonFlags,
@@ -735,6 +773,11 @@ mod win {
             .context("create message-only window")?;
             handles.set_hwnd(hwnd.0 as isize);
 
+            // A handle on the counters that does not go through the state the
+            // window procedure owns, so the per-drain publishing below never
+            // aliases the pointer `drain_buffer` is handed.
+            #[cfg(feature = "observability")]
+            let t1_stats = Arc::clone(&stats);
             let mut state = CaptureState {
                 producer,
                 stats,
@@ -746,6 +789,7 @@ mod win {
                 events: 0,
                 ring_drops: 0,
                 abs_frames: 0,
+                raw_read_errors: 0,
             };
             let state_ptr: *mut CaptureState = &mut state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -787,8 +831,20 @@ mod win {
             // reports each at 2ms) as wake-then-window did.
             let cadence = coalesce + CADENCE_SLACK;
             let cadence_ms = cadence.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // Every wait on the timer is bounded by one cadence period plus
+            // slack, so a timer that stops firing costs one late drain rather
+            // than the rest of the session.
+            let timer_wait_ms = (cadence + TIMER_WAIT_SLACK)
+                .as_millis()
+                .clamp(1, u32::MAX as u128 - 1) as u32;
+            let mut timer_warn = Throttle::new(TIMER_WARN_INTERVAL);
+            // `SetWaitableTimer` failing is a one-off fact about this machine,
+            // not a per-drain event: say it once and fall back for good.
+            let mut arm_failure_logged = false;
             let mut raw_buf: Vec<RAWINPUT> = vec![RAWINPUT::default(); RAW_BUFFER_REPORTS];
             let mut msg = MSG::default();
+            #[cfg(feature = "observability")]
+            let mut drains: u64 = 0;
             // True after a drain that returned reports: the stream is live
             // and the next drain is taken on the cadence timer rather than
             // on the queue wait (see the module docs for why that matters).
@@ -801,10 +857,14 @@ mod win {
                     if let Some(timer) = coalesce_timer {
                         // Armed periodic on the first drain of this stream;
                         // every wait here is one cadence period.
-                        waited = WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
-                        if !waited {
+                        waited = WaitForSingleObject(timer, timer_wait_ms) == WAIT_OBJECT_0;
+                        if !waited && let Some(suppressed) = timer_warn.allow(Instant::now()) {
                             let e = windows::core::Error::from_thread();
-                            tracing::warn!(error = %e, "cadence wait failed; sleeping the period");
+                            tracing::warn!(
+                                error = %e,
+                                suppressed,
+                                "cadence wait failed; sleeping the period"
+                            );
                         }
                     }
                     if !waited {
@@ -842,12 +902,29 @@ mod win {
                             // display change) is handled after the drain, at
                             // most one window late.
                             let due = -((coalesce.as_nanos() / 100) as i64);
-                            if SetWaitableTimer(timer, &due, cadence_ms, None, None, false).is_ok()
-                            {
-                                waited = WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
-                                if !waited {
-                                    let e = windows::core::Error::from_thread();
-                                    tracing::warn!(error = %e, "coalesce wait failed; sleeping the window");
+                            match SetWaitableTimer(timer, &due, cadence_ms, None, None, false) {
+                                Ok(()) => {
+                                    waited =
+                                        WaitForSingleObject(timer, timer_wait_ms) == WAIT_OBJECT_0;
+                                    if !waited
+                                        && let Some(suppressed) = timer_warn.allow(Instant::now())
+                                    {
+                                        let e = windows::core::Error::from_thread();
+                                        tracing::warn!(
+                                            error = %e,
+                                            suppressed,
+                                            "coalesce wait failed; sleeping the window"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    if !arm_failure_logged {
+                                        arm_failure_logged = true;
+                                        tracing::warn!(
+                                            error = %e,
+                                            "SetWaitableTimer failed; coalescing falls back to thread::sleep"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -863,6 +940,20 @@ mod win {
                 // count, which needs no estimate).
                 if let Stamping::Anchored { wake } = stamping {
                     stamper.finish(wake.min(now), n);
+                }
+                // Two relaxed stores on T1's own cache line: the estimate the
+                // reported polling rate is derived from, and how many drains
+                // produced it.
+                #[cfg(feature = "observability")]
+                {
+                    let step_us =
+                        (stamper.step() as u128 * 1_000_000 / qpc_freq.max(1) as u128) as u32;
+                    t1_stats
+                        .t1
+                        .report_interval_us
+                        .store(step_us, Ordering::Relaxed);
+                    drains = drains.wrapping_add(1);
+                    t1_stats.t1.drains.store(drains, Ordering::Relaxed);
                 }
                 prev_now = now;
                 let was_live = live;

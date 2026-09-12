@@ -1,0 +1,7 @@
+# Store every text file with LF regardless of the contributor's core.autocrlf,
+# so a Windows checkout without that setting cannot commit CRLF churn.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.jsonl -diff
+*.ipynb -diff

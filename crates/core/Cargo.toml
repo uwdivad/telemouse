@@ -2,17 +2,38 @@
 name = "telemouse-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
+
+# The packaged build is the default: no subscriber, no Kafka, no dashboard.
+# A developer build turns the extras back on per crate; `logging` is the one
+# core owns — it pulls in `tracing-subscriber` and with it `core::logging`.
+[features]
+default = []
+logging = ["dep:tracing-subscriber"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-# Only for the shared panic hook; no subscriber lives here.
+# Only for the shared panic hook; the subscriber lives behind `logging`.
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Console control handler (core::shutdown): the one Win32 API core needs, so
+# every binary can block Windows' teardown until its sinks are closed.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3.27.0"
 
 [[bench]]
 name = "wire"
