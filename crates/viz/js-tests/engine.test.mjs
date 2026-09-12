@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 
 import {
   ANCHOR_QPC,
+  ANCHOR_UTC_US,
   batchEnvelope,
   ev,
   loadApp,
@@ -21,6 +22,78 @@ import {
 } from "./harness.mjs";
 
 const CM_PER_INCH = 2.54;
+
+test("arrival latency stays fixed while event age increases, then becomes idle", () => {
+  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1030, monotonicMs: 1000 };
+  const { telemouse: { engine, ui }, sandbox, elements } = loadApp({ clock });
+  const receive = (env) => ui.ws.onmessage({ data: JSON.stringify(env) });
+  receive(sessionEnvelope());
+  // Events waited 30 and 10 ms, so their mean delivery latency is 20 ms.
+  receive(batchEnvelope(0, [ev(1, 1, 0), ev(1.02, 1, 0)]));
+  const paint = () => sandbox.paintStats(clock.monotonicMs / 1000);
+  paint();
+  assert.equal(elements.get("sLat").textContent, "20.0");
+  assert.equal(elements.get("sAge").textContent, "10.0");
+  assert.equal(sandbox.hudValue("latency", engine), "20.0");
+  clock.utcMs += 2000; clock.monotonicMs += 2000;
+  receive(batchEnvelope(1, []));
+  receive({ type: "marker", ts_qpc: ev(2, 0, 0).ts_qpc, label: "idle marker" });
+  paint();
+  assert.equal(elements.get("sLat").textContent, "20.0");
+  assert.equal(elements.get("sAge").textContent, "2010.0");
+  assert.equal(elements.get("statAge").classList.contains("alert"), false);
+  clock.utcMs += 1000; clock.monotonicMs += 1000;
+  paint();
+  assert.equal(elements.get("sLat").textContent, "idle");
+  assert.equal(elements.get("sLatUnit").textContent, "");
+  assert.equal(elements.get("statLat").classList.contains("warn"), false);
+  assert.equal(sandbox.hudValue("latency", engine), "idle");
+  assert.equal(sandbox.hudValue("eventage", engine), "3010.0");
+  // The first sample after idle starts fresh instead of averaging old data.
+  receive(batchEnvelope(2, [ev(4.025, 1, 0)]));
+  paint();
+  assert.equal(elements.get("sLat").textContent, "5.0");
+  assert.equal(elements.get("sLatUnit").textContent, "ms");
+});
+
+test("timing samples need a live arrival and anchor, reset on restart, and preserve clock skew", () => {
+  const { engine, ui } = fresh();
+  const arrival = ANCHOR_UTC_US / 1000 + 1010;
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), arrival, 1);
+  assert.equal(engine.arrivalLatencyMs, null, "no clock anchor");
+  engine.reset();
+  engine.ingest(sessionEnvelope());
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]));
+  assert.equal(engine.arrivalLatencyMs, null, "no delivery timestamp");
+  ui.mode = "replay";
+  engine.ingest(batchEnvelope(1, [ev(1, 1, 0)]), arrival, 1);
+  assert.equal(engine.arrivalLatencyMs, null, "replay does not measure delivery");
+  ui.mode = "live";
+  engine.ingest(batchEnvelope(2, [ev(1.02, 1, 0)]), arrival, 1);
+  assert.equal(engine.arrivalLatencyMs, -10, "clock skew stays visible");
+  engine.ingest(batchEnvelope(3, [ev(1, 1, 0)]), arrival, 2);
+  assert.equal(engine.arrivalLatencyMs, -5, "smoothing happens on arrival");
+  engine.ingest(sessionEnvelope({ session_id: "new-session" }));
+  assert.equal(engine.arrivalLatencyMs, null);
+  assert.equal(engine.latencyReceivedAt, null);
+  assert.equal(engine.newestUtcUs(), null);
+});
+
+test("replay hides both timing tiles and OBS accepts both readouts", () => {
+  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1010, monotonicMs: 1000 };
+  const { telemouse: { engine, ui, obs }, sandbox, elements } = loadApp({
+    clock, search: "?obs=1&hud=eventage,latency",
+  });
+  assert.deepEqual([...obs.hud], ["eventage", "latency"]);
+  engine.ingest(sessionEnvelope());
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), clock.utcMs, 1);
+  ui.mode = "replay";
+  sandbox.paintStats(1);
+  assert.equal(elements.get("sAge").textContent, "—");
+  assert.equal(elements.get("sLat").textContent, "—");
+  assert.equal(sandbox.hudValue("latency", engine), "—");
+  assert.equal(sandbox.hudValue("eventage", engine), "—");
+});
 
 function fresh(opts) {
   const { telemouse } = loadApp(opts);

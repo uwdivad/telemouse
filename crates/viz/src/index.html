@@ -318,8 +318,10 @@
   <div class="stat"><div class="k">aim distance</div><div class="v"><span id="sDistDeg">0</span> <small>&deg;</small></div></div>
   <div class="stat"><div class="k">clicks / min</div><div class="v"><span id="sCpm">0</span> <small id="sClicks">0 total</small></div></div>
   <div class="stat"><div class="k">events / s</div><div class="v"><span id="sEps">0</span></div></div>
-  <div class="stat" id="statLat" title="End-to-end estimate for the newest event: this browser's wall clock minus the event's capture time (session anchor + event offset). Assumes the capture agent and this browser share a clock — a skewed clock shows up here as a constant offset, so trust the trend, not the absolute value.">
-    <div class="k">latency</div><div class="v"><span id="sLat">—</span> <small>ms</small></div></div>
+  <div class="stat" id="statAge" title="Time since the newest received mouse event was captured. Increases while the mouse is idle; this is normal and does not indicate delivery delay. Requires synchronized capture and browser clocks.">
+    <div class="k">event age</div><div class="v"><span id="sAge">—</span> <small>ms</small></div></div>
+  <div class="stat" id="statLat" title="Capture-to-browser delivery time, sampled when a batch arrives: browser arrival time minus the mean event capture time, smoothed across batches. Includes capture batching and transport, excludes playback buffering and rendering. Shows idle after 3 seconds without a new sample. Requires synchronized clocks; negative values indicate clock skew.">
+    <div class="k">latency</div><div class="v"><span id="sLat">—</span> <small id="sLatUnit"></small></div></div>
   <div class="stat" id="statLag" title="How far the play head trails the newest event received (live buffer plus any backlog still draining).">
     <div class="k">lag</div><div class="v"><span id="sLag">0</span> <small>ms</small></div></div>
   <div class="stat" id="statFps" title="Smoothed animation frame rate against an estimate of this display's refresh rate. Drawing is capped (?fps=, default 120; 30 while this window is not focused) so the dashboard does not compete with a game for the GPU.">

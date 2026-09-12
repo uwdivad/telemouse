@@ -847,8 +847,10 @@ repaint at 10 Hz. The desk panel also draws a cursor "ghost" minimap in
 desktop mode (a live correctness check on integration).
 
 **Stat tiles**: speed cm/s, aim °/s, hand distance m, aim distance °,
-clicks/min, events/s, end-to-end latency (browser wall clock − newest
-`anchor.utc_us`; warn >10 ms, alert >25 ms), lag-behind-live (alert >250 ms),
+clicks/min, events/s, event age (time since the newest received mouse event
+was captured; increases normally while idle), latency (browser arrival time
+minus mean event capture time, smoothed across batches; warn >10 ms, alert
+>25 ms, shows idle after 3 seconds without a sample), lag-behind-live (alert >250 ms),
 FPS, ring drops, lost batches, abs frames, bridge (datagrams/s + p50 from
 `viz_stats`), pointer locked/desktop, CPI/sens, and profile ms with
 `?profile=1` (which wraps tick/draw/stats/ingest in `performance.measure`).
@@ -1131,7 +1133,7 @@ hotkey = "ctrl+alt+r"         # system-wide, needs the tray: stop capture if run
 [viz.obs]                     # defaults for /obs; every one overridable by URL param
 layout = "split"              # split | stack | desk | aim
 background = "transparent"    # or #rrggbb / #rrggbbaa
-hud = ["speed", "aim", "cpm"] # also eps, dist, aimdist, clicks, game, latency
+hud = ["speed", "aim", "cpm"] # also eps, dist, aimdist, clicks, game, latency, eventage
 hud_position = "bottom-left"
 scale = 1.0                   # 0.5–4
 trail_secs = 3.0              # 0.3–12
@@ -1216,10 +1218,12 @@ Kafka: same JSON, topics `mouse.events` (batches), `mouse.sessions`
   the read time. `SessionConfig.coalesce_ms` tells you the precision (8 ms
   default). The audit measured the analyzer's view of a 1 kHz mouse as median
   1.00 ms, p99 1.25 ms with coalescing vs 1.00 / 1.29 ms exact.
-- The viz's end-to-end latency tile is browser wall clock minus the newest
-  batch's `ts_anchor_us` mapped through the anchor, so it depends on the PC's
-  clock being sane; the bridge additionally counts negative samples as clock
-  skew.
+- The viz's latency tile samples browser arrival time minus the batch's mean
+  event capture time, mapped through the session anchor. It includes capture
+  batching and transport, but excludes playback buffering and rendering.
+  Event age separately shows how old the newest received mouse event is.
+  Both require synchronized capture and browser clocks; negative latency
+  indicates clock skew. The bridge also counts negative samples separately.
 - The analyzer works in integer µs since `t0` and flags any non-monotonic
   interval as a `monotonicity_violation`.
 

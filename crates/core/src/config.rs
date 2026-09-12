@@ -228,7 +228,7 @@ impl Default for CtlConfig {
 pub const OBS_LAYOUTS: &[&str] = &["split", "stack", "desk", "aim"];
 /// HUD readouts the OBS page can show, in the order they are listed.
 pub const OBS_HUD_ITEMS: &[&str] = &[
-    "speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency",
+    "speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency", "eventage",
 ];
 pub const OBS_HUD_POSITIONS: &[&str] = &["top-left", "top-right", "bottom-left", "bottom-right"];
 
@@ -820,7 +820,7 @@ mod tests {
             [viz.obs]
             layout = "aim"
             background = "#0e131ccc"
-            hud = ["speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency"]
+            hud = ["speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency", "eventage"]
             hud_position = "top-right"
             scale = 1.5
             trail_secs = 2.0

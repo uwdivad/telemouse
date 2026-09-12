@@ -6,6 +6,13 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+- **Viz timing tiles.** Renamed the former latency readout to **event age**;
+  it naturally increases while the mouse is idle. A separate **latency**
+  tile measures capture-to-browser delivery on batch arrival, averaging
+  event delays within each batch and smoothing across batches. It shows
+  **idle** after 3 seconds without a sample. Both are available in the OBS
+  HUD as `eventage` and `latency`.
+
 ## [0.1.2] — 2026-09-12
 
 Field-audit release: what the tools tell you when something goes wrong, a

@@ -82,7 +82,7 @@ hotkey = "ctrl+alt+r"
 [viz.obs]
 layout = "split"            # split | stack | desk | aim
 background = "transparent"  # or "#rrggbb" / "#rrggbbaa"
-hud = ["speed", "aim", "cpm"]  # also: eps, dist, aimdist, clicks, game, latency; [] hides it
+hud = ["speed", "aim", "cpm"]  # also: eps, dist, aimdist, clicks, game, latency, eventage; [] hides it
 hud_position = "bottom-left"
 scale = 1.0                 # stroke/marker/HUD size multiplier for small sources
 trail_secs = 3.0

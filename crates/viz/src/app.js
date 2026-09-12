@@ -112,6 +112,7 @@ const HUD_ITEMS = {
   clicks:  { k: "clicks" },
   game:    { k: "game", text: true },
   latency: { k: "latency",   unit: "ms" },
+  eventage: { k: "event age", unit: "ms" },
   status:  { k: "feed", text: true },
 };
 
@@ -479,6 +480,9 @@ const engine = {
   /* Seconds of events one live batch covers; floors the live buffer. */
   batchSpan: 0,
   haveTimeline: false,
+  newestEventT: null,
+  arrivalLatencyMs: null,
+  latencyReceivedAt: null,
 
   /* integrator checkpoints, built at load; empty in live mode */
   checkpoints: [],
@@ -555,6 +559,9 @@ const engine = {
     this.tStart = 0; this.tEnd = 0;
     this.batchSpan = 0;
     this.haveTimeline = false;
+    this.newestEventT = null;
+    this.arrivalLatencyMs = null;
+    this.latencyReceivedAt = null;
     this.checkpoints.length = 0;
     this.cpBuilt = 0;
     this._cpNextT = 0;
@@ -629,7 +636,7 @@ const engine = {
   metaAt(i) { return this.metas[this.ev.mi[i] - this.metaBase]; },
 
   /** Feed one wire envelope. Identical path for WebSocket and JSONL. */
-  ingest(env) {
+  ingest(env, receivedUtcMs = null, receivedAt = nowSec()) {
     if (!env || typeof env !== "object") return;
     const type = env.type;
 
@@ -654,7 +661,7 @@ const engine = {
       const anchor = env.anchor || {};
       this.qpcFreq = +(anchor.qpc_freq || env.qpc_freq) || 1e7;
       this.anchorQpc = anchor.qpc !== undefined ? +anchor.qpc : null;
-      /* utc_us is what makes the latency tile possible: it maps event
+      /* utc_us is what makes the timing tiles possible: it maps event
          offsets back onto this browser's wall clock. */
       this.anchorUtcUs = anchor.utc_us !== undefined ? +anchor.utc_us
         : (env.started_utc_us !== undefined ? +env.started_utc_us : null);
@@ -715,12 +722,14 @@ const engine = {
       this.metas.push(meta);
 
       const cols = this.ev;
-      let tFirst = 0, tLast = 0;
+      let tFirst = 0, tLast = 0, tSum = 0;
       for (let i = 0; i < evs.length; i++) {
         const e = evs[i];
         const t = this.qpcToT(e.ts_qpc);
         if (i === 0) tFirst = t;
         tLast = t;
+        tSum += t;
+        this.newestEventT = this.newestEventT === null ? t : Math.max(this.newestEventT, t);
         /* `| 0` is doing real work here: buttons/wheel/wheel_h are omitted
            from the JSON when zero, so these are routinely undefined. */
         cols.push(t, e.dx | 0, e.dy | 0, e.buttons | 0, e.wheel | 0, e.wheel_h | 0, mi);
@@ -732,6 +741,17 @@ const engine = {
          so a quiet feed does not pin the floor at a stale value. */
       const span = Math.max(0, tLast - tFirst);
       this.batchSpan = Math.max(span, this.batchSpan * 0.9);
+      /* Sample once at delivery, before playback or paint. Averaging the
+         event capture times includes the wait inside the capture batch.
+         Replay has no arrival timestamp and must never produce a sample. */
+      if (ui.mode === "live" && receivedUtcMs !== null && this.anchorUtcUs !== null) {
+        const ms = receivedUtcMs - (this.anchorUtcUs / 1000 + tSum / evs.length * 1000);
+        if (Number.isFinite(ms)) {
+          const idle = this.latencyReceivedAt === null || receivedAt - this.latencyReceivedAt >= NO_DATA_SECS;
+          this.arrivalLatencyMs = idle ? ms : this.arrivalLatencyMs + (ms - this.arrivalLatencyMs) * 0.25;
+          this.latencyReceivedAt = receivedAt;
+        }
+      }
     }
 
     if (drops > 0 || lost > 0) {
@@ -796,8 +816,8 @@ const engine = {
   /** UTC µs the newest received event was captured at, or null if the
       session anchor is unknown. */
   newestUtcUs() {
-    if (this.anchorUtcUs === null || !this.haveTimeline) return null;
-    return this.anchorUtcUs + this.tEnd * 1e6;
+    if (this.anchorUtcUs === null || this.newestEventT === null) return null;
+    return this.anchorUtcUs + this.newestEventT * 1e6;
   },
 
   /* ---------------- checkpoints ---------------- */
@@ -1696,12 +1716,13 @@ const ui = {
       this.refreshConn();
     };
     ws.onmessage = (m) => {
+      const receivedUtcMs = Date.now(), receivedAt = nowSec();
       let env;
       try { env = JSON.parse(m.data); } catch (e) {
         this.noteBad("ws parse", e && e.message);
         return;
       }
-      ingest(env);
+      ingest(env, receivedUtcMs, receivedAt);
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
@@ -2095,10 +2116,10 @@ function profileRoll(now) {
 }
 
 /** The single ingest entry point, so profiling wraps both sources. */
-function ingest(env) {
-  if (!PROFILE) { engine.ingest(env); return; }
+function ingest(env, receivedUtcMs = null, receivedAt = nowSec()) {
+  if (!PROFILE) { engine.ingest(env, receivedUtcMs, receivedAt); return; }
   performance.mark("ig0");
-  engine.ingest(env);
+  engine.ingest(env, receivedUtcMs, receivedAt);
   performance.mark("ig1");
   measure("ingest", "ig0", "ig1", "ingest");
 }
@@ -2110,7 +2131,6 @@ function ingest(env) {
 let lastStatsPaint = 0;
 let fpsEma = 60;
 let refreshEst = 60;
-let latEma = null;
 
 /* Every element the stats bar writes, looked up once. This runs ten times a
    second over ~25 ids; getElementById is cheap but not free, and the lookups
@@ -2118,7 +2138,7 @@ let latEma = null;
 const SE = {};
 for (const id of [
   "sSpeedCm", "sSpeedDeg", "sDistM", "sDistDeg", "sCpm", "sClicks", "sEps",
-  "sLat", "statLat", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
+  "sLat", "sLatUnit", "statLat", "sAge", "statAge", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
   "sDrops", "statDrops", "sLost", "statLost", "sAbs", "statAbs",
   "sBad", "statBad", "statBridge", "sBridge", "sBridgeSub",
   "sLocked", "sCpi", "gameText", "sProf",
@@ -2150,24 +2170,19 @@ function paintStats(now) {
   setText(SE.sClicks, e.totalClicks + " total");
   setText(SE.sEps, Math.round(e.eventRate.perSecond(e.playT)).toLocaleString());
 
-  /* Latency and lag are both about keeping up with a live feed. In replay
-     the "newest event" is hours old and the play head is wherever you put
-     it, so both would read as a permanent alarm; show them as N/A instead. */
+  /* Event age keeps increasing during normal inactivity. Delivery latency
+     only changes on arrival; old samples become idle. Neither is a replay metric. */
   const live = ui.mode === "live";
   const capturedUs = live ? e.newestUtcUs() : null;
-  if (capturedUs === null) {
-    latEma = null;
-    setText(SE.sLat, "—");
-    SE.statLat.classList.remove("alert", "warn");
-    SE.statLat.classList.toggle("dim", !live);
-  } else {
-    SE.statLat.classList.remove("dim");
-    const ms = (Date.now() * 1000 - capturedUs) / 1000;
-    latEma = latEma === null ? ms : latEma + (ms - latEma) * 0.25;
-    setText(SE.sLat, latEma.toFixed(1));
-    SE.statLat.classList.toggle("alert", latEma > 25);
-    SE.statLat.classList.toggle("warn", latEma > 10 && latEma <= 25);
-  }
+  setText(SE.sAge, capturedUs === null ? "—" : ((Date.now() * 1000 - capturedUs) / 1000).toFixed(1));
+  SE.statAge.classList.toggle("dim", !live);
+  const latency = latencyValue(e, now);
+  const measured = latency !== "—" && latency !== "idle";
+  setText(SE.sLat, latency);
+  setText(SE.sLatUnit, measured ? "ms" : "");
+  SE.statLat.classList.toggle("dim", !measured);
+  SE.statLat.classList.toggle("alert", measured && e.arrivalLatencyMs > 25);
+  SE.statLat.classList.toggle("warn", measured && e.arrivalLatencyMs > 10 && e.arrivalLatencyMs <= 25);
 
   if (!live) {
     setText(SE.sLag, "—");
@@ -2357,15 +2372,17 @@ function buildHud() {
     const val = document.createElement("span");
     val.textContent = "—";
     v.appendChild(val);
+    let unit = null;
     if (spec.unit) {
       const u = document.createElement("small");
       u.textContent = spec.unit;
       v.appendChild(u);
+      unit = u;
     }
     item.appendChild(k);
     item.appendChild(v);
     box.appendChild(item);
-    hud.items.push({ key: key, el: val, last: "—" });
+    hud.items.push({ key: key, el: val, unit: unit, last: "—" });
   }
 }
 
@@ -2373,6 +2390,12 @@ function buildHud() {
    constructs a fresh Intl formatter per call, and hudValue runs at 10Hz.
    Same locale, same default options — output is identical. */
 const hudIntFmt = new Intl.NumberFormat();
+
+function latencyValue(e, now = nowSec()) {
+  if (ui.mode !== "live" || e.arrivalLatencyMs === null) return "—";
+  if (now - e.latencyReceivedAt >= NO_DATA_SECS) return "idle";
+  return e.arrivalLatencyMs.toFixed(1);
+}
 
 function hudValue(key, e) {
   switch (key) {
@@ -2384,12 +2407,10 @@ function hudValue(key, e) {
     case "aimdist": return hudIntFmt.format(Math.round(e.totalDeg));
     case "clicks": return hudIntFmt.format(e.totalClicks);
     case "game": return e.game ? e.game.replace(/\.exe$/i, "") : "—";
-    case "latency": {
+    case "latency": return latencyValue(e);
+    case "eventage": {
       const us = ui.mode === "live" ? e.newestUtcUs() : null;
-      if (us === null) { latEma = null; return "—"; }
-      const ms = (Date.now() * 1000 - us) / 1000;
-      latEma = latEma === null ? ms : latEma + (ms - latEma) * 0.25;
-      return latEma.toFixed(1);
+      return us === null ? "—" : ((Date.now() * 1000 - us) / 1000).toFixed(1);
     }
     case "status":
       return staleView.on ? "no feed (" + Math.round(staleView.age) + "s)" : "live";
@@ -2402,6 +2423,7 @@ function paintHud() {
   for (const it of hud.items) {
     const v = hudValue(it.key, e);
     if (v !== it.last) { it.last = v; it.el.textContent = v; }
+    if (it.key === "latency" && it.unit) setText(it.unit, v === "idle" || v === "—" ? "" : "ms");
   }
   /* The panel hints are only visible with labels on; paintStats normally
      keeps them current, and this is its stand-in. */

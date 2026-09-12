@@ -294,7 +294,7 @@ config and still differ:
 |---|---|---|
 | `layout` | `split` (desk ǀ aim), `stack`, `desk`, `aim` — `view=desk\|aim\|both` is accepted as an alias | `split` |
 | `bg` | `transparent`, `rrggbb`, `rrggbbaa` (e.g. `0e131c80` = half-opaque panel) | `transparent` |
-| `hud` | comma list of `speed, aim, cpm, eps, dist, aimdist, clicks, game, latency`; empty hides it | `speed,aim,cpm` |
+| `hud` | comma list of `speed, aim, cpm, eps, dist, aimdist, clicks, game, latency, eventage`; empty hides it | `speed,aim,cpm` |
 | `hudpos` | `bottom-left`, `top-left`, `top-right`, `bottom-right` | `bottom-left` |
 | `scale` | 0.5–4 — stroke, marker and HUD size, for small sources on a 1080p canvas | `1` |
 | `trail` | 0.3–12 s of trail decay | `3` |

@@ -88,7 +88,7 @@ class WebSocket {
  * `config` is what the server injects as window.TELEMOUSE_CONFIG.
  * Returns { telemouse, sandbox } — `telemouse` is the page's devtools handle.
  */
-export function loadApp({ search = "", config = {} } = {}) {
+export function loadApp({ search = "", config = {}, clock = null } = {}) {
   const elements = new Map();
   const document = {
     getElementById(id) {
@@ -127,6 +127,10 @@ export function loadApp({ search = "", config = {} } = {}) {
     clearTimeout() {},
   };
   sandbox.window = sandbox;
+  if (clock) {
+    sandbox.Date = class extends Date { static now() { return clock.utcMs; } };
+    sandbox.performance = { now: () => clock.monotonicMs };
+  }
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(APP_JS, sandbox, { filename: "app.js" });
