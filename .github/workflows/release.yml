@@ -98,7 +98,7 @@ jobs:
           $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($ver))\]").LineNumber
           if (-not $start) { throw "CHANGELOG.md has no '## [$ver]' section" }
           $rest = $lines[$start..($lines.Count - 1)]
-          $end = ($rest | Select-String -Pattern '^## \[').LineNumber
+          $end = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1).LineNumber
           $body = if ($end -gt 1) { $rest[0..($end - 2)] } elseif ($end -eq 1) { @() } else { $rest }
           $body | Set-Content notes.md
 
