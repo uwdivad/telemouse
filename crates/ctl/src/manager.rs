@@ -486,7 +486,9 @@ impl LogRing {
             .iter()
             .rev()
             .find(|l| !l.trim().is_empty() && !l.starts_with("--- "))
-            .cloned()
+            // Trailing whitespace is the shell's, not the child's (cmd.exe
+            // keeps the space before an &), and the card should not show it.
+            .map(|l| l.trim_end().to_owned())
     }
 }
 

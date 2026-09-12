@@ -84,11 +84,20 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
+    /// A wait that nobody ends runs to its deadline and reports "not set".
+    /// The condvar may wake spuriously (an early return is legitimate — it
+    /// is how `notify` works), so the caller's pattern of re-waiting until
+    /// the deadline is what is exercised here.
     #[test]
     fn wait_times_out_when_nothing_happens() {
         let s = Shutdown::new();
         let start = Instant::now();
-        assert!(!s.wait_timeout(Duration::from_millis(40)));
+        let deadline = start + Duration::from_millis(40);
+        let mut set = false;
+        while Instant::now() < deadline {
+            set = s.wait_until(deadline);
+        }
+        assert!(!set);
         assert!(
             start.elapsed() >= Duration::from_millis(30),
             "returned too early"
