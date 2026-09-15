@@ -65,14 +65,15 @@ jobs:
         run: |
           $base = "telemouse-${{ github.ref_name }}-windows-x86_64"
           # What every zip carries: the loopback sample as telemouse.toml
-          # (never the repository's own dev config), the license, the two
-          # user-facing docs, the plan the GUIDE links to, and the demo
-          # recording the README tells people to try first.
+          # (never the repository's own dev config), the license, the
+          # user-facing docs (guide, conventions, fair-play statement, API
+          # reference), the plan the GUIDE links to, and the demo recording
+          # the README tells people to try first. Audit notes stay out.
           function Common($dir) {
             New-Item -ItemType Directory "$dir/docs", "$dir/recordings" | Out-Null
             Copy-Item telemouse.example.toml "$dir/telemouse.toml"
             Copy-Item LICENSE, README.md, CHANGELOG.md, mouse-telemetry-plan.md $dir
-            Copy-Item docs/GUIDE.md, docs/CONVENTIONS.md "$dir/docs"
+            Copy-Item docs/GUIDE.md, docs/CONVENTIONS.md, docs/FAIR-PLAY.md, docs/API.md "$dir/docs"
             Copy-Item recordings/demo-session.jsonl "$dir/recordings"
           }
           function Zip($dir) {

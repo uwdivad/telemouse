@@ -54,7 +54,8 @@ in the viz session list, and one reference for every route and file.
   one place; `docs/AGENTIC-2026-09-13.md` is the plan for plugging telemouse
   into agents and its status; `CLAUDE.md` and a `/telemouse` Claude Code
   skill live in the repo for working on and with telemouse from an agent.
-
+  Both release zips now carry `docs/FAIR-PLAY.md` and `docs/API.md` next to
+  the guide, so the README's links resolve from the download.
 - **Viz timing tiles.** Renamed the former latency readout to **event age**;
   it naturally increases while the mouse is idle. A separate **latency**
   tile measures capture-to-browser delivery on batch arrival, averaging
