@@ -14,8 +14,12 @@
 #   .\bench.ps1 -Label w25c2 -WindowMs 25 -CoalesceMs 2
 #   .\bench.ps1 -Label two-clients -Clients 2     # dashboard + OBS overlay
 #
-# Do not run cargo (or a game) while a run is in progress; do not run two runs
-# at once (same ports). See docs/BENCHMARKS.md for the numbers this produced.
+# Never run this with a game open: the load phase synthesizes mouse input with
+# SendInput, which a game's anti-cheat would rightly read as automation.
+# `tmbench inject` refuses to run unless TMBENCH_ALLOW_INJECT=1, which this
+# script sets for its own load phase only (docs/ANTICHEAT-2026-09-14.md, F2).
+# Do not run cargo while a run is in progress; do not run two runs at once
+# (same ports). See docs/BENCHMARKS.md for the numbers this produced.
 param(
     [string]$Label = "run",
     [string]$BinDir = (Join-Path $PSScriptRoot "..\..\target-bench\release"),
@@ -100,7 +104,13 @@ Start-Sleep -Milliseconds 700
 # --- load phase ---
 $meas = Start-Process -FilePath $tm -ArgumentList (@("measure","$LoadSecs") + $targets) -PassThru -NoNewWindow -RedirectStandardOutput "$logDir\measure-load.txt"
 Start-Sleep -Milliseconds 400   # measure's 300ms calibration spin
-Start-Process -FilePath $tm -ArgumentList @("inject","$Hz","$LoadSecs") -NoNewWindow -RedirectStandardOutput "$logDir\inject.txt" -Wait
+# The opt-in for synthetic input, for this child only (see the header).
+$env:TMBENCH_ALLOW_INJECT = "1"
+try {
+    Start-Process -FilePath $tm -ArgumentList @("inject","$Hz","$LoadSecs") -NoNewWindow -RedirectStandardOutput "$logDir\inject.txt" -Wait
+} finally {
+    Remove-Item Env:\TMBENCH_ALLOW_INJECT -ErrorAction SilentlyContinue
+}
 $meas.WaitForExit()
 foreach ($w in $wsProcs) { $w.WaitForExit() }
 if ($poll) { $poll.WaitForExit() }

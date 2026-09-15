@@ -9,11 +9,11 @@ Goal: capture raw mouse deltas during gaming with microsecond-quality timestamps
 | Concern | Choice | Why |
 |---|---|---|
 | Capture language | Rust (`windows`, `rtrb`, `rdkafka` crates) | No GC pauses, typed Win32, single binary |
-| Capture mechanism | Raw Input API (`RIDEV_INPUTSINK`, `WM_INPUT`) | True HID deltas, pre-acceleration, passive/anticheat-safe |
+| Capture mechanism | Raw Input API (`RIDEV_INPUTSINK`, `WM_INPUT`) | True HID deltas, pre-acceleration, passive (a copy of the input; nothing anti-cheat systems act on) |
 | Timestamps | `QueryPerformanceCounter` at receipt + one QPC↔UTC anchor per session | Monotonic, µs precision, replayable |
 | Transport | Kafka (durable log) + localhost UDP/WebSocket dual-write (live path) | Viz latency never gated on Kafka |
 | Storage | TimescaleDB (or Parquet + DuckDB to start) | Right-sized for single user |
-| Viz | Browser, Canvas/WebGL, second monitor | No in-game overlay → zero anticheat surface |
+| Viz | Browser, Canvas/WebGL, second monitor | No in-game overlay → nothing drawn into or read from the game |
 
 ---
 

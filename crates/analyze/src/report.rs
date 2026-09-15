@@ -131,6 +131,108 @@ pub struct Report {
     pub timings: Vec<PhaseTiming>,
 }
 
+/// The headline numbers of a [`Report`], small enough to paste into a chat
+/// or hand to a tool: `report --summary`. Every field is a projection of the
+/// full report — nothing here is computed differently — plus the per-sink
+/// losses from the sidecar, which the report itself does not carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportSummary {
+    pub schema: String,
+    pub analyzer_version: String,
+    pub session: SessionSummary,
+    pub quality: QualityHeadline,
+    pub flicks: FlickHeadline,
+    pub micro: MicroHeadline,
+    pub clicks: ClickHeadline,
+    pub kinematics: KinematicsHeadline,
+    pub lifts: LiftHeadline,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityHeadline {
+    pub events: usize,
+    pub ring_drops: u64,
+    pub lost_batches: u64,
+    pub seq_gaps: usize,
+    pub monotonicity_violations: usize,
+    pub bad_lines: usize,
+    pub pct_within_1ms: f64,
+    pub median_interval_ms: f64,
+    pub p99_interval_ms: f64,
+    pub gaps_over_10ms: usize,
+    pub poll_hz: Option<f64>,
+    pub locked_fraction: f64,
+    /// No data-quality warning fired: `warnings` is empty.
+    pub clean: bool,
+    /// The sidecar's own flag: every capture thread joined without
+    /// panicking. `None` without a sidecar.
+    pub threads_clean: Option<bool>,
+    /// The sidecar's exit reason, when there is a sidecar.
+    pub exit: Option<String>,
+    /// The run had not finished when the sidecar was last written.
+    pub unfinished: bool,
+    pub capture_profile: Option<String>,
+    /// Envelopes each sink failed to deliver, `[["kafka", 400], ...]`.
+    pub sink_losses: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlickHeadline {
+    pub count: usize,
+    pub per_minute: f64,
+    pub amplitude_deg_median: f64,
+    pub peak_velocity_deg_s_median: f64,
+    pub duration_ms_median: f64,
+    pub overshoot_ratio_median: f64,
+    pub overshoot_ratio_p90: f64,
+    pub settle_ms_median: f64,
+    pub settle_ms_p90: f64,
+    pub time_to_click_ms_median: f64,
+    pub clicked_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicroHeadline {
+    pub total_corrections: usize,
+    pub clean_segment_fraction: f64,
+    pub tremor_rms_counts_s: f64,
+    pub tremor_rms_cm_s: f64,
+    pub band_ratio_8_12: f64,
+    pub dominant_hz: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClickHeadline {
+    pub total: usize,
+    pub per_minute: f64,
+    pub still_click_fraction: f64,
+    pub click_to_still_ms_median: f64,
+    pub hold_ms_median: f64,
+    pub double_clicks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KinematicsHeadline {
+    pub total_distance_m: f64,
+    pub distance_cm_per_min: f64,
+    pub moving_fraction: f64,
+    pub path_efficiency_weighted: f64,
+    pub speed_cm_per_s_median: f64,
+    pub speed_cm_per_s_p99: f64,
+    pub speed_deg_per_s_p99: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiftHeadline {
+    pub count: usize,
+    pub per_minute: f64,
+    pub mean_drift_cm: f64,
+}
+
+/// Schema tag of [`ReportSummary`]; bump when a field changes meaning.
+pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/1";
+
 /// Times one phase, logs it, and records it for the `--timing` table.
 struct Phases {
     started: std::time::Instant,
@@ -494,6 +596,83 @@ fn summary(p: &Prepared) -> SessionSummary {
 }
 
 impl Report {
+    /// The headline numbers, see [`ReportSummary`]. `sink_losses` comes from
+    /// the sidecar (`load::read_sidecar(..).losses()`), which the report does
+    /// not carry; pass an empty list when there is none.
+    pub fn summary(&self, sink_losses: Vec<(String, u64)>) -> ReportSummary {
+        let q = &self.quality;
+        let sc = q.sidecar.as_ref();
+        ReportSummary {
+            schema: SUMMARY_SCHEMA.to_string(),
+            analyzer_version: self.analyzer_version.clone(),
+            session: self.session.clone(),
+            quality: QualityHeadline {
+                events: q.event_count,
+                ring_drops: q.ring_drops,
+                lost_batches: q.lost_batches,
+                seq_gaps: q.seq_gaps,
+                monotonicity_violations: q.monotonicity_violations,
+                bad_lines: q.bad_lines,
+                pct_within_1ms: q.pct_within_1ms,
+                median_interval_ms: q.median_interval_ms,
+                p99_interval_ms: q.p99_interval_ms,
+                gaps_over_10ms: q.gaps_over_10ms,
+                poll_hz: q.polling.hz,
+                locked_fraction: q.locked_fraction,
+                clean: q.clean,
+                threads_clean: sc.map(|s| s.clean),
+                exit: sc.map(|s| s.exit.clone()),
+                unfinished: sc.is_some_and(|s| s.unfinished),
+                capture_profile: sc.map(|s| s.capture_profile.clone()),
+                sink_losses,
+            },
+            flicks: FlickHeadline {
+                count: self.flicks.count,
+                per_minute: self.flicks.per_minute,
+                amplitude_deg_median: self.flicks.amplitude_deg.median,
+                peak_velocity_deg_s_median: self.flicks.peak_velocity_deg_s.median,
+                duration_ms_median: self.flicks.duration_ms.median,
+                overshoot_ratio_median: self.flicks.overshoot_ratio.median,
+                overshoot_ratio_p90: self.flicks.overshoot_ratio.p90,
+                settle_ms_median: self.flicks.settle_ms.median,
+                settle_ms_p90: self.flicks.settle_ms.p90,
+                time_to_click_ms_median: self.flicks.time_to_click_ms.median,
+                clicked_fraction: self.flicks.clicked_fraction,
+            },
+            micro: MicroHeadline {
+                total_corrections: self.micro.total_corrections,
+                clean_segment_fraction: self.micro.clean_segment_fraction,
+                tremor_rms_counts_s: self.micro.tremor_rms_counts_s,
+                tremor_rms_cm_s: self.micro.tremor_rms_cm_s,
+                band_ratio_8_12: self.micro.band_ratio_8_12,
+                dominant_hz: self.micro.dominant_hz,
+            },
+            clicks: ClickHeadline {
+                total: self.clicks.total_clicks,
+                per_minute: self.clicks.clicks_per_min,
+                still_click_fraction: self.clicks.still_click_fraction,
+                click_to_still_ms_median: self.clicks.click_to_still_ms.median,
+                hold_ms_median: self.clicks.hold_ms.median,
+                double_clicks: self.clicks.double_clicks,
+            },
+            kinematics: KinematicsHeadline {
+                total_distance_m: self.kinematics.total_distance_m,
+                distance_cm_per_min: self.kinematics.distance_cm_per_min,
+                moving_fraction: self.kinematics.moving_fraction,
+                path_efficiency_weighted: self.kinematics.path_efficiency_weighted,
+                speed_cm_per_s_median: self.kinematics.speed_cm_per_s.median,
+                speed_cm_per_s_p99: self.kinematics.speed_cm_per_s.p99,
+                speed_deg_per_s_p99: self.kinematics.speed_deg_per_s.p99,
+            },
+            lifts: LiftHeadline {
+                count: self.lifts.count,
+                per_minute: self.lifts.per_minute,
+                mean_drift_cm: self.lifts.mean_drift_cm,
+            },
+            warnings: self.warnings.clone(),
+        }
+    }
+
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }

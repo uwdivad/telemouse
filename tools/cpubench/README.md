@@ -4,7 +4,9 @@ Its own tiny crate (`tmbench`, not a workspace member) plus `bench.ps1`.
 Windows only, like the capture agent.
 
 ```
-tmbench inject <hz> <secs>              synthetic relative mouse motion via SendInput
+tmbench inject <hz> <secs>              synthetic relative mouse motion via SendInput; refuses to run
+                                        unless TMBENCH_ALLOW_INJECT=1 — never with a game open, it is
+                                        input automation to any anti-cheat (docs/ANTICHEAT-2026-09-14.md)
 tmbench ws <url> <secs>                 drain a viz WebSocket like a browser page
 tmbench http <url> <secs> <interval_ms> GET a URL on a timer, like the ctl page's poll
 tmbench measure <secs> <label=pid>...   QueryProcessCycleTime / QueryThreadCycleTime per target,

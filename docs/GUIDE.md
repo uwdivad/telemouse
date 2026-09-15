@@ -50,11 +50,17 @@ a 1 kHz mouse), and turns that into:
 
 Two design commitments shape everything:
 
-**It is passive and anticheat-safe.** Input comes from the Windows *Raw Input*
-API. A hidden window registers with `RIDEV_INPUTSINK`, which asks Windows to
-deliver a *copy* of every HID mouse report to it, even while a game is in the
-foreground. Nothing is injected into the game; the only thing read about the
-game is the foreground window's process name. There is no overlay.
+**It is passive.** Input comes from the Windows *Raw Input* API. A hidden
+window registers with `RIDEV_INPUTSINK`, which asks Windows to deliver a
+*copy* of every HID mouse report to it, even while a game is in the
+foreground. Nothing is injected into the game and no input is ever
+synthesized; the only thing read about the game is the foreground window's
+process name, taken from a process-table snapshot so no handle is ever
+opened on the game. There is no overlay. That is everything anti-cheat
+systems are documented to act on, and telemouse does none of it — but no
+publisher endorses third-party tools, so the claim stops there. The exact
+Win32 surface is in [FAIR-PLAY.md](FAIR-PLAY.md); the audit behind it in
+[ANTICHEAT-2026-09-14.md](ANTICHEAT-2026-09-14.md).
 
 **Raw counts stay raw on the wire.** The mouse reports integer "counts" (one
 count = 1/CPI inch). telemouse never converts these before writing them down.
@@ -108,7 +114,7 @@ datagram, JSONL line, Kafka message) carries one JSON-encoded record per unit:
 |---|---|---|
 | `session` | once, at start | session id, QPC frequency, QPC↔UTC anchor, mouse CPI, per-game sens table, monitors, device list |
 | `batch` | every ~25 ms while the mouse moves (`batch.window_ms`) | up to 448 `RawEvent`s (`ts_qpc, dx, dy, buttons, wheel, wheel_h, device_ix`) plus context (game, pointer-locked, cursor, drop counters, seq_no) |
-| `marker` | on F9 / config change / clock drift | a labelled timestamp |
+| `marker` | on the marker hotkey (F9 by default) / a line on a piped stdin / config change / clock drift | a labelled timestamp |
 
 The capture agent runs **three threads**:
 
@@ -211,7 +217,7 @@ docker compose up -d
 # sanity-check the machine: QPC, monitors, devices, UDP bind, Kafka reachability
 cargo run -p telemouse-capture -- doctor
 
-# capture (Ctrl-C to stop; F9 drops a marker)
+# capture (Ctrl-C to stop; the marker hotkey, F9 by default, drops a marker)
 cargo run --release -p telemouse-capture -- run --print
 
 # live viz: open http://127.0.0.1:7879  (OBS overlay at /obs)
@@ -519,7 +525,8 @@ priority to `ABOVE_NORMAL`; `RegisterClassW` a window class
 `"TelemouseRawInputClass"` with `wndproc`; `CreateWindowExW` with parent
 `HWND_MESSAGE` (a *message-only* window: no screen presence at all);
 `RegisterRawInputDevices` for usage page 1 / usage 2 (generic mouse) with
-`RIDEV_INPUTSINK`; `RegisterHotKey(F9, MOD_NOREPEAT)` (failure only warns).
+`RIDEV_INPUTSINK`; `RegisterHotKey` for `marker_hotkey` (F9 by default, with
+`MOD_NOREPEAT`; failure only warns, and `""` registers nothing).
 All per-thread state (`CaptureState`: the ring producer, stats, marker
 sender, waker, context, device table, running totals) lives on the thread's
 stack with a pointer in `GWLP_USERDATA`.
@@ -597,7 +604,7 @@ thread-local running total**, not atomic RMWs, and `T1Counters` is
 `Thread` handle. `wake()` is one relaxed load and only calls `unpark` if T2
 actually armed the flag — so the per-report cost is a load, not a syscall.
 
-**`wndproc`** handles `WM_INPUT` (fallback single read), `WM_HOTKEY` (F9 →
+**`wndproc`** handles `WM_INPUT` (fallback single read), `WM_HOTKEY` (the marker chord →
 `MarkerSignal { ts_qpc, label: "hotkey" }` on the channel + wake T2),
 `WM_DISPLAYCHANGE` (flag for T3 to re-read monitors), and
 `WM_TELEMOUSE_QUIT`/`WM_DESTROY` → `PostQuitMessage`.
@@ -644,7 +651,8 @@ warn per sink per 10 s with a suppressed count).
 Ticks every 250 ms (`TICK`); waits on the shutdown condvar between ticks.
 Each tick `sample()` reads the primary screen, cursor, and foreground process
 (via `ForegroundCache`, which only re-resolves the executable name when the
-PID changes — ~14 400 handle opens/hour → one per alt-tab), and feeds the
+PID changes — one process-table snapshot per alt-tab, and no handle is ever
+opened on the foreground process; see ANTICHEAT-2026-09-14.md), and feeds the
 cursor plus "events since last tick" to `PointerLockDetector`.
 
 **Pointer-lock heuristic** (`pointer_lock.rs`): cursor *frozen* while
@@ -908,8 +916,11 @@ UDP datagram → udp::listen → hub.publish → classify_datagram (tag probe)
 
 ### 8.1 CLI
 
-- `report <SESSION.jsonl> [--json FILE] [--json-dir DIR] [--csv-dir DIR]
-  [--timing] [--quiet] [detector flags…]`
+- `report <SESSION.jsonl | session-id> [--dir recordings] [--summary]
+  [--json FILE] [--json-dir DIR] [--csv-dir DIR] [--timing] [--quiet]
+  [detector flags…]` — a bare id is looked up as `<dir>/<id>.jsonl`;
+  `--summary` prints `Report::summary()` (the headline numbers, ~3 KB of
+  JSON) instead of the terminal rendering.
 - `trend [--dir recordings] [--json-dir DIR] [--metric a.b.c]… [--csv FILE]
   [--json] [detector flags…]`
 - `list [--dir recordings] [--json]` — header-only scan, never loads events.
@@ -1101,6 +1112,7 @@ silently turn every degree-valued metric into a guess.
 
 ```toml
 mouse_cpi = 1600.0            # counts per inch → cm. Wrong value = wrong cm, fixable later.
+marker_hotkey = "f9"          # system-wide chord that drops a marker (same grammar as [ctl] hotkey, must differ from it); "" = none
 
 [batch]
 window_ms = 25                # responsive live default; use 50 to halve per-batch CPU
@@ -1489,8 +1501,11 @@ Observed during this read; none are correctness bugs in normal use.
 - `mouse.sessions` is created with the broker's defaults, not compacted
   (rskafka's `create_topic` takes no configs); compact it at the broker if
   session records must outlive the events' retention.
-- The marker hotkey is F9, not configurable; a `[ctl] hotkey` of `f9`
-  collides with it and whichever registers second gets a warning.
+- The marker hotkey (`marker_hotkey`, F9 by default) is one chord with one
+  fixed label; labelled markers come from a piped stdin — what the panel
+  provides — see `capture/src/stdin_markers.rs`. A `[ctl] hotkey` equal to
+  it is rejected at config load, since whichever registered second would
+  silently lose.
 - In-game hitching traced to the dashboard tab's GPU load and the panel's
   process scan, not to capture (§14); an input drop-out while dragging the
   OBS window is still unexplained.
@@ -1521,7 +1536,7 @@ Observed during this read; none are correctness bugs in normal use.
 - **Settle time** — ballistic end → 20 ms of stillness.
 - **Savitzky–Golay** — least-squares polynomial smoothing/differentiation.
 - **Run** — a contiguous span of the sparse 1 ms grid around activity.
-- **Marker** — a labelled timestamp (F9, config change, clock drift).
+- **Marker** — a labelled timestamp (the marker hotkey, a line on a piped stdin, config change, clock drift).
 - **Envelope** — the tagged JSON record (`session` | `batch` | `marker`).
 
 ---
@@ -1564,6 +1579,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `GET /api/sessions` | `*.jsonl` names in `recording.dir`, newest first (the report picker). |
 | `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl", save?: bool }`. `save` is the capture card's switch: the server turns it into `--record` / `--no-record` against its own `recording.enabled` (`recording_flags`), so the page and the tray never derive the flag themselves; omitted = the config default. 404 unknown, 409 already running, 400 disallowed flag / bad session (including `save` on a component without the switch), 500 spawn failure (binary missing). |
 | `POST /api/components/{id}/stop` | body `{ force?: bool }` → `{ outcome: "graceful" \| "terminated" }`. 409 if not running. |
+| `POST /api/components/{id}/marker` | body `{ label }` → `{ ok, label }`. Writes `label\n` to the child's stdin; only components with `markers: true` (capture) are started with a pipe. 400 for a blank, multi-line or >120-character label or a component without a pipe, 409 if not running, 500 if the write fails. Echoed as `--- marker: <label> ---` in the component log. |
 | `POST /api/processes/{pid}/kill` | 403 for this panel or an unrelated process, 404 unknown, 500 if the OS refuses. |
 
 Every `POST` without `X-Telemouse-Ctl: 1` is a 403. A browser only adds a

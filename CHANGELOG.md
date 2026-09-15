@@ -4,7 +4,56 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
-## [Unreleased]
+## [0.1.3] — 2026-09-15
+
+Anticheat posture, markers from the panel and from a pipe, and the machine
+interfaces an agent needs: session-id reports with a JSON summary, sidecars
+in the viz session list, and one reference for every route and file.
+
+- **Anticheat audit and hardening.** `docs/ANTICHEAT-2026-09-14.md` audits
+  every Win32 call against what Call of Duty's RICOCHET and Activision's
+  enforcement policy act on (public record in `-sources.md`; the user-facing
+  statement is `docs/FAIR-PLAY.md`). What changed: the capture agent no
+  longer opens a handle on the foreground process to learn its name — it
+  reads a process-table snapshot, so it holds no handle on any process but
+  itself and names an elevated game without being elevated; `tmbench
+  inject` (the benchmark harness's `SendInput` load generator, never
+  shipped) refuses to run without `TMBENCH_ALLOW_INJECT=1`; every executable
+  carries a Windows version resource (product, description, version) and an
+  application manifest (`asInvoker`, per-monitor DPI, Windows 10+); the
+  panel's access-denied hint names the protected-folder cause instead of
+  suggesting "run as administrator"; the README no longer says
+  "anticheat-safe" (no publisher endorses third-party tools; "passive" is
+  what the code supports).
+- **`marker_hotkey`.** The capture agent's marker chord is configurable:
+  `marker_hotkey = "f9"` at the top of `telemouse.toml`, same grammar as
+  `[ctl] hotkey`, `""` for none; a `[ctl] hotkey` equal to it is rejected at
+  load. New key: rebuild every binary (an older agent refuses the file).
+- **Markers from a pipe.** When the capture agent's stdin is a pipe, every
+  line written to it becomes a labelled marker (`round 3 start`, or
+  `{"label":"round 3 start"}`), timestamped on arrival, exactly like F9. A
+  console stdin is left alone. The control panel now starts capture with
+  such a pipe and exposes it as `POST /api/components/capture/marker`
+  `{ "label": "…" }` (guard header required; 400 for a blank, multi-line or
+  over-long label, 409 when capture is not running); the marker is also
+  echoed into the component's log. `/api/state` components carry a
+  `markers` flag.
+- **`telemouse-analyze report` takes a session id.** `report s-2026…`
+  looks the id up in `--dir` (default `recordings`) so a caller that only
+  knows the id from `list` or the panel need not know the directory; a path
+  still works. New `--summary` prints the headline numbers as ~3 KB of JSON
+  (`telemouse-report-summary/1`: session, data quality incl. sidecar exit
+  and per-sink losses, flicks, micro-control, clicks, kinematics, lifts,
+  warnings) instead of the terminal rendering — meant for scripts and
+  agents that should not swallow the full report.
+- **Sidecar in the viz session list.** `GET /api/sessions` entries carry a
+  `sidecar` field with the parsed `<id>.meta.json` (exit reason, counters,
+  per-sink losses), or `null` when there is none.
+- **Agent-facing docs.** `docs/API.md` describes every machine interface
+  (ctl and viz HTTP, WebSocket, the analyzer's JSON, the files on disk) in
+  one place; `docs/AGENTIC-2026-09-13.md` is the plan for plugging telemouse
+  into agents and its status; `CLAUDE.md` and a `/telemouse` Claude Code
+  skill live in the repo for working on and with telemouse from an agent.
 
 - **Viz timing tiles.** Renamed the former latency readout to **event age**;
   it naturally increases while the mouse is idle. A separate **latency**

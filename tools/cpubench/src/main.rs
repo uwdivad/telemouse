@@ -1,6 +1,7 @@
 //! tmbench: load generator + cycle-exact CPU meter for telemouse benchmarks.
 //!
 //!   tmbench inject <hz> <secs>              inject relative mouse motion via SendInput
+//!                                           (refuses unless TMBENCH_ALLOW_INJECT=1; never with a game open)
 //!   tmbench ws <url> <secs>                 drain a viz WebSocket, report frames/bytes
 //!   tmbench http <url> <secs> <interval_ms> GET a URL every interval (stands in for the ctl page poll)
 //!   tmbench measure <secs> <label=pid>...   QueryProcessCycleTime / QueryThreadCycleTime per target
@@ -20,15 +21,33 @@ fn main() {
         Some("tcp") => tcp(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), args[5].parse().unwrap()),
         Some("udpsink") => udpsink(&args[2], args[3].parse().unwrap()),
         Some("udpsend") => udpsend(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), args[5].parse().unwrap()),
-        _ => eprintln!("usage: tmbench inject <hz> <secs> | ws <url> <secs> | http <url> <secs> <interval_ms> | measure <secs> <label=pid>... | udp <addr> <file> <secs>"),
+        _ => eprintln!("usage: tmbench inject <hz> <secs> (needs TMBENCH_ALLOW_INJECT=1) | ws <url> <secs> | http <url> <secs> <interval_ms> | measure <secs> <label=pid>... | udp <addr> <file> <secs>"),
     }
 }
 
+/// The one thing in the telemouse tree that puts input *into* the system:
+/// `SendInput` motion (and a click every 1000 reports) to load the capture
+/// agent on an idle desk. As far as any game or its anti-cheat is concerned
+/// that is input automation, so it refuses to run unless the operator says
+/// so explicitly — bench.ps1 sets the variable for its own load phase — and
+/// it must never run with a game open (docs/ANTICHEAT-2026-09-14.md, F2).
 fn inject(hz: u64, secs: u64) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
         MOUSEINPUT, SendInput,
     };
+    if std::env::var("TMBENCH_ALLOW_INJECT").as_deref() != Ok("1") {
+        eprintln!(
+            "inject: refusing to synthesize input. This subcommand drives SendInput \
+             (relative mouse motion plus a click every 1000 reports) into the whole \
+             desktop, which is input automation to any game that is running. Close \
+             every game, then set TMBENCH_ALLOW_INJECT=1 to run it."
+        );
+        std::process::exit(2);
+    }
+    eprintln!(
+        "inject: synthesizing {hz} Hz relative mouse motion (a click every 1000 reports) for {secs} s via SendInput"
+    );
     let period = Duration::from_nanos(1_000_000_000 / hz);
     let total = hz * secs;
     let start = Instant::now();

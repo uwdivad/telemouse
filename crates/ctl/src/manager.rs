@@ -31,8 +31,9 @@ use telemouse_core::config::AppConfig;
 use telemouse_core::recordings::id_from_file_name;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -90,6 +91,9 @@ pub struct Component {
     pub takes_session: bool,
     /// Gets `--config <telemouse.toml>` appended.
     pub passes_config: bool,
+    /// Started with a piped stdin that `POST /api/components/{id}/marker`
+    /// writes labels to, one per line. Only the capture agent reads them.
+    pub markers: bool,
 }
 
 /// The panel's catalogue. Order is display order.
@@ -113,6 +117,7 @@ pub const COMPONENTS: &[Component] = &[
         ],
         takes_session: false,
         passes_config: true,
+        markers: true,
     },
     Component {
         id: "viz",
@@ -124,6 +129,7 @@ pub const COMPONENTS: &[Component] = &[
         flags: &[],
         takes_session: false,
         passes_config: true,
+        markers: false,
     },
     Component {
         id: "doctor",
@@ -135,6 +141,7 @@ pub const COMPONENTS: &[Component] = &[
         flags: &[],
         takes_session: false,
         passes_config: true,
+        markers: false,
     },
     Component {
         id: "trend",
@@ -146,6 +153,7 @@ pub const COMPONENTS: &[Component] = &[
         flags: &[],
         takes_session: false,
         passes_config: false,
+        markers: false,
     },
     Component {
         id: "report",
@@ -160,6 +168,7 @@ pub const COMPONENTS: &[Component] = &[
         }],
         takes_session: true,
         passes_config: false,
+        markers: false,
     },
 ];
 
@@ -242,10 +251,13 @@ pub const HINT_STALE_BINARY: &str = "telemouse.toml has a key this binary does n
 pub const HINT_PORT_IN_USE: &str =
     "port already in use: another instance is running, or change the address in telemouse.toml";
 
-/// `ERROR_ACCESS_DENIED`. Raw input and process queries against an elevated
-/// foreground application need the same elevation.
-pub const HINT_ACCESS_DENIED: &str =
-    "access denied: the target runs elevated; run the panel as administrator";
+/// `ERROR_ACCESS_DENIED`. A file or directory the component uses is not
+/// writable — recordings or logs under a protected folder such as Program
+/// Files. Nothing telemouse does needs elevation (a game's name comes from
+/// the process table, not from a handle on it), so the fix is a folder the
+/// user owns, never "run as administrator": an elevated panel would run
+/// every child elevated too, for no gain.
+pub const HINT_ACCESS_DENIED: &str = "access denied: a file or folder this component uses is not writable (recording.dir, ctl.log_dir, or the telemouse folder itself, e.g. under Program Files); move telemouse to a folder you own or point those paths elsewhere. Running as administrator is not needed";
 
 /// A hint for an unexpected exit, read off the child's last lines. The
 /// order is most-specific first: a config rejection explains itself, so it
@@ -305,6 +317,8 @@ pub struct ComponentState {
     pub bin_found: bool,
     pub flags: Vec<Flag>,
     pub takes_session: bool,
+    /// Accepts `POST /api/components/{id}/marker` while running.
+    pub markers: bool,
     pub running: bool,
     pub pid: Option<u32>,
     pub since_unix_s: Option<u64>,
@@ -435,6 +449,56 @@ impl std::fmt::Display for StopError {
             Self::NotRunning => "not running",
         })
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MarkerError {
+    UnknownComponent,
+    /// The component is not started with a stdin (`Component::markers`).
+    Unsupported,
+    NotRunning,
+    BadLabel(String),
+    /// The pipe write failed — the child is on its way out.
+    Write(String),
+}
+
+impl std::fmt::Display for MarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownComponent => f.write_str("no such component"),
+            Self::Unsupported => f.write_str("this component does not take markers"),
+            Self::NotRunning => f.write_str("not running"),
+            Self::BadLabel(x) => write!(f, "bad label: {x}"),
+            Self::Write(x) => write!(f, "could not deliver the marker: {x}"),
+        }
+    }
+}
+
+/// Longest marker label accepted, in characters. Mirrors the capture agent's
+/// own cap, so what the panel accepts is what the recording keeps.
+pub const MAX_MARKER_LABEL_CHARS: usize = 120;
+
+/// The label as it will be written, or why it cannot be. One line, no
+/// control characters, not blank, not longer than [`MAX_MARKER_LABEL_CHARS`]:
+/// the pipe protocol is one marker per line, so a newline inside a label
+/// would be two markers.
+pub fn marker_label(label: &str) -> Result<String, MarkerError> {
+    let s = label.trim();
+    if s.is_empty() {
+        return Err(MarkerError::BadLabel("must not be blank".into()));
+    }
+    if s.chars().any(char::is_control) {
+        return Err(MarkerError::BadLabel(
+            "must be one line without control characters".into(),
+        ));
+    }
+    let n = s.chars().count();
+    if n > MAX_MARKER_LABEL_CHARS {
+        return Err(MarkerError::BadLabel(format!(
+            "{n} characters; at most {MAX_MARKER_LABEL_CHARS}"
+        )));
+    }
+    Ok(s.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -619,6 +683,8 @@ impl LogSink {
 
 struct Slot {
     child: Option<Child>,
+    /// The child's stdin when it was started with one (`Component::markers`).
+    stdin: Option<ChildStdin>,
     pid: Option<u32>,
     since: Option<u64>,
     last_exit: Option<ExitInfo>,
@@ -634,6 +700,7 @@ impl Slot {
     fn new() -> Self {
         Self {
             child: None,
+            stdin: None,
             pid: None,
             since: None,
             last_exit: None,
@@ -702,6 +769,7 @@ impl Slot {
 
     fn clear(&mut self) {
         self.child = None;
+        self.stdin = None;
         self.pid = None;
         self.since = None;
         self.stopping = false;
@@ -1065,6 +1133,7 @@ impl Manager {
                     bin_found,
                     flags: c.flags.to_vec(),
                     takes_session: c.takes_session,
+                    markers: c.markers,
                     running,
                     pid: s.pid,
                     since_unix_s: s.since,
@@ -1187,7 +1256,11 @@ impl Manager {
 
         let mut cmd = Command::new(&bin);
         cmd.args(&args)
-            .stdin(Stdio::null())
+            .stdin(if c.markers {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What a child prints is read by a page and appended to a file:
@@ -1213,6 +1286,7 @@ impl Manager {
         if let Some(err) = child.stderr.take() {
             tokio::spawn(pump(err, slot.log.clone()));
         }
+        slot.stdin = child.stdin.take();
         slot.child = Some(child);
         slot.pid = Some(pid);
         slot.since = Some(now_unix());
@@ -1222,6 +1296,43 @@ impl Manager {
         self.invalidate_bins();
         self.work.notify_waiters();
         Ok(pid)
+    }
+
+    /// Hand a marker label to a running component's stdin. The label is
+    /// validated by [`marker_label`]; what the child does with it is its
+    /// business (the capture agent stamps it and records it, see
+    /// `stdin_markers.rs` there).
+    pub async fn marker(&self, id: &str, label: &str) -> Result<String, MarkerError> {
+        let c = self.component(id).ok_or(MarkerError::UnknownComponent)?;
+        if !c.markers {
+            return Err(MarkerError::Unsupported);
+        }
+        let label = marker_label(label)?;
+        let mut slots = self.slots.lock().await;
+        let slot = slots.get_mut(c.id).expect("slot per component");
+        if slot.reap(c) {
+            return Err(MarkerError::NotRunning);
+        }
+        let Some(stdin) = slot.stdin.as_mut() else {
+            return Err(MarkerError::NotRunning);
+        };
+        let line = format!("{label}\n");
+        let written = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        }
+        .await;
+        match written {
+            Ok(()) => {
+                info!(component = c.id, pid = slot.pid, label = %label, "marker sent");
+                slot.log.push(format!("--- marker: {label} ---"));
+                Ok(label)
+            }
+            Err(e) => {
+                warn!(component = c.id, pid = slot.pid, error = %e, "marker not delivered");
+                Err(MarkerError::Write(e.to_string()))
+            }
+        }
     }
 
     /// Stop a component: Ctrl-Break, wait up to the grace period, then
@@ -1380,6 +1491,7 @@ mod tests {
         }],
         takes_session: false,
         passes_config: false,
+        markers: true,
     };
 
     const REPORTER: Component = Component {
@@ -1392,6 +1504,7 @@ mod tests {
         flags: &[],
         takes_session: true,
         passes_config: false,
+        markers: false,
     };
 
     /// A task that fails: exits 3 without being asked to.
@@ -1411,6 +1524,7 @@ mod tests {
         flags: &[],
         takes_session: false,
         passes_config: false,
+        markers: false,
     };
 
     fn config(dir: &Path) -> ManagerConfig {
@@ -1674,6 +1788,58 @@ mod tests {
     }
 
     #[test]
+    fn marker_labels_are_one_clean_line() {
+        assert_eq!(marker_label("  round 3 start  ").unwrap(), "round 3 start");
+        assert!(matches!(marker_label("   "), Err(MarkerError::BadLabel(_))));
+        assert!(matches!(
+            marker_label("two\nlines"),
+            Err(MarkerError::BadLabel(_))
+        ));
+        assert!(matches!(
+            marker_label("tab\tinside"),
+            Err(MarkerError::BadLabel(_))
+        ));
+        assert!(marker_label(&"x".repeat(MAX_MARKER_LABEL_CHARS)).is_ok());
+        assert!(matches!(
+            marker_label(&"x".repeat(MAX_MARKER_LABEL_CHARS + 1)),
+            Err(MarkerError::BadLabel(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn markers_need_a_running_component_that_takes_them() {
+        let m = manager(Path::new("."));
+        assert_eq!(
+            m.marker("nope", "x").await,
+            Err(MarkerError::UnknownComponent)
+        );
+        assert_eq!(m.marker("rep", "x").await, Err(MarkerError::Unsupported));
+        assert_eq!(m.marker("sleeper", "x").await, Err(MarkerError::NotRunning));
+        // A bad label is refused before the running check, so a client learns
+        // about it without starting anything.
+        assert!(matches!(
+            m.marker("sleeper", "").await,
+            Err(MarkerError::BadLabel(_))
+        ));
+
+        m.start("sleeper", &StartRequest::default()).await.unwrap();
+        assert_eq!(m.marker("sleeper", " t1 ").await, Ok("t1".into()));
+        let snap = m.snapshot(50).await;
+        let s = snap.iter().find(|s| s.id == "sleeper").unwrap();
+        assert!(s.markers);
+        assert!(
+            s.log.iter().any(|l| l == "--- marker: t1 ---"),
+            "log: {:?}",
+            s.log
+        );
+        m.stop("sleeper", true).await.unwrap();
+        assert_eq!(
+            m.marker("sleeper", "t2").await,
+            Err(MarkerError::NotRunning)
+        );
+    }
+
+    #[test]
     fn arguments_enforce_the_allow_list_and_the_session_rules() {
         let dir = tmpdir("args");
         std::fs::write(dir.join("s-1.jsonl"), "{}\n").unwrap();
@@ -1932,11 +2098,13 @@ mod tests {
             Some(HINT_PORT_IN_USE)
         );
 
-        // An elevated target.
+        // A protected folder. The hint must never send the user to "run as
+        // administrator": nothing telemouse does needs it.
         assert_eq!(
             exit_hint(&lines(&["Access is denied. (os error 5)"])).as_deref(),
             Some(HINT_ACCESS_DENIED)
         );
+        assert!(!HINT_ACCESS_DENIED.contains("run the panel as administrator"));
 
         // A value the config rejects explains itself; echo it verbatim.
         let echo = exit_hint(&lines(&[

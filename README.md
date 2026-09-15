@@ -5,11 +5,17 @@ microsecond-quality timestamps — while you play, streams them to a live
 visualization, records every session, replays them, and computes an aim-metrics
 report over the data. Implements [mouse-telemetry-plan.md](mouse-telemetry-plan.md).
 
-**Passive and anticheat-safe by design:** input comes from the Windows Raw
-Input API (`RIDEV_INPUTSINK` on a hidden message-only window — the OS delivers
-a copy of every HID report), and game detection only reads the foreground
-process's executable name. No injection, no hooks, no reads of game memory,
-no in-game overlay.
+**Passive by design:** input comes from the Windows Raw Input API
+(`RIDEV_INPUTSINK` on a hidden message-only window — the OS delivers a copy
+of every HID mouse report), game detection reads the foreground window's
+executable name from the process table, and nothing else is touched. No
+injection, no hooks, no driver, no handle on the game process, no reads of
+game memory, no in-game overlay, and no synthesized input: telemouse maps,
+remaps and generates nothing. It does nothing that anti-cheat systems are
+documented to act on, and it is endorsed by no game publisher; what it does
+and does not do, exactly, is in [docs/FAIR-PLAY.md](docs/FAIR-PLAY.md), and
+the audit behind that page in
+[docs/ANTICHEAT-2026-09-14.md](docs/ANTICHEAT-2026-09-14.md).
 
 ## The pieces
 
@@ -56,7 +62,8 @@ later (its embedded Chromium). From source:
 # 0. One-time: check your environment (QPC clock, monitors, UDP, Kafka reachability)
 cargo run -p telemouse-capture -- doctor
 
-# 1. Start capturing. Ctrl-C stops; F9 drops a marker ("clutch", "round start"...)
+# 1. Start capturing. Ctrl-C stops; the marker hotkey (F9 by default) drops a marker ("clutch", "round start"...);
+#    so does every line written to its stdin when that is a pipe (the panel's marker API)
 cargo run --release -p telemouse-capture -- run --print
 
 # 2. In another terminal: live viz — then open http://127.0.0.1:7879
@@ -103,6 +110,7 @@ what the binaries read when run from this checkout. All fields optional:
 
 ```toml
 mouse_cpi = 1600.0            # your mouse's real CPI/DPI → physical cm
+marker_hotkey = "f9"          # system-wide chord that drops a marker; the game never sees it; "" = none
 
 [batch]
 window_ms = 25                # responsive live default; use 50 to halve per-batch CPU
@@ -337,7 +345,8 @@ terminating. Closing the panel with Ctrl-C stops what it started.
 Binaries are looked up next to `telemouse-ctl` itself (so `cargo build
 --workspace` is all the setup there is), then on `PATH`; `[ctl] bin_dir` or
 `--bin-dir` points elsewhere. The API is plain JSON (`GET /api/state`,
-`POST /api/components/{id}/start|stop`, `POST /api/processes/{pid}/kill`);
+`POST /api/components/{id}/start|stop|marker`, `POST /api/processes/{pid}/kill`;
+every machine interface is written up in [docs/API.md](docs/API.md));
 mutating calls must carry an `X-Telemouse-Ctl: 1` header, which keeps a random
 web page open in the same browser from reaching the panel through `localhost`,
 and every request must carry a `Host` naming this machine (an IP literal or
@@ -450,9 +459,12 @@ replay. If you want it open, `?fps=60` on the URL halves the cost again.
 
 ## The analysis report
 
-`telemouse-analyze report <session.jsonl>` prints a structured summary; add
-`--json out.json` and/or `--csv-dir DIR` (per-second aggregates + flick table)
-for further processing. Metric groups, per the plan's catalog:
+`telemouse-analyze report <session.jsonl>` prints a structured summary (a bare
+session id from `list` works too, looked up in `--dir`); add `--json out.json`
+and/or `--csv-dir DIR` (per-second aggregates + flick table) for further
+processing, or `--summary` for the headline numbers as a few KB of JSON —
+what a script or an agent should read instead of the full report. Metric
+groups, per the plan's catalog:
 
 - **Data quality** — inter-event interval histogram (1KHz mice should cluster
   at ≤1ms), gaps, ring drops, timestamp monotonicity.
@@ -465,7 +477,7 @@ for further processing. Metric groups, per the plan's catalog:
   (fatigue indicator), micro-adjustment size distribution.
 - **Trigger discipline** — pre-click stability, click-to-still latency,
   hold durations, double-click intervals, clicks/min.
-- **Segmentation & habits** — `--split-by-marker` sub-reports between F9
+- **Segmentation & habits** — `--split-by-marker` sub-reports between hotkey
   markers (round/clutch analysis), per-minute fatigue table, inferred
   mousepad repositioning lifts, `--locked-only` to keep desktop-mode noise
   out of aim metrics.
@@ -598,7 +610,11 @@ The August 2026 performance/observability audit and its resolutions are
 documented in [docs/AUDIT-2026-08.md](docs/AUDIT-2026-08.md).
 The September implementation pass, including reproducible before/after replay,
 analyzer, memory, and sink-latency measurements, is documented in
-[docs/PERFORMANCE-2026-09.md](docs/PERFORMANCE-2026-09.md).
+[docs/PERFORMANCE-2026-09.md](docs/PERFORMANCE-2026-09.md). Where telemouse
+plugs into agents (an MCP server, post-session triage, experiment runners,
+a live feature stream) and what has landed so far is in
+[docs/AGENTIC-2026-09-13.md](docs/AGENTIC-2026-09-13.md); the machine
+interfaces it builds on are in [docs/API.md](docs/API.md).
 
 **Releasing.** CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on
 every push. A release is a tag: bump `version` in the root `Cargo.toml`, add

@@ -155,8 +155,16 @@ impl ParamFlags {
 enum Cmd {
     /// Analyze one recording and print the metrics summary.
     Report {
-        /// Path to a `recordings/<session_id>.jsonl` file.
-        session: PathBuf,
+        /// Path to a `recordings/<session_id>.jsonl` file, or a bare
+        /// session id looked up in `--dir`.
+        session: String,
+        /// Where a bare session id is looked up.
+        #[arg(long, default_value = "recordings", value_name = "DIR")]
+        dir: PathBuf,
+        /// Print the headline numbers as JSON instead of the terminal
+        /// summary: a few KB that says what the full report says.
+        #[arg(long)]
+        summary: bool,
         /// Also write the full structured report here.
         #[arg(long, value_name = "FILE")]
         json: Option<PathBuf>,
@@ -207,6 +215,35 @@ enum Cmd {
     },
 }
 
+/// The recording `arg` names: an existing file, or a session id (with or
+/// without `.jsonl`) under `dir`. Tools that know a session only by the id
+/// the panel and `list` show should not have to know the recordings dir.
+fn resolve_session(arg: &str, dir: &std::path::Path) -> Result<PathBuf> {
+    let as_path = PathBuf::from(arg);
+    if as_path.is_file() {
+        return Ok(as_path);
+    }
+    let id = arg.strip_suffix(".jsonl").unwrap_or(arg);
+    match telemouse_core::recordings::recording_file_name(id) {
+        Some(name) => {
+            let in_dir = dir.join(name);
+            if in_dir.is_file() {
+                Ok(in_dir)
+            } else {
+                anyhow::bail!(
+                    "no recording {arg}: neither {} nor {} exists",
+                    as_path.display(),
+                    in_dir.display()
+                )
+            }
+        }
+        None => anyhow::bail!(
+            "no recording {arg}: {} is not a file and {arg:?} is not a session id",
+            as_path.display()
+        ),
+    }
+}
+
 fn main() -> Result<()> {
     init_logging();
     telemouse_core::panic_hook::install("analyze");
@@ -215,6 +252,8 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Report {
             session,
+            dir,
+            summary,
             json,
             json_dir,
             csv_dir,
@@ -223,6 +262,7 @@ fn main() -> Result<()> {
             params,
         } => {
             let params = params.apply();
+            let session = resolve_session(&session, &dir)?;
 
             let t = Instant::now();
             let (mut report, cache) = trend::report_for(&session, json_dir.as_deref(), params)
@@ -235,7 +275,12 @@ fn main() -> Result<()> {
                 );
             }
 
-            if !quiet {
+            if summary {
+                let losses = load::read_sidecar(&session)
+                    .map(|m| m.losses())
+                    .unwrap_or_default();
+                println!("{}", serde_json::to_string_pretty(&report.summary(losses))?);
+            } else if !quiet {
                 let t = Instant::now();
                 let text = report.render();
                 report.push_timing("render", t.elapsed().as_secs_f64() * 1000.0);

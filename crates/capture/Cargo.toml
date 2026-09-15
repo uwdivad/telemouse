@@ -63,6 +63,9 @@ windows = { version = "0.62.2", features = [
     "Win32_Security",
     # GetConsoleProcessList: "was this window opened just for me?".
     "Win32_System_Console",
+    # The foreground process's name comes from a Toolhelp snapshot, so the
+    # agent never opens a handle on a game process (docs/ANTICHEAT-2026-09-14.md).
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
@@ -70,3 +73,6 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"

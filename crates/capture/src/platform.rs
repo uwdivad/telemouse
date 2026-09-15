@@ -27,13 +27,16 @@ mod imp {
         GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
     use windows::Win32::System::Console::GetConsoleProcessList;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentThread, OpenProcess, PROCESS_NAME_WIN32,
-        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, ProcessPowerThrottling,
-        QueryFullProcessImageNameW, SetProcessInformation, SetThreadPriority,
+        GetCurrentProcess, GetCurrentThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetProcessInformation, SetThreadPriority,
         THREAD_PRIORITY_ABOVE_NORMAL,
     };
     use windows::Win32::UI::HiDpi::{
@@ -43,7 +46,7 @@ mod imp {
         GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
         SM_CYSCREEN,
     };
-    use windows::core::{PWSTR, s, w};
+    use windows::core::{s, w};
 
     const MONITORINFOF_PRIMARY: u32 = 1;
 
@@ -156,31 +159,48 @@ mod imp {
         }
     }
 
-    /// Executable name of `pid`, lowercased. Read-only and handle-free: the
-    /// process handle is opened with the minimum right and closed immediately.
-    /// The caller (see [`super::ForegroundCache`]) only calls this when the
-    /// foreground PID actually changed.
+    /// Executable name of `pid`, lowercased, read from a snapshot of the
+    /// process table.
+    ///
+    /// No handle to `pid` is ever opened: the snapshot is a kernel-built list
+    /// of names and ids, the same thing Task Manager shows, so the agent
+    /// never holds a handle on a game — the one thing an anti-cheat driver
+    /// could have logged about it — and an elevated game, which would refuse
+    /// `OpenProcess` from here, is named just the same. The walk costs a few
+    /// milliseconds; the caller (see [`super::ForegroundCache`]) only asks
+    /// when the foreground PID actually changed.
     pub fn process_name(pid: u32) -> Option<String> {
         if pid == 0 {
             return None;
         }
+        // SAFETY: Toolhelp snapshot iteration with a correctly sized entry;
+        // the snapshot handle is closed on every path, and nothing is read
+        // from any other process.
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-            let mut buf = [0u16; 512];
-            let mut len = buf.len() as u32;
-            let ok = QueryFullProcessImageNameW(
-                handle,
-                PROCESS_NAME_WIN32,
-                PWSTR(buf.as_mut_ptr()),
-                &mut len,
-            )
-            .is_ok();
-            let _ = CloseHandle(handle);
-            if !ok {
-                return None;
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+            let mut entry = PROCESSENTRY32W {
+                dwSize: size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut name = None;
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    if entry.th32ProcessID == pid {
+                        let end = entry
+                            .szExeFile
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(entry.szExeFile.len());
+                        name = Some(String::from_utf16_lossy(&entry.szExeFile[..end]));
+                        break;
+                    }
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
             }
-            let path = String::from_utf16_lossy(&buf[..len as usize]);
-            super::basename_lower(&path)
+            let _ = CloseHandle(snap);
+            super::basename_lower(&name?)
         }
     }
 
@@ -408,11 +428,12 @@ pub fn monitors() -> Vec<MonitorInfo> {
     imp::monitors()
 }
 
-/// Remembers the foreground PID→name mapping so alt-tabbing costs one process
-/// handle, not four a second.
+/// Remembers the foreground PID→name mapping so alt-tabbing costs one
+/// process-table snapshot, not four a second.
 ///
-/// The plan's "no handles into the game process" spirit: while a game holds the
-/// foreground, this opens nothing at all.
+/// The plan's "no handles into the game process" rule, kept literally: the
+/// name comes from a Toolhelp snapshot, which opens no handle on any process,
+/// and while a game holds the foreground nothing is asked at all.
 #[derive(Debug, Default, Clone)]
 pub struct ForegroundCache {
     pid: u32,
@@ -543,6 +564,19 @@ mod tests {
         let parts: Vec<&str> = v.trim_start_matches("Windows ").split('.').collect();
         assert_eq!(parts.len(), 3, "{v}");
         assert!(parts[2].parse::<u32>().unwrap() > 0, "{v}");
+    }
+
+    /// The process table names this very process without a handle being
+    /// opened on it — the whole point of reading names that way.
+    #[cfg(windows)]
+    #[test]
+    fn the_process_table_names_this_process_and_nobody_else() {
+        let me = super::imp::process_name(std::process::id()).expect("own name");
+        assert!(me.ends_with(".exe"), "{me}");
+        assert_eq!(me, me.to_ascii_lowercase());
+        assert!(me.contains("telemouse"), "{me}");
+        assert_eq!(super::imp::process_name(u32::MAX - 7), None);
+        assert_eq!(super::imp::process_name(0), None);
     }
 
     #[cfg(windows)]

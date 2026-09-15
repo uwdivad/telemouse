@@ -56,6 +56,12 @@ fn invalid_message(path: Option<&Path>, field: &str, reason: &str) -> String {
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub mouse_cpi: f64,
+    /// System-wide chord the capture agent registers to drop a marker into
+    /// the recording: `f9` by default, `""` for none, grammar in
+    /// [`crate::hotkey`]. Windows hands a registered chord to its owner
+    /// before the foreground program sees it, so pick one the game does not
+    /// use. Must differ from `[ctl] hotkey`.
+    pub marker_hotkey: String,
     pub batch: BatchConfig,
     pub udp: UdpConfig,
     pub kafka: KafkaConfig,
@@ -273,6 +279,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             mouse_cpi: 1600.0,
+            marker_hotkey: "f9".into(),
             batch: BatchConfig::default(),
             udp: UdpConfig::default(),
             kafka: KafkaConfig::default(),
@@ -591,6 +598,20 @@ impl AppConfig {
         if let Err(reason) = crate::hotkey::Hotkey::parse(&self.ctl.hotkey) {
             return Err(invalid("ctl.hotkey", reason));
         }
+        let marker = match crate::hotkey::Hotkey::parse(&self.marker_hotkey) {
+            Ok(hk) => hk,
+            Err(reason) => return Err(invalid("marker_hotkey", reason)),
+        };
+        // Both chords are system-wide and only one owner gets a chord;
+        // whichever registered second would silently lose.
+        if let (Some(a), Ok(Some(b))) = (marker, crate::hotkey::Hotkey::parse(&self.ctl.hotkey))
+            && a == b
+        {
+            return Err(invalid(
+                "ctl.hotkey",
+                format!("{a} is also marker_hotkey; the two chords must differ"),
+            ));
+        }
         for (game, g) in &self.games {
             if let Err(reason) = game_key_problem(game) {
                 return Err(invalid("games", reason));
@@ -642,6 +663,9 @@ impl AppConfig {
 
         if self.mouse_cpi != d.mouse_cpi {
             add("mouse_cpi", self.mouse_cpi.to_string());
+        }
+        if self.marker_hotkey != d.marker_hotkey {
+            add("marker_hotkey", self.marker_hotkey.clone());
         }
         if self.batch.window_ms != d.batch.window_ms {
             add("batch.window_ms", self.batch.window_ms.to_string());
@@ -728,6 +752,54 @@ mod tests {
         assert!(c.udp.enabled);
         assert!(!c.kafka.enabled);
         assert!(c.recording.enabled);
+        assert_eq!(c.marker_hotkey, "f9");
+    }
+
+    #[test]
+    fn the_marker_hotkey_is_a_chord_or_nothing_and_never_the_panels() {
+        let c: AppConfig = toml::from_str("marker_hotkey = \"ctrl+shift+m\"\n").unwrap();
+        assert_eq!(c.marker_hotkey, "ctrl+shift+m");
+        c.validate().unwrap();
+
+        let off = AppConfig {
+            marker_hotkey: String::new(),
+            ..AppConfig::default()
+        };
+        off.validate().unwrap();
+
+        // A plain letter would steal every `m` typed on the machine.
+        let bad = AppConfig {
+            marker_hotkey: "m".into(),
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::Invalid {
+                field: "marker_hotkey",
+                ..
+            })
+        ));
+
+        // The same chord as the panel's: one of them would silently lose.
+        let mut clash = AppConfig {
+            marker_hotkey: "Ctrl + Alt + R".into(),
+            ..AppConfig::default()
+        };
+        let err = clash.validate().unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Invalid {
+                    field: "ctl.hotkey",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Ctrl+Alt+R"), "{err}");
+        // ...unless the panel has none.
+        clash.ctl.hotkey = String::new();
+        clash.validate().unwrap();
     }
 
     #[test]
@@ -928,6 +1000,9 @@ mod tests {
             ("games", "[games.\"CS2.EXE\"]\nsens = 1.0"),
             ("games", "[games.\"cs2\"]\nsens = 1.0"),
             ("games", "[games.\"c:/games/cs2.exe\"]\nsens = 1.0"),
+            ("marker_hotkey", "marker_hotkey = \"m\""),
+            ("marker_hotkey", "marker_hotkey = \"ctrl+bogus\""),
+            ("ctl.hotkey", "marker_hotkey = \"ctrl+alt+r\""),
         ];
         for (field, toml_text) in cases {
             let cfg: AppConfig = toml::from_str(toml_text).unwrap();

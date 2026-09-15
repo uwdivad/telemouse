@@ -305,7 +305,7 @@ mod win {
         GetCurrentThreadId, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForSingleObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_F9,
+        HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::Input::{
         GetRawInputBuffer, GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -354,19 +354,24 @@ mod win {
     /// A timer wait that keeps failing warns at most this often.
     const TIMER_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
-    /// Which hotkey to register for markers.
+    /// Which chord to register for markers: `marker_hotkey` in the config,
+    /// already parsed and validated by `telemouse_core::config`.
     #[derive(Debug, Clone, Copy)]
     pub struct Hotkey {
+        /// `MOD_*` bits, without `MOD_NOREPEAT` (added at registration).
+        pub modifiers: u32,
         pub vk: u32,
         pub label: &'static str,
     }
 
-    impl Default for Hotkey {
-        fn default() -> Self {
-            Self {
-                vk: VK_F9.0 as u32,
+    impl Hotkey {
+        /// `None` when the config says there is no marker chord.
+        pub fn from_config(hk: Option<telemouse_core::hotkey::Hotkey>) -> Option<Self> {
+            hk.map(|h| Self {
+                modifiers: h.modifiers(),
+                vk: u32::from(h.vk),
                 label: "hotkey",
-            }
+            })
         }
     }
 
@@ -381,7 +386,8 @@ mod win {
         /// The startup enumeration, whose `names()` are exactly
         /// `SessionConfig.devices`.
         pub devices: DeviceTable,
-        pub hotkey: Hotkey,
+        /// The marker chord; `None` registers nothing.
+        pub hotkey: Option<Hotkey>,
         /// How long to let reports pile up after a wake before reading them
         /// all at once. Zero reads immediately (one report per wake).
         pub coalesce: Duration,
@@ -782,7 +788,7 @@ mod win {
                 producer,
                 stats,
                 marker_tx,
-                hotkey_label: hotkey.label,
+                hotkey_label: hotkey.map_or("hotkey", |h| h.label),
                 waker,
                 ctx,
                 devices,
@@ -808,10 +814,29 @@ mod win {
                 return Err(e).context("RegisterRawInputDevices for the mouse usage page");
             }
 
-            match RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_NOREPEAT, hotkey.vk) {
-                Ok(()) => tracing::info!(vk = hotkey.vk, "marker hotkey registered"),
-                // Another app owns the key: markers are a nice-to-have.
-                Err(e) => tracing::warn!(error = %e, vk = hotkey.vk, "marker hotkey unavailable"),
+            let mut hotkey_registered = false;
+            match hotkey {
+                Some(hk) => {
+                    let mods = HOT_KEY_MODIFIERS(hk.modifiers) | MOD_NOREPEAT;
+                    match RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, hk.vk) {
+                        Ok(()) => {
+                            hotkey_registered = true;
+                            tracing::info!(
+                                vk = hk.vk,
+                                modifiers = hk.modifiers,
+                                "marker hotkey registered"
+                            );
+                        }
+                        // Another app owns the chord: markers are a nice-to-have.
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            vk = hk.vk,
+                            modifiers = hk.modifiers,
+                            "marker hotkey unavailable (another program holds it?); change marker_hotkey in telemouse.toml"
+                        ),
+                    }
+                }
+                None => tracing::info!("no marker hotkey (marker_hotkey is empty)"),
             }
 
             tracing::info!(
@@ -983,7 +1008,9 @@ mod win {
                 }
             }
 
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            if hotkey_registered {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            }
             if let Some(timer) = coalesce_timer {
                 let _ = CloseHandle(timer);
             }

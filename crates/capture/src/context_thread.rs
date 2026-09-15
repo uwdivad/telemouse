@@ -239,6 +239,11 @@ pub fn describe_config_change(old: &AppConfig, new: &AppConfig) -> Vec<String> {
             new.mouse_cpi.to_string(),
         ),
         (
+            "marker_hotkey",
+            old.marker_hotkey.clone(),
+            new.marker_hotkey.clone(),
+        ),
+        (
             "batch.window_ms",
             old.batch.window_ms.to_string(),
             new.batch.window_ms.to_string(),

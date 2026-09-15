@@ -26,7 +26,7 @@ use serde_json::json;
 use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted};
 use tracing::{info, warn};
 
-use crate::manager::{Manager, StartError, StartRequest, StopError};
+use crate::manager::{Manager, MarkerError, StartError, StartRequest, StopError};
 use crate::places::Places;
 use crate::procs::{KillError, Scanner};
 
@@ -80,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(api_sessions))
         .route("/api/components/{id}/start", post(api_start))
         .route("/api/components/{id}/stop", post(api_stop))
+        .route("/api/components/{id}/marker", post(api_marker))
         .route("/api/processes/{pid}/kill", post(api_kill))
         .layer(middleware::from_fn(require_local_host))
         .layer(middleware::from_fn(security_headers))
@@ -238,6 +239,40 @@ async fn api_stop(
             error(StatusCode::NOT_FOUND, StopError::UnknownComponent)
         }
         Err(StopError::NotRunning) => error(StatusCode::CONFLICT, StopError::NotRunning),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MarkerBody {
+    #[serde(default)]
+    label: String,
+}
+
+/// `POST /api/components/{id}/marker` `{ label }`: drop a labelled marker
+/// into a running capture, the way the hotkey does — for a script or an
+/// agent that wants to say "trial 3 starts here" in the recording.
+async fn api_marker(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<axum::Json<MarkerBody>>,
+) -> Response {
+    if let Some(r) = guard(&headers) {
+        return r;
+    }
+    let label = body.map(|b| b.0.label).unwrap_or_default();
+    match st.manager.marker(&id, &label).await {
+        Ok(label) => axum::Json(json!({ "ok": true, "label": label })).into_response(),
+        Err(e) => {
+            let status = match e {
+                MarkerError::UnknownComponent => StatusCode::NOT_FOUND,
+                MarkerError::Unsupported | MarkerError::BadLabel(_) => StatusCode::BAD_REQUEST,
+                MarkerError::NotRunning => StatusCode::CONFLICT,
+                MarkerError::Write(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            warn!(component = %id, error = %e, "marker refused");
+            error(status, e)
+        }
     }
 }
 
@@ -549,6 +584,43 @@ mod tests {
         assert_eq!(s, StatusCode::CONFLICT);
         let (s, _, _) = call(st, Method::POST, "/api/components/nope/stop", true, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn markers_map_manager_errors_to_statuses() {
+        let st = state();
+        let marker = |st: AppState, id: &'static str, guarded: bool, body| async move {
+            call(
+                st,
+                Method::POST,
+                &format!("/api/components/{id}/marker"),
+                guarded,
+                body,
+            )
+            .await
+        };
+        let (s, _, _) = marker(st.clone(), "capture", false, Some(json!({ "label": "x" }))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "guard header required");
+        let (s, _, _) = marker(st.clone(), "nope", true, Some(json!({ "label": "x" }))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, v, _) = marker(st.clone(), "viz", true, Some(json!({ "label": "x" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not take markers")
+        );
+        let (s, v, _) = marker(st.clone(), "capture", true, Some(json!({ "label": "  " }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("blank"));
+        let (s, v, _) = marker(st.clone(), "capture", true, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "no body is an empty label");
+        assert!(v["error"].as_str().unwrap().contains("blank"));
+        // Nothing is running in tests (no binaries), so a good label is 409.
+        let (s, v, _) = marker(st, "capture", true, Some(json!({ "label": "round 1" }))).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(v["error"], "not running");
     }
 
     #[tokio::test]

@@ -610,6 +610,7 @@ mod tests {
             bin_found,
             flags: Vec::<Flag>::new(),
             takes_session: false,
+            markers: false,
             running,
             pid: running.then_some(4242),
             since_unix_s: running.then_some(1_000_000),

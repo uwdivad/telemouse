@@ -53,3 +53,6 @@ tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"

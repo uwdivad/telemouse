@@ -16,6 +16,13 @@
 # Your mouse's real CPI (a.k.a. DPI). Used by consumers to derive physical cm.
 mouse_cpi = 1600.0
 
+# System-wide hotkey that drops a marker into the recording ("clutch", "round
+# start"...). Windows hands a registered chord to telemouse before the game
+# sees it, so pick one the game does not use. Same grammar as [ctl] hotkey
+# (modifiers ctrl/alt/shift/win + a key; function keys may stand alone), and
+# it must differ from it; "" for none.
+marker_hotkey = "f9"
+
 [batch]
 # Batch window: the live-viz latency floor and the batches/s every hop pays
 # for (~150us of kernel CPU per batch across capture, bridge and each

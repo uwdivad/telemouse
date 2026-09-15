@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
+use telemouse_core::recordings::{SessionMeta, meta_file_name};
 
 /// One recorded session offered to the replay mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionEntry {
     /// File stem — also the session id, and the `{id}` in `/api/session/{id}`.
     pub id: String,
@@ -29,6 +30,11 @@ pub struct SessionEntry {
     /// the file's tail so a 500 MB recording costs the same as a 5 KB one.
     /// `None` if the tail holds no timestamped line.
     pub ended_utc_us: Option<i64>,
+    /// The `<id>.meta.json` sidecar the capture agent wrote next to the
+    /// recording — exit reason, drop and per-sink loss counters — when there
+    /// is one and it parses. `None` for a recording made without the
+    /// `observability` feature, or one still being written by an older agent.
+    pub sidecar: Option<SessionMeta>,
 }
 
 /// How much of a recording's head and tail is inspected for timestamps.
@@ -138,6 +144,7 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let (started_utc_us, ended_utc_us) = probe_time_range(&path);
+            let sidecar = read_sidecar(dir, &id);
             Some(SessionEntry {
                 id,
                 path: path.to_string_lossy().replace('\\', "/"),
@@ -145,6 +152,7 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
                 modified_epoch_ms,
                 started_utc_us,
                 ended_utc_us,
+                sidecar,
             })
         })
         .collect();
@@ -154,6 +162,15 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
             .then_with(|| a.id.cmp(&b.id))
     });
     out
+}
+
+/// The sidecar for `id` in `dir`, if it exists and parses. A sidecar is a
+/// few hundred bytes, so reading one per listed session costs less than the
+/// timestamp probe already does.
+fn read_sidecar(dir: &Path, id: &str) -> Option<SessionMeta> {
+    let path = dir.join(meta_file_name(id)?);
+    let text = std::fs::read_to_string(path).ok()?;
+    SessionMeta::from_json(&text).ok()
 }
 
 /// Resolve `id` to a readable recording path, or `None` if it is not one of the
@@ -222,6 +239,33 @@ mod tests {
         assert!(json.contains("modified_epoch_ms"));
         assert!(json.contains(r#""started_utc_us":null"#));
         assert!(json.contains(r#""ended_utc_us":null"#));
+    }
+
+    #[test]
+    fn listing_carries_the_sidecar_when_there_is_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "s-1.jsonl", "{}");
+        write(
+            tmp.path(),
+            "s-1.meta.json",
+            r#"{"session_id":"s-1","exit":"interrupt","clean":true,"events":42,"sinks":{"kafka":{"errors":0,"dropped":7,"abandoned":0}}}"#,
+        );
+        write(tmp.path(), "s-2.jsonl", "{}");
+        write(tmp.path(), "s-3.jsonl", "{}");
+        write(tmp.path(), "s-3.meta.json", "not json");
+
+        let list = list_recordings(tmp.path());
+        let by_id = |id: &str| list.iter().find(|e| e.id == id).unwrap();
+        let meta = by_id("s-1").sidecar.as_ref().expect("sidecar parsed");
+        assert_eq!(meta.exit, "interrupt");
+        assert_eq!(meta.events, 42);
+        assert_eq!(meta.losses(), vec![("kafka".to_string(), 7)]);
+        assert!(by_id("s-2").sidecar.is_none(), "no sidecar file");
+        assert!(by_id("s-3").sidecar.is_none(), "unparseable sidecar");
+
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains(r#""sidecar":null"#));
+        assert!(json.contains(r#""exit":"interrupt""#));
     }
 
     const SESSION_LINE: &str = r#"{"type":"session","session_id":"s","started_utc_us":1756000000000000,"qpc_freq":10000000,"anchor":{"qpc":5000000000,"utc_us":1756000000000500,"qpc_freq":10000000}}"#;

@@ -25,6 +25,7 @@ mod shipping;
 mod shutdown;
 mod sinks;
 mod stats;
+mod stdin_markers;
 
 use std::path::{Path, PathBuf};
 
@@ -330,9 +331,19 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         window_ms = cfg.batch.window_ms,
         coalesce_ms = cfg.batch.coalesce_ms,
         mouse_cpi = cfg.mouse_cpi,
+        marker_hotkey = %cfg.marker_hotkey,
         overrides = ?overrides,
         "telemouse starting"
     );
+
+    // The marker chord, validated when the config loaded; `""` means none.
+    let marker_hotkey = match telemouse_core::hotkey::Hotkey::parse(&cfg.marker_hotkey) {
+        Ok(hk) => hk,
+        Err(e) => {
+            tracing::warn!(error = %e, "marker_hotkey is unusable; no marker hotkey");
+            None
+        }
+    };
 
     // Keep Windows from parking us on a throttled E-core while a game owns the
     // P-cores. Best effort: a failure is logged, never fatal.
@@ -512,7 +523,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             waker: Arc::clone(&waker),
             ctx: Arc::clone(&ctx),
             devices: device_table,
-            hotkey: raw_input::Hotkey::default(),
+            hotkey: raw_input::Hotkey::from_config(marker_hotkey),
             coalesce: Duration::from_millis(cfg.batch.coalesce_ms),
             qpc_freq,
         };
@@ -532,6 +543,12 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             })
             .context("spawn capture thread")?
     };
+
+    // A piped stdin (the control panel, a script) is a marker source; a
+    // console is not. Not a thread we join: it ends when the pipe does.
+    if stdin_markers::spawn(marker_tx.clone(), Arc::clone(&waker)) {
+        tracing::info!("stdin is a pipe; each line written to it becomes a marker");
+    }
 
     let t3 = {
         let (ctx, stats, shutdown) = (Arc::clone(&ctx), Arc::clone(&stats), Arc::clone(&shutdown));
