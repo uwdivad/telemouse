@@ -1,14 +1,22 @@
 name: release
 
-# Pushing a `v*` tag builds two flavours on Windows and attaches both to a
+# Pushing a `v*` tag builds the workspace on Windows and attaches one zip to a
 # GitHub Release for that tag. Release notes are the matching CHANGELOG.md
 # section.
 #
-#   telemouse-vX.Y.Z-windows-x86_64.zip       minimal: capture, viz, control
-#                                             panel; no logging, no Kafka, no
-#                                             observability compiled in
-#   telemouse-vX.Y.Z-windows-x86_64-full.zip  everything: the four binaries
-#                                             with default features
+#   telemouse-vX.Y.Z-windows-x86_64.zip   the four binaries with default
+#                                         features (capture, viz, analyzer,
+#                                         control panel), the sample config,
+#                                         the user docs, the demo recording
+#
+# The minimal flavour (--no-default-features + quiet) is still linted and
+# tested here and in ci.yml so the feature flags keep working, but it is no
+# longer built or published: docs/DEVELOPING.md says how to build it yourself.
+#
+# Code signing (Azure Artifact Signing, formerly Trusted Signing) runs only
+# when the repository has the secrets and variables listed in
+# docs/DEVELOPING.md, "Code signing". Without them the release is published
+# unsigned, exactly as before.
 #
 #   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 
@@ -27,6 +35,16 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    # The OIDC token azure/login exchanges is issued for this environment
+    # (subject "repo:uwdivad/telemouse:environment:release"), which is what
+    # the federated credential in Entra ID trusts; a tag ref would need one
+    # credential per tag. GitHub creates the environment on the first run.
+    environment: release
+    env:
+      # `secrets` cannot be read in a step's `if:`, so the decision is made
+      # once here: 'true' only when the app registration and the signing
+      # account are all configured; anything else is an unsigned release.
+      SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' && vars.SIGNING_ENDPOINT != '' && vars.SIGNING_ACCOUNT_NAME != '' && vars.SIGNING_CERTIFICATE_PROFILE != '' }}
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml is the single source of truth for the version.
@@ -55,41 +73,83 @@ jobs:
       - name: Test (minimal)
         run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
 
-      - name: Build (full)
+      - name: Build
         run: cargo build --release --workspace --locked
-      - name: Build (minimal)
-        run: cargo build --release --locked -p telemouse-capture -p telemouse-viz -p telemouse-ctl --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet --target-dir target/minimal
+
+      # Signing comes before packaging so the zip, its hash and the
+      # attestation all describe the signed files. OIDC: no client secret is
+      # stored anywhere; azure/login leaves an Azure CLI session behind and
+      # the signing action picks it up (every other credential source is
+      # switched off so a stray environment variable cannot be tried first).
+      - name: Azure login (OIDC)
+        if: env.SIGNING == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign the executables
+        if: env.SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.SIGNING_CERTIFICATE_PROFILE }}
+          files: |
+            ${{ github.workspace }}\target\release\telemouse.exe
+            ${{ github.workspace }}\target\release\telemouse-viz.exe
+            ${{ github.workspace }}\target\release\telemouse-analyze.exe
+            ${{ github.workspace }}\target\release\telemouse-ctl.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: telemouse
+          description-url: https://github.com/uwdivad/telemouse
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+      - name: Verify the signatures
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          foreach ($exe in 'telemouse', 'telemouse-viz', 'telemouse-analyze', 'telemouse-ctl') {
+            $sig = Get-AuthenticodeSignature "target/release/$exe.exe"
+            "{0,-22} {1}  {2}" -f "$exe.exe", $sig.Status, $sig.SignerCertificate.Subject
+            if ($sig.Status -ne 'Valid') { throw "$exe.exe: signature is $($sig.Status): $($sig.StatusMessage)" }
+            if (-not $sig.TimeStamperCertificate) { throw "$exe.exe: signed but not timestamped; it would stop verifying when the certificate expires" }
+          }
+      - name: Note an unsigned release
+        if: env.SIGNING != 'true'
+        shell: pwsh
+        run: Write-Output "::notice title=Unsigned release::Signing secrets/variables are not configured (docs/DEVELOPING.md, Code signing); the executables are published unsigned."
 
       - name: Package
         shell: pwsh
         run: |
-          $base = "telemouse-${{ github.ref_name }}-windows-x86_64"
-          # What every zip carries: the loopback sample as telemouse.toml
-          # (never the repository's own dev config), the license, the
-          # user-facing docs (guide, conventions, fair-play statement, API
-          # reference), the plan the GUIDE links to, and the demo recording
-          # the README tells people to try first. Audit notes stay out.
-          function Common($dir) {
-            New-Item -ItemType Directory "$dir/docs", "$dir/recordings" | Out-Null
-            Copy-Item telemouse.example.toml "$dir/telemouse.toml"
-            Copy-Item LICENSE, README.md, CHANGELOG.md, mouse-telemetry-plan.md $dir
-            Copy-Item docs/GUIDE.md, docs/CONVENTIONS.md, docs/FAIR-PLAY.md, docs/API.md "$dir/docs"
-            Copy-Item recordings/demo-session.jsonl "$dir/recordings"
-          }
-          function Zip($dir) {
-            Compress-Archive -Path $dir -DestinationPath "$dir.zip"
-            Get-FileHash "$dir.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $dir.zip" } | Set-Content "$dir.zip.sha256"
-          }
-          $min = $base
-          New-Item -ItemType Directory $min | Out-Null
-          Copy-Item target/minimal/release/telemouse.exe, target/minimal/release/telemouse-viz.exe, target/minimal/release/telemouse-ctl.exe $min
-          Common $min
-          Zip $min
-          $full = "$base-full"
-          New-Item -ItemType Directory $full | Out-Null
-          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $full
-          Common $full
-          Zip $full
+          $dir = "telemouse-${{ github.ref_name }}-windows-x86_64"
+          # Beside the binaries: the loopback sample as telemouse.toml (never
+          # the repository's own dev config; Kafka is off in it), the license,
+          # the user-facing docs (help, guide, fair-play statement, API
+          # reference, the README's screenshot)
+          # and the demo recording the README tells people to try first.
+          # Contributor material (CONVENTIONS.md, DEVELOPING.md, the design
+          # plan) and audit notes stay out; the GUIDE links to the plan on
+          # GitHub.
+          New-Item -ItemType Directory $dir, "$dir/docs", "$dir/recordings" | Out-Null
+          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $dir
+          Copy-Item telemouse.example.toml "$dir/telemouse.toml"
+          Copy-Item LICENSE, README.md, CHANGELOG.md $dir
+          Copy-Item docs/HELP.md, docs/GUIDE.md, docs/FAIR-PLAY.md, docs/API.md "$dir/docs"
+          Copy-Item docs/img "$dir/docs" -Recurse
+          Copy-Item recordings/demo-session.jsonl "$dir/recordings"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          Get-FileHash "$dir.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $dir.zip" } | Set-Content "$dir.zip.sha256"
 
       - name: Release notes from CHANGELOG.md
         shell: pwsh
@@ -103,14 +163,12 @@ jobs:
           $body = if ($end -gt 1) { $rest[0..($end - 2)] } elseif ($end -eq 1) { @() } else { $rest }
           $body | Set-Content notes.md
 
-      # A signed statement that these exact zips were built by this workflow
-      # from this commit: the trust signal that stands in for a code
-      # signature until the binaries are signed.
+      # A signed statement that this exact zip was built by this workflow from
+      # this commit. It holds whether or not the executables inside carry an
+      # Authenticode signature.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: |
-            telemouse-${{ github.ref_name }}-windows-x86_64.zip
-            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip
+          subject-path: telemouse-${{ github.ref_name }}-windows-x86_64.zip
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -119,5 +177,3 @@ jobs:
           files: |
             telemouse-${{ github.ref_name }}-windows-x86_64.zip
             telemouse-${{ github.ref_name }}-windows-x86_64.zip.sha256
-            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip
-            telemouse-${{ github.ref_name }}-windows-x86_64-full.zip.sha256

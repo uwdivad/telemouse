@@ -853,13 +853,15 @@ mod tests {
         }
     }
 
-    /// The engine's unit tests (`js-tests/engine.test.mjs`) against a stub
-    /// DOM: unit conversion, unwrapped yaw, loss accounting, the live-buffer
-    /// floor, the memory cap, checkpointed seeking, session restarts and OBS
-    /// parameter clamping.
+    /// Every `js-tests/*.test.mjs`: the engine's unit tests against a stub
+    /// DOM (unit conversion, unwrapped yaw, loss accounting, the live-buffer
+    /// floor, the memory cap, checkpointed seeking, session restarts, OBS
+    /// parameter clamping) and the DOM-id check that every element the
+    /// script looks up exists in the page.
     #[test]
     fn app_js_engine_tests_pass_under_node_when_available() {
-        if let Some(out) = node(&["--test", "js-tests/engine.test.mjs"]).unwrap() {
+        // Node expands the glob itself, so this works from any shell.
+        if let Some(out) = node(&["--test", "js-tests/*.test.mjs"]).unwrap() {
             assert!(
                 out.status.success(),
                 "node --test failed:\n{}\n{}",

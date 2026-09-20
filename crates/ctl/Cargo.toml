@@ -11,8 +11,8 @@ rust-version.workspace = true
 name = "telemouse-ctl"
 path = "src/main.rs"
 
-# The developer build has everything; the minimal release zip is built with
-# `--no-default-features --features quiet`. `logging` is the panel's own
+# The default build (what the release ships) has everything; a minimal
+# build is `--no-default-features --features quiet`. `logging` is the panel's own
 # `ctl.log` plus one `<component>.log` per launched child (the in-memory log
 # ring the page shows always exists); `observability` reads the capture
 # agent's stats line into the card, the tray tooltip and `/api/state`, and
@@ -42,6 +42,10 @@ tokio = { version = "1.53.1", features = [
     "sync",
 ] }
 axum = { version = "0.8.9" }
+# The settings editor (settings.rs) changes values in the user's
+# telemouse.toml in place: comments, ordering and keys the form does not
+# know survive a save.
+toml_edit = "0.25.15"
 
 # The process table is read with a Toolhelp snapshot plus per-process
 # queries for the few matching names (see procs.rs for why not sysinfo).
@@ -69,7 +73,14 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_HiDpi",
     # GetDiskFreeSpaceExW for the "GB free" reading on the capture card.
     "Win32_Storage_FileSystem",
+    # CoInitializeEx on the UI thread: WebView2 is a COM object that wants
+    # a single-threaded apartment.
+    "Win32_System_Com",
 ] }
+# The panel page inside the window (gui/webview.rs). Microsoft's own
+# bindings, same `windows` line as above; the loader is linked statically,
+# so no DLL ships. The runtime itself comes with Windows 10/11 (Edge).
+webview2-com = "0.39.1"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"

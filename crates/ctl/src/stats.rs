@@ -147,6 +147,51 @@ impl RecordingLive {
     }
 }
 
+/// The line the agent prints the moment another program comes to the front,
+/// so the panel does not have to wait for the next report to know.
+const FOREGROUND_MESSAGE: &str = "foreground changed";
+
+/// How many distinct programs [`note_seen`] remembers per capture run.
+pub const MAX_SEEN: usize = 8;
+
+/// A program the capture agent saw in the foreground during this run, and
+/// when it last did. The first-run guide offers these as "is this your
+/// game?" — the name comes from what actually ran on this PC, never from a
+/// list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeenProgram {
+    pub exe: String,
+    pub last_unix_s: u64,
+}
+
+/// The program a `foreground changed` line names, if `line` is one.
+pub fn parse_foreground_line(line: &str) -> Option<String> {
+    let rest = line.split_once(FOREGROUND_MESSAGE)?.1;
+    fields(rest)
+        .into_iter()
+        .find(|(k, _)| *k == "game")
+        .map(|(_, v)| v)
+}
+
+/// Remember `exe` as seen at `now`, most recent first, at most [`MAX_SEEN`].
+/// "Nothing in front" (`-`) and telemouse's own windows are not programs
+/// anyone would pick as their game.
+pub fn note_seen(seen: &mut Vec<SeenProgram>, exe: &str, now: u64) {
+    let exe = exe.trim();
+    if exe.is_empty() || exe == "-" || exe.to_ascii_lowercase().starts_with("telemouse") {
+        return;
+    }
+    seen.retain(|s| !s.exe.eq_ignore_ascii_case(exe));
+    seen.insert(
+        0,
+        SeenProgram {
+            exe: exe.to_string(),
+            last_unix_s: now,
+        },
+    );
+    seen.truncate(MAX_SEEN);
+}
+
 /// Parse one line of child output, if it is a `capture stats` report.
 ///
 /// The line is whatever `tracing`'s formatter wrote: a timestamp, a level,
@@ -280,6 +325,43 @@ mod tests {
     /// Exactly what `tracing`'s formatter writes for the agent's report
     /// (`with_target(false)`), quotes and all.
     const LINE: &str = "2026-09-12T09:12:33.481234Z  INFO capture stats session=s-20260912-091100 events_per_s=1002.4 events=120400 batches_per_s=20 drops=0 idle_for_s=0.4 udp_unreachable=0 jsonl_dropped=0 kafka_dropped=0 game=\"cs2.exe\" pointer_locked=true";
+
+    #[test]
+    fn foreground_lines_name_the_program() {
+        let l = "2026-09-20T10:00:00.000000Z  INFO foreground changed game=\"Some Game.exe\"";
+        assert_eq!(parse_foreground_line(l).as_deref(), Some("Some Game.exe"));
+        assert_eq!(
+            parse_foreground_line("INFO foreground changed game=-").as_deref(),
+            Some("-")
+        );
+        assert_eq!(parse_foreground_line(LINE), None);
+    }
+
+    #[test]
+    fn seen_programs_are_recent_first_distinct_and_bounded() {
+        let mut seen = Vec::new();
+        for (exe, at) in [
+            ("a.exe", 1),
+            ("-", 2),
+            ("", 3),
+            ("telemouse-ctl.exe", 4),
+            ("Telemouse-Viz.exe", 5),
+            ("b.exe", 6),
+            ("A.EXE", 7),
+        ] {
+            note_seen(&mut seen, exe, at);
+        }
+        let names: Vec<_> = seen
+            .iter()
+            .map(|s| (s.exe.as_str(), s.last_unix_s))
+            .collect();
+        assert_eq!(names, vec![("A.EXE", 7), ("b.exe", 6)]);
+        for i in 0..20 {
+            note_seen(&mut seen, &format!("p{i}.exe"), 10 + i);
+        }
+        assert_eq!(seen.len(), MAX_SEEN);
+        assert_eq!(seen[0].exe, "p19.exe");
+    }
 
     #[test]
     fn the_agents_stats_line_becomes_numbers() {

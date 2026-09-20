@@ -49,7 +49,7 @@ all members and shared `[workspace.dependencies]`; add crate-local deps with
   repeated as a `warn` once a minute, never only as a number in the stats
   line.
 - Build flavours: `logging`, `observability` and (capture only) `kafka` are
-  Cargo features, on by default, off in the minimal release zip; `quiet`
+  Cargo features, on by default, off in a minimal build; `quiet`
   compiles `tracing` calls out. New code that logs to a file, reports
   stats, or talks to Kafka goes behind the matching feature; the pipeline
   itself (capture → UDP → viz, JSONL recording, the pages) never does. Every

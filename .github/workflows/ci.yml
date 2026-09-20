@@ -27,8 +27,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy (full, default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # The minimal flavour is what the release zip ships: no logging, no
-      # Kafka, no observability. It must build and pass its tests too.
+      # The minimal flavour (no logging, no Kafka, no observability) is no
+      # longer published, only documented as a build-it-yourself option
+      # (docs/DEVELOPING.md). These two steps keep its feature flags working.
       - name: clippy (minimal)
         run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
       - name: test (full)
@@ -40,7 +41,7 @@ jobs:
       - name: viz page syntax
         run: node --check crates/viz/src/app.js
       - name: viz engine tests
-        run: node --test crates/viz/js-tests/engine.test.mjs
+        run: node --test "crates/viz/js-tests/*.test.mjs"
 
   audit:
     runs-on: ubuntu-latest

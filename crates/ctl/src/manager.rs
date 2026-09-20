@@ -94,7 +94,21 @@ pub struct Component {
     /// Started with a piped stdin that `POST /api/components/{id}/marker`
     /// writes labels to, one per line. Only the capture agent reads them.
     pub markers: bool,
+    /// Gets `--json-dir <the panel's report cache>` appended (the analyzer):
+    /// a report computed once is reused by the next run over the same
+    /// recording, and by the summary the result card is drawn from.
+    pub report_cache: bool,
 }
+
+/// The folder inside the recordings directory where the analyzer's cached
+/// `<id>.report.json` files and the panel's `<id>.summary.json` go. Dotted
+/// like the analyzer's own index file, so it sorts out of the way.
+pub const REPORTS_DIR: &str = ".reports";
+
+/// How long one summary run of the analyzer may take before it is given up
+/// on. A cached report answers in well under a second; an hour-long
+/// recording analysed from cold takes tens of seconds.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The panel's catalogue. Order is display order.
 // rustfmt would spread every `Flag` over four lines; one row per flag reads
@@ -118,6 +132,7 @@ pub const COMPONENTS: &[Component] = &[
         takes_session: false,
         passes_config: true,
         markers: true,
+        report_cache: false,
     },
     Component {
         id: "viz",
@@ -130,6 +145,7 @@ pub const COMPONENTS: &[Component] = &[
         takes_session: false,
         passes_config: true,
         markers: false,
+        report_cache: false,
     },
     Component {
         id: "doctor",
@@ -142,6 +158,7 @@ pub const COMPONENTS: &[Component] = &[
         takes_session: false,
         passes_config: true,
         markers: false,
+        report_cache: false,
     },
     Component {
         id: "trend",
@@ -154,6 +171,7 @@ pub const COMPONENTS: &[Component] = &[
         takes_session: false,
         passes_config: false,
         markers: false,
+        report_cache: true,
     },
     Component {
         id: "report",
@@ -169,6 +187,7 @@ pub const COMPONENTS: &[Component] = &[
         takes_session: true,
         passes_config: false,
         markers: false,
+        report_cache: true,
     },
 ];
 
@@ -304,7 +323,7 @@ pub fn short_hint(hint: &str, max: usize) -> String {
 /// Where a component's live numbers come from: the last `capture stats`
 /// line, plus what the recording it names costs on disk.
 #[cfg(feature = "observability")]
-pub use crate::stats::{ChildStats, RecordingLive};
+pub use crate::stats::{ChildStats, RecordingLive, SeenProgram};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentState {
@@ -345,6 +364,11 @@ pub struct ComponentState {
     #[cfg(feature = "observability")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording: Option<RecordingLive>,
+    /// Capture only: the programs seen in the foreground during this run,
+    /// most recent first (the first-run guide's "is this your game?").
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub foreground_seen: Vec<SeenProgram>,
 }
 
 /// Whether recording is on by default (`recording.enabled`) and where it
@@ -474,6 +498,36 @@ impl std::fmt::Display for MarkerError {
     }
 }
 
+/// Why a recording's summary could not be had.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SummaryError {
+    /// Not a recording id (`telemouse_core::recordings::is_safe_id`).
+    BadId,
+    NoRecording,
+    /// `telemouse-analyze` is not next to the panel.
+    NoAnalyzer,
+    Failed(String),
+}
+
+impl std::fmt::Display for SummaryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadId => write!(f, "not a recording id"),
+            Self::NoRecording => write!(f, "no such recording"),
+            Self::NoAnalyzer => write!(
+                f,
+                "telemouse-analyze was not found next to telemouse-ctl, so there is no report card"
+            ),
+            Self::Failed(why) => write!(f, "the report could not be summarised: {why}"),
+        }
+    }
+}
+
+/// `path`'s modification time, to the filesystem's own resolution.
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Longest marker label accepted, in characters. Mirrors the capture agent's
 /// own cap, so what the panel accepts is what the recording keeps.
 pub const MAX_MARKER_LABEL_CHARS: usize = 120;
@@ -571,6 +625,9 @@ pub struct LogSink {
     file: Mutex<Option<std::sync::mpsc::Sender<String>>>,
     #[cfg(feature = "observability")]
     stats: Mutex<Option<ChildStats>>,
+    /// Programs seen in the foreground during the current run.
+    #[cfg(feature = "observability")]
+    seen: Mutex<Vec<SeenProgram>>,
 }
 
 impl LogSink {
@@ -585,7 +642,12 @@ impl LogSink {
 
         #[cfg(feature = "observability")]
         if let Some(s) = crate::stats::parse_stats_line(&line) {
+            if let Some(game) = s.game.as_deref() {
+                self.note_seen(game);
+            }
             *self.stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(s);
+        } else if let Some(game) = crate::stats::parse_foreground_line(&line) {
+            self.note_seen(&game);
         }
 
         #[cfg(feature = "logging")]
@@ -630,6 +692,24 @@ impl LogSink {
     #[cfg(feature = "observability")]
     fn stats(&self) -> Option<ChildStats> {
         self.stats.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    #[cfg(feature = "observability")]
+    fn note_seen(&self, exe: &str) {
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        crate::stats::note_seen(&mut seen, exe, now_unix());
+    }
+
+    #[cfg(feature = "observability")]
+    fn seen(&self) -> Vec<SeenProgram> {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A new run starts with nothing seen: last session's programs are not
+    /// this session's.
+    #[cfg(feature = "observability")]
+    fn forget_seen(&self) {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Attach the file on first use. Opening lazily means an unwritable log
@@ -864,6 +944,8 @@ pub struct Manager {
     slots: tokio::sync::Mutex<HashMap<&'static str, Slot>>,
     /// Binary lookups, good for [`BIN_TTL`]; dropped on every start and stop.
     bins: Mutex<BinCache>,
+    /// Held while a summary run of the analyzer is in flight.
+    summary_lock: tokio::sync::Mutex<()>,
     /// Fired whenever something starts or stops, so the reaper and the tray
     /// publisher can sleep instead of polling an idle panel.
     work: Notify,
@@ -890,6 +972,7 @@ impl Manager {
             live: Mutex::new(live),
             slots: tokio::sync::Mutex::new(slots),
             bins: Mutex::new(None),
+            summary_lock: tokio::sync::Mutex::new(()),
             work: Notify::new(),
             #[cfg(feature = "observability")]
             disk: Mutex::new(None),
@@ -940,6 +1023,111 @@ impl Manager {
             .recording_enabled
     }
 
+    /// The `telemouse.toml` this panel runs on and hands to its children.
+    pub fn config_path(&self) -> &Path {
+        &self.cfg.config_path
+    }
+
+    /// Where the analyzer's cached reports and the summaries go.
+    pub fn reports_dir(&self) -> PathBuf {
+        self.recordings_dir().join(REPORTS_DIR)
+    }
+
+    pub async fn is_running(&self, id: &str) -> bool {
+        let Some(c) = self.component(id) else {
+            return false;
+        };
+        let mut slots = self.slots.lock().await;
+        slots.get_mut(c.id).is_some_and(|s| !s.reap(c))
+    }
+
+    /// The stored summary of a recording, if one was made after the
+    /// recording last changed. Reads a small file; runs nothing.
+    pub fn stored_summary(&self, id: &str) -> Result<Option<serde_json::Value>, SummaryError> {
+        let recording = self.recording_by_id(id)?;
+        let path = self.reports_dir().join(format!("{id}.summary.json"));
+        let fresh = match (mtime_of(&path), mtime_of(&recording)) {
+            (Some(s), Some(r)) => s >= r,
+            _ => false,
+        };
+        if !fresh {
+            return Ok(None);
+        }
+        Ok(std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// `<recordings>/<id>.jsonl` for an id that obeys the workspace rule.
+    fn recording_by_id(&self, id: &str) -> Result<PathBuf, SummaryError> {
+        if !telemouse_core::recordings::is_safe_id(id) {
+            return Err(SummaryError::BadId);
+        }
+        let p = self.recordings_dir().join(format!("{id}.jsonl"));
+        if p.is_file() {
+            Ok(p)
+        } else {
+            Err(SummaryError::NoRecording)
+        }
+    }
+
+    /// Run `telemouse-analyze report <recording> --summary --json-dir
+    /// <cache>` and return the JSON it prints: the headline numbers the
+    /// page's result card is drawn from. Fixed arguments, one recording
+    /// named by id — the same launcher rule as [`Self::arguments`]. After a
+    /// text report over the same recording this is a cache hit. The result
+    /// is also kept as `<cache>/<id>.summary.json` for [`Self::stored_summary`].
+    pub async fn report_summary(&self, id: &str) -> Result<serde_json::Value, SummaryError> {
+        self.refresh_config();
+        let recording = self.recording_by_id(id)?;
+        let (bin, found) = self.resolve_bin("telemouse-analyze");
+        if !found {
+            return Err(SummaryError::NoAnalyzer);
+        }
+        // One at a time: two cold analyses of a long recording would fight
+        // over the same cores the game is using.
+        let _one = self.summary_lock.lock().await;
+        let dir = self.reports_dir();
+        let mut cmd = Command::new(&bin);
+        cmd.arg("report")
+            .arg(&recording)
+            .arg("--summary")
+            .arg("--json-dir")
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("NO_COLOR", "1")
+            .kill_on_drop(true);
+        let run = tokio::time::timeout(SUMMARY_TIMEOUT, cmd.output());
+        let out = match run.await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(SummaryError::Failed(format!("{}: {e}", bin.display()))),
+            Err(_) => return Err(SummaryError::Failed("the analyzer took too long".into())),
+        };
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let last = err
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no message");
+            let last = telemouse_core::logging::strip_ansi(last);
+            warn!(id, error = %last, "summary run failed");
+            return Err(SummaryError::Failed(clip(last.trim(), 300)));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            SummaryError::Failed(format!("the analyzer did not print a summary: {e}"))
+        })?;
+        let path = dir.join(format!("{id}.summary.json"));
+        if let Err(e) =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &out.stdout))
+        {
+            warn!(path = %path.display(), error = %e, "could not keep the summary; it will be computed again next time");
+        }
+        Ok(value)
+    }
+
     /// Re-read `telemouse.toml` if it changed since we last looked, and take
     /// the two fields a running panel can honour: whether capture saves by
     /// default, and where recordings go. Everything else (ports, the bin
@@ -956,6 +1144,14 @@ impl Manager {
                 return;
             }
         }
+        self.reload_config();
+    }
+
+    /// [`Self::refresh_config`] without the "did it change" question: the
+    /// settings editor has just written the file, and two saves inside one
+    /// second carry the same mtime.
+    pub fn reload_config(&self) {
+        let current = mtime_unix(&self.cfg.config_path);
         let base = telemouse_core::paths::config_base(&self.cfg.config_path);
         let loaded = match AppConfig::load_or_default(&self.cfg.config_path) {
             Ok(mut c) => {
@@ -1154,6 +1350,8 @@ impl Manager {
                         })
                         .flatten(),
                     #[cfg(feature = "observability")]
+                    foreground_seen: if running { s.log.seen() } else { Vec::new() },
+                    #[cfg(feature = "observability")]
                     stats,
                 }
             })
@@ -1217,6 +1415,10 @@ impl Manager {
             args.push("--config".into());
             args.push(self.cfg.config_path.display().to_string());
         }
+        if c.report_cache {
+            args.push("--json-dir".into());
+            args.push(self.reports_dir().display().to_string());
+        }
         // `save` becomes a flag here and then goes through the same allow-list
         // as any other, so a component without the recording switch refuses it
         // the way it refuses the raw flag.
@@ -1253,6 +1455,8 @@ impl Manager {
         if let Some(dir) = &self.cfg.log_dir {
             slot.log.ensure_file(dir, c.id);
         }
+        #[cfg(feature = "observability")]
+        slot.log.forget_seen();
 
         let mut cmd = Command::new(&bin);
         cmd.args(&args)
@@ -1492,6 +1696,7 @@ mod tests {
         takes_session: false,
         passes_config: false,
         markers: true,
+        report_cache: false,
     };
 
     const REPORTER: Component = Component {
@@ -1505,6 +1710,7 @@ mod tests {
         takes_session: true,
         passes_config: false,
         markers: false,
+        report_cache: true,
     };
 
     /// A task that fails: exits 3 without being asked to.
@@ -1525,6 +1731,7 @@ mod tests {
         takes_session: false,
         passes_config: false,
         markers: false,
+        report_cache: false,
     };
 
     fn config(dir: &Path) -> ManagerConfig {
@@ -1915,6 +2122,11 @@ mod tests {
             .unwrap();
         assert_eq!(ok[0], "report");
         assert!(ok[1].ends_with("s-1.jsonl"));
+        // The analyzer is pointed at the panel's report cache, inside the
+        // recordings directory.
+        assert_eq!(ok[2], "--json-dir");
+        assert_eq!(PathBuf::from(&ok[3]), dir.join(REPORTS_DIR));
+        assert_eq!(ok.len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

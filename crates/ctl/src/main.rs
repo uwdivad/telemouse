@@ -18,6 +18,7 @@ mod manager;
 mod places;
 mod procs;
 mod server;
+mod settings;
 #[cfg(feature = "observability")]
 mod stats;
 
@@ -36,6 +37,7 @@ use crate::manager::{ConfigStatus, Manager, ManagerConfig};
 use crate::places::Places;
 use crate::procs::Scanner;
 use crate::server::{AppState, PageConfig};
+use crate::settings::{Seed, seed_config};
 
 /// How often exited children are reaped while something is running. When
 /// nothing is, the reaper sleeps until the manager reports a start.
@@ -45,50 +47,6 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 /// children are stopped. Windows gives a console process about five seconds
 /// before it is killed regardless; the fast stop is clamped below this.
 const SIGNAL_MAX_WAIT: Duration = Duration::from_secs(4);
-
-/// The sample config shipped with every release: `telemouse.example.toml`
-/// at the workspace root (loopback everywhere, Kafka off). Written as
-/// `telemouse.toml` on first start when none exists. The path reaches
-/// outside this crate, so the crate builds from the workspace only.
-const SAMPLE_CONFIG: &str = include_str!("../../../telemouse.example.toml");
-
-/// What [`seed_config`] did; reported once the subscriber exists.
-enum Seed {
-    /// A file was already there (or something else is; `load` will say).
-    Existing,
-    /// The sample was written.
-    Written,
-    /// The sample could not be written (a directory in the way, a read-only
-    /// location, ...); `load` decides what that means.
-    Failed(std::io::Error),
-}
-
-/// Write the shipped sample to `path` unless something is already there.
-/// `create_new` means an existing file is never touched, even one that
-/// appears between a check and the write; a half-written file is removed
-/// rather than left to fail parsing on the next start.
-fn seed_config(path: &Path) -> Seed {
-    use std::io::Write;
-    match std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut f) => match f
-            .write_all(SAMPLE_CONFIG.as_bytes())
-            .and_then(|()| f.flush())
-        {
-            Ok(()) => Seed::Written,
-            Err(e) => {
-                drop(f);
-                let _ = std::fs::remove_file(path);
-                Seed::Failed(e)
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Seed::Existing,
-        Err(e) => Seed::Failed(e),
-    }
-}
 
 /// The features this binary was built with, for the startup line and the
 /// page: the one fact a bug report needs and nobody thinks to include.
@@ -183,10 +141,15 @@ struct ServeArgs {
     /// Override `ctl.bin_dir`: where the telemouse binaries are.
     #[arg(long, value_name = "DIR")]
     bin_dir: Option<PathBuf>,
-    /// Do not show the tray icon and status window (Windows only; the panel
+    /// Do not show the tray icon and the window (Windows only; the panel
     /// is always headless elsewhere).
     #[arg(long)]
     no_gui: bool,
+    /// Keep the tray and the window but do not host the panel page in it
+    /// (no WebView2 / Edge components are loaded); the window shows the
+    /// text status view and the page stays in your browser.
+    #[arg(long)]
+    no_webview: bool,
     /// Override `ctl.log_dir`: where `ctl.log` and one `<component>.log` per
     /// launched component are written (builds with the `logging` feature).
     #[arg(long, value_name = "DIR")]
@@ -312,6 +275,21 @@ async fn serve(
         },
     ));
 
+    // Where the window's embedded browser may write. Created now so a
+    // missing or unwritable location is known before the window exists (it
+    // then shows the text view and says so).
+    let webview_data_dir = if gui_mode && !args.no_webview {
+        places::webview_data_dir().and_then(|d| match std::fs::create_dir_all(&d) {
+            Ok(()) => Some(d),
+            Err(e) => {
+                warn!(error = %e, path = %d.display(), "cannot create the WebView2 data folder; the window will show the text view");
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     // Every place the panel talks about, decided once so the header, the
     // tray menu and the page cannot disagree.
     let exe_dir = telemouse_core::paths::exe_dir();
@@ -330,6 +308,10 @@ async fn serve(
             .unwrap_or_default(),
         docs: Places::docs_target(exe_dir.as_deref()),
         releases: places::RELEASES_URL.into(),
+        webview_data: webview_data_dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
     };
 
     let state = AppState {
@@ -342,8 +324,11 @@ async fn serve(
             stop_grace_secs: cfg.ctl.stop_grace_secs,
             features: features().into(),
             places: places.clone(),
+            marker_hotkey: cfg.marker_hotkey.clone(),
+            hotkey: cfg.ctl.hotkey.clone(),
         })),
         places: Arc::new(places.clone()),
+        settings_lock: Arc::default(),
     };
 
     // Reap exited children while anything runs; when nothing does, sleep
@@ -422,6 +407,8 @@ async fn serve(
             None
         }
     };
+    // The listener above is already bound: the window's embedded page has
+    // something to navigate to the moment it exists.
     let gui = if gui_mode {
         gui::spawn(gui::GuiDeps {
             handle: tokio::runtime::Handle::current(),
@@ -430,6 +417,8 @@ async fn serve(
             quit: quit.clone(),
             hotkey,
             places: places.clone(),
+            webview_data_dir,
+            no_webview: args.no_webview,
         })
     } else {
         None
@@ -510,6 +499,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::SAMPLE_CONFIG;
     use clap::CommandFactory;
 
     #[test]
@@ -536,6 +526,7 @@ mod tests {
         assert_eq!(a.http.as_deref(), Some("127.0.0.1:9001"));
         assert_eq!(a.bin_dir, Some(PathBuf::from("target/release")));
         assert!(!a.no_gui, "the gui is on by default");
+        assert!(!a.no_webview, "the embedded page is on by default");
         assert!(
             a.log_dir.is_none(),
             "log dir comes from the config by default"

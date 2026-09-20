@@ -3,108 +3,158 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>telemouse — live &amp; replay</title>
 <!-- Server-injected config ([viz.obs] defaults, and whether this is the /obs
      route). The placeholder survives when the file is opened raw, in which
      case the page sees an empty object and behaves as the dashboard. -->
 <script>window.TELEMOUSE_CONFIG = {/*__TELEMOUSE_CONFIG__*/};</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1017'/%3E%3Cpath d='M5 25 C11 25 9 8 16 8 C23 8 21 21 27 12' fill='none' stroke='%2335d0e0' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
-<style>
-  :root {
-    --bg: #080a0f;
-    --panel: #0e131c;
-    --panel-2: #121826;
-    --line: #1d2634;
-    --line-soft: #151c28;
-    --fg: #d5deea;
-    --fg-dim: #7c8ba1;
-    --fg-faint: #4d5a6d;
-    --accent: #35d0e0;
-    --accent-2: #7c8cff;
-    --warn: #ffb02e;
-    --bad: #ff4d5e;
-    --good: #46d68a;
-    --lmb: #46d68a;
-    --rmb: #7c8cff;
-    --aux: #ffb02e;
-    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+<!-- Theme before first paint, so a remembered light theme never flashes dark.
+     The /obs overlay is not themed: it is composited over a game, keeps the
+     dark tokens whatever Windows says, reads no storage, and drops the
+     color-scheme hint so the page stays exactly as transparent as it was. -->
+<script>
+(function () {
+  var root = document.documentElement, cfg = window.TELEMOUSE_CONFIG || {};
+  if (cfg.obs_route === true || /[?&]obs=1(&|$)/.test(location.search)) {
+    root.dataset.theme = "dark";
+    root.classList.add("obs-root");
+    var m = document.querySelector('meta[name="color-scheme"]');
+    if (m) m.remove();
+    return;
   }
+  try {
+    var t = localStorage.getItem("tmTheme");
+    if (t === "light" || t === "dark") root.dataset.theme = t;
+  } catch (e) { /* storage blocked: follow the system */ }
+})();
+</script>
+<style>
+  /* ---------- tokens: the control panel's design system (crates/ctl/src/index.html).
+     Dark by default, light when Windows is, or by choice. The second group in
+     each block is what the canvases draw with; app.js reads those once and
+     again on a theme change, never per frame, so they stay plain hex. ---------- */
+  :root {
+    --bg: #0b0f16; --surface: #121826; --surface-2: #182033; --line: #222c3d; --line-strong: #2e3a50;
+    --fg: #e6edf6; --fg-2: #9aa8bb; --fg-3: #66748a;
+    --accent: #35d0e0; --accent-ink: #062126;
+    --ok: #46d68a; --warn: #ffb02e; --bad: #ff5c5c;
+    --shadow: 0 8px 28px #0009;
+    --sans: system-ui, "Segoe UI Variable", "Segoe UI", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --r: 10px; --r-sm: 6px;
+
+    --canvas: #0b0f16; --grid: #161e2b; --grid-axis: #2a3547; --grid-wrap: #3a2b46;
+    --head: #ffffff; --lmb: #46d68a; --rmb: #7c8cff; --aux: #ffb02e;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6fa; --surface: #ffffff; --surface-2: #eef2f7; --line: #dde3ec; --line-strong: #c9d2df;
+    --fg: #16202c; --fg-2: #4e5d70; --fg-3: #7b8899;
+    --accent: #0b8f9c; --accent-ink: #ffffff;
+    --ok: #178f4f; --warn: #b26a00; --bad: #c62b2b;
+    --shadow: 0 8px 28px #0002;
+
+    --canvas: #ffffff; --grid: #edf1f6; --grid-axis: #c9d2df; --grid-wrap: #d6c3ea;
+    --head: #16202c; --lmb: #178f4f; --rmb: #4a5ad6; --aux: #b26a00;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+      --bg: #f4f6fa; --surface: #ffffff; --surface-2: #eef2f7; --line: #dde3ec; --line-strong: #c9d2df;
+      --fg: #16202c; --fg-2: #4e5d70; --fg-3: #7b8899;
+      --accent: #0b8f9c; --accent-ink: #ffffff;
+      --ok: #178f4f; --warn: #b26a00; --bad: #c62b2b;
+      --shadow: 0 8px 28px #0002;
+
+      --canvas: #ffffff; --grid: #edf1f6; --grid-axis: #c9d2df; --grid-wrap: #d6c3ea;
+      --head: #16202c; --lmb: #178f4f; --rmb: #4a5ad6; --aux: #b26a00;
+      color-scheme: light;
+    }
+  }
+
+  /* ---------- base ---------- */
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 14px/1.5 var(--sans);
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
-
-  /* ---------- top bar ---------- */
-  .topbar {
-    display: flex; align-items: center; gap: 14px;
-    padding: 8px 14px;
-    background: linear-gradient(180deg, #10161f, #0b1017);
-    border-bottom: 1px solid var(--line);
-    flex: none;
-  }
-  .brand {
-    font-weight: 700; letter-spacing: .16em; text-transform: uppercase;
-    font-size: 12px; color: var(--accent);
-  }
-  .brand span { color: var(--fg-faint); }
-  .seg { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-  .seg button {
-    background: transparent; border: 0; color: var(--fg-dim);
-    padding: 5px 14px; font: inherit; cursor: pointer;
-  }
-  .seg button:hover { background: #182130; color: var(--fg); }
-  .seg button.on { background: var(--accent); color: #04222a; font-weight: 600; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button, select, input[type=range] { font: inherit; }
-  .btn {
-    background: #161d2a; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: 5px 11px; cursor: pointer;
+
+  /* ---------- top bar: wraps, never clips ---------- */
+  .topbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+    padding: 8px 16px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    flex: none; min-width: 0;
   }
-  .btn:hover { background: #1d2637; border-color: #2b3648; }
+  .brand { font-weight: 600; font-size: 15px; letter-spacing: .01em; }
+  .brand span { color: var(--accent); }
+  .seg {
+    display: flex; border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+    overflow: hidden; background: var(--surface-2); flex: none;
+  }
+  .seg button {
+    background: transparent; border: 0; color: var(--fg-2);
+    padding: 5px 12px; font: 600 12px/1.3 var(--sans); cursor: pointer;
+  }
+  .seg button:hover { color: var(--fg); }
+  .seg button.on { background: var(--accent); color: var(--accent-ink); }
+  .btn {
+    font: 600 13px/1 var(--sans); padding: 8px 14px; border-radius: var(--r-sm);
+    border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--fg);
+    cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--fg-3); }
   .btn:active { transform: translateY(1px); }
+  .btn.small { font-size: 12px; padding: 6px 10px; }
   .btn.on { border-color: var(--accent); color: var(--accent); }
   .btn kbd {
-    font: 10px var(--mono); color: var(--fg-faint);
-    border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; margin-left: 6px;
+    font: 10px var(--mono); color: var(--fg-3);
+    border: 1px solid var(--line-strong); border-radius: 3px; padding: 0 3px; margin-left: 6px;
   }
-  select.btn { padding: 5px 8px; }
-  .grow { flex: 1 1 auto; }
-  .ctl { display: flex; align-items: center; gap: 7px; color: var(--fg-dim); }
+  select.btn { font-weight: 500; padding: 5px 8px; min-width: 0; max-width: 100%; }
+  .grow { flex: 1 1 0; min-width: 0; }
+  .ctl { display: flex; align-items: center; gap: 7px; color: var(--fg-2); font-size: 12px; }
   .ctl input[type=range] { width: 96px; accent-color: var(--accent); }
-  .val { font: 11px var(--mono); color: var(--fg); min-width: 40px; }
+  .val { font: 12px var(--mono); color: var(--fg); min-width: 40px; font-variant-numeric: tabular-nums; }
   .pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    font: 11px var(--mono); padding: 3px 9px; border-radius: 999px;
-    border: 1px solid var(--line); color: var(--fg-dim); white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 7px; min-width: 0; max-width: 100%;
+    font-size: 12px; line-height: 1.5; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--fg-2); white-space: nowrap;
   }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-faint); }
-  .pill.ok    { border-color: #1d5c40; color: var(--good); }
-  .pill.ok .dot { background: var(--good); box-shadow: 0 0 8px var(--good); }
-  .pill.warn  { border-color: #5c4a1d; color: var(--warn); }
+  .pill > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-3); }
+  .pill.ok { color: var(--fg); }
+  .pill.ok .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
   .pill.warn .dot { background: var(--warn); }
-  .pill.err   { border-color: #5c1d24; color: var(--bad); }
+  .pill.err { color: var(--bad); }
   .pill.err .dot { background: var(--bad); }
   .pill.hidden { display: none; }
 
   /* ---------- replay transport ---------- */
   .transport {
     display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
-    padding: 8px 14px; background: var(--panel-2);
-    border-bottom: 1px solid var(--line); flex: none;
+    padding: 8px 16px; background: var(--surface);
+    border-bottom: 1px solid var(--line); flex: none; min-width: 0;
   }
   .transport.hidden { display: none; }
-  .scrubwrap { position: relative; flex: 1 1 auto; height: 26px; }
+  .transport #sessionSel { flex: 0 1 300px; }
+  .scrubwrap { position: relative; flex: 1 1 220px; min-width: 0; height: 26px; }
   .track {
     position: absolute; left: 0; right: 0; top: 11px; height: 4px;
-    background: #1b2331; border-radius: 2px; overflow: hidden;
+    background: var(--line-strong); border-radius: 2px; overflow: hidden;
   }
-  .track .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); opacity: .55; }
+  .track .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); opacity: .7; }
   .notch {
     position: absolute; top: 4px; width: 2px; height: 18px;
     background: var(--warn); border-radius: 1px; opacity: .85; pointer-events: none;
@@ -117,34 +167,36 @@
   .scrubwrap input[type=range]::-webkit-slider-thumb {
     -webkit-appearance: none; appearance: none;
     width: 12px; height: 20px; border-radius: 3px;
-    background: var(--fg); border: 1px solid #000; margin-top: 0;
+    background: var(--fg); border: 1px solid var(--bg); margin-top: 0;
   }
   .scrubwrap input[type=range]::-moz-range-thumb {
-    width: 12px; height: 20px; border-radius: 3px; background: var(--fg); border: 1px solid #000;
+    width: 12px; height: 20px; border-radius: 3px; background: var(--fg); border: 1px solid var(--bg);
   }
-  .time { font: 12px var(--mono); color: var(--fg); min-width: 120px; text-align: right; }
-  .wall { font: 11px var(--mono); color: var(--fg-dim); min-width: 150px; text-align: right; }
+  .time { font: 12px var(--mono); color: var(--fg); min-width: 120px; text-align: right; font-variant-numeric: tabular-nums; }
+  .wall { font: 12px var(--mono); color: var(--fg-2); min-width: 150px; text-align: right; font-variant-numeric: tabular-nums; }
   .wall:empty { display: none; }
-  .goto { display: flex; align-items: center; gap: 6px; flex: none; }
+  .goto { display: flex; align-items: center; gap: 6px; flex: none; max-width: 100%; }
   .goto input[type=datetime-local] {
-    font: 12px var(--mono); color: var(--fg); background: var(--panel);
-    border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px;
-    color-scheme: dark;
+    font: 12px var(--mono); color: var(--fg); background: var(--surface-2); min-width: 0;
+    border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 4px 6px;
   }
 
   /* ---------- panels ---------- */
-  .panels { flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
-  .panel { position: relative; background: var(--panel); min-width: 0; min-height: 0; overflow: hidden; }
-  .panel canvas { display: block; width: 100%; height: 100%; }
+  .panels {
+    flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: minmax(0, 1fr);
+    gap: 1px; background: var(--line); min-height: 0; position: relative;
+  }
+  .panel { position: relative; background: var(--canvas); min-width: 0; min-height: 0; overflow: hidden; }
+  .panel canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
   .panel .title {
-    position: absolute; left: 12px; top: 10px; pointer-events: none;
-    font: 11px var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--fg-dim);
+    position: absolute; left: 14px; top: 10px; pointer-events: none;
+    font: 12px/1.4 var(--sans); color: var(--fg-2);
   }
   .panel .title b { color: var(--fg); font-weight: 600; }
-  .panel .sub { display: block; letter-spacing: .06em; text-transform: none; color: var(--fg-faint); margin-top: 3px; }
+  .panel .sub { display: block; font: 11px/1.4 var(--mono); color: var(--fg-3); margin-top: 2px; }
   .panel .hint {
-    position: absolute; right: 12px; top: 10px; pointer-events: none;
-    font: 10px var(--mono); color: var(--warn); text-align: right; max-width: 45%;
+    position: absolute; right: 14px; top: 10px; pointer-events: none;
+    font: 11px/1.4 var(--mono); color: var(--warn); text-align: right; max-width: 45%;
   }
   .panel .hint:empty { display: none; }
   .flash {
@@ -153,49 +205,79 @@
   }
 
   /* ---------- stats ---------- */
+  /* A grid, not a wrapping flex row: tiles keep one width on every row, so a
+     wrapped bar reads as a table instead of a ragged last line. The rules are
+     the 1px gaps showing the container through; ::after fills what is left of
+     the last row so the gaps there are rules too, not a grey block. */
   .stats {
-    flex: none; display: flex; flex-wrap: wrap; gap: 1px;
-    background: var(--line); border-top: 1px solid var(--line);
+    flex: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
+    gap: 1px; background: var(--line); border-top: 1px solid var(--line);
   }
-  .stat { flex: 1 1 108px; background: var(--panel-2); padding: 7px 12px; min-width: 96px; }
-  .stat .k { font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--fg-faint); }
+  .stats::after { content: ""; grid-column-end: -1; background: var(--surface); }
+  .stat { min-width: 0; padding: 7px 14px 8px; background: var(--surface); }
+  .stat.wide { grid-column: span 2; }
+  .stat .k { font-size: 12px; line-height: 1.4; color: var(--fg-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stat .v {
-    font: 16px/1.25 var(--mono); color: var(--fg); margin-top: 2px;
+    font: 500 16px/1.3 var(--mono); color: var(--fg); font-variant-numeric: tabular-nums;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .stat .v small { font-size: 11px; color: var(--fg-dim); }
+  .stat .v small { font: 11px var(--sans); color: var(--fg-2); }
   .stat.alert .v { color: var(--bad); }
   .stat.warn .v { color: var(--warn); }
-  .stat.dim .v { color: var(--fg-dim); }
+  .stat.dim .v { color: var(--fg-3); }
   .stat.hidden { display: none; }
 
   /* ---------- toasts ---------- */
   #toasts {
-    position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column;
+    position: fixed; right: 16px; bottom: 16px; left: 16px; display: flex; flex-direction: column;
     gap: 8px; align-items: flex-end; pointer-events: none; z-index: 10;
   }
   .toast {
-    background: #1a2231; border: 1px solid var(--warn); border-left-width: 3px;
-    color: var(--fg); padding: 7px 13px; border-radius: 5px;
-    font: 12px var(--mono); box-shadow: 0 8px 24px #0009;
+    background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    color: var(--fg); padding: 8px 12px; border-radius: var(--r-sm); max-width: 420px;
+    font-size: 13px; box-shadow: var(--shadow);
     animation: pop .25s ease-out;
   }
-  .toast .lbl { color: var(--warn); }
-  .toast.bad { border-color: var(--bad); }
+  .toast .lbl { color: var(--accent); font-weight: 600; }
+  .toast.bad { border-left-color: var(--bad); }
   .toast.bad .lbl { color: var(--bad); }
   @keyframes pop { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   .toast.out { opacity: 0; transition: opacity .4s; }
 
-  @media (max-width: 900px) { .panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+  /* ---------- narrow windows ----------
+     Under 900px the panels stack and the page scrolls rather than squeezing
+     the canvases to nothing between a wrapped top bar and a wrapped stats bar.
+     Scoped away from the OBS overlay, whose layout is explicit, not
+     viewport-driven. */
+  @media (max-width: 900px) {
+    body:not(.obs) { overflow-y: auto; }
+    body:not(.obs) .panels { flex: 1 0 auto; grid-template-columns: 1fr; grid-auto-rows: minmax(240px, 1fr); }
+  }
+  @media (max-width: 560px) {
+    .topbar, .transport { padding: 8px 12px; }
+    .grow { display: none; }
+    .ctl { flex: 1 1 100%; }
+    .ctl input[type=range] { flex: 1 1 auto; width: auto; min-width: 0; }
+    .transport #sessionSel { flex: 1 1 100%; }
+    .scrubwrap { flex: 1 1 100%; }
+    .time, .wall { min-width: 0; text-align: left; }
+    .goto { flex: 1 1 100%; }
+    .goto input[type=datetime-local] { flex: 1 1 auto; }
+    .stats { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
+    .stat { padding: 6px 10px 7px; }
+  }
 
   /* ---------- OBS browser-source mode ----------
      No chrome, no gaps, a transparent page (OBS composites it over the game
      capture), and a HUD instead of the stats bar. These rules come after the
-     media query on purpose: the layout is explicit here, not viewport-driven. */
+     media queries on purpose: the layout is explicit here, not viewport-driven.
+     Colours over game footage are fixed, not themed. */
+  /* `color-scheme: dark` makes the browser paint a dark backdrop behind a
+     transparent page; the overlay must stay see-through. */
+  html.obs-root { color-scheme: normal; background: transparent; }
   body.obs { background: transparent; }
   .obs .topbar, .obs .transport, .obs .stats, .obs #toasts { display: none; }
   .obs .panels { gap: 0; background: transparent; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
-  .obs .panels { position: relative; }
   .obs .panel { background: transparent; }
   .obs.layout-stack .panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
   .obs.layout-desk .panels, .obs.layout-aim .panels { grid-template-columns: 1fr; }
@@ -204,7 +286,27 @@
   .view-desk .panels, .view-aim .panels { grid-template-columns: 1fr; }
   .view-desk #aimPanel, .view-aim #deskPanel { display: none; }
   .obs:not(.labels) .panel .title, .obs:not(.labels) .panel .hint { display: none; }
-  .obs .panel .title { font-size: calc(11px * var(--s, 1)); text-shadow: 0 1px 3px #000c; }
+  .obs .panel .title { font-size: calc(12px * var(--s, 1)); color: #c8d2df; text-shadow: 0 1px 3px #000c; }
+  .obs .panel .title b { color: #fff; }
+  .obs .panel .sub { font-size: calc(11px * var(--s, 1)); color: #c8d2df; }
+
+  /* No feed (`[viz.obs] stale_secs`, `?stale=`): the panels dim and a small
+     badge says so, top centre, clear of the HUD corners and the panel labels. The fade is on the way out only, so recovery is instant;
+     opacity is compositor work, nothing is repainted for it. */
+  .obs.stale .panel canvas { opacity: .4; transition: opacity .3s ease-out; }
+  .feed-badge {
+    display: none; position: absolute; z-index: 6; top: calc(10px * var(--s, 1)); left: 50%; transform: translateX(-50%);
+    pointer-events: none; align-items: center; gap: calc(7px * var(--s, 1));
+    font: 600 calc(12px * var(--s, 1))/1.4 var(--sans); color: #fff;
+    padding: calc(3px * var(--s, 1)) calc(10px * var(--s, 1)); border-radius: 999px;
+    background: #0b0f16b3; border: 1px solid #ffffff33;
+    font-variant-numeric: tabular-nums;
+  }
+  .feed-badge::before {
+    content: ""; width: calc(7px * var(--s, 1)); height: calc(7px * var(--s, 1));
+    border-radius: 50%; background: #ffb02e;
+  }
+  .obs.stale .feed-badge { display: inline-flex; }
 
   .hud {
     position: absolute; z-index: 5; pointer-events: none;
@@ -221,15 +323,15 @@
   .hud.bottom-right { right: 0; bottom: 0; flex-direction: row-reverse; }
   .hud .item { display: flex; flex-direction: column; min-width: calc(64px * var(--s, 1)); }
   .hud .k {
-    font-size: calc(10px * var(--s, 1)); letter-spacing: .12em; text-transform: uppercase;
-    color: #c8d2df; opacity: .8; text-shadow: 0 1px 2px #000, 0 0 6px #000a;
+    font: calc(11px * var(--s, 1))/1.4 var(--sans);
+    color: #c8d2df; opacity: .85; text-shadow: 0 1px 2px #000, 0 0 6px #000a;
   }
   .hud .v {
     font-size: calc(22px * var(--s, 1)); line-height: 1.15; font-weight: 600; color: #fff;
     white-space: nowrap; font-variant-numeric: tabular-nums;
     text-shadow: 0 1px 2px #000, 0 0 8px #000c;
   }
-  .hud .v small { font-size: calc(11px * var(--s, 1)); font-weight: 400; color: #c8d2df; margin-left: .2em; }
+  .hud .v small { font: 400 calc(11px * var(--s, 1)) var(--sans); color: #c8d2df; margin-left: .2em; }
   .hud .item.text .v { font-size: calc(15px * var(--s, 1)); font-weight: 500; }
 </style>
 </head>
@@ -265,16 +367,17 @@
     <input type="range" id="decay" min="0.3" max="12" step="0.1" value="3">
     <span class="val" id="decayVal">3.0s</span>
   </div>
-  <button class="btn" id="btnReset">Recenter<kbd>R</kbd></button>
-  <button class="btn" id="btnPause">Pause<kbd>space</kbd></button>
+  <button class="btn small" id="btnReset">Recenter<kbd>R</kbd></button>
+  <button class="btn small" id="btnPause">Pause<kbd>space</kbd></button>
+  <button class="btn small" id="themeBtn" title="Follows Windows until you pick one. Shift-click to follow Windows again.">Light theme</button>
 </div>
 
 <div class="transport hidden" id="transport">
-  <button class="btn" id="btnPlay">Play</button>
-  <button class="btn" id="btnPrevMarker" title="Previous marker">&#9664;|</button>
-  <button class="btn" id="btnNextMarker" title="Next marker">|&#9654;</button>
-  <select class="btn" id="sessionSel"><option value="">— loading sessions —</option></select>
-  <select class="btn" id="speedSel">
+  <button class="btn small" id="btnPlay">Play</button>
+  <button class="btn small" id="btnPrevMarker" title="Previous marker">&#9664;|</button>
+  <button class="btn small" id="btnNextMarker" title="Next marker">|&#9654;</button>
+  <select class="btn small" id="sessionSel"><option value="">— loading sessions —</option></select>
+  <select class="btn small" id="speedSel">
     <option value="0.25">0.25&times;</option>
     <option value="0.5">0.5&times;</option>
     <option value="1" selected>1&times;</option>
@@ -291,7 +394,7 @@
   <div class="wall" id="wallText" title="Wall-clock time (local) of the play head"></div>
   <label class="goto" title="Jump to a moment in the past: picks the recording that was running then and seeks to it. Also ?at=2026-08-29T21:14:03 on the URL.">
     <input type="datetime-local" step="1" id="gotoTime">
-    <button class="btn" id="btnGoto">Go to time</button>
+    <button class="btn small" id="btnGoto">Go to time</button>
   </label>
 </div>
 
@@ -309,6 +412,7 @@
     <div class="flash" id="aimFlash"></div>
   </div>
   <div class="hud hidden" id="hud"></div>
+  <div class="feed-badge" id="feedBadge">no feed</div>
 </div>
 
 <div class="stats" id="stats">
@@ -332,10 +436,12 @@
     <div class="k">lost batches</div><div class="v"><span id="sLost">0</span></div></div>
   <div class="stat dim" id="statAbs" title="Absolute-motion WM_INPUT frames the capture agent saw and discarded (RDP, tablets, virtual devices). Nonzero means some input was not delta-based and is not in this timeline.">
     <div class="k">abs frames</div><div class="v"><span id="sAbs">0</span></div></div>
-  <div class="stat dim" id="statBridge" title="Reported by the viz bridge once a second."><div class="k">bridge</div>
+  <div class="stat dim" id="statBad" title="Frames this page could not use: unparseable WebSocket messages or bad replay lines. Distinct from the bridge's parse errors, which count datagrams the bridge could not read.">
+    <div class="k">bad frames</div><div class="v"><span id="sBad">0</span></div></div>
+  <div class="stat dim wide" id="statBridge" title="Reported by the viz bridge once a second."><div class="k">bridge</div>
     <div class="v"><span id="sBridge">—</span> <small id="sBridgeSub"></small></div></div>
   <div class="stat dim"><div class="k">pointer</div><div class="v"><span id="sLocked">—</span></div></div>
-  <div class="stat dim"><div class="k">cpi / sens</div><div class="v"><span id="sCpi">—</span></div></div>
+  <div class="stat dim wide"><div class="k">cpi / sens</div><div class="v"><span id="sCpi">—</span></div></div>
   <div class="stat dim hidden" id="statProf" title="?profile=1 — mean ms per frame spent in each stage over the last second."><div class="k">profile ms</div>
     <div class="v"><span id="sProf">—</span></div></div>
 </div>

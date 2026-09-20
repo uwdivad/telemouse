@@ -498,7 +498,17 @@ impl AppConfig {
             source,
         })?;
         let text = decode_config(path, bytes)?;
-        let cfg: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        Self::from_toml(&text, path)
+    }
+
+    /// Parse and validate the text of a `telemouse.toml`, exactly as
+    /// [`Self::load`] would once it is on disk at `path` — for a caller that
+    /// is about to write that text (the panel's settings editor) and must
+    /// not write something the binaries would then refuse. Nothing is read
+    /// from `path`; it only names the file in the error.
+    pub fn from_toml(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let cfg: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
@@ -1158,5 +1168,22 @@ mod tests {
             sample, expected,
             "telemouse.example.toml has drifted from AppConfig::default()"
         );
+    }
+
+    /// Text that is about to be written is held to the same rules as a file
+    /// that is read, and the error names the file it is meant for.
+    #[test]
+    fn text_is_parsed_and_validated_like_a_file() {
+        let p = Path::new("somewhere/telemouse.toml");
+        let c = AppConfig::from_toml("\u{feff}mouse_cpi = 800.0\n", p).unwrap();
+        assert_eq!(c.mouse_cpi, 800.0);
+        let e = AppConfig::from_toml("mouse_cpi = -1.0\n", p).unwrap_err();
+        assert!(
+            matches!(&e, ConfigError::Invalid { field, .. } if *field == "mouse_cpi"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("telemouse.toml"), "{e}");
+        let e = AppConfig::from_toml("mouse_dpi = 800.0\n", p).unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }), "{e}");
     }
 }

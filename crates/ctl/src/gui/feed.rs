@@ -96,6 +96,15 @@ pub struct GuiLink {
     /// A [`new_session`] is in flight (stop, then start). A second press
     /// during the stop's grace period is ignored rather than raced.
     pub restarting: Arc<AtomicBool>,
+
+    /// `http://…/`: what the window's embedded browser navigates to. The
+    /// first snapshot in the channel is empty, so it is carried here.
+    pub panel_url: String,
+    /// Where WebView2 may write its cache; `None` when nowhere is writable,
+    /// which is a text-only window.
+    pub webview_data_dir: Option<std::path::PathBuf>,
+    /// `--no-webview`: text-only window on purpose, no Edge components.
+    pub no_webview: bool,
 }
 
 impl GuiLink {
@@ -434,6 +443,9 @@ mod tests {
             hotkey: Hotkey::parse("ctrl+alt+r").unwrap(),
             hotkey_status: Arc::new(AtomicU8::new(HOTKEY_UNKNOWN)),
             restarting: Arc::new(AtomicBool::new(false)),
+            panel_url: "http://127.0.0.1:7880/".into(),
+            webview_data_dir: None,
+            no_webview: true,
         }
     }
 

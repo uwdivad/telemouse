@@ -68,7 +68,7 @@ Centimetres and degrees are *derived by consumers* from a per-session config
 record (CPI, per-game sensitivity). So if you discover your CPI was configured
 wrong, you fix the config and re-analyze; the recording is still correct.
 
-The original design document is [`mouse-telemetry-plan.md`](../mouse-telemetry-plan.md).
+The original design document is [`mouse-telemetry-plan.md`](https://github.com/uwdivad/telemouse/blob/master/mouse-telemetry-plan.md) (in the repository, not in the release zip).
 The code implements phases 1–5 of that plan (capture, Kafka topics, live viz,
 replay, analysis), with the exception that "storage" is JSONL files instead of
 TimescaleDB/Parquet.
@@ -103,7 +103,8 @@ library:
 
         ┌────────────────────────────────────────────────────────────────────┐
         │ crates/ctl  bin: telemouse-ctl — control panel on 127.0.0.1:7880   │
-        │ starts/stops the three binaries above, tray icon + status window   │
+        │ starts/stops the three binaries above; native window (WebView2)   │
+        │ showing the panel page, tray icon, text status view as fallback   │
         └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -155,12 +156,13 @@ telemouse/
 ├── telemouse.toml             the one config file (every binary reads it)
 ├── compose.yaml               local single-node Kafka broker (docker compose up -d)
 ├── CHANGELOG.md               release notes; the release workflow publishes the matching section
-├── README.md                  user-facing overview
-├── mouse-telemetry-plan.md    the original design/plan document
+├── README.md                  user-facing: download, run, first session, OBS, troubleshooting
+├── mouse-telemetry-plan.md    the original design/plan document (repository only)
 ├── .github/workflows/
 │   ├── ci.yml                 fmt --check, clippy -D warnings, tests on windows-latest, every push
 │   └── release.yml            on a vX.Y.Z tag: build, test, zip the binaries, GitHub Release
 ├── docs/
+│   ├── DEVELOPING.md          building from source, flavours, Kafka, benches, releasing
 │   ├── CONVENTIONS.md         workspace rules (edition 2024, tracing, no panics on degraded env…)
 │   ├── AUDIT-2026-08.md       Aug-2026 perf/observability audit and every pass since, with leftovers
 │   ├── BENCHMARKS.md          criterion numbers, the live-stack CPU table, what is left on the table
@@ -245,7 +247,8 @@ subscriber is always set up through `telemouse_core::logging::init`, which
 can also write a size-rotated `<log_dir>/<component>.log`.
 
 **Build flavours.** Logging, Kafka and observability are Cargo features,
-on by default and compiled out of the minimal release zip:
+on by default (the release zip has them) and compiled out of a minimal
+build you can make yourself (`docs/DEVELOPING.md`):
 
 | Feature | Crates | Adds |
 |---|---|---|
@@ -266,12 +269,13 @@ every push, plus a dependency advisory scan, so the tree must stay
 rustfmt-clean at default settings and must build with `--no-default-features`.
 A release is a tag: bump `version` in the root `Cargo.toml`, add a
 `## [X.Y.Z]` section to `CHANGELOG.md`, commit, tag `vX.Y.Z`, push the tag;
-`release.yml` builds and tests both flavours in release mode and publishes a
-GitHub Release with two zips (`telemouse-vX.Y.Z-windows-x86_64.zip`, the
-minimal capture + viz + panel, and `…-full.zip` with everything including
-`telemouse-analyze`), each with a SHA-256 and a build-provenance attestation,
-whose notes are that changelog section. Every zip carries the loopback sample
-as `telemouse.toml`, the license, this guide, and the demo recording.
+`release.yml` lints and tests both flavours, builds the default one in
+release mode, signs the executables when the signing secrets are configured
+(`docs/DEVELOPING.md`, "Code signing") and publishes a GitHub Release with
+one zip, `telemouse-vX.Y.Z-windows-x86_64.zip`: all four binaries including
+`telemouse-analyze`, with a SHA-256 and a build-provenance attestation. The
+release notes are that changelog section. The zip carries the loopback
+sample as `telemouse.toml`, the license, this guide, and the demo recording.
 
 A good first hands-on exercise: run `telemouse-viz`, open the page, pick
 `demo-session` in the replay dropdown, and scrub. Then run
@@ -881,10 +885,50 @@ transport shows the play head's wall clock next to the elapsed time.
 at that moment. WebSocket reconnect backs off
 `400·1.7ⁿ` ms up to 8 s.
 
+**Look and theme.** The dashboard uses the control panel's design tokens
+(`--bg --surface --surface-2 --line --line-strong --fg --fg-2 --fg-3 --accent
+--accent-ink --ok --warn --bad --shadow --sans --mono --r --r-sm`, copied from
+`crates/ctl/src/index.html`): dark by default, light under
+`:root[data-theme="light"]` or `prefers-color-scheme: light` when no theme was
+picked. The *Light theme / Dark theme* button stores `localStorage.tmTheme`
+(same key and behaviour as the panel, separate origin so separately
+remembered; Shift-click hands the choice back to Windows), and a script in
+`<head>` applies it before first paint. The canvases cannot follow CSS, so
+everything they draw with lives in one `PAL` object: `readTokens()` fills it
+from the tokens plus the canvas-only ones (`--canvas --grid --grid-axis
+--grid-wrap --head --lmb --rmb --aux`, plain hex on purpose) at start-up and
+on a theme change — **never per frame** — and `buildRamp()` swaps the velocity
+ramp for one that ends dark instead of white on a light canvas. The top bar
+and the transport wrap; the stats bar is a CSS grid (`auto-fill`), so tiles
+keep one width on every row; under 900 px the panels stack at ≥240 px each and
+the page scrolls instead of squeezing the canvases.
+
+**Feed state** is time-driven, so the 10 Hz block of `frame()` is what
+evaluates it (nothing arrives to announce that nothing is arriving):
+`ui.refreshConn()` moves the dashboard pill between *waiting for capture on
+udp …*, *live* and *no data for N s* (`feedState`, fixed 3 s), and
+`updateStale()` drives the overlay's indicator. `ui.onBatch()` clears the
+overlay's state the instant a batch arrives. `js-tests/feed.test.mjs` drives
+`frame()` on a fake clock for both.
+
 **OBS mode** (`?obs=1` or the `/obs` route): config layering is built-in
 defaults → `[viz.obs]` → URL params (`layout, bg, hud, hudpos, scale, trail,
-buffer, grid, legend, labels`); chrome hidden, HUD replaces the stats bar,
-toasts suppressed, no localStorage. **Hidden tabs**: rAF stops but the socket
+buffer, grid, legend, labels, stale`); chrome hidden, HUD replaces the stats
+bar, toasts suppressed, no localStorage, **not themed** (the head script pins
+the dark tokens, drops the `color-scheme` hint so the page stays see-through,
+and `PAL` keeps its built-in values; HUD and label colours are fixed light
+text with a shadow because they sit on game footage, not on the page).
+**No feed**: after `stale` seconds without a batch (`[viz.obs] stale_secs`,
+`?stale=`, 0–60, 0 = never) — counted from the last batch, or from page load
+when there has been none, and deliberately blind to the socket so a page
+that is still connecting does not flash it — `body.stale` dims the canvases
+to 40 % and shows a *no feed · 12s* badge top centre (`#feedBadge`); the
+`status` HUD item says the same. The capture agent sends nothing while the
+mouse is still, so a hand at rest for longer than `stale` reads as no feed
+too; raise `stale_secs` (or set 0) if that bothers a stream. **Hidden
+source**: `obsSourceVisibleChanged` / `obsSourceActiveChanged` (or
+`visibilitychange` in a plain browser) stop `frame()` from drawing while it
+keeps ticking; coming back repaints once. **Hidden tabs**: rAF stops but the socket
 doesn't, so `ingest` enforces the hard cap and a `setInterval(trim, 250)`
 keeps memory bounded; on return the play head snaps forward.
 
@@ -907,7 +951,7 @@ UDP datagram → udp::listen → hub.publish → classify_datagram (tag probe)
   → ws.onmessage → JSON.parse → engine.ingest → EventColumns + metas
   → rAF frame(): tick → advance play head → consume → applyIdx (counts→cm/°)
       → Trail/EffectRing → (if dirty) Panel.render → grid, bucketed strokes, rings, head
-  → 10 Hz: paintStats / paintHud / transport
+  → 10 Hz: refreshConn + paintStats (dashboard) / updateStale + paintHud (OBS) / transport
 ```
 
 ---
@@ -924,6 +968,22 @@ UDP datagram → udp::listen → hub.publish → classify_datagram (tag probe)
 - `trend [--dir recordings] [--json-dir DIR] [--metric a.b.c]… [--csv FILE]
   [--json] [detector flags…]`
 - `list [--dir recordings] [--json]` — header-only scan, never loads events.
+
+`--help` groups the flags under clap `help_heading`s (Input, Output,
+Filtering, then three Advanced groups for the detector parameters) and ends
+each command with copy-pasteable examples (`after_help`). Headings appear in
+the order their first flag is declared, so the field order of `ParamFlags`
+is the order of the groups.
+
+**Double-click guard** (`explorer.rs`). Started with no arguments, as the only
+process on its console (`GetConsoleProcessList` = 1, the test ctl's
+`hide_console_if_owned` uses; declared here as a one-function `extern` block
+rather than a `windows` dependency) and with stdin and stdout both that
+console, the exe prints what it is, points at the Report button in
+telemouse-ctl, and waits for Enter before exiting 2 — instead of a window
+that flashes and vanishes. The decision is the pure
+`should_hold_window(Launch)`; any argument, a shared console, piped stdio
+(ctl, scripts, CI) or a non-Windows build never reaches the blocking read.
 
 Every detector parameter is a flag; unset flags keep `Params::default()`
 (`series.rs:106-133`):
@@ -1511,8 +1571,9 @@ Observed during this read; none are correctness bugs in normal use.
   OBS window is still unexplained.
 - The performance leftovers ranked by value are in `docs/BENCHMARKS.md`
   ("What is left on the table" / "What is left on the live path") and the
-  end of `docs/AUDIT-2026-08.md`; `CHANGELOG.md` `[Unreleased]` lists what
-  is in the tree but not yet in a release.
+  end of `docs/AUDIT-2026-08.md`. The `## [Unreleased]` section at the top
+  of `CHANGELOG.md` lists what is in the tree but not yet in a tagged
+  release; cutting a release renames it to the version.
 
 ---
 
@@ -1559,28 +1620,35 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 
 | File | Owns |
 |---|---|
-| `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Warns if bound to a non-loopback address. |
-| `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
-| `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink`, `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
-| `gui/model.rs` | Pure: `render_text` (the window body, CRLF, fixed columns), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
-| `gui/win.rs` | `#[cfg(windows)]`: one window with one read-only `EDIT`, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, and the message loop. See §19.5. |
+| `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --no-webview --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, the WebView2 data folder (`places::webview_data_dir`, created once, `None` → text view), Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Binds the HTTP listener *before* `gui::spawn`, so the window's first navigation finds a live server. Warns if bound to a non-loopback address. |
+| `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiDeps` carries the panel URL, the WebView2 data folder and `no_webview`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
+| `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink` (channel, `panel_url`, `webview_data_dir`, `no_webview`), `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
+| `gui/model.rs` | Pure: `render_text` (the text view's body, CRLF, fixed columns), `WebStatus` + `web_banner` (the lines above it: "Loading the panel…", or why the page is not hosted and where it is instead), `window_text` (banner + body), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text, *Open in browser*, the *Open …* items), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
+| `gui/win.rs` | `#[cfg(windows)]`: one top-level window (`telemouse`, 1120×760 scaled to DPI, minimum 720×520) that hosts the page through `webview.rs` with one read-only `EDIT` as the text fallback, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, `WM_DPICHANGED`, and the message loop. See §19.5. |
+| `gui/webview.rs` | `#[cfg(windows)]`: the WebView2 host. `begin` probes the runtime and asks for an environment; two completion handlers (`on_environment`, `on_controller`) create the controller, tune the settings and navigate; `on_navigated` retries a refused connection; `timer` (watchdog, navigation retry), `resize`, `position_changed`, `set_visible`, `close`, and `fallback` (text view + banner, browser opened once). Handlers capture the window handle, never the state pointer. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` takes one Toolhelp snapshot every 30 s and answers in between with per-PID queries (about 20 µs each) for the few matching names; a process whose handle cannot be opened (an elevated one) is judged alive or gone from the `OpenProcess` error, not from a table walk; `scan_cached(ttl)` serves a short cache; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
-| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, `stop_grace_secs`, the build's features and the absolute `Places`). `/api/state` carries `version`, `config` (path, found, seeded, mtime) and `places`, and accepts `?log_since=<n>` to send only new log lines. |
-| `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases — decided once at startup so the status-window header, the tray's *Open …* items and the page cannot disagree. |
-| `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
-| `index.html` | Self-contained page: polls `/api/state` + `/api/sessions` every 2 s (10 s while the tab is hidden), re-renders only when something structural changed and patches the live numbers otherwise, two-click kill (no modal dialogs). |
+| `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, `stop_grace_secs`, the marker hotkey, the build's features and the absolute `Places`). `/api/state` carries `version`, `config` (path, found, seeded, status, mtime) and `places`, and accepts `?log_since=<n>` to send only new log lines. `POST /api/open` opens one of the places by name (§19.2). |
+| `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases, and the WebView2 data folder (`webview_data_dir`: `%LOCALAPPDATA%\telemouse\WebView2`, else `%TEMP%\telemouse\WebView2`, never next to the config) — decided once at startup so the text view's header, the tray's *Open …* items, `/api/open` and the page cannot disagree. |
+| `settings.rs` | The settings editor's pure half. `Settings` is the editable subset of `AppConfig` (`mouse_cpi`, `marker_hotkey`, `[recording] enabled`/`dir`, `[ctl] hotkey`, `[games]`, the `[viz.obs]` basics); `Patch` is the change request, and its `deny_unknown_fields` shape *is* the allow-list: bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` cannot be expressed in it. `apply_patch` edits the file's text with `toml_edit` (values are replaced through the existing item so the comment lines above a key, its trailing comment, the ordering and unknown keys survive; a value that already means the same is left as written), `checked` parses the result back through `AppConfig::from_toml` + `validate` and turns the error into `{ field, reason }` without the file path, `token` is an FNV-1a fingerprint of the bytes, `write_atomic` is temp-file-plus-rename in the same directory, and `save` strings them together (token check → patch → validate → seed from the embedded sample when there is no file → write). `game_key` is a shape check on a user-typed exe name (trim, lowercase, `.exe` appended, no separators / control / reserved characters, ≤ 64 chars) — deliberately not a list of names. `changed` + `effects` say which groups moved and who only sees them later (`restart_required`: the tray's hotkey; `next_start`: a running capture or viz). Also owns `SAMPLE_CONFIG` and `seed_config`, which `main.rs` uses on first start. |
+| `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `parse_foreground_line` + `note_seen` keep the last 8 distinct programs the agent saw in front during the current run (`foreground_seen` on the capture component; never `-` or a `telemouse*` name), which is what the first-run guide offers as *Use <exe>*; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
+| `index.html` | Self-contained page (inline CSS and JS, system fonts, no external URLs — the server test rejects any): dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s (10 s while hidden), patches values in place, two-click kill (no modal dialogs). Works in the window and in a normal browser. |
 
 ### 19.2 The API
 
 | Route | Effect |
 |---|---|
-| `GET /api/state` | `{ self_pid, now_unix_s, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `recording` is the config default; each component carries its run's `args`, `exits` / `unexpected_exits` since the panel started (a service that died without a stop, or a task that finished non-zero), and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
+| `GET /api/state` | `{ self_pid, now_unix_s, version, config, places, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `places` includes `webview_data`, the window's WebView2 cache folder (empty when there is no window or with `--no-webview`). `recording` is the config default; each component carries its run's `args`, `exits` / `unexpected_exits` since the panel started (a service that died without a stop, or a task that finished non-zero), and, for capture, `saving` (`recording_saves(config, args)`: `--no-record` / `--record` beat the config). Reaps exited children as a side effect. |
 | `GET /api/sessions` | `*.jsonl` names in `recording.dir`, newest first (the report picker). |
 | `POST /api/components/{id}/start` | body `{ flags: [..], session?: "x.jsonl", save?: bool }`. `save` is the capture card's switch: the server turns it into `--record` / `--no-record` against its own `recording.enabled` (`recording_flags`), so the page and the tray never derive the flag themselves; omitted = the config default. 404 unknown, 409 already running, 400 disallowed flag / bad session (including `save` on a component without the switch), 500 spawn failure (binary missing). |
 | `POST /api/components/{id}/stop` | body `{ force?: bool }` → `{ outcome: "graceful" \| "terminated" }`. 409 if not running. |
 | `POST /api/components/{id}/marker` | body `{ label }` → `{ ok, label }`. Writes `label\n` to the child's stdin; only components with `markers: true` (capture) are started with a pipe. 400 for a blank, multi-line or >120-character label or a component without a pipe, 409 if not running, 500 if the write fails. Echoed as `--- marker: <label> ---` in the component log. |
 | `POST /api/processes/{pid}/kill` | 403 for this panel or an unrelated process, 404 unknown, 500 if the OS refuses. |
+| `GET /api/config` | `{ path, status, exists, token, settings, error, choices, not_editable }`: the editable settings as the file on disk has them now (paths as written, not resolved), the token a save must echo, and the OBS vocabularies for the form. A file that cannot be used gives `settings: null` and `error`; no file gives the shipped sample's values and `token: "none"`. |
+| `POST /api/config` | body `{ token, patch }` → `{ ok, token, created, settings, changed, restart_required, next_start }`. See `settings.rs` in §19.1 for the pipeline. 400 `{ error, field }` when the patched file would not load (nothing is written) or the body is not a `Patch` (which is how a non-editable key is refused); 409 `{ error, token }` when the file is not the one `token` was taken from; 500 when the write fails. Afterwards the manager re-reads the file at once (`reload_config`), so `recording` in `/api/state` and the next start follow; children read the file when they start. |
+| `GET /api/reports/{id}` | The stored `ReportSummary` for that recording when one exists and is not older than the recording; 404 otherwise. `id` must pass `is_safe_id` (400). Runs nothing. |
+| `POST /api/reports/{id}` | Runs `telemouse-analyze report <recordings>/<id>.jsonl --summary --json-dir <recordings>/.reports` (fixed arguments, one at a time, 5 min cap), returns the JSON it prints and keeps it as `.reports/<id>.summary.json`. The `report` and `trend` tasks get the same `--json-dir` (`Component::report_cache`), so after a text report this is a cache hit. 400 bad id, 404 no such recording, 503 when `telemouse-analyze` is not there (the minimal zip), 500 when the run fails. |
+| `POST /api/open` | body `{ target: "config" \| "recordings" \| "logs" \| "docs" }` → `{ ok, target, path }`. Opens that place with the shell's default handler (`gui::open_url` in `spawn_blocking`): the config in an editor, a folder in Explorer, the docs. The target is an allow-listed name mapped to a `Places` string on the server, never a client path. 400 unknown target, 404 when this build has no such place (logs without the `logging` feature), 500 if the shell refused. The page's first-run banner and its *Open* buttons use it; before it, the page could only show paths for the user to copy. |
 
 Every `POST` without `X-Telemouse-Ctl: 1` is a 403. A browser only adds a
 custom header to a cross-origin request after a CORS preflight, which this
@@ -1615,7 +1683,11 @@ A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
   service, greys a missing binary, offers *New session* only while capture
   runs, and puts the chord on the item the hotkey is equivalent to;
   `panel_url` swaps an unspecified bind address for loopback; the icon is an
-  opaque disc with transparent, masked corners.
+  opaque disc with transparent, masked corners; `web_banner` is empty while
+  hosted, names the reason and the URL in the fallback, and omits the
+  "install the runtime" line for `--no-webview`.
+- `places`: `webview_data_dir_in` prefers `LOCALAPPDATA`, falls back to
+  `TEMP`, and is `None` when both are unset or empty.
 - `gui::feed`: a visible publisher delivers components, processes, the
   hotkey label and a wake; a hidden one skips the process scan and answers
   a poke at once; the publisher exits when its receiver is dropped; tray
@@ -1640,46 +1712,123 @@ A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
   config cannot break out of its `<script>`; `/api/state` has the documented
   shape; every mutating route is 403 without the header; start/stop map
   manager errors to statuses (using an empty `bin_dir`, so tests never launch
-  a real agent); kill refuses self and unrelated PIDs.
+  a real agent); kill refuses self and unrelated PIDs; `/api/open` is 403
+  without the header, 400 for an unknown target and 404 over an empty
+  `Places`.
+- `settings`: an empty patch (or one that says what the file says) returns
+  the text byte for byte; changed values keep every comment, the ordering
+  and unknown keys; games are added, updated and removed (inline tables
+  too); missing sections are created without empty `[games]` / `[viz]`
+  headers; the patch shape refuses every non-editable key; `game_key` is a
+  shape rule; errors name their field and drop the file path; a string
+  cannot smuggle TOML; `save` checks the token, writes nothing on an invalid
+  result, leaves no temp file, and creates a missing file from the sample.
+  `server` drives the same through `/api/config` (403 / 400 / 409, comments
+  kept, the panel's own `recording` refreshed) and `/api/reports/{id}` (403
+  without the guard on `POST`, 400 for unsafe ids, 404, 503 without an
+  analyzer, a stored summary served only when not older than the recording).
 - `core::config`: the `[ctl]` section parses, defaults, and rejects
   `stop_grace_secs > 60` and an unparsable `hotkey`; `core::hotkey`: chords
   parse case- and space-insensitively, named and function keys map to their
   VK codes, typing keys need a modifier, `""`/`none`/`off` disable, and
   errors name the offending part.
 
-### 19.5 Tray icon and status window (Windows)
+### 19.5 The native window and the tray (Windows)
 
-`telemouse-ctl serve` also shows a native window and a tray icon unless
-`--no-gui` is given (off Windows there is never one). It is deliberately the
-cheapest GUI that still reads well: one top-level window holding one
-read-only monospace `EDIT` control, a `Shell_NotifyIcon` icon, and a popup
-menu — no GPU-rendered toolkit, so it costs nothing while a game runs.
+`telemouse-ctl serve` shows a native window and a tray icon unless
+`--no-gui` is given (off Windows there is never one). The window, titled
+*telemouse* (1120×760 scaled to the monitor's DPI, minimum 720×520, a plain
+`WS_OVERLAPPEDWINDOW`), hosts the control panel page itself through
+**WebView2**, the browser engine that ships with Windows 10 and 11, so a
+normal start opens no browser tab. Under the page sits one read-only
+monospace `EDIT` control, the **text view**, which is what the window shows
+while the page is loading and whenever it cannot be hosted. A
+`Shell_NotifyIcon` icon and a popup menu complete it.
 
-**What it shows.** The window body is `gui::model::render_text` over a
-`Snapshot`: every component (label, kind, running/stopped/not built, pid,
-uptime, how the last run exited, summary), the related-processes table
+**The WebView2 sequence** (`gui/webview.rs`). COM is initialised as an STA
+on the `ctl-gui` thread, since WebView2 is single-threaded COM whose
+callbacks arrive as posted messages on the creating thread — the existing
+`GetMessageW` loop is the only loop involved. After the window is on screen
+`begin` probes the runtime (`GetAvailableCoreWebView2BrowserVersionString`;
+the version is logged) and asks for an environment with the user-data
+folder from `GuiLink`; the environment's completion handler asks it for a
+controller parented to the window; the controller's handler paints the
+page's own background colour (no white flash), sizes it to the client
+rectangle, turns off context menus, zoom, the status bar, host objects, web
+messages and the built-in error page (dev tools only in debug builds),
+routes every `NewWindowRequested` (the dashboard, the docs, the releases —
+every `target="_blank"`) to the system browser through `ShellExecuteW`,
+navigates to the panel URL, and hides the text view. Each handler captures
+only the window handle and reaches the state through `GWLP_USERDATA`, the
+same rule as `wndproc`: a callback that fires after the window is gone
+finds nothing and returns. `WM_SIZE` calls `SetBounds`, `WM_MOVE` /
+`WM_WINDOWPOSCHANGED` call `NotifyParentWindowPositionChanged`, and
+`WM_DPICHANGED` applies the suggested rectangle (this also fixes the text
+view, which ignored DPI changes before). Hiding the window to the tray
+calls `SetIsVisible(false)`: a hidden WebView2 stops rendering and the
+page's document reports `hidden`, so it falls to its 10 s poll and the
+window costs nothing while a game is in front.
+
+**The fallback.** Every failure ends in `webview::fallback`: a runtime that
+is not installed, an environment or controller that fails, a watchdog timer
+that fires because neither answered within 10 s, or a navigation that is
+still refused after six retries half a second apart. The partial COM
+objects are released, the text view is shown with `model::web_banner` above
+`render_text` ("The panel page is not shown here: <reason>. It is open in
+your browser at <url> — tray → Open in browser reopens it. Install the
+WebView2 Runtime from Microsoft to see the panel in this window."), the
+page is opened in the default browser once, and the reason is a `warn!`.
+`--no-webview` starts in that state on purpose — tray and text view, no
+Edge components loaded, no browser opened, an `info!` instead. To simulate
+a missing runtime on a machine that has one, set
+`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=C:\nope` before starting. Nothing here
+panics and nothing blocks the thread.
+
+**What the text view shows.** `gui::model::window_text` over a `Snapshot`:
+the banner, then every component (label, kind, running/stopped/not built,
+pid, uptime, how the last run exited, summary), the related-processes table
 (pid, kind, name, CPU %, working set, "(this panel)"), and the log tail of
 the *focus* component — the running capture agent, else the running viz
-server, else whatever started or exited last. The tray icon is a grey disc
-while idle and a green one while capture runs (drawn at runtime by
-`icon_bitmap` and `CreateIconIndirect`; there is no `.ico` and no resource
-compiler); its tooltip names both services with uptime.
+server, else whatever started or exited last. It is re-rendered only while
+it is showing. The tray icon is a grey disc while idle and a green one
+while capture runs (drawn at runtime by `icon_bitmap` and
+`CreateIconIndirect`; there is no `.ico` and no resource compiler); its
+tooltip names both services with uptime.
 
-**What it does.** Left click toggles the window; right click opens the menu:
-*Show/Hide window*, *Start capture (save data → dir)* and *Start capture
-(don't save)* **or** *Stop capture (saving data | not saving)* (starts greyed
-when the binary is missing; the save choice becomes `--record` /
-`--no-record` only when it differs from `[recording] enabled`), *New session
-(restart capture, save data → dir)* while capture runs, the same start/stop
-for the viz server, *Open web panel* (`ShellExecuteW` on the panel URL,
-loopback if the bind address was unspecified), and *Exit*. Closing or
-minimising the window hides it to the tray; Shift+close, or the tray's Exit,
-quits — through the same graceful path as Ctrl-C (`stop_all`, then the icon
-goes away). Doctor, the analyzers and process kills stay on the web page.
+**The user-data folder.** WebView2 writes a cache, cookies and lock files,
+tens of megabytes, so it never goes next to the config (the unzip folder
+may be read-only, synced or on a share): `places::webview_data_dir` picks
+`%LOCALAPPDATA%\telemouse\WebView2`, else `%TEMP%\telemouse\WebView2`;
+`main.rs` creates it once and hands it to `Places` (as `webview_data`, shown
+in the page's *Where things are* and in `/api/state`) and to `GuiDeps`. No
+writable folder means the text view. It is the one thing telemouse writes
+outside its own folder, and the removal instructions in `docs/HELP.md` name it.
+
+**What the tray does.** Left click toggles the window; right click opens
+the menu: *Show/Hide window*, *Start capture (save data → dir)* and *Start
+capture (don't save)* **or** *Stop capture (saving data | not saving)*
+(starts greyed when the binary is missing; the save choice becomes
+`--record` / `--no-record` only when it differs from `[recording] enabled`),
+*New session (restart capture, save data → dir)* while capture runs, the
+same start/stop for the viz server, *Open in browser* (`ShellExecuteW` on
+the panel URL, loopback if the bind address was unspecified — the same page
+the window shows), *Open logs folder*, *Open recordings folder*, *Edit
+telemouse.toml*, *Open docs*, and *Exit*. Closing or minimising the window
+hides it to the tray; Shift+close, or the tray's Exit, quits — through the
+same graceful path as Ctrl-C (`stop_all`, then the icon goes away).
+Doctor, the analyzers and process kills are on the page, which is now in
+the window.
+
+**Anti-cheat posture.** WebView2 runs as Microsoft-signed
+`msedgewebview2.exe` child processes that render into this ordinary
+window. The panel opens no handle on any other process, hooks nothing and
+draws nothing over a game; `procs.rs` lists processes by their `telemouse*`
+stem, so the WebView2 children never appear in the process table and cannot
+become kill targets.
 
 **The new-session hotkey.** `[ctl] hotkey` (default `ctrl+alt+r`, `""` for
 none; grammar in `core::hotkey`, rejected at config load) is registered
-system-wide with `RegisterHotKey` on the status window, so it works from
+system-wide with `RegisterHotKey` on the panel window, so it works from
 inside a game without alt-tabbing. Pressing it runs `feed::new_session`:
 stop the capture agent if it is running (gracefully, so the file it was
 writing is complete), then start one with `save = true` — a fresh
@@ -1703,13 +1852,16 @@ without a process scan while it is hidden, and at once when poked (after an
 action, on show); it hands each `Snapshot` over a `watch` channel and posts
 `WM_APP_REFRESH`. The UI thread never blocks on the runtime: it reads
 `rx.borrow()`, and its actions are `Handle::spawn`ed futures whose outcome
-shows up in the next snapshot, exactly like the web page's. The window text
-is re-rendered from the snapshot with the scroll position preserved; the
-icon is `NIM_MODIFY`ed only when its state or tooltip changed. Explorer
-restarts are handled by re-adding the icon on the `TaskbarCreated` message.
-Every failure — no window, no tray — is a `warn!` and a headless server,
-never a panic; if the tray cannot be added the window stays up and close
-means exit, so nobody is stranded.
+shows up in the next snapshot, exactly like the web page's. While the text
+view is showing it is re-rendered from the snapshot with the scroll
+position preserved (while the page is hosted the snapshot only feeds the
+icon); the icon is `NIM_MODIFY`ed only when its state or tooltip changed.
+Explorer restarts are handled by re-adding the icon on the `TaskbarCreated`
+message. Teardown releases the WebView2 controller before `DestroyWindow`
+and calls `CoUninitialize` last. Every failure — no page, no window, no
+tray — is a `warn!` and a headless server, never a panic; if the tray
+cannot be added the window stays up and close means exit, so nobody is
+stranded.
 
 **Why the console stays.** Graceful stop is `GenerateConsoleCtrlEvent`,
 which needs the panel and its children to share a console, and a child of a
@@ -1720,10 +1872,15 @@ console *window* (`ShowWindow(GetConsoleWindow(), SW_HIDE)`); started from
 a terminal it leaves it alone, so logs stay in view.
 
 **Manual checks.** `cargo run -p telemouse-ctl -- serve --bin-dir
-target\debug`: window + grey icon; right-click → *Start capture* → green
-within a second and the web page agrees; *Stop capture* → grey, "exited:
-Ctrl-Break" in the log tail; close → hidden, icon click → back; *Exit* →
-children stopped, icon gone. Menu choices are the return value of
+target\debug`: the window shows the dark panel within about a second
+(`ctl.log` has the runtime version line and "panel page hosted in the
+window") + grey icon; right-click → *Start capture* → green within a second
+and the page agrees; *Stop capture* → grey, "stopped" on the page and
+"exited: Ctrl-Break" in the text view's log tail; close → hidden, icon
+click → back; *open dashboard* → the system browser, not a second window;
+`--no-webview` → text view, no `msedgewebview2.exe` children;
+`$env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = "C:\nope"` → text view with the
+banner and the browser opened once; *Exit* → children stopped, icon gone. Menu choices are the return value of
 `TrackPopupMenu` (`TPM_RETURNCMD`), not `WM_COMMAND`s — a posted
 `WM_COMMAND` from another process is ignored, since it could otherwise start
 a capture or exit the panel. To script the same loop, use the HTTP API the

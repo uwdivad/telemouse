@@ -198,7 +198,7 @@ fn header(s: &Snapshot) -> Vec<String> {
     }
     vec![
         format!(
-            "{:<LABEL_COL$}{} (tray → Open web panel)",
+            "{:<LABEL_COL$}{} (tray → Open in browser)",
             "PANEL",
             or_dash(&p.panel_url)
         ),
@@ -207,6 +207,63 @@ fn header(s: &Snapshot) -> Vec<String> {
         format!("{:<LABEL_COL$}{}", "VERSION", or_dash(&p.version)),
         String::new(),
     ]
+}
+
+/// What the window's embedded browser is doing, for the text view that
+/// shows while it is not (yet) showing the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebStatus {
+    /// The WebView2 runtime is being probed or the page is being created.
+    Loading,
+    /// The page is on screen; the text view is hidden.
+    Hosted,
+    /// The page could not be hosted; the text view is the window.
+    Fallback {
+        reason: String,
+        /// The page was opened in the default browser instead.
+        browser_opened: bool,
+    },
+}
+
+/// The lines above the status text that explain why it is text and not
+/// the page: nothing while hosted, one line while loading, a short
+/// paragraph when hosting failed.
+pub fn web_banner(status: &WebStatus, panel_url: &str) -> Vec<String> {
+    match status {
+        WebStatus::Hosted => Vec::new(),
+        WebStatus::Loading => vec!["Loading the panel…".to_string(), String::new()],
+        WebStatus::Fallback {
+            reason,
+            browser_opened,
+        } => {
+            let mut v = vec![format!("The panel page is not shown here: {reason}.")];
+            v.push(if *browser_opened {
+                format!(
+                    "It is open in your browser at {panel_url} — tray → Open in browser reopens it."
+                )
+            } else {
+                format!("Open it in your browser: {panel_url} (tray → Open in browser).")
+            });
+            if !reason.contains("--no-webview") {
+                v.push(
+                    "Install the WebView2 Runtime from Microsoft to see the panel in this window."
+                        .to_string(),
+                );
+            }
+            v.push(String::new());
+            v
+        }
+    }
+}
+
+/// The text view: the web banner, then [`render_text`].
+pub fn window_text(s: &Snapshot, status: &WebStatus) -> String {
+    let mut out = web_banner(status, &s.places.panel_url).join("\r\n");
+    if !out.is_empty() {
+        out.push_str("\r\n");
+    }
+    out.push_str(&render_text(s));
+    out
 }
 
 /// The whole body of the status window. CRLF line endings: a Win32 `EDIT`
@@ -480,7 +537,7 @@ pub fn menu(s: &Snapshot, window_visible: bool) -> Vec<MenuEntry> {
             MENU_STOP_VIZ,
         ),
         MenuEntry::Separator,
-        item(MENU_OPEN_PANEL, "Open web panel", true),
+        item(MENU_OPEN_PANEL, "Open in browser", true),
         // Everything a support question ends up asking for, one click away.
         item(
             MENU_OPEN_LOGS,
@@ -625,6 +682,8 @@ mod tests {
             stats: None,
             #[cfg(feature = "observability")]
             recording: None,
+            #[cfg(feature = "observability")]
+            foreground_seen: Vec::new(),
         }
     }
 
@@ -637,6 +696,7 @@ mod tests {
             bin_dir: "C:\\tm".into(),
             docs: "C:\\tm\\docs".into(),
             releases: crate::places::RELEASES_URL.into(),
+            webview_data: "C:\\Users\\x\\AppData\\Local\\telemouse\\WebView2".into(),
         }
     }
 
@@ -794,6 +854,42 @@ mod tests {
     }
 
     #[test]
+    fn web_banner_explains_the_text_view() {
+        let s = snap(false, false);
+        assert_eq!(window_text(&s, &WebStatus::Hosted), render_text(&s));
+        let loading = window_text(&s, &WebStatus::Loading);
+        assert!(
+            loading.starts_with("Loading the panel…\r\n\r\nPANEL"),
+            "{loading}"
+        );
+        let fb = window_text(
+            &s,
+            &WebStatus::Fallback {
+                reason: "WebView2 runtime not installed".into(),
+                browser_opened: true,
+            },
+        );
+        assert!(fb.contains("WebView2 runtime not installed"), "{fb}");
+        assert!(
+            fb.contains("open in your browser at http://127.0.0.1:7880/"),
+            "{fb}"
+        );
+        assert!(fb.contains("Install the WebView2 Runtime"), "{fb}");
+        let off = window_text(
+            &s,
+            &WebStatus::Fallback {
+                reason: "disabled with --no-webview".into(),
+                browser_opened: false,
+            },
+        );
+        assert!(
+            off.contains("Open it in your browser: http://127.0.0.1:7880/"),
+            "{off}"
+        );
+        assert!(!off.contains("Install the WebView2 Runtime"), "{off}");
+    }
+
+    #[test]
     fn focus_prefers_running_services_then_recency() {
         let s = snap(true, true);
         assert_eq!(focus_component(&s.components).unwrap().id, "capture");
@@ -814,7 +910,7 @@ mod tests {
         assert!(
             t.starts_with(&labelled(
                 "PANEL",
-                "http://127.0.0.1:7880/ (tray → Open web panel)"
+                "http://127.0.0.1:7880/ (tray → Open in browser)"
             )),
             "{}",
             &t[..120.min(t.len())]

@@ -33,7 +33,7 @@ BTN.ANY_DOWN = BTN.LEFT_DOWN | BTN.RIGHT_DOWN | BTN.MIDDLE_DOWN | BTN.X1_DOWN | 
 BTN.ANY_UP = BTN.ANY_DOWN << 1;   // every *_UP bit is its *_DOWN bit shifted left
 /* Ring colour per button: left, right, everything else. */
 const BTN_KIND = [[BTN.LEFT_DOWN, 0], [BTN.RIGHT_DOWN, 1], [BTN.MIDDLE_DOWN, 2], [BTN.X1_DOWN, 2], [BTN.X2_DOWN, 2]];
-const RING_COLORS = ["70,214,138", "124,140,255", "255,176,46"];
+/* Index into PAL.ring (see "Palette" below). */
 
 /* Used when the session has no profile for the foreground process. */
 const FALLBACK_SENS = { sens: 1.0, yaw_coeff: 0.022, pitch_coeff: 0.022, fallback: true };
@@ -60,7 +60,6 @@ const EFFECT_CAP = 512;      // click rings / wheel ticks in flight
 const CHECKPOINT_SEC = 10;   // integrator snapshot spacing, in timeline seconds
 const MAX_DROP_MARKS = 4000;
 const PITCH_LIMIT = 89;      // FPS engines clamp pitch; so do we
-const PANEL_BG = "#0e131c";  // must match --panel: the canvases are opaque now
 
 const QUERY = new URLSearchParams(location.search);
 const PROFILE = QUERY.get("profile") === "1";
@@ -150,11 +149,20 @@ function feedState(o) {
   return { kind: "live", age: age };
 }
 
-/** Whether the overlay should show its "no feed" state for `st`. */
-function feedIsStale(st, staleAfter) {
-  if (!(staleAfter > 0)) return false;
-  return st.kind === "down" || st.kind === "stale" ||
-         (st.kind === "waiting" && st.age > staleAfter);
+/**
+ * Whether the overlay should show its "no feed" state: `quietFor` seconds
+ * have passed without a batch, and that is more than `staleAfter`
+ * (`[viz.obs] stale_secs`, `?stale=`; 0 or less = never).
+ *
+ * Deliberately blind to the socket. "Seconds without data" is the one thing
+ * the viewer can see, and it reads the same whether the capture agent
+ * stopped, the bridge went away or the socket is between retries — so a page
+ * that has just loaded, or a socket that has just dropped, gets the same
+ * grace period as a feed that went quiet, instead of flashing "no feed"
+ * for the moment it takes to connect.
+ */
+function feedIsStale(quietFor, staleAfter) {
+  return staleAfter > 0 && quietFor > staleAfter;
 }
 
 /** Connection-pill text for a feed state: class, and what it says. */
@@ -228,11 +236,73 @@ const MAX_FPS = isFinite(fpsQ) && fpsQ > 0 ? clamp(fpsQ, 5, 400) : (OBS ? FPS_OB
 
 /* Stroke / marker size multiplier: 1 on the dashboard, `scale` in OBS mode. */
 const S = OBS ? OBS.scale : 1;
-/* Grid lines are near-invisible on a transparent page composited over dark
-   game footage, so the overlay gets a lighter, alpha-based palette. */
-const GRID = OBS && OBS.bg.alpha < 1
-  ? { line: "rgba(255,255,255,0.07)", axis: "rgba(255,255,255,0.16)", wrap: "rgba(200,140,255,0.35)" }
-  : { line: "#151c28", axis: "#25303f", wrap: "#3a2b46" };
+/* =====================================================================
+   Palette
+
+   Everything the canvases draw with, in one object. The dashboard fills it
+   from the page's design tokens (the CSS custom properties on :root) once
+   at start-up and again when the theme changes — never per frame: a
+   getComputedStyle in the draw path is a forced style recalc at 240Hz.
+   The draw code only ever reads ready-made strings from PAL.
+
+   The OBS overlay does not read the tokens at all. It is composited over
+   game footage, not over the page, so it keeps these built-in values
+   whatever the theme; grid lines, near-invisible on a transparent page
+   over dark footage, get a lighter, alpha-based set.
+   ===================================================================== */
+
+const PAL = {
+  canvas: "#0b0f16",
+  grid: "#161e2b", gridAxis: "#2a3547", gridWrap: "#3a2b46",
+  head: "#ffffff", headHalo: "rgba(255,255,255,0.10)",
+  cross: "rgba(53,208,224,0.55)",
+  accent: "#35d0e0", accentRgb: "53,208,224",
+  rail: "#222c3d", ghostFill: "#121826", ghostLine: "#2e3a50",
+  text: "#9aa8bb", textDim: "#66748a",
+  /* "r,g,b" per button kind: left, right, everything else. */
+  ring: ["70,214,138", "124,140,255", "255,176,46"],
+  light: false,
+};
+if (OBS) {
+  PAL.textDim = "#c8d2df";
+  if (OBS.bg.alpha < 1) {
+    PAL.grid = "rgba(255,255,255,0.07)";
+    PAL.gridAxis = "rgba(255,255,255,0.16)";
+    PAL.gridWrap = "rgba(200,140,255,0.35)";
+  }
+}
+
+/** "#rgb" | "#rrggbb" → "r,g,b", or null when it is not a hex colour. */
+function hexToRgb(hex) {
+  let h = String(hex || "").trim().replace(/^#/, "");
+  if (h.length === 3) h = h.replace(/./g, (c) => c + c);
+  if (!/^[0-9a-f]{6}$/i.test(h)) return null;
+  return parseInt(h.slice(0, 2), 16) + "," + parseInt(h.slice(2, 4), 16) + "," + parseInt(h.slice(4, 6), 16);
+}
+
+/** Overwrite PAL from a token lookup (`name` → value, "" when unset). A token
+    that is missing or not plain hex leaves the built-in value alone, so a page
+    opened without its stylesheet still draws. Pure: the tests drive it. */
+function paletteFromTokens(get) {
+  const hex = (name) => (hexToRgb(get(name)) === null ? null : String(get(name)).trim());
+  const set = (key, name) => { const v = hex(name); if (v !== null) PAL[key] = v; };
+  set("canvas", "--canvas");
+  set("grid", "--grid"); set("gridAxis", "--grid-axis"); set("gridWrap", "--grid-wrap");
+  set("head", "--head");
+  set("accent", "--accent");
+  set("rail", "--line"); set("ghostFill", "--surface"); set("ghostLine", "--line-strong");
+  set("text", "--fg-2"); set("textDim", "--fg-3");
+  PAL.headHalo = "rgba(" + hexToRgb(PAL.head) + ",0.10)";
+  PAL.accentRgb = hexToRgb(PAL.accent);
+  PAL.cross = "rgba(" + PAL.accentRgb + ",0.55)";
+  ["--lmb", "--rmb", "--aux"].forEach((name, i) => {
+    const rgb = hexToRgb(get(name));
+    if (rgb !== null) PAL.ring[i] = rgb;
+  });
+  /* A light canvas needs the other velocity ramp: the dark one ends in white. */
+  const c = hexToRgb(PAL.canvas).split(",");
+  PAL.light = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] > 140;
+}
 
 
 function niceStep(raw) {
@@ -414,7 +484,7 @@ class EffectRing {
 }
 
 /* Velocity → colour: cool blue (slow) through cyan and amber to hot white. */
-const RAMP = [
+const RAMP_DARK = [
   [0.00, 42, 86, 200],
   [0.28, 42, 200, 235],
   [0.52, 120, 235, 190],
@@ -422,7 +492,18 @@ const RAMP = [
   [0.88, 255, 122, 32],
   [1.00, 255, 250, 245],
 ];
-function rampColor(x) {
+/* The same walk on a light canvas, where white would vanish: it ends hot and
+   dark instead, and every stop is deep enough to read on white. */
+const RAMP_LIGHT = [
+  [0.00, 52, 84, 200],
+  [0.28, 0, 140, 186],
+  [0.52, 16, 150, 104],
+  [0.72, 204, 138, 0],
+  [0.88, 226, 88, 12],
+  [1.00, 150, 16, 24],
+];
+function rampColor(x, RAMP) {
+  RAMP = RAMP || RAMP_DARK;
   x = clamp(x, 0, 1);
   for (let i = 1; i < RAMP.length; i++) {
     if (x <= RAMP[i][0]) {
@@ -442,10 +523,15 @@ function rampColor(x) {
    number of stroke() calls instead of one per sample. */
 const VLEVELS = 14;
 const RAMP_CSS = [];
-for (let i = 0; i < VLEVELS; i++) {
-  const c = rampColor(i / (VLEVELS - 1));
-  RAMP_CSS.push("rgb(" + c[0] + "," + c[1] + "," + c[2] + ")");
+/** (Re)build the quantised ramp for the current palette, in place. */
+function buildRamp() {
+  const ramp = PAL.light ? RAMP_LIGHT : RAMP_DARK;
+  for (let i = 0; i < VLEVELS; i++) {
+    const c = rampColor(i / (VLEVELS - 1), ramp);
+    RAMP_CSS[i] = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+  }
 }
+buildRamp();
 const ALEVELS = 7;
 
 /* =====================================================================
@@ -1140,7 +1226,9 @@ class Panel {
        cleared. The one exception is an OBS overlay with a see-through
        background, which needs the alpha channel and pays for it. */
     this.opaque = !(OBS && OBS.bg.alpha < 1);
-    this.bg = OBS ? OBS.bg : { css: PANEL_BG, alpha: 1 };
+    /* The overlay's configured background; the dashboard paints PAL.canvas,
+       which follows the theme. */
+    this.bg = OBS ? OBS.bg : null;
     this.hidden = false;
     this.ctx = this.canvas.getContext("2d", { alpha: !this.opaque, desynchronized: true });
     this.unit = opts.unit;             // "cm" | "deg"
@@ -1218,7 +1306,7 @@ class Panel {
     ctx.save();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     if (this.opaque) {
-      ctx.fillStyle = this.bg.css;
+      ctx.fillStyle = this.bg ? this.bg.css : PAL.canvas;
       ctx.fillRect(0, 0, this.w, this.h);
     } else {
       ctx.clearRect(0, 0, this.w, this.h);
@@ -1258,7 +1346,7 @@ class Panel {
     const y1 = this.cy + halfY;
 
     ctx.beginPath();
-    ctx.strokeStyle = GRID.line;
+    ctx.strokeStyle = PAL.grid;
     for (let x = x0; x <= x1; x += step) {
       if (Math.abs(x) < step * 0.001) continue;
       const px = Math.round(this.toX(x)) + 0.5;
@@ -1275,7 +1363,7 @@ class Panel {
        unwrapped, so every full turn (k·360°) is the same facing and gets
        the axis too. */
     ctx.beginPath();
-    ctx.strokeStyle = GRID.axis;
+    ctx.strokeStyle = PAL.gridAxis;
     const oy = Math.round(this.toY(0)) + 0.5;
     ctx.moveTo(0, oy); ctx.lineTo(this.w, oy);
     if (isDesk) {
@@ -1294,7 +1382,7 @@ class Panel {
          of 180°. Crossing one means you are now facing directly behind
          where "recenter" left you. */
       ctx.beginPath();
-      ctx.strokeStyle = GRID.wrap;
+      ctx.strokeStyle = PAL.gridWrap;
       ctx.setLineDash([4, 5]);
       for (let b = (Math.floor((this.cx - halfX - 180) / 360) * 360) + 180; b <= x1; b += 360) {
         const px = Math.round(this.toX(b)) + 0.5;
@@ -1364,7 +1452,7 @@ class Panel {
     let n = 0;
     for (let i = 0; i < BTN_KIND.length; i++) {
       if (!(eng.held & BTN_KIND[i][0])) continue;
-      const col = RING_COLORS[BTN_KIND[i][1]];
+      const col = PAL.ring[BTN_KIND[i][1]];
       const rad = (13 + 6 * n) * S;
       n++;
       ctx.fillStyle = "rgba(" + col + ",0.22)";
@@ -1376,7 +1464,7 @@ class Panel {
   }
 
   drawRings(ctx, eng, isDesk) {
-    const colors = RING_COLORS;
+    const colors = PAL.ring;
     const now = eng.playT;
     for (let k = 0; k < eng.rings.n; k++) {
       const r = eng.rings.at(k);
@@ -1403,11 +1491,11 @@ class Panel {
 
   drawHead(ctx, head) {
     const x = this.toX(head.x), y = this.toY(head.y);
-    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    ctx.fillStyle = PAL.headHalo;
     ctx.beginPath(); ctx.arc(x, y, 9 * S, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle = PAL.head;
     ctx.beginPath(); ctx.arc(x, y, 2.6 * S, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = "rgba(53,208,224,0.55)";
+    ctx.strokeStyle = PAL.cross;
     ctx.lineWidth = S;
     ctx.beginPath();
     ctx.moveTo(x - 12 * S, y); ctx.lineTo(x - 5 * S, y);
@@ -1426,7 +1514,7 @@ class Panel {
     const hy = Math.min(this.h - 12, by + 70);   // tilt bar baseline
     const hx = this.w - 46;
 
-    ctx.strokeStyle = "#1d2634";
+    ctx.strokeStyle = PAL.rail;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(bx, by - 46); ctx.lineTo(bx, by + 46);
@@ -1443,7 +1531,7 @@ class Panel {
         sawH = true;
         netH += t.dir;
         const x = hx + t.dir * (8 + 26 * f);
-        ctx.strokeStyle = "rgba(124,140,255," + alpha + ")";
+        ctx.strokeStyle = "rgba(" + PAL.ring[1] + "," + alpha + ")";
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(x, hy - 6); ctx.lineTo(x, hy + 6);
@@ -1451,7 +1539,7 @@ class Panel {
       } else {
         net += t.dir;
         const y = by - t.dir * (8 + 38 * f);
-        ctx.strokeStyle = "rgba(53,208,224," + alpha + ")";
+        ctx.strokeStyle = "rgba(" + PAL.accentRgb + "," + alpha + ")";
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(bx - 7, y); ctx.lineTo(bx + 7, y);
@@ -1462,19 +1550,19 @@ class Panel {
     ctx.font = "10px ui-monospace, monospace";
     ctx.textAlign = "center";
     if (net !== 0) {
-      ctx.fillStyle = "#7c8ba1";
+      ctx.fillStyle = PAL.text;
       ctx.fillText((net > 0 ? "+" : "") + net, bx, by + 62);
     }
     if (sawH) {
       /* The tilt axis only draws its rail once the mouse has actually used
          it — most do not have one. */
-      ctx.strokeStyle = "#1d2634";
+      ctx.strokeStyle = PAL.rail;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(hx - 34, hy); ctx.lineTo(hx + 34, hy);
       ctx.stroke();
       if (netH !== 0) {
-        ctx.fillStyle = "#7c8cff";
+        ctx.fillStyle = "rgb(" + PAL.ring[1] + ")";
         ctx.fillText((netH > 0 ? "+" : "") + netH + " ⇄", hx, hy + 18);
       }
     }
@@ -1498,22 +1586,22 @@ class Panel {
 
     ctx.save();
     ctx.globalAlpha = 0.5;
-    ctx.fillStyle = "#0b1017";
+    ctx.fillStyle = PAL.ghostFill;
     ctx.fillRect(x, y, gw, gh);
-    ctx.strokeStyle = "#25303f";
+    ctx.strokeStyle = PAL.ghostLine;
     ctx.lineWidth = 1;
     ctx.strokeRect(x + 0.5, y + 0.5, gw - 1, gh - 1);
 
     const px = x + clamp(eng.cursorX / eng.screenW, 0, 1) * gw;
     const py = y + clamp(eng.cursorY / eng.screenH, 0, 1) * gh;
     ctx.globalAlpha = 0.85;
-    ctx.fillStyle = "#35d0e0";
+    ctx.fillStyle = PAL.accent;
     ctx.beginPath();
     ctx.arc(px, py, 2.4, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.globalAlpha = 0.6;
-    ctx.fillStyle = "#4d5a6d";
+    ctx.globalAlpha = 0.8;
+    ctx.fillStyle = PAL.textDim;
     ctx.font = "9px ui-monospace, monospace";
     ctx.fillText("desktop cursor " + eng.screenW + "×" + eng.screenH, x, y - 4);
     ctx.restore();
@@ -1525,7 +1613,7 @@ class Panel {
       ctx.fillStyle = RAMP_CSS[i];
       ctx.fillRect(x + (w / VLEVELS) * i, y, w / VLEVELS + 0.6, h);
     }
-    ctx.fillStyle = OBS ? "#c8d2df" : "#4d5a6d";
+    ctx.fillStyle = PAL.textDim;
     ctx.font = Math.round(10 * S) + "px ui-monospace, monospace";
     ctx.fillText("0", x, y + 16 * S);
     const top = isDesk
@@ -1599,6 +1687,8 @@ const ui = {
      for a recording to finish streaming in. Wall-clock UTC µs or null. */
   pendingUtcUs: null,
   seekAfterLoadUtcUs: null,
+  /* ?session=<id>: the recording to open once the list is in. */
+  pendingSessionId: null,
   _wallSec: null,
   liveBuffer: LIVE_BUFFER_DEFAULT,
   bridge: null,
@@ -1610,6 +1700,10 @@ const ui = {
   wsOpen: false,
   lastBatchAt: 0,
   feedSince: 0,
+  /* When the page last had data: the newest batch, or the moment the page
+     loaded while there has been none. Unlike `lastBatchAt` no socket event
+     resets it; the overlay's "no feed" timer runs off this alone. */
+  lastDataAt: nowSec(),
   udpAddr: UDP_ADDR,
   /* Frames the page could not use: unparseable WebSocket messages and bad
      replay lines. Shown in the stats bar next to the bridge's own parse
@@ -1621,12 +1715,13 @@ const ui = {
     const p = $("connPill");
     if (p.className !== name) p.className = name;
     const t = $("connText");
-    if (t.textContent !== text) t.textContent = text;
+    /* The pill ellipsizes in a narrow window; the tooltip keeps the whole text. */
+    if (t.textContent !== text) { t.textContent = text; p.title = text; }
   },
 
   /** A batch arrived. */
   onBatch() {
-    this.lastBatchAt = nowSec();
+    this.lastBatchAt = this.lastDataAt = nowSec();
     /* Recovery is instant rather than "within the next 100ms repaint": an
        overlay that stays dimmed for a tenth of a second after the feed comes
        back is a visible flicker on stream. */
@@ -1783,6 +1878,16 @@ const ui = {
       const target = this.pendingUtcUs;
       this.pendingUtcUs = null;
       if (this.gotoUtcUs(target)) return;
+    }
+    if (this.pendingSessionId !== null) {
+      const id = this.pendingSessionId;
+      this.pendingSessionId = null;
+      if (list.some((s) => s.id === id)) {
+        sel.value = id;
+        await this.loadSession(id);
+        return;
+      }
+      this.toast("session", "no recording named " + id, true);
     }
     await this.loadSession(list[0].id);
   },
@@ -2291,24 +2396,31 @@ function paintBridge(now) {
    fallback in a plain browser, and a page with neither is unchanged.
    ===================================================================== */
 
-const staleView = { on: false, age: 0 };
+const staleView = { on: false, age: 0, badge: null };
 
+/** Re-evaluate the overlay's "no feed" state. Runs from the 10Hz block of the
+    frame loop (the only thing that can turn it on) and from `ui.onBatch`
+    (which turns it off the instant data returns). While it is on, the badge
+    counts the silence in whole seconds — one text write a second. */
 function updateStale() {
   if (!OBS) return;
-  const st = feedState({
-    connected: ui.wsOpen,
-    lastBatchAt: ui.lastBatchAt,
-    since: ui.feedSince,
-    now: nowSec(),
-    staleAfter: OBS.stale,
-  });
-  staleView.age = st.age;
-  const on = feedIsStale(st, OBS.stale);
+  staleView.age = Math.max(0, nowSec() - ui.lastDataAt);
+  const on = feedIsStale(staleView.age, OBS.stale);
   if (on !== staleView.on) {
     staleView.on = on;
     document.body.classList.toggle("stale", on);
     engine.dirty = true;
   }
+  if (on) {
+    if (!staleView.badge) staleView.badge = $("feedBadge");
+    setText(staleView.badge, "no feed \u00b7 " + fmtQuiet(staleView.age));
+  }
+}
+
+/** "7s", "4m 05s": how long the feed has been quiet. */
+function fmtQuiet(sec) {
+  sec = Math.floor(sec);
+  return sec < 60 ? sec + "s" : Math.floor(sec / 60) + "m " + pad2(sec % 60) + "s";
 }
 
 /* Each channel is tracked separately: OBS reports "this source is hidden"
@@ -2413,7 +2525,7 @@ function hudValue(key, e) {
       return us === null ? "—" : ((Date.now() * 1000 - us) / 1000).toFixed(1);
     }
     case "status":
-      return staleView.on ? "no feed (" + Math.round(staleView.age) + "s)" : "live";
+      return staleView.on ? "no feed (" + fmtQuiet(staleView.age) + ")" : "live";
   }
   return "—";
 }
@@ -2472,8 +2584,10 @@ function frame(msNow) {
   /* Keep drawing while anything is still decaying, and draw one final frame
      after the last trail point expires so the panels actually end up
      empty instead of holding a ghost. */
+  /* A hidden OBS source (or an inactive scene) keeps ticking and stops
+     drawing; `setVisible` marks the engine dirty on the way back. */
   const alive = engine.visualsAlive();
-  if (due && !ui.paused && (engine.dirty || alive || wasAlive)) {
+  if (due && !ui.paused && isVisible() && (engine.dirty || alive || wasAlive)) {
     if (PROFILE) performance.mark("dr0");
     engine.draw();
     if (PROFILE) { performance.mark("dr1"); measure("draw", "dr0", "dr1", "draw"); }
@@ -2487,8 +2601,10 @@ function frame(msNow) {
     if (PROFILE) performance.mark("st0");
     /* OBS mode: the stats bar is display:none, so writing ~20 tiles into
        it would be pure layout work; the HUD is the only readout. */
-    if (OBS) paintHud();
-    else paintStats(now);
+    /* The feed verdicts are time-driven: nothing arrives to announce that
+       nothing is arriving, so they are re-evaluated here or never. */
+    if (OBS) { updateStale(); paintHud(); }
+    else { ui.refreshConn(); paintStats(now); }
     /* The transport writes layout-affecting styles; at 240Hz that was a
        style recalc per frame for a bar that changes by a pixel. Same 100ms
        cadence as the stats. */
@@ -2624,6 +2740,76 @@ function armDprWatch() {
 }
 armDprWatch();
 
+/* =====================================================================
+   Theme (dashboard only)
+
+   Same contract as the control panel: `localStorage.tmTheme` is "light" or
+   "dark" when the user picked one, absent to follow the system; the choice
+   lands on <html data-theme>, which is all the stylesheet looks at. (The
+   head of index.html applies it before first paint; this keeps it current.)
+   The two pages are different origins, so each remembers its own.
+
+   The canvases cannot follow CSS, so every change re-reads the tokens into
+   PAL and repaints once. The overlay is never themed and never gets here.
+   ===================================================================== */
+
+const THEME_KEY = "tmTheme";
+let lightQuery = null;
+try { lightQuery = matchMedia("(prefers-color-scheme: light)"); } catch (e) { lightQuery = null; }
+
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t === "light" || t === "dark") return t;
+  return lightQuery && lightQuery.matches ? "light" : "dark";
+}
+
+/** Tokens → PAL → ramp. Returns false where there is no stylesheet to read. */
+function readTokens() {
+  if (OBS || typeof getComputedStyle !== "function") return false;
+  let cs;
+  try { cs = getComputedStyle(document.documentElement); } catch (e) { return false; }
+  paletteFromTokens((name) => cs.getPropertyValue(name));
+  buildRamp();
+  engine.dirty = true;
+  return true;
+}
+
+function applyTheme(repaint) {
+  if (OBS) return;
+  let t = themePicked;
+  if (t === undefined) {
+    try { t = localStorage.getItem(THEME_KEY); } catch (e) { t = null; /* storage blocked */ }
+  }
+  const root = document.documentElement;
+  if (t === "light" || t === "dark") root.dataset.theme = t;
+  else delete root.dataset.theme;
+  setText($("themeBtn"), currentTheme() === "dark" ? "Light theme" : "Dark theme");
+  /* A paused picture is not redrawn by the frame loop; repaint it here so
+     the canvases never sit in the old theme under new chrome. */
+  if (readTokens() && repaint) { engine.draw(); engine.dirty = false; }
+}
+
+/* This page load's pick, so the button still works where storage is blocked. */
+let themePicked;
+
+function setTheme(t) {
+  themePicked = t;
+  try {
+    if (t === null) localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, t);
+  } catch (e) { /* storage blocked: the choice lasts until reload */ }
+  applyTheme(true);
+}
+
+if (!OBS) {
+  /* Shift-click hands the choice back to the system (the panel has a
+     "use system" link for this; the top bar has no room for one). */
+  $("themeBtn").addEventListener("click", (e) =>
+    setTheme(e.shiftKey ? null : currentTheme() === "dark" ? "light" : "dark"));
+  if (lightQuery && lightQuery.addEventListener) lightQuery.addEventListener("change", () => applyTheme(true));
+  applyTheme(false);
+}
+
 /* A trim the render loop cannot starve. rAF is suspended in a background
    tab but the socket is not, so this is the timer that keeps a hidden tab
    from growing without bound. */
@@ -2665,9 +2851,17 @@ if (AT && !OBS) {
   atMs = /^\d{11,}$/.test(AT) ? +AT : new Date(AT).getTime();
   if (!isFinite(atMs)) ui.toast("?at=", "unreadable date/time: " + AT, true);
 }
+/* ?session=<id> opens that recording in replay: what the control panel's
+   Recordings list links to. The id must look like one (the server 404s
+   anything else anyway). */
+const SESSION = QUERY.get("session");
+const wantSession = !!SESSION && !OBS && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(SESSION);
 if (isFinite(atMs)) {
   ui.pendingUtcUs = atMs * 1000;
   $("gotoTime").value = toDatetimeLocal(atMs);
+  ui.setMode("replay");
+} else if (wantSession) {
+  ui.pendingSessionId = SESSION;
   ui.setMode("replay");
 } else {
   ui.setConn("warn", "connecting");
@@ -2679,4 +2873,7 @@ requestAnimationFrame(frame);
 window.telemouse = {
   engine: engine, ui: ui, deskPanel: deskPanel, aimPanel: aimPanel,
   prof: prof, profiling: PROFILE, obs: OBS,
+  /* For the Node tests, which have no animation frames of their own. */
+  frame: frame, staleView: staleView, feedIsStale: feedIsStale,
+  palette: PAL, paletteFromTokens: paletteFromTokens, buildRamp: buildRamp, rampCss: RAMP_CSS,
 };

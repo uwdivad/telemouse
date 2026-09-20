@@ -26,9 +26,10 @@ use serde_json::json;
 use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted};
 use tracing::{info, warn};
 
-use crate::manager::{Manager, MarkerError, StartError, StartRequest, StopError};
+use crate::manager::{Manager, MarkerError, StartError, StartRequest, StopError, SummaryError};
 use crate::places::Places;
 use crate::procs::{KillError, Scanner};
+use crate::settings::{self, SaveError};
 
 /// The single-file browser app. No external assets, no CDN.
 pub const INDEX_HTML: &str = include_str!("index.html");
@@ -52,6 +53,8 @@ pub struct AppState {
     pub page: Arc<String>,
     /// Version, config, logs and docs, as absolute strings the page shows.
     pub places: Arc<Places>,
+    /// One settings save at a time: read, check the token, write.
+    pub settings_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the page needs to know at load: links and limits, not secrets.
@@ -63,6 +66,11 @@ pub struct PageConfig {
     /// `minimal`, ...): shown next to the version.
     pub features: String,
     pub places: Places,
+    /// `marker_hotkey`: the page says "or press F9 in game" next to its
+    /// marker field. Empty when none.
+    pub marker_hotkey: String,
+    /// `[ctl] hotkey`: the new-session chord, for the same hint.
+    pub hotkey: String,
 }
 
 pub fn render_page(cfg: &PageConfig) -> String {
@@ -82,6 +90,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/components/{id}/stop", post(api_stop))
         .route("/api/components/{id}/marker", post(api_marker))
         .route("/api/processes/{pid}/kill", post(api_kill))
+        .route("/api/open", post(api_open))
+        .route("/api/config", get(api_config).post(api_config_save))
+        .route("/api/reports/{id}", get(api_report).post(api_report_run))
         .layer(middleware::from_fn(require_local_host))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -304,6 +315,204 @@ async fn api_kill(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct OpenBody {
+    #[serde(default)]
+    target: String,
+}
+
+/// `POST /api/open` `{ target }`: open one of the places the panel talks
+/// about with the shell's default handler — the config in an editor, the
+/// recordings or logs folder in Explorer, the docs. The target is a name;
+/// the path comes from this server, never from the request.
+async fn api_open(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Option<axum::Json<OpenBody>>,
+) -> Response {
+    if let Some(r) = guard(&headers) {
+        return r;
+    }
+    let target = body.map(|b| b.0.target).unwrap_or_default();
+    let path = match target.as_str() {
+        "config" => st.places.config.clone(),
+        "recordings" => st.manager.recording().dir,
+        "logs" => st.places.logs.clone(),
+        "docs" => st.places.docs.clone(),
+        other => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown target {other:?}: one of config, recordings, logs, docs"),
+            );
+        }
+    };
+    if path.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("nothing to open for {target}: this build has no such place"),
+        );
+    }
+    let shown = path.clone();
+    let opened = tokio::task::spawn_blocking(move || crate::gui::open_url(&path))
+        .await
+        .unwrap_or(false);
+    if opened {
+        info!(target, path = %shown, "opened from the page");
+        axum::Json(json!({ "ok": true, "target": target, "path": shown })).into_response()
+    } else {
+        warn!(target, path = %shown, "the shell refused to open it");
+        error(StatusCode::INTERNAL_SERVER_ERROR, "could not open it")
+    }
+}
+
+/// `GET /api/config`: the settings the page may edit, as the file on disk
+/// has them now, and the token a save must echo. A file that cannot be used
+/// comes back with `settings: null` and the reason.
+async fn api_config(State(st): State<AppState>) -> Response {
+    let path = st.manager.config_path().to_path_buf();
+    let shown = path.display().to_string();
+    let view = tokio::task::spawn_blocking(move || settings::view(&path)).await;
+    let Ok(view) = view else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read the settings",
+        );
+    };
+    axum::Json(json!({
+        "path": shown,
+        "status": st.manager.config_info().status,
+        "exists": view.exists,
+        "token": view.token,
+        "settings": view.settings,
+        "error": view.error,
+        "choices": settings::CHOICES,
+        "not_editable": settings::NOT_EDITABLE,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigSaveBody {
+    /// The `token` of the `GET /api/config` the edit was made against.
+    token: String,
+    patch: settings::Patch,
+}
+
+/// `POST /api/config` `{ token, patch }`: change allow-listed settings in
+/// `telemouse.toml`, keeping the rest of the file as the user wrote it.
+/// `400` (nothing written) when the result would not be a valid config,
+/// `409` when the file changed since `token` was handed out.
+async fn api_config_save(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Result<axum::Json<ConfigSaveBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(r) = guard(&headers) {
+        return r;
+    }
+    let body = match body {
+        Ok(b) => b.0,
+        // Unknown fields land here: the patch shape is the allow-list.
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    let _one = st.settings_lock.lock().await;
+    let path = st.manager.config_path().to_path_buf();
+    let saved =
+        tokio::task::spawn_blocking(move || settings::save(&path, &body.token, &body.patch)).await;
+    let saved = match saved {
+        Ok(Ok(s)) => s,
+        Ok(Err(SaveError::Stale(token))) => {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": "telemouse.toml was changed by something else since this page read it; your edit was not saved. The form now shows the file as it is.",
+                    "token": token,
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(SaveError::Invalid(why))) => {
+            warn!(error = %why, "settings not saved: invalid");
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({ "error": why.reason, "field": why.field })),
+            )
+                .into_response();
+        }
+        Ok(Err(SaveError::Io(why))) => {
+            warn!(error = %why, "settings not saved");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not write the settings: {why}"),
+            );
+        }
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    // Whether recordings are saved and where is in force from here on; the
+    // rest belongs to processes that read the file when they start.
+    st.manager.reload_config();
+    let changed = match &saved.old {
+        Some(old) => settings::changed(old, &saved.new),
+        None => Vec::new(),
+    };
+    let effects = settings::effects(
+        &changed,
+        st.manager.is_running("capture").await,
+        st.manager.is_running("viz").await,
+    );
+    info!(changed = ?changed, created = saved.created, "settings saved from the page");
+    axum::Json(json!({
+        "ok": true,
+        "token": saved.token,
+        "created": saved.created,
+        "settings": settings::Settings::from(&saved.new),
+        "changed": changed,
+        "restart_required": effects.restart_required,
+        "next_start": effects.next_start,
+    }))
+    .into_response()
+}
+
+fn summary_error(e: SummaryError) -> Response {
+    let status = match e {
+        SummaryError::BadId => StatusCode::BAD_REQUEST,
+        SummaryError::NoRecording => StatusCode::NOT_FOUND,
+        SummaryError::NoAnalyzer => StatusCode::SERVICE_UNAVAILABLE,
+        SummaryError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error(status, e)
+}
+
+/// `GET /api/reports/{id}`: the stored `ReportSummary` of a recording, if
+/// one was made since the recording last changed. Reads a file; `404` when
+/// there is none yet (`POST` makes it).
+async fn api_report(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let m = st.manager.clone();
+    match tokio::task::spawn_blocking(move || m.stored_summary(&id)).await {
+        Ok(Ok(Some(v))) => axum::Json(v).into_response(),
+        Ok(Ok(None)) => error(StatusCode::NOT_FOUND, "no summary yet"),
+        Ok(Err(e)) => summary_error(e),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `POST /api/reports/{id}`: run the analyzer in summary mode over that
+/// recording and return the `ReportSummary` JSON it prints.
+async fn api_report_run(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(r) = guard(&headers) {
+        return r;
+    }
+    match st.manager.report_summary(&id).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => summary_error(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,9 +548,31 @@ mod tests {
                     panel_url: "http://127.0.0.1:7880/".into(),
                     ..Default::default()
                 },
+                marker_hotkey: "f9".into(),
+                hotkey: "ctrl+alt+r".into(),
             })),
             places: Arc::new(Places::default()),
+            settings_lock: Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn open_needs_the_guard_a_known_target_and_a_place() {
+        let body = Some(serde_json::json!({ "target": "logs" }));
+        let (status, _, _) = call(state(), Method::POST, "/api/open", false, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, v, _) = call(
+            state(),
+            Method::POST,
+            "/api/open",
+            true,
+            Some(serde_json::json!({ "target": "C:\\Windows\\System32\\cmd.exe" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        // Places::default(): no logs folder in this build → nothing opens.
+        let (status, v, _) = call(state(), Method::POST, "/api/open", true, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
     }
 
     async fn call(
@@ -395,6 +626,33 @@ mod tests {
         assert_eq!(INDEX_HTML.matches(CONFIG_PLACEHOLDER).count(), 1);
         // The page must send the guard header, or nothing it does will work.
         assert!(INDEX_HTML.contains("X-Telemouse-Ctl"));
+        // Light and dark, a first-run banner, and the shell-open route.
+        for needed in [
+            "data-theme",
+            "prefers-color-scheme",
+            "/api/open",
+            "id=\"firstRun\"",
+            "/api/components/capture/marker",
+            // The settings editor, the report card and the first-run guide.
+            "/api/config",
+            "/api/reports/",
+            "id=\"settingsCard\"",
+            "id=\"reportCard\"",
+            "id=\"wizStep2\"",
+            "foreground_seen",
+        ] {
+            assert!(INDEX_HTML.contains(needed), "page lacks {needed}");
+        }
+        // Nobody is sent to a TOML editor on first run any more, and nobody
+        // is ever told to elevate.
+        let first_run = INDEX_HTML
+            .split("id=\"firstRun\"")
+            .nth(1)
+            .and_then(|s| s.split("</section>").next())
+            .expect("the first-run section");
+        assert!(!first_run.contains("restart the panel"));
+        assert!(!first_run.contains("[games]"));
+        assert!(!INDEX_HTML.to_lowercase().contains("as administrator"));
     }
 
     #[test]
@@ -407,6 +665,8 @@ mod tests {
                 docs: "</script><script>alert(2)</script>".into(),
                 ..Default::default()
             },
+            marker_hotkey: "</script><script>alert(3)</script>".into(),
+            hotkey: String::new(),
         });
         assert!(!html.contains("</script><script>alert"));
     }
@@ -460,6 +720,9 @@ mod tests {
             ("/api/state", Method::GET),
             ("/api/components/capture/stop", Method::POST),
             ("/api/processes/1/kill", Method::POST),
+            ("/api/config", Method::GET),
+            ("/api/config", Method::POST),
+            ("/api/reports/s-1", Method::GET),
         ] {
             let req = Request::builder()
                 .method(method)
@@ -488,6 +751,8 @@ mod tests {
             "/api/components/capture/start",
             "/api/components/capture/stop",
             "/api/processes/1/kill",
+            "/api/config",
+            "/api/reports/s-1",
         ] {
             let (status, v, _) = call(state(), Method::POST, uri, false, None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
@@ -661,6 +926,252 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// A state whose config and recordings live in a throwaway directory.
+    fn state_in(dir: &std::path::Path) -> AppState {
+        let mut st = state();
+        st.manager = Arc::new(Manager::new(
+            crate::manager::COMPONENTS,
+            crate::manager::ManagerConfig {
+                bin_dir: Some(std::env::temp_dir().join("telemouse-ctl-no-bins")),
+                config_path: dir.join("telemouse.toml"),
+                recordings_dir: dir.join("recordings"),
+                recording_enabled: true,
+                config_status: crate::manager::ConfigStatus::Defaults,
+                grace: Duration::from_secs(1),
+                log_dir: None,
+            },
+        ));
+        st
+    }
+
+    const USER_FILE: &str = "# mine\nmouse_cpi = 1600.0  # the white one\n\n[recording]\nenabled = true\ndir = \"recordings\"\n\n# main game\n[games.\"one.exe\"]\nsens = 1.0\nyaw_coeff = 0.022\npitch_coeff = 0.022\n";
+
+    async fn get_config(st: &AppState) -> serde_json::Value {
+        let (s, v, _) = call(st.clone(), Method::GET, "/api/config", false, None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v
+    }
+
+    #[tokio::test]
+    async fn config_is_read_with_a_token_and_saved_keeping_comments() {
+        let d = crate::manager::tmpdir("srv-config");
+        let p = d.join("telemouse.toml");
+        std::fs::write(&p, USER_FILE).unwrap();
+        let st = state_in(&d);
+
+        let v = get_config(&st).await;
+        assert_eq!(v["exists"], true);
+        assert_eq!(v["settings"]["mouse_cpi"], 1600.0);
+        assert_eq!(v["settings"]["recording"]["dir"], "recordings");
+        assert_eq!(v["settings"]["games"]["one.exe"]["sens"], 1.0);
+        assert_eq!(v["settings"]["ctl"]["hotkey"], "ctrl+alt+r");
+        assert!(v["choices"]["obs_layouts"].as_array().unwrap().len() >= 4);
+        assert!(v["settings"].get("kafka").is_none(), "{v}");
+        let token = v["token"].as_str().unwrap().to_string();
+
+        // No guard header: refused before anything is read.
+        let body = json!({ "token": token, "patch": { "mouse_cpi": 800 } });
+        let (s, _, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/config",
+            false,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), USER_FILE);
+
+        let (s, v, _) = call(st.clone(), Method::POST, "/api/config", true, Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["settings"]["mouse_cpi"], 800.0);
+        assert_eq!(v["changed"], json!(["mouse_cpi"]));
+        assert_eq!(v["restart_required"], json!([]));
+        assert_eq!(v["next_start"], json!([]), "nothing is running");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            text,
+            USER_FILE.replace("1600.0", "800.0"),
+            "only the value moved"
+        );
+        assert_eq!(get_config(&st).await["token"], v["token"]);
+
+        // The old token is now stale: 409, the file untouched, the new token offered.
+        let (s, v2, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/config",
+            true,
+            Some(json!({ "token": token, "patch": { "mouse_cpi": 400 } })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v2}");
+        assert_eq!(v2["token"], v["token"]);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_or_disallowed_save_writes_nothing() {
+        let d = crate::manager::tmpdir("srv-config-bad");
+        let p = d.join("telemouse.toml");
+        std::fs::write(&p, USER_FILE).unwrap();
+        let st = state_in(&d);
+        let token = get_config(&st).await["token"].clone();
+
+        for (patch, field) in [
+            (json!({ "mouse_cpi": -1 }), "mouse_cpi"),
+            (json!({ "marker_hotkey": "ctrl+alt+r" }), "ctl.hotkey"),
+            (json!({ "ctl": { "hotkey": "banana" } }), "ctl.hotkey"),
+            (
+                json!({ "games": { "C:\\x\\game.exe": { "sens": 1 } } }),
+                "games",
+            ),
+            (json!({ "games": { "new.exe": { "sens": 0 } } }), "games"),
+            (json!({ "obs": { "layout": "sideways" } }), "viz.obs.layout"),
+        ] {
+            let (s, v, _) = call(
+                st.clone(),
+                Method::POST,
+                "/api/config",
+                true,
+                Some(json!({ "token": token, "patch": patch })),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{patch} → {v}");
+            assert_eq!(v["field"], field, "{patch} → {v}");
+            assert!(!v["error"].as_str().unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), USER_FILE, "{patch}");
+        }
+        // What the form may not touch is not a patch at all.
+        for patch in [
+            json!({ "ctl": { "http_addr": "0.0.0.0:7880" } }),
+            json!({ "ctl": { "bin_dir": "C:/elsewhere" } }),
+            json!({ "kafka": { "enabled": true } }),
+            json!({ "viz": { "http_addr": "0.0.0.0:7879" } }),
+        ] {
+            let (s, v, _) = call(
+                st.clone(),
+                Method::POST,
+                "/api/config",
+                true,
+                Some(json!({ "token": token, "patch": patch })),
+            )
+            .await;
+            assert!(s.is_client_error(), "{patch} → {s} {v}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), USER_FILE, "{patch}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn games_are_added_and_removed_through_the_route() {
+        let d = crate::manager::tmpdir("srv-config-games");
+        let p = d.join("telemouse.toml");
+        std::fs::write(&p, USER_FILE).unwrap();
+        let st = state_in(&d);
+        let token = get_config(&st).await["token"].clone();
+        let (s, v, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/config",
+            true,
+            Some(json!({ "token": token, "patch": { "games": {
+                "My Game": { "sens": 2.5, "yaw_coeff": 0.0066 },
+                "one.exe": null,
+            }}})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["changed"], json!(["games"]));
+        let games = v["settings"]["games"].as_object().unwrap();
+        assert_eq!(games.len(), 1);
+        assert_eq!(games["my game.exe"]["pitch_coeff"], 0.0066);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[games.\"my game.exe\"]"), "{text}");
+        assert!(!text.contains("one.exe"), "{text}");
+        assert!(text.starts_with("# mine\nmouse_cpi = 1600.0  # the white one\n"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn the_first_save_creates_the_file_from_the_sample() {
+        let d = crate::manager::tmpdir("srv-config-seed");
+        let p = d.join("telemouse.toml");
+        let st = state_in(&d);
+        let v = get_config(&st).await;
+        assert_eq!(v["exists"], false);
+        assert_eq!(v["status"], "defaults");
+        assert_eq!(v["token"], "none");
+        let (s, v, _) = call(
+            st.clone(),
+            Method::POST,
+            "/api/config",
+            true,
+            Some(json!({ "token": "none", "patch": { "mouse_cpi": 3200, "recording": { "enabled": false } } })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["created"], true);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("# telemouse configuration"), "{text}");
+        assert!(text.contains("mouse_cpi = 3200.0"));
+        // The panel's own copy follows at once.
+        let (_, state, _) = call(st.clone(), Method::GET, "/api/state", false, None).await;
+        assert_eq!(state["recording"]["enabled"], false);
+        assert_eq!(state["config"]["status"], "loaded");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn report_summaries_are_by_safe_id_only() {
+        let d = crate::manager::tmpdir("srv-reports");
+        std::fs::create_dir_all(d.join("recordings")).unwrap();
+        std::fs::write(d.join("recordings").join("s-1.jsonl"), "{}\n").unwrap();
+        let st = state_in(&d);
+
+        let (s, _, _) = call(st.clone(), Method::POST, "/api/reports/s-1", false, None).await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "running the analyzer needs the guard"
+        );
+        for bad in ["..%5Cx", "C:s-1", "s%201", ".hidden", "s-1.jsonl"] {
+            for method in [Method::GET, Method::POST] {
+                let (s, v, _) = call(
+                    st.clone(),
+                    method,
+                    &format!("/api/reports/{bad}"),
+                    true,
+                    None,
+                )
+                .await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{bad} → {v}");
+            }
+        }
+        let (s, _, _) = call(st.clone(), Method::POST, "/api/reports/nope", true, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        // The test bin dir is empty: no analyzer, said plainly, no panic.
+        let (s, v, _) = call(st.clone(), Method::POST, "/api/reports/s-1", true, None).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("telemouse-analyze"));
+
+        // Nothing stored yet; then a stored summary newer than the recording is served.
+        let (s, _, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let cache = d.join("recordings").join(crate::manager::REPORTS_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("s-1.summary.json"),
+            r#"{"schema":"telemouse-report-summary/1"}"#,
+        )
+        .unwrap();
+        let (s, v, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["schema"], "telemouse-report-summary/1");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

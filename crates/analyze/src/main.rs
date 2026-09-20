@@ -11,6 +11,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+mod explorer;
+
 use telemouse_analyze::{
     load,
     series::Params,
@@ -32,10 +34,53 @@ fn init_logging() {
     });
 }
 
+// Help headings. Flags keep their names and defaults; only where `--help`
+// lists them changes.
+const H_INPUT: &str = "Input";
+const H_OUTPUT: &str = "Output";
+const H_FILTER: &str = "Filtering";
+const H_DETECT: &str = "Advanced (flick and click detection)";
+const H_LIFT: &str = "Advanced (lift / repositioning detection)";
+const H_GRID: &str = "Advanced (smoothing and grid)";
+
+const TOP_EXAMPLES: &str = "\
+Examples:
+  telemouse-analyze list
+  telemouse-analyze report demo-session
+  telemouse-analyze trend --csv trend.csv
+
+Run `telemouse-analyze <COMMAND> --help` for the options of one command.
+The Report button in telemouse-ctl runs `report` for you.";
+
+const REPORT_EXAMPLES: &str = "\
+Examples:
+  telemouse-analyze report demo-session
+  telemouse-analyze report recordings\\demo-session.jsonl --split-by-marker
+  telemouse-analyze report demo-session --summary
+  telemouse-analyze report demo-session --quiet --json report.json --csv-dir tables
+
+The Advanced options tune the detectors; left alone they keep the built-in
+defaults, which is what the numbers in the docs assume.";
+
+const TREND_EXAMPLES: &str = "\
+Examples:
+  telemouse-analyze trend
+  telemouse-analyze trend --json-dir reports --csv trend.csv
+  telemouse-analyze trend --metric micro.band_ratio_8_12 --json
+
+--json-dir makes the second run fast: sessions already analyzed are read back
+instead of recomputed.";
+
+const LIST_EXAMPLES: &str = "\
+Examples:
+  telemouse-analyze list
+  telemouse-analyze list --dir D:\\telemouse\\recordings --json";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "telemouse-analyze",
-    about = "Offline metrics over recorded telemouse sessions",
+    about = "Turn recorded telemouse sessions into aim metrics: flicks, overshoot, settle time, tremor, clicks",
+    after_help = TOP_EXAMPLES,
     version
 )]
 struct Cli {
@@ -47,72 +92,77 @@ struct Cli {
 /// `Params::default()`, so an unset flag never invents a value here.
 #[derive(Args, Debug, Default)]
 struct ParamFlags {
-    /// Uniform resampling grid width, seconds.
-    #[arg(long, value_name = "SECONDS")]
-    grid_dt: Option<f64>,
-    /// Savitzky–Golay half-window, in grid cells.
-    #[arg(long, value_name = "CELLS")]
-    sg_half: Option<usize>,
-    /// Savitzky–Golay polynomial order.
-    #[arg(long, value_name = "ORDER")]
-    sg_order: Option<usize>,
-    /// Speed a movement must reach to count as a flick, counts/s.
-    #[arg(long, value_name = "COUNTS_PER_S")]
-    flick_threshold: Option<f64>,
-    /// Speed below which the hand counts as still, counts/s.
-    #[arg(long, value_name = "COUNTS_PER_S")]
-    still_threshold: Option<f64>,
-    /// How long speed must stay below the still threshold to settle, ms.
-    #[arg(long, value_name = "MS")]
-    still_hold_ms: Option<u64>,
-    /// Flick start → button-down search window, ms.
-    #[arg(long, value_name = "MS")]
-    click_window_ms: Option<f64>,
-    /// Start of the pre-click stability window, ms before the down.
-    #[arg(long, value_name = "MS")]
-    pre_click_lo_ms: Option<f64>,
-    /// End of the pre-click stability window, ms before the down.
-    #[arg(long, value_name = "MS")]
-    pre_click_hi_ms: Option<f64>,
-    /// Longest gap between two downs that still reads as a double click, ms.
-    #[arg(long, value_name = "MS")]
-    double_click_max_ms: Option<f64>,
-    /// Shortest run above the still threshold that counts as a movement, ms.
-    #[arg(long, value_name = "MS")]
-    min_segment_ms: Option<usize>,
-    /// How long a reversed velocity must persist to count as a correction, ms.
-    #[arg(long, value_name = "MS")]
-    min_reversal_ms: Option<usize>,
-    /// Boxcar width used as the tremor high-pass baseline, ms.
-    #[arg(long, value_name = "MS")]
-    tremor_baseline_ms: Option<usize>,
-    /// Safety cap on grid size, cells.
-    #[arg(long, value_name = "CELLS")]
-    max_grid_cells: Option<usize>,
-    /// Shortest drift that can open a repositioning lift, ms.
-    #[arg(long, value_name = "MS")]
-    lift_drift_min_ms: Option<usize>,
-    /// Fastest a drift may be and still read as running out of pad, counts/s.
-    #[arg(long, value_name = "COUNTS_PER_S")]
-    lift_drift_max_speed: Option<f64>,
-    /// Shortest drift displacement that can open a lift, counts.
-    #[arg(long, value_name = "COUNTS")]
-    lift_drift_min_counts: Option<f64>,
-    /// Slowest return sweep that still closes a lift, counts/s.
-    #[arg(long, value_name = "COUNTS_PER_S")]
-    lift_return_min_speed: Option<f64>,
-    /// Longest stillness between drift and return, ms.
-    #[arg(long, value_name = "MS")]
-    lift_max_gap_ms: Option<usize>,
-    /// How opposed the return must be, as a cosine (−1 = exactly reversed).
-    #[arg(long, value_name = "COS", allow_negative_numbers = true)]
-    lift_opposite_cos: Option<f64>,
-    /// Restrict degree-valued metrics to pointer-locked spans.
-    #[arg(long)]
+    /// Only count in-game aiming (pointer locked) for the metrics given in degrees.
+    #[arg(long, help_heading = H_FILTER)]
     locked_only: bool,
-    /// Print the per-marker-interval breakdown.
-    #[arg(long)]
+    /// Also break the report down by the stretches between markers.
+    #[arg(long, help_heading = H_OUTPUT)]
     split_by_marker: bool,
+    /// Speed a movement must reach to count as a flick, in counts/s.
+    #[arg(long, value_name = "COUNTS_PER_S", help_heading = H_DETECT)]
+    flick_threshold: Option<f64>,
+    /// Speed below which the hand counts as still, in counts/s.
+    #[arg(long, value_name = "COUNTS_PER_S", help_heading = H_DETECT)]
+    still_threshold: Option<f64>,
+    /// How long the hand must stay still for a flick to count as settled, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    still_hold_ms: Option<u64>,
+    /// Longest time from the start of a flick to the click that ends it, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    click_window_ms: Option<f64>,
+    /// Start of the steadiness window before a click, in ms before the press.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    pre_click_lo_ms: Option<f64>,
+    /// End of the steadiness window before a click, in ms before the press.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    pre_click_hi_ms: Option<f64>,
+    /// Longest gap between two presses that still counts as a double click, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    double_click_max_ms: Option<f64>,
+    /// Ignore movements shorter than this, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    min_segment_ms: Option<usize>,
+    /// How long a change of direction must last to count as a correction, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_DETECT)]
+    min_reversal_ms: Option<usize>,
+    /// Shortest slow drift that can start a lift, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_LIFT)]
+    lift_drift_min_ms: Option<usize>,
+    /// Fastest a drift may be and still read as running out of pad, in counts/s.
+    #[arg(long, value_name = "COUNTS_PER_S", help_heading = H_LIFT)]
+    lift_drift_max_speed: Option<f64>,
+    /// Shortest drift distance that can start a lift, in counts.
+    #[arg(long, value_name = "COUNTS", help_heading = H_LIFT)]
+    lift_drift_min_counts: Option<f64>,
+    /// Slowest return sweep that still ends a lift, in counts/s.
+    #[arg(long, value_name = "COUNTS_PER_S", help_heading = H_LIFT)]
+    lift_return_min_speed: Option<f64>,
+    /// Longest pause between the drift and the return sweep, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_LIFT)]
+    lift_max_gap_ms: Option<usize>,
+    /// How opposite the return sweep must be, as a cosine (-1 = exactly reversed).
+    #[arg(
+        long,
+        value_name = "COS",
+        allow_negative_numbers = true,
+        help_heading = H_LIFT
+    )]
+    lift_opposite_cos: Option<f64>,
+    /// Time step the movement is resampled to, in seconds.
+    #[arg(long, value_name = "SECONDS", help_heading = H_GRID)]
+    grid_dt: Option<f64>,
+    /// Smoothing (Savitzky–Golay) half-window, in time steps.
+    #[arg(long, value_name = "CELLS", help_heading = H_GRID)]
+    sg_half: Option<usize>,
+    /// Smoothing (Savitzky–Golay) polynomial order.
+    #[arg(long, value_name = "ORDER", help_heading = H_GRID)]
+    sg_order: Option<usize>,
+    /// Averaging width used to separate tremor from intended movement, in ms.
+    #[arg(long, value_name = "MS", help_heading = H_GRID)]
+    tremor_baseline_ms: Option<usize>,
+    /// Safety cap on how much of a very long session is analyzed, in time steps.
+    #[arg(long, value_name = "CELLS", help_heading = H_GRID)]
+    max_grid_cells: Option<usize>,
 }
 
 impl ParamFlags {
@@ -153,64 +203,84 @@ impl ParamFlags {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Analyze one recording and print the metrics summary.
+    /// Analyze one recording and print its aim metrics.
+    #[command(after_help = REPORT_EXAMPLES)]
     Report {
-        /// Path to a `recordings/<session_id>.jsonl` file, or a bare
-        /// session id looked up in `--dir`.
+        /// The recording: a path to a `.jsonl` file, or just the session id
+        /// that `list` and the control panel show.
         session: String,
-        /// Where a bare session id is looked up.
-        #[arg(long, default_value = "recordings", value_name = "DIR")]
+        /// Folder a session id is looked up in.
+        #[arg(
+            long,
+            default_value = "recordings",
+            value_name = "DIR",
+            help_heading = H_INPUT
+        )]
         dir: PathBuf,
-        /// Print the headline numbers as JSON instead of the terminal
-        /// summary: a few KB that says what the full report says.
-        #[arg(long)]
+        /// Print only the headline numbers, as a few KB of JSON, instead of
+        /// the text report.
+        #[arg(long, help_heading = H_OUTPUT)]
         summary: bool,
-        /// Also write the full structured report here.
-        #[arg(long, value_name = "FILE")]
+        /// Also save the full report as JSON to this file.
+        #[arg(long, value_name = "FILE", help_heading = H_OUTPUT)]
         json: Option<PathBuf>,
-        /// Cache directory for `<session_id>.report.json`. A cached report is
-        /// reused when it was written by this analyzer version and the
-        /// recording has not changed since.
-        #[arg(long, value_name = "DIR")]
+        /// Keep `<session>.report.json` files in this folder and reuse them
+        /// while the recording and the analyzer are unchanged.
+        #[arg(long, value_name = "DIR", help_heading = H_OUTPUT)]
         json_dir: Option<PathBuf>,
-        /// Also write the derived-table CSVs into this directory.
-        #[arg(long, value_name = "DIR")]
+        /// Also save the report's tables as CSV files in this folder.
+        #[arg(long, value_name = "DIR", help_heading = H_OUTPUT)]
         csv_dir: Option<PathBuf>,
-        /// Print the per-phase timing table at the end.
-        #[arg(long)]
+        /// Show how long each analysis step took.
+        #[arg(long, help_heading = H_OUTPUT)]
         timing: bool,
-        /// Suppress the terminal summary (useful with --json).
-        #[arg(long)]
+        /// Do not print the text report (useful with --json or --csv-dir).
+        #[arg(long, help_heading = H_OUTPUT)]
         quiet: bool,
         #[command(flatten)]
         params: ParamFlags,
     },
-    /// One row per session across a directory of recordings.
+    /// Compare sessions over time: one row per recording in a folder.
+    #[command(after_help = TREND_EXAMPLES)]
     Trend {
-        #[arg(long, default_value = "recordings", value_name = "DIR")]
+        /// Folder of recordings to compare.
+        #[arg(
+            long,
+            default_value = "recordings",
+            value_name = "DIR",
+            help_heading = H_INPUT
+        )]
         dir: PathBuf,
-        /// Read and write cached per-session reports here.
-        #[arg(long, value_name = "DIR")]
+        /// Keep per-session `<session>.report.json` files here and reuse
+        /// them, so only new recordings are analyzed.
+        #[arg(long, value_name = "DIR", help_heading = H_OUTPUT)]
         json_dir: Option<PathBuf>,
-        /// Extra dotted metric paths to add as columns, e.g.
-        /// `micro.band_ratio_8_12`. Repeatable.
-        #[arg(long, value_name = "PATH")]
+        /// Add a column for another metric, named by its dotted path in the
+        /// JSON report, e.g. `micro.band_ratio_8_12`. Repeatable.
+        #[arg(long, value_name = "PATH", help_heading = H_OUTPUT)]
         metric: Vec<String>,
-        /// Write the table as CSV here.
-        #[arg(long, value_name = "FILE")]
+        /// Also save the table as CSV to this file.
+        #[arg(long, value_name = "FILE", help_heading = H_OUTPUT)]
         csv: Option<PathBuf>,
-        /// Emit the table as JSON instead of the terminal rendering.
-        #[arg(long)]
+        /// Print the table as JSON instead of text.
+        #[arg(long, help_heading = H_OUTPUT)]
         json: bool,
         #[command(flatten)]
         params: ParamFlags,
     },
-    /// List the recordings in a directory.
+    /// List the recordings in a folder, with their size and health.
+    #[command(after_help = LIST_EXAMPLES)]
     List {
-        #[arg(long, default_value = "recordings", value_name = "DIR")]
+        /// Folder of recordings to list.
+        #[arg(
+            long,
+            default_value = "recordings",
+            value_name = "DIR",
+            help_heading = H_INPUT
+        )]
         dir: PathBuf,
-        /// Emit the listing as JSON.
-        #[arg(long)]
+        /// Print the listing as JSON instead of text.
+        #[arg(long, help_heading = H_OUTPUT)]
         json: bool,
     },
 }
@@ -245,6 +315,13 @@ fn resolve_session(arg: &str, dir: &std::path::Path) -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // Before anything else: a double-click from Explorer gets an explanation
+    // instead of a window that flashes and vanishes. Exit 2 is what clap's
+    // own "no subcommand" usage error returns.
+    if explorer::hold_window_if_double_clicked() {
+        std::process::exit(2);
+    }
+
     init_logging();
     telemouse_core::panic_hook::install("analyze");
 

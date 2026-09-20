@@ -4,7 +4,9 @@ Windows mouse-telemetry toolkit: a raw-input capture agent, a live viz/OBS
 overlay, an offline analyzer and a control panel. Read
 `docs/CONVENTIONS.md` before editing any crate; `docs/GUIDE.md` explains the
 internals module by module; `docs/API.md` is the reference for every
-machine interface (HTTP routes, JSON shapes, files on disk). The
+machine interface (HTTP routes, JSON shapes, files on disk). `README.md`
+is deliberately one screen for newcomers; user-facing detail goes in
+`docs/HELP.md`, not back into the README. The
 `/telemouse` skill (`.claude/skills/telemouse`) covers how to *use* the
 tools on recorded sessions.
 
@@ -16,7 +18,7 @@ tools on recorded sessions.
 | `crates/capture` | `telemouse` | Raw input → 25 ms batches → UDP + JSONL recording (+ Kafka). `doctor` subcommand. |
 | `crates/viz` | `telemouse-viz` | UDP→WebSocket bridge, dashboard + `/obs` overlay, replay over recordings. |
 | `crates/analyze` | `telemouse-analyze` | `report` / `trend` / `list` over `recordings/*.jsonl`. |
-| `crates/ctl` | `telemouse-ctl` | Control panel: HTTP JSON API + tray. Starts/stops the others with allow-listed flags. |
+| `crates/ctl` | `telemouse-ctl` | Control panel: HTTP JSON API + native window (WebView2) + tray. Starts/stops the others with allow-listed flags. |
 | `tools/cpubench` | `tmbench` | Standalone CPU harness (not a workspace member). |
 | `tools/kafka2parquet` | notebooks | Kafka → Parquet archiver, PySpark walkthrough. |
 
@@ -29,7 +31,7 @@ cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-target
 cargo test --workspace --locked
 cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
 node --check crates/viz/src/app.js
-node --test crates/viz/js-tests/engine.test.mjs
+node --test "crates/viz/js-tests/*.test.mjs"
 ```
 
 Tests need no mouse, admin rights, Kafka or browser. Run the full list before
@@ -38,7 +40,8 @@ saying a change is done; a formatting or clippy miss fails CI.
 ## Rules that are easy to get wrong
 
 - **Two build flavours.** `logging`, `observability`, `kafka` are Cargo
-  features, on by default, off in the minimal release zip; `quiet` compiles
+  features, on by default, off in a minimal build (CI-gated, no longer
+  published: the release is one zip with the default features); `quiet` compiles
   `tracing` out. Anything that logs to a file, emits stats, writes a sidecar
   or talks to Kafka goes behind the matching feature. Every crate must build
   and test with `--no-default-features` too.
@@ -48,11 +51,24 @@ saying a change is done; a formatting or clippy miss fails CI.
 - **ctl stays a console app.** The tray/status window lives in
   `crates/ctl/src/gui` but the exe keeps the console subsystem; Ctrl-Break
   delivery to children depends on it. `--no-gui` exists for headless runs.
+- **The ctl window hosts the panel page via WebView2**
+  (`crates/ctl/src/gui/webview.rs`). The read-only `EDIT` text view
+  (`model::window_text`) is the fallback when the runtime is missing, fails
+  or is disabled with `--no-webview`; it must keep working. Never
+  feature-gate WebView2: a minimal build needs the window too. Its user-data
+  folder is `%LOCALAPPDATA%\telemouse\WebView2` (`places.webview_data`), the
+  one thing telemouse writes outside its own folder.
 - **New config keys need every binary rebuilt.** ctl spawns whatever is in
   `bin_dir` (default `target/release`); an older child refuses a
   `telemouse.toml` with keys it does not know. After adding a key, rebuild the
   workspace and update `telemouse.example.toml` (it ships in the zip and is
   what ctl seeds a first-run `telemouse.toml` from).
+- **The panel writes `telemouse.toml`** (`crates/ctl/src/settings.rs`,
+  `GET`/`POST /api/config`) with `toml_edit`, validated through
+  `AppConfig::from_toml` before an atomic write. The editable set is the
+  `Patch` struct's allow-list; bind addresses, Kafka, `bin_dir` and
+  `log_dir` stay hand-edit only (LAN exposure). A new user-facing key
+  belongs in `Patch`, the Settings card and `docs/API.md`.
 - **`telemouse.toml` is this machine's live config** (LAN bind, Kafka on).
   Do not copy its values into `telemouse.example.toml`; the example keeps
   loopback defaults.
@@ -83,13 +99,19 @@ saying a change is done; a formatting or clippy miss fails CI.
 Bump `version` in the root `Cargo.toml`, add a `## [X.Y.Z]` section to
 `CHANGELOG.md`, commit, tag `vX.Y.Z`, push. `release.yml` refuses a tag that
 does not match the Cargo version and uses the changelog section as the notes.
+It publishes one zip (four default-feature binaries) and signs the exes with
+Azure Artifact Signing when the secrets exist (`docs/DEVELOPING.md`, "Code
+signing"); without them the release is unsigned. The exe icon is
+`assets/telemouse.ico` (regenerate with `assets/make-icon.ps1`).
 
 ## Where things land at runtime
 
 `recordings/<id>.jsonl` + `<id>.meta.json` sidecar (rewritten every 5 s with
 `"exit":"running"` until a clean stop), `logs/{ctl,capture,viz}.log` (full
-build), `.telemouse-analyze-index-v1.json` cache in the recordings dir, and
-`<id>.report.json` wherever `--json-dir` points.
+build), `.telemouse-analyze-index-v1.json` cache in the recordings dir,
+`<id>.report.json` wherever `--json-dir` points (the panel uses
+`recordings/.reports/`, which also holds its `<id>.summary.json`), and the
+WebView2 cache in `%LOCALAPPDATA%\telemouse\WebView2`.
 
 ## History worth knowing
 

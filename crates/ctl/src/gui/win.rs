@@ -1,13 +1,14 @@
-//! The Win32 side of the GUI: one top-level window holding one read-only
-//! `EDIT` control, a `Shell_NotifyIcon` tray icon with a popup menu, and the
-//! message loop that owns them, on the `ctl-gui` thread.
+//! The Win32 side of the GUI: one top-level window that hosts the panel
+//! page through WebView2 (`webview.rs`) with a read-only `EDIT` control as
+//! the text fallback, a `Shell_NotifyIcon` tray icon with a popup menu, and
+//! the message loop that owns them, on the `ctl-gui` thread.
 //!
 //! Nothing here blocks on the runtime. A snapshot arrives as
-//! `WM_APP_REFRESH` (posted by the publisher's `wake`), the window text is
-//! re-rendered from `model::render_text`, and the tray icon is modified only
-//! when its state or tooltip actually changed. Actions are spawned through
-//! `feed::start` / `feed::stop`; Exit notifies `main`, which stops the
-//! children and then calls [`post_quit`].
+//! `WM_APP_REFRESH` (posted by the publisher's `wake`), the text view is
+//! re-rendered from `model::window_text` while it is showing, and the tray
+//! icon is modified only when its state or tooltip actually changed. Actions
+//! are spawned through `feed::start` / `feed::stop`; Exit notifies `main`,
+//! which stops the children and then calls [`post_quit`].
 //!
 //! Every failure is a `warn!` and a headless server, never a panic. The
 //! window state is a heap allocation owned by [`run`] as a raw pointer and
@@ -36,16 +37,18 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ANSI_FIXED_FONT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateBitmap,
     CreateFontW, DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject,
     HBRUSH, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
 };
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_SHIFT,
 };
@@ -54,24 +57,26 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW,
-    IDI_APPLICATION, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MB_TOPMOST, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SW_HIDE, SW_SHOW,
-    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW,
-    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-    WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-    WS_VSCROLL,
+    AppendMenuW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON,
+    HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
+    MB_TOPMOST, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
+    SC_MINIMIZE, SIZE_MINIMIZED, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DPICHANGED, WM_ENDSESSION, WM_GETMINMAXINFO, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_MOVE, WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE,
+    WM_SYSCOMMAND, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
 use super::feed::{self, GuiLink, HOTKEY_FAILED, HOTKEY_OK};
 use super::model::{self, IconState, MenuEntry};
+use super::webview::{self, WebHost};
 
 const CLASS_NAME: PCWSTR = w!("TelemouseCtlWindow");
 /// Tray icon callback (legacy semantics: the mouse message in `lParam`).
@@ -90,13 +95,20 @@ const TRAY_ID: u32 = 1;
 const HOTKEY_ID: i32 = 1;
 const EDIT_ID: usize = 100;
 const ICON_SIZE: u32 = 16;
-const WINDOW_W: i32 = 900;
-const WINDOW_H: i32 = 560;
+/// Outer size at 96 dpi, scaled to the system dpi at creation; the page
+/// lays itself out for anything above the minimum.
+const WINDOW_W: i32 = 1120;
+const WINDOW_H: i32 = 760;
+const MIN_W: i32 = 720;
+const MIN_H: i32 = 520;
 
-struct UiState {
-    link: GuiLink,
-    hwnd: HWND,
-    edit: HWND,
+pub(super) struct UiState {
+    pub(super) link: GuiLink,
+    pub(super) hwnd: HWND,
+    /// The text fallback, hidden while the page is hosted.
+    pub(super) edit: HWND,
+    /// The embedded page.
+    pub(super) web: WebHost,
     font: HFONT,
     /// Indexed by `IconState::index()`.
     icons: [HICON; IconState::COUNT],
@@ -105,7 +117,7 @@ struct UiState {
     tooltip: String,
     /// `RegisterWindowMessageW("TaskbarCreated")`: Explorer restarted.
     taskbar_created: u32,
-    visible: bool,
+    pub(super) visible: bool,
     /// Exit was requested; the tooltip says so until `main` posts quit.
     exiting: bool,
     /// A double-click's trailing `WM_LBUTTONUP` must not toggle the window.
@@ -151,6 +163,38 @@ fn post(hwnd: isize, msg: u32) {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The live state behind a window, or null once it is gone. The one way a
+/// WebView2 callback (which captured only the handle) reaches the state.
+pub(super) unsafe fn state_of(hwnd: HWND) -> *mut UiState {
+    // SAFETY: GWLP_USERDATA is 0 or the live state of this thread.
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut UiState }
+}
+
+/// The page is gone (or never came): the text view is the window again.
+pub(super) unsafe fn show_text_view(s: *mut UiState) {
+    // SAFETY: `s` is live; ShowWindow may re-enter wndproc.
+    unsafe {
+        let edit = (*s).edit;
+        let _ = ShowWindow(edit, SW_SHOW);
+        refresh(s);
+    }
+}
+
+/// The page is on screen: the text view goes behind it.
+pub(super) unsafe fn hide_text_view(s: *mut UiState) {
+    // SAFETY: as `show_text_view`.
+    unsafe {
+        let _ = ShowWindow((*s).edit, SW_HIDE);
+    }
+}
+
+/// Outer window size for the system dpi.
+fn scaled(px: i32) -> i32 {
+    // SAFETY: no arguments; returns 96 when it cannot tell.
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 { px } else { (px * dpi as i32) / 96 }
 }
 
 fn loword(v: usize) -> u32 {
@@ -201,11 +245,22 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
     // released in `teardown`, and `GWLP_USERDATA` is cleared before the
     // state goes out of scope.
     unsafe {
+        // WebView2 wants a single-threaded apartment on the thread that
+        // creates it; S_FALSE (already initialised) is fine too.
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if com.is_err() {
+            warn!(hresult = ?com, "CoInitializeEx failed; the window will show the text view");
+        }
         let hinstance: HINSTANCE = GetModuleHandleW(None).context("GetModuleHandleW")?.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
+            // Resource id 1 is the icon `build.rs` embeds (winresource's
+            // default id); a build without it gets the stock icon.
+            hIcon: LoadIconW(Some(hinstance), PCWSTR(std::ptr::without_provenance(1)))
+                .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+                .unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hbrBackground: HBRUSH((COLOR_WINDOW.0 as usize + 1) as *mut c_void),
             ..Default::default()
@@ -216,18 +271,18 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             CLASS_NAME,
-            w!("telemouse-ctl"),
+            w!("telemouse"),
             WS_OVERLAPPEDWINDOW,
-            120,
-            120,
-            WINDOW_W,
-            WINDOW_H,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            scaled(WINDOW_W),
+            scaled(WINDOW_H),
             None,
             None,
             Some(hinstance),
             None,
         )
-        .context("create the status window")?;
+        .context("create the window")?;
 
         let edit = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -301,6 +356,7 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             link,
             hwnd,
             edit,
+            web: WebHost::new(),
             font,
             icons,
             tray_added: false,
@@ -330,6 +386,18 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             tray = (*ptr).tray_added,
             "gui running; double-click the tray icon to show the window"
         );
+        // The listener is bound before this thread is spawned (main.rs), so
+        // the page has something to navigate to; a refused connection is
+        // retried anyway.
+        if com.is_ok() {
+            webview::begin(ptr);
+        } else {
+            webview::fallback(
+                ptr,
+                "COM could not be initialised on the window thread",
+                true,
+            );
+        }
 
         let mut msg = MSG::default();
         loop {
@@ -352,6 +420,9 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         // Nothing can reach the state any more: GWLP_USERDATA is cleared and
         // the window is gone.
         drop(Box::from_raw(ptr));
+        if com.is_ok() {
+            CoUninitialize();
+        }
         info!("gui stopped");
     }
     Ok(())
@@ -360,6 +431,8 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
 unsafe fn teardown(s: *mut UiState) {
     // SAFETY: caller guarantees `s` is the live state on this thread.
     unsafe {
+        // The page first: its child windows go before the parent does.
+        webview::close(s);
         if (*s).hotkey_registered {
             let _ = UnregisterHotKey(Some((*s).hwnd), HOTKEY_ID);
             (*s).hotkey_registered = false;
@@ -380,8 +453,9 @@ unsafe fn teardown(s: *mut UiState) {
     }
 }
 
-/// A disc icon drawn at runtime (there is no `.ico` in the repo and no
-/// resource compiler); the stock application icon if GDI says no.
+/// The tray's disc icon, drawn at runtime because its colour follows the
+/// capture state (the window class uses the embedded `.ico`); the stock
+/// application icon if GDI says no.
 unsafe fn make_icon(state: IconState) -> HICON {
     let px = model::icon_bitmap(state, ICON_SIZE);
     // SAFETY: the pixel buffers outlive the CreateBitmap calls, which copy;
@@ -575,6 +649,7 @@ unsafe fn set_visible(s: *mut UiState, show: bool) {
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
+        webview::set_visible(s, show);
         debug!(show, "window visibility");
     }
 }
@@ -602,9 +677,12 @@ unsafe fn refresh(s: *mut UiState) {
     // SAFETY: `s` is live; the snapshot is cloned out before any Win32 call.
     unsafe {
         let snap = (*s).link.state.borrow().clone();
-        if (*s).visible {
+        // The text view is only worth rendering while it is what the user
+        // sees: not behind the hosted page, not while hidden to the tray.
+        if (*s).visible && !(*s).web.hosted() {
             let edit = (*s).edit;
-            set_text(edit, &model::render_text(&snap));
+            let status = (*s).web.status();
+            set_text(edit, &model::window_text(&snap, &status));
         }
         let icon = model::icon_state(&snap);
         let tip = if (*s).exiting {
@@ -811,15 +889,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe {
         match msg {
             WM_SIZE => {
-                let edit = (*s).edit;
-                let _ = MoveWindow(
-                    edit,
-                    0,
-                    0,
-                    loword(lparam.0 as usize) as i32,
-                    hiword(lparam.0 as usize) as i32,
-                    true,
-                );
+                if wparam.0 as u32 != SIZE_MINIMIZED {
+                    let (w, h) = (
+                        loword(lparam.0 as usize) as i32,
+                        hiword(lparam.0 as usize) as i32,
+                    );
+                    let _ = MoveWindow((*s).edit, 0, 0, w, h, true);
+                    webview::resize(s, w, h);
+                }
+                LRESULT(0)
+            }
+            WM_MOVE => {
+                webview::position_changed(s);
+                LRESULT(0)
+            }
+            // The window crossed onto a display with another scale: take
+            // the size Windows suggests; the WM_SIZE that follows re-bounds
+            // the page, which rescales itself for a PerMonitorV2 parent.
+            WM_DPICHANGED => {
+                let suggested = lparam.0 as *const RECT;
+                if !suggested.is_null() {
+                    let r = *suggested;
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                LRESULT(0)
+            }
+            WM_GETMINMAXINFO => {
+                let info = lparam.0 as *mut MINMAXINFO;
+                if !info.is_null() {
+                    (*info).ptMinTrackSize.x = scaled(MIN_W);
+                    (*info).ptMinTrackSize.y = scaled(MIN_H);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                webview::timer(s, wparam.0);
                 LRESULT(0)
             }
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE && (*s).tray_added => {

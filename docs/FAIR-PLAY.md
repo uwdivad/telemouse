@@ -35,7 +35,7 @@ saying "safe".
 | Lists your mice | `GetRawInputDeviceList` / `GetRawInputDeviceInfo` (device names) | Nothing. |
 | Marker hotkey | `RegisterHotKey` for `marker_hotkey` (F9 by default) in the agent, and `[ctl] hotkey` (Ctrl+Alt+R) in the panel | The chord goes to telemouse instead of the game; pick one the game does not use, or set `""`. |
 | Keeps its own thread responsive | `SetThreadPriority(ABOVE_NORMAL)` on one thread; an opt-out of power throttling | Nothing. Normal priority class. |
-| Control panel | A tray icon and one ordinary window; a process list that only ever queries or stops `telemouse*` processes | An ordinary window. Never a topmost, layered or transparent one. |
+| Control panel | A tray icon and one ordinary window that shows the panel page through WebView2, the browser engine that ships with Windows; a process list that only ever queries or stops `telemouse*` processes | An ordinary window. Never a topmost, layered or transparent one. WebView2 runs as Microsoft-signed `msedgewebview2.exe` child processes that render into that window; telemouse opens no handle on any other process, hooks nothing and draws nothing over a game. |
 | Talks to | UDP 127.0.0.1:7878, HTTP 127.0.0.1:7879 and :7880 (the viz can be bound to your LAN for OBS), Kafka only if enabled | Ordinary traffic. No VPN, proxy or shaping. |
 | Persists | Nothing: no service, no scheduled task, no registry entry, no startup item. Delete the folder and it is gone. | |
 

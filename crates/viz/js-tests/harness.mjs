@@ -86,10 +86,16 @@ class WebSocket {
 /**
  * Load the app. `search` is the URL query (e.g. "?obs=1&layout=aim");
  * `config` is what the server injects as window.TELEMOUSE_CONFIG.
- * Returns { telemouse, sandbox } — `telemouse` is the page's devtools handle.
+ * `globals` is merged into the page's `window` before the script runs (e.g.
+ * `{ obsstudio: {} }` to look like an OBS browser source).
+ * Returns { telemouse, sandbox, elements, fire } — `telemouse` is the page's
+ * devtools handle; `fire(type, detail)` dispatches a window event to whatever
+ * the page registered for it. No animation frame ever runs by itself: tests
+ * that need the frame loop call `sandbox.frame(ms)`.
  */
-export function loadApp({ search = "", config = {}, clock = null } = {}) {
+export function loadApp({ search = "", config = {}, clock = null, globals = {} } = {}) {
   const elements = new Map();
+  const listeners = new Map();
   const document = {
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, element(id));
@@ -117,7 +123,10 @@ export function loadApp({ search = "", config = {}, clock = null } = {}) {
     history: { replaceState() {} },
     localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
     matchMedia() { return { addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }; },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
     removeEventListener() {},
     requestAnimationFrame() { return 0; },
     cancelAnimationFrame() {},
@@ -126,6 +135,7 @@ export function loadApp({ search = "", config = {}, clock = null } = {}) {
     setTimeout() { return 0; },
     clearTimeout() {},
   };
+  Object.assign(sandbox, globals);
   sandbox.window = sandbox;
   if (clock) {
     sandbox.Date = class extends Date { static now() { return clock.utcMs; } };
@@ -135,7 +145,8 @@ export function loadApp({ search = "", config = {}, clock = null } = {}) {
   vm.createContext(sandbox);
   vm.runInContext(APP_JS, sandbox, { filename: "app.js" });
   if (!sandbox.telemouse) throw new Error("app.js did not publish window.telemouse");
-  return { telemouse: sandbox.telemouse, sandbox, elements };
+  const fire = (type, detail) => (listeners.get(type) || []).forEach((fn) => fn({ type, detail }));
+  return { telemouse: sandbox.telemouse, sandbox, elements, fire };
 }
 
 /* ---------- wire-format builders (mirror telemouse-core) ---------- */

@@ -1,17 +1,24 @@
-//! The native status window and tray icon (Windows only).
+//! The native window and tray icon (Windows only).
 //!
 //! * [`feed`] — the runtime side: a publisher task that snapshots the manager
 //!   and the process table, and the spawned start/stop actions. Portable.
 //! * [`model`] — what to show: text, tooltip, icon state, menu, icon pixels.
 //!   Pure, tested anywhere.
-//! * `win` — the Win32 glue: one window, one `EDIT`, `Shell_NotifyIcon`, a
-//!   popup menu, and the message loop on its own OS thread.
+//! * `win` — the Win32 glue: one window, `Shell_NotifyIcon`, a popup menu,
+//!   and the message loop on its own OS thread.
+//! * `webview` — the panel page hosted inside that window through WebView2
+//!   (the browser engine that ships with Windows). When the runtime is
+//!   missing the window falls back to a read-only `EDIT` with the text
+//!   status view and the page opens in the default browser instead.
 //!
 //! Off Windows [`spawn`] returns `None` and the panel is what it always was:
-//! a web page. On Windows `--no-gui` does the same.
+//! a web page. On Windows `--no-gui` does the same; `--no-webview` keeps the
+//! window and the tray but never loads Edge components.
 
 pub mod feed;
 pub mod model;
+#[cfg(windows)]
+mod webview;
 #[cfg(windows)]
 mod win;
 
@@ -35,6 +42,10 @@ pub struct GuiDeps {
     pub hotkey: Option<Hotkey>,
     /// Version, config, logs and docs: what the header and the menu open.
     pub places: Places,
+    /// Where WebView2 may write; `None` disables the embedded page.
+    pub webview_data_dir: Option<std::path::PathBuf>,
+    /// `--no-webview`.
+    pub no_webview: bool,
 }
 
 /// The running UI thread. [`GuiHandle::shutdown`] is the only way to end it.
@@ -134,13 +145,16 @@ pub fn spawn(deps: GuiDeps) -> Option<GuiHandle> {
             hotkey: deps.hotkey,
             hotkey_status,
             restarting: Arc::new(AtomicBool::new(false)),
+            panel_url: deps.places.panel_url.clone(),
+            webview_data_dir: deps.webview_data_dir,
+            no_webview: deps.no_webview,
         };
         let (h, t) = (hwnd.clone(), thread_id.clone());
         let thread = std::thread::Builder::new()
             .name("ctl-gui".into())
             .spawn(move || {
                 if let Err(e) = win::run(link, h, t) {
-                    tracing::warn!(error = %e, "gui unavailable; the web panel keeps serving");
+                    tracing::warn!(error = %e, "gui unavailable; the panel keeps serving in the browser");
                 }
             });
         match thread {
