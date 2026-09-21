@@ -154,7 +154,9 @@ pub const COMPONENTS: &[Component] = &[
         bin: "telemouse",
         base_args: &["doctor"],
         kind: Kind::Task,
-        flags: &[],
+        flags: &[
+            Flag { flag: "--json",       help: "print one telemouse-doctor/1 JSON document instead of the text rows" },
+        ],
         takes_session: false,
         passes_config: true,
         markers: false,
@@ -2510,5 +2512,46 @@ mod tests {
                 c.bin
             );
         }
+    }
+
+    /// An agent asks for the machine-readable environment check through the
+    /// panel, so `--json` is on doctor's allow-list — and nothing else is.
+    #[test]
+    fn doctor_may_be_asked_for_json_and_nothing_else() {
+        let doctor = COMPONENTS
+            .iter()
+            .find(|c| c.id == "doctor")
+            .expect("the panel runs doctor");
+        assert_eq!(
+            doctor.flags.iter().map(|f| f.flag).collect::<Vec<_>>(),
+            vec!["--json"]
+        );
+        let m = Manager::new(std::slice::from_ref(doctor), config(Path::new(".")));
+        let args = m
+            .arguments(
+                doctor,
+                &StartRequest {
+                    flags: vec!["--json".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("doctor"));
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(
+            args.iter().any(|a| a == "--config"),
+            "doctor takes a config"
+        );
+        assert_eq!(
+            m.arguments(
+                doctor,
+                &StartRequest {
+                    flags: vec!["--json-dir".into()],
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            StartError::FlagNotAllowed("--json-dir".into())
+        );
     }
 }

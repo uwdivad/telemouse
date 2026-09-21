@@ -10,6 +10,22 @@ publishes the section below that names that version.
   two example `[games]` entries, so a new panel listed two games nobody had
   added under *Settings → Your games*. They are comments in the sample now;
   an existing `telemouse.toml` is not touched.
+- **`telemouse doctor --json`.** The environment check prints one
+  `telemouse-doctor/1` document on stdout — a schema tag, an overall
+  `verdict`, and a row per check with a stable `id`, a `status` of
+  `pass`/`warn`/`fail`, a human `title` and `detail`, the `hint` when there
+  is something to do about it, and the resolved config — so a script or an
+  assistant can read the same answer a person gets. Logs stay on stderr, so
+  the output pipes straight into a JSON parser. Text and JSON are rendered
+  from the same checks, which means the text mode now leads each row with
+  its status and says which of them are worth acting on; a debug build, a
+  missing config, a screenless machine and a broker that is configured but
+  unreachable are called out where they used to be facts you had to read.
+  Exit codes are unchanged: `0` whenever a report was produced, `fail` rows
+  included, non-zero only when doctor could not get that far. The control
+  panel allow-lists `--json` for its *Check my setup* component, so it can
+  be asked for over `POST /api/components/doctor/start`
+  (`docs/API.md`, `docs/HELP.md`).
 
 ## [0.2.0] — 2026-09-20
 
