@@ -32,7 +32,7 @@ OBS overlay on another PC); everything else is loopback-only.
 | `GET /healthz` | `ok` |
 | `GET /api/state?log_since=N` | `{ self_pid, now_unix_s, version, config, places, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `config` is `{ path, found, seeded, status: "seeded"\|"loaded"\|"defaults", mtime_unix_s? }`. `places` is the absolute locations the panel talks about: `panel_url, config, logs, bin_dir, docs, releases, version, webview_data` (`webview_data` is the window's WebView2 cache folder, `%LOCALAPPDATA%\telemouse\WebView2`; empty in a headless or `--no-webview` run). `ComponentState`: `id, label, summary, kind ("service"\|"task"), bin, bin_path, bin_found, flags: [{flag, help}], takes_session, markers, running, pid, since_unix_s, last_exit: { code, ctrl_break, at_unix_s, hint?, last_line? }, exits, unexpected_exits, args, saving, log: [lines], log_seq, stats?, recording?, foreground_seen?`. `log` is the last 120 lines the child printed (stdout + stderr, ANSI stripped); pass the previous `log_seq` as `log_since` to get only newer lines. `stats` (full build) is the child's last `capture stats` line parsed: `session, events_per_s, events, drops, idle_for_s, udp_unreachable, jsonl_dropped, kafka_dropped, game, pointer_locked`. `foreground_seen` (full build, capture only, while running) is `[{ exe, last_unix_s }]`, the last 8 distinct programs the agent saw in the foreground during this run, most recent first, telemouse's own windows excluded: the first-run guide's "is this your game?". `processes` is every telemouse process on the machine. |
 | `GET /api/sessions` | `["<id>.jsonl", ...]`, newest first — the report picker's list. |
-| `POST /api/components/{id}/start` | `{ flags?: [..], session?: "<id>.jsonl", save?: bool }` → `{ ok, pid }`. Component ids: `capture`, `viz`, `doctor`, `trend`, `report`. `flags` must be from the component's allow-list (`capture`: `--print`, `--no-kafka`, `--no-udp`, `--record`, `--no-record`; `report`: `--timing`); anything else is `400`. `save` is the capture card's switch and becomes `--record`/`--no-record`. `report` needs `session`. `404` unknown id, `409` already running, `500` binary missing. |
+| `POST /api/components/{id}/start` | `{ flags?: [..], session?: "<id>.jsonl", save?: bool }` → `{ ok, pid }`. Component ids: `capture`, `viz`, `doctor`, `trend`, `report`. `flags` must be from the component's allow-list (`capture`: `--print`, `--no-kafka`, `--no-udp`, `--record`, `--no-record`; `doctor`: `--json`; `report`: `--timing`); anything else is `400`. `save` is the capture card's switch and becomes `--record`/`--no-record`. `report` needs `session`. `404` unknown id, `409` already running, `500` binary missing. |
 | `POST /api/components/{id}/stop` | `{ force?: bool }` → `{ ok, outcome: "graceful"\|"terminated" }`. Ctrl-Break, then terminate after `[ctl] stop_grace_secs`; `force` terminates at once. `409` not running. |
 | `POST /api/components/{id}/marker` | `{ label }` → `{ ok, label }`. Drops a labelled marker into a running capture, timestamped on arrival (see *Markers*). `400` blank / multi-line / >120 chars / component without a pipe (only `capture` has one), `409` not running, `500` pipe write failed. |
 | `POST /api/processes/{pid}/kill` | → `{ ok, killed: ProcInfo }`. `403` for the panel itself or a process the scan would not list, `404` unknown. |
@@ -68,13 +68,46 @@ Invoke-RestMethod -Method Post http://127.0.0.1:7880/api/components/capture/stop
 ```
 telemouse run    [--config FILE] [--log-dir DIR] [--print] [--no-kafka] [--no-udp]
                  [--record | --no-record] [--duration-secs N]
-telemouse doctor [--config FILE]
+telemouse doctor [--config FILE] [--json]
 ```
 
 Exits `0` on Ctrl-C / Ctrl-Break / `--duration-secs`; non-zero with the
 reason on stderr when the config does not parse or raw input cannot be
-registered. `doctor` prints the resolved config and environment checks
-(QPC, monitors, devices, UDP bind, Kafka reachability).
+registered. `doctor` checks the environment (build, OS, config, QPC,
+screens, cursor, foreground, devices, UDP bind, recording folder, Kafka
+reachability) and prints the resolved config.
+
+### `doctor --json`
+
+One `telemouse-doctor/1` document on stdout and nothing else (the log goes
+to stderr, as always), rendered from the same checks as the text rows:
+
+```json
+{ "schema": "telemouse-doctor/1", "capture_version": "0.2.0",
+  "generated_utc_us": 1790000000000000, "verdict": "warn",
+  "checks": [ { "id": "udp", "status": "pass", "title": "UDP sink",
+                "detail": "ready -> 127.0.0.1:7878" },
+              { "id": "kafka_broker_1", "status": "warn",
+                "title": "Kafka broker 1",
+                "detail": "192.168.137.67:9092 unreachable",
+                "hint": "batches queue and are dropped while the broker is away; ..." } ],
+  "config": { ...the resolved config, every relative path absolute... } }
+```
+
+- `verdict` is the worst `status` in `checks`: `pass` | `warn` | `fail`.
+- `status` is `pass` (nothing to do), `warn` (works, something will be
+  missing) or `fail` (this part will not work).
+- `hint` is present only when there is something to do about the row.
+- `id` is stable across versions and independent of the wording — match on
+  it, not on `title` or `detail`. Today's rows, in order: `build`, `os`,
+  `config`, `config_overrides`, `clock`, `screen`, `cursor`, `foreground`,
+  `devices`, `udp`, `recording`, `kafka`, then `kafka_broker_<n>` per
+  configured broker.
+- **Exit codes are the same as in text mode**, i.e. doctor exits `0`
+  whenever it produced a report — `fail` rows included — and non-zero only
+  when it could not get that far (a `telemouse.toml` that exists but does
+  not parse, with the reason on stderr). Decide on `verdict`, not on the
+  exit code.
 
 ### Markers
 

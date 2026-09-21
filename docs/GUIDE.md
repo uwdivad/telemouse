@@ -474,11 +474,25 @@ a separator check alone let a drive-relative `C:x.jsonl` through on Windows.
   true (the two recording flags conflict; the control panel's save-data
   switch is implemented with them); `--duration-secs` auto-stops (smoke
   tests).
-- `telemouse doctor [--config …]` prints what the agent sees: OS, config
-  loaded?, QPC frequency and resolution, monitors + refresh, cursor, foreground
-  process, enumerated mice (numbered from 1; 0 is "unknown"), UDP bind test,
-  recording dir writable?, TCP probe of each Kafka broker (500 ms), then the
-  resolved config as TOML. Works on non-Windows.
+- `telemouse doctor [--config …] [--json]` reports what the agent sees, as
+  a row per check: build and features, OS, config loaded?, non-default
+  settings, QPC frequency and resolution, screens + refresh, cursor,
+  foreground process, enumerated mice, UDP bind test, recording dir
+  writable?, a TCP probe of each Kafka broker (500 ms), then the resolved
+  config. Works on non-Windows.
+
+  `doctor.rs` is split so that only the *looking* touches the machine:
+  `probe()` gathers `Facts` (Win32 through `platform`, one UDP socket,
+  one `create_dir_all`, a connect per broker) and everything after it is
+  pure. `Facts::into_report()` judges each fact into a `Check`
+  (`id`/`status`/`title`/`detail`/`hint`), the verdict is the worst status,
+  and `Report::render_text()` and serde draw the same rows — text mode and
+  `--json` cannot drift, and the whole judging half is unit-tested on a
+  machine with no mouse. `--json` prints one `telemouse-doctor/1` document
+  and nothing else on stdout (logs are on stderr); the exit code means the
+  same in both modes — `0` once a report exists, `fail` rows included,
+  non-zero only when the config could not be read at all. Bump `SCHEMA`
+  when a field changes meaning, and keep `docs/API.md`'s id list in step.
 
 ### 6.2 Startup, step by step (`cmd_run`, `main.rs:172-452`)
 

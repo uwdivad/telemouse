@@ -102,6 +102,30 @@ drops, game, flicks, flicks_per_min, overshoot_median, settle_median_ms,
 tremor_rms_counts_s, path_efficiency, clicks_per_min, distance_m, lifts,
 cm_per_360, from_cache, extra[]}`.
 
+## Environment check
+
+```powershell
+.\target\release\telemouse.exe doctor --json            # one telemouse-doctor/1 document
+.\target\release\telemouse.exe doctor --json --config C:\path\telemouse.toml
+```
+
+→ `{schema: "telemouse-doctor/1", capture_version, generated_utc_us,
+verdict, checks[], config}`. `verdict` is the worst row: `pass` | `warn` |
+`fail`. Each row is `{id, status, title, detail, hint?}` — match on `id`,
+never on the wording. Rows: `build`, `os`, `config`, `config_overrides`,
+`clock`, `screen`, `cursor`, `foreground`, `devices`, `udp`, `recording`,
+`kafka`, `kafka_broker_<n>`. `hint` is only there when something can be
+done about the row; quote it when reporting. `config` is the resolved
+configuration (relative paths made absolute) — it names the mouse's device
+strings and the foreground program, so do not paste it whole into a public
+issue.
+
+The exit code is `0` whenever doctor produced a document, `fail` rows
+included; a non-zero exit means it never got there (usually a
+`telemouse.toml` that does not parse — the reason is on stderr). So read
+`verdict`, not `$LASTEXITCODE`. Logs go to stderr, so the stdout of
+`doctor --json` is safe to pipe into `ConvertFrom-Json`.
+
 ## Live processes
 
 All servers bind loopback. Send a `Host` of `127.0.0.1:<port>` or
@@ -128,7 +152,8 @@ Invoke-RestMethod http://127.0.0.1:7879/api/sessions   # [{id, bytes, started_ut
 ```
 
 Capture flags ctl accepts: `--print`, `--no-kafka`, `--no-udp`, `--record`,
-`--no-record`; anything else is rejected with 400. `save: true|false` is the
+`--no-record`; `doctor` accepts `--json`; `report` accepts `--timing`;
+anything else is rejected with 400. `save: true|false` is the
 same as `--record`/`--no-record`. Start returns 409 if already running.
 Markers: one line of text, at most 120 characters; 400 if blank, 409 if
 capture is not running; the label appears in the recording and in the
@@ -157,6 +182,12 @@ Only start, mark or stop capture when the user asked for it. Never call
   start"`...), stop, then `report <id> --split-by-marker --json FILE` and
   compare `segments[]` (one per marker interval). Ask the human to do the
   physical part between markers; say exactly when to start.
+- **"Is my setup right?" / "why is the dashboard empty?" / "why is nothing
+  recorded?"** `telemouse.exe doctor --json`. Report every row whose
+  `status` is not `pass`, with its `detail` and `hint`; if they all pass,
+  say so and move on to the live processes below. Through a running panel:
+  `POST /api/components/doctor/start` with `{"flags":["--json"]}`, then read
+  the JSON out of that component's `log` in `/api/state`.
 - **"Is capture healthy right now?"** `/api/state` component `capture`
   running + its `stats`; `/healthz` on viz for `feed`; the last log lines for
   `warn` entries (dropping sink, ring overflow, no input).

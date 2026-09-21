@@ -15,6 +15,7 @@
 mod context;
 mod context_thread;
 mod devices;
+mod doctor;
 #[cfg(feature = "observability")]
 mod meta;
 mod platform;
@@ -103,6 +104,10 @@ struct RunArgs {
 struct DoctorArgs {
     #[arg(long, default_value = DEFAULT_CONFIG)]
     config: PathBuf,
+    /// Print one `telemouse-doctor/1` JSON document instead of the text
+    /// rows. Nothing else goes to stdout; the log stays on stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 /// The optional features this build was compiled with, comma-separated in a
@@ -778,133 +783,29 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Look at the machine once, then render what was found either way.
+///
+/// Both modes are drawn from the same [`doctor::Report`], so a row can never
+/// be in one and missing from the other. The exit code is the same either
+/// way too: `0` once a report exists, whatever the rows say — a caller acts
+/// on `verdict`, not on the code — and non-zero only if we never got that
+/// far, which here means a `telemouse.toml` that exists but does not parse.
 fn cmd_doctor(args: DoctorArgs) -> Result<()> {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
     let config_path = telemouse_core::paths::locate_config(&args.config);
     let cfg = resolve_config(&config_path, None)?;
-
-    println!("telemouse {} — doctor", env!("CARGO_PKG_VERSION"));
-    println!(
-        "build             : {PROFILE}, features [{}]",
-        enabled_features()
-    );
-    println!("os                : {}", std::env::consts::OS);
-    println!(
-        "os version        : {}",
-        platform::os_version().unwrap_or_else(|| "unknown".into())
-    );
-    println!(
-        "config            : {} ({})",
-        config_path.display(),
-        if config_path.exists() {
-            "loaded"
-        } else {
-            "missing, using defaults"
-        }
-    );
-    let overrides = cfg.non_default_fields();
-    if overrides.is_empty() {
-        println!("non-default       : (none — everything is at its default)");
+    let report = doctor::probe(
+        &config_path,
+        &cfg,
+        env!("CARGO_PKG_VERSION"),
+        PROFILE,
+        enabled_features(),
+    )
+    .into_report();
+    if args.json {
+        // The one and only thing this mode writes to stdout.
+        println!("{}", report.to_json_pretty()?);
     } else {
-        println!("non-default       : {} setting(s)", overrides.len());
-        for (field, value) in &overrides {
-            println!("  {field:<18}: {value}");
-        }
-    }
-
-    let freq = platform::qpc_freq();
-    let a = platform::qpc();
-    let b = platform::qpc();
-    println!(
-        "qpc frequency     : {freq} ticks/s ({:.3} MHz), resolution {} ticks between reads",
-        freq as f64 / 1e6,
-        b.saturating_sub(a)
-    );
-
-    let (w, h) = platform::primary_screen();
-    println!("primary screen    : {w}x{h}");
-    for (i, m) in platform::monitors().iter().enumerate() {
-        println!(
-            "  monitor[{i}]     : {}x{}{}{}",
-            m.width,
-            m.height,
-            m.refresh_hz.map(|r| format!(" @{r}Hz")).unwrap_or_default(),
-            if m.primary { " (primary)" } else { "" }
-        );
-    }
-    println!(
-        "cursor            : {}",
-        platform::cursor_pos()
-            .map(|(x, y)| format!("{x},{y}"))
-            .unwrap_or_else(|| "unavailable".into())
-    );
-    println!(
-        "foreground process: {}",
-        platform::foreground_process_name().unwrap_or_else(|| "unknown".into())
-    );
-
-    let mice = devices::enumerate_mice();
-    println!("pointing devices  : {}", mice.len());
-    for (ix, (_, name)) in mice.iter().enumerate() {
-        // device_ix 0 is reserved for "unknown", so real devices start at 1.
-        println!("  device[{}]      : {name}", ix + 1);
-    }
-
-    // UDP: we can only prove our own socket works — nothing listens on the far
-    // end of an unconnected datagram socket.
-    print!("udp sink          : ");
-    if cfg.udp.enabled {
-        match sinks::UdpSink::connect(&cfg.udp.addr, std::sync::Arc::new(stats::Stats::default())) {
-            Ok(s) => println!("ready -> {}", s.addr()),
-            Err(e) => println!("UNAVAILABLE ({e:#})"),
-        }
-    } else {
-        println!("disabled");
-    }
-
-    print!("recording         : ");
-    if cfg.recording.enabled {
-        match std::fs::create_dir_all(&cfg.recording.dir) {
-            Ok(()) => println!("ready -> {}", cfg.recording.dir.display()),
-            Err(e) => println!("UNAVAILABLE ({e})"),
-        }
-    } else {
-        println!("disabled");
-    }
-
-    println!(
-        "kafka             : {}",
-        if !cfg!(feature = "kafka") {
-            "NOT BUILT IN (probing brokers anyway)"
-        } else if cfg.kafka.enabled {
-            "enabled"
-        } else {
-            "disabled (probing brokers anyway)"
-        }
-    );
-    for broker in &cfg.kafka.brokers {
-        let reachable = broker
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
-            .unwrap_or(false);
-        println!(
-            "  broker {broker:<22}: {}",
-            if reachable {
-                "reachable"
-            } else {
-                "UNREACHABLE"
-            }
-        );
-    }
-
-    println!("--- resolved config ---");
-    match toml::to_string_pretty(&cfg) {
-        Ok(text) => print!("{text}"),
-        Err(e) => println!("(could not render config: {e})"),
+        print!("{}", report.render_text());
     }
     Ok(())
 }
@@ -975,12 +876,25 @@ mod tests {
     }
 
     #[test]
-    fn doctor_defaults_to_the_repo_config() {
+    fn doctor_defaults_to_the_repo_config_and_to_text() {
         let cli = Cli::parse_from(["telemouse", "doctor"]);
         let Command::Doctor(args) = cli.command else {
             panic!("expected doctor");
         };
         assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG));
+        assert!(!args.json, "text is what a person gets by default");
+    }
+
+    /// The flag the control panel allow-lists and an agent asks for.
+    #[test]
+    fn doctor_takes_json() {
+        let Command::Doctor(args) =
+            Cli::parse_from(["telemouse", "doctor", "--json", "--config", "x.toml"]).command
+        else {
+            panic!("expected doctor");
+        };
+        assert!(args.json);
+        assert_eq!(args.config, PathBuf::from("x.toml"));
     }
 
     #[test]

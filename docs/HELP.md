@@ -174,6 +174,13 @@ trim before sharing.
   [OBS overlay](#obs-overlay).
 - **Run it elevated?** No. Nothing needs administrator rights. "Access
   denied" means the folder is protected; move telemouse to a folder you own.
+- **Something else is wrong and you want the whole picture**: *Check my
+  setup* in the panel — `telemouse.exe doctor` in a terminal — walks the
+  build, your config, the clock, the screens, your mice, the UDP socket,
+  the recordings folder and Kafka, and marks every row `pass`, `warn` or
+  `fail` with a hint on the ones worth fixing. `telemouse.exe doctor
+  --json` prints those same rows as one JSON document, for a script or for
+  an assistant reading it.
 
 ## Reporting problems
 
