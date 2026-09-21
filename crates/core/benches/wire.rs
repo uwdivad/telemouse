@@ -117,6 +117,7 @@ fn bench_batcher(c: &mut Criterion) {
     for n in SIZES {
         let evs = events(n);
         let mut b = Batcher::with_window_ms(448, 25, 10_000_000);
+        b.open_window(0);
         g.throughput(Throughput::Elements(n as u64));
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, _| {
             bench.iter(|| {

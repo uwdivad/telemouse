@@ -4,6 +4,30 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **`window_ms` now means what it says.** The batch window was timed from the
+  first event's timestamp but tested against the wall clock, and raw-input
+  reads are coalesced — they back-date a drain's stamps by up to
+  `coalesce_ms + 1` ms. Every window was short by that much, so the shipped
+  default of 25 ms produced about **52 batches a second instead of 40**. The
+  window is now wall-clock and runs on a fixed grid, so a live stream ships
+  exactly `1000 / window_ms` batches a second. At the same `window_ms` you
+  will see **fewer, fuller batches** in recordings and on the dashboard —
+  ~25 events per batch at 1 kHz where it used to be ~18 — and a batch
+  sequence number covers more time. Nothing about per-event data changes:
+  timestamps are still the raw-input stamps, and analysis is unaffected. An
+  event reaches the wire within `window_ms + coalesce_ms + 1` ms, and the
+  first batch after an idle desk still goes out one window after the hand
+  moved.
+- **The shipping thread wakes once per batch, not twice.** It used to fall
+  back to its idle park after every flush, be unparked by the capture thread
+  on the next drain (a syscall on the hot thread), and then park again on the
+  window timer. The window now stays open across a flush while the stream is
+  live. Together with the cadence fix that is about −0.25% of a core on the
+  live path; the capture thread makes one wake-up syscall per burst instead
+  of one per batch.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon

@@ -26,8 +26,11 @@ marker_hotkey = "f9"
 [batch]
 # Batch window: the live-viz latency floor and the batches/s every hop pays
 # for (~150us of kernel CPU per batch across capture, bridge and each
-# browser). 25 = 40 batches/s for responsive live visualization; use 50 to
-# halve that per-batch CPU cost. Recordings and analysis are unchanged.
+# browser). A live stream ships exactly 1000/window_ms batches a second, so
+# 25 = 40 batches/s for responsive live visualization; use 50 to halve that
+# per-batch CPU cost. An event reaches the wire within window_ms +
+# coalesce_ms + 1. Recordings and analysis are unchanged: the per-event
+# timestamps do not depend on how events are grouped into batches.
 window_ms = 25              # max 1000
 max_events = 448
 ring_capacity = 65536       # max 4194304
