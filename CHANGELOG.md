@@ -4,6 +4,27 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **The report summary names the marked stretches.**
+  `telemouse-analyze report <id> --summary` now carries `markers`
+  (`{t_s, label}`) and `segments` (per marker interval: the `label` that
+  opens it, the `next_label` that closes it, and the flick, overshoot,
+  settle, tremor, path-efficiency and click-rate numbers for that stretch),
+  with `markers_total` / `segments_total` beside them. An experiment marked
+  `"sens A"` / `"sens B"` can be read off the few-KB summary instead of the
+  whole report; at most the first 12 of each are listed and a label longer
+  than 120 characters is clipped, so the document stays the size it was. An
+  unmarked recording lists neither.
+- The summary's schema tag is `telemouse-report-summary/2`. The control
+  panel serves a cached `recordings/.reports/<id>.summary.json` only when it
+  carries the tag this build knows: a finished recording never changes
+  again, so without that test a summary cached before the fields existed
+  would be served for the rest of the recording's life. Cached summaries
+  from an older build are simply recomputed on the next report.
+- The panel's report card lists what you marked, with the offset into the
+  recording, when the session has markers.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon

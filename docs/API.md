@@ -38,7 +38,7 @@ OBS overlay on another PC); everything else is loopback-only.
 | `POST /api/processes/{pid}/kill` | → `{ ok, killed: ProcInfo }`. `403` for the panel itself or a process the scan would not list, `404` unknown. |
 | `GET /api/config` | `{ path, status, exists, token, settings: { mouse_cpi, marker_hotkey, recording: { enabled, dir }, ctl: { hotkey }, games: { "<exe>": { sens, yaw_coeff, pitch_coeff } }, obs: { layout, background, hud, hud_position, scale } } \| null, error, choices: { obs_layouts, obs_hud_items, obs_hud_positions }, not_editable: [..] }`. The editable subset of `telemouse.toml` as it is on disk now. `token` fingerprints the file's bytes (`"none"` when there is no file). `settings` is `null` and `error` says why when the file cannot be used. |
 | `POST /api/config` | `{ token, patch }` → `{ ok, token, created, settings, changed: ["mouse_cpi"\|"marker_hotkey"\|"recording"\|"ctl.hotkey"\|"games"\|"viz.obs"], restart_required: ["ctl hotkey"], next_start: ["capture"\|"viz"] }`. `patch` has the shape of `settings` with every field optional; in `games` a value of `null` removes that game, a new game needs `sens` (`yaw_coeff` defaults to 0.022, `pitch_coeff` to the yaw), and the exe name is trimmed, lowercased and given `.exe`. Comments, ordering and other keys in the file are kept; the result is validated exactly as the binaries validate it before anything is written, and the write is atomic. Bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` are not in the patch shape and cannot be changed here. `400 { error, field }` invalid value or unknown key (nothing written), `409 { error, token }` the file changed since `token` (re-`GET` and retry), `500` write failed. `recording` takes effect at once; `next_start` names running components that keep their old settings until restarted; `restart_required` needs the panel restarted. |
-| `GET /api/reports/{id}` | The stored `ReportSummary` (see *Analyzer*, `report --summary`) for recording `<id>`, if one was made since the recording last changed; `404` otherwise. `400` when `id` is not a safe recording id. |
+| `GET /api/reports/{id}` | The stored `ReportSummary` (see *Analyzer*, `report --summary`) for recording `<id>`, if one was made since the recording last changed *and* carries the schema this panel knows (`telemouse-report-summary/2`); `404` otherwise, which is also how a cache written for an older shape is retired — a finished recording never changes again, so mtime alone would serve it forever. `400` when `id` is not a safe recording id. |
 | `POST /api/reports/{id}` | Runs the analyzer in `--summary` mode over `<id>.jsonl` and returns the `ReportSummary`; also stored as `<recordings>/.reports/<id>.summary.json` next to the analyzer's cached `<id>.report.json`. `400` bad id, `404` no such recording, `503` no `telemouse-analyze` beside the panel (minimal zip), `500` the run failed. |
 | `POST /api/open` | `{ target: "config"\|"recordings"\|"logs"\|"docs" }` → `{ ok, target, path }`. Opens that place with the shell's default handler (the config in an editor, the recordings or logs folder in Explorer, the docs). The target is a name; the path comes from the server, never from the request. `400` unknown target, `404` when this build has no such place (logs in the minimal build), `500` if the shell refused. |
 
@@ -114,7 +114,8 @@ telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]...
 - **`report <id|path>`**: a bare id is `<dir>/<id>.jsonl`. Pass `--json-dir`
   so the cached `<id>.report.json` is reused (analyzer version, params and
   the recording's signature must match).
-- **`report --summary`** → `telemouse-report-summary/1`, ~3 KB:
+- **`report --summary`** → `telemouse-report-summary/2`, ~3 KB (~5 KB for a
+  marked session, ~8 KB with both marker tables full):
   `{ schema, analyzer_version, session: { session_id, started_utc,
   duration_s, event_count, marker_count, mouse_cpi, game, sens,
   deg_per_count, cm_per_360, aim_profile_missing, ... }, quality: { events,
@@ -131,10 +132,23 @@ telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]...
   hold_ms_median, double_clicks }, kinematics: { total_distance_m,
   distance_cm_per_min, moving_fraction, path_efficiency_weighted,
   speed_cm_per_s_median, speed_cm_per_s_p99, speed_deg_per_s_p99 }, lifts:
-  { count, per_minute, mean_drift_cm }, warnings: [..] }`. `clean` means no
+  { count, per_minute, mean_drift_cm }, markers: [{ t_s, label }, ..],
+  markers_total, segments: [{ index, label, next_label, t_start_s, t_end_s,
+  flicks, flicks_per_min, overshoot_median, settle_median_ms,
+  tremor_rms_counts_s, path_efficiency, clicks_per_min }, ..],
+  segments_total, warnings: [..] }`. `clean` means no
   data-quality warning fired; `threads_clean` is the sidecar's own flag.
   If `aim_profile_missing` is true every degree-valued number uses a
   fallback sensitivity and is not comparable across sessions.
+  `markers`/`segments` carry at most the first 12 of each (`markers_total`
+  and `segments_total` are the real counts) and a label longer than 120
+  characters is clipped with `…`, so the document stays a few KB. A
+  `segments[i]` runs from the marker named by `label` to the one named by
+  `next_label` — both empty at the ends of the session — which is what tells
+  a `"sens A"` stretch from a `"sens B"` one. An unmarked recording has
+  `markers: []`, `segments: []` and both totals `0`: its single interval
+  would only repeat the headline numbers. `/2` added these four fields;
+  `/1` had none of them.
 - **`report --json FILE`** → the full report: `schema, analyzer_version,
   params, session, quality, kinematics, flicks, micro, clicks, lifts,
   markers[], segments[], per_second[], per_minute[], warnings[], timings[]`.

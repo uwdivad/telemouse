@@ -146,7 +146,76 @@ pub struct ReportSummary {
     pub clicks: ClickHeadline,
     pub kinematics: KinematicsHeadline,
     pub lifts: LiftHeadline,
+    /// The markers, oldest first, at most [`MAX_SUMMARY_MARKERS`] of them —
+    /// without their labels an experiment's "sens A" / "sens B" stretches
+    /// cannot be told apart without opening the full report.
+    pub markers: Vec<SummaryMarker>,
+    /// How many markers the recording holds; larger than `markers.len()`
+    /// when the list was truncated.
+    pub markers_total: usize,
+    /// One entry per marker interval, oldest first, at most
+    /// [`MAX_SUMMARY_MARKERS`] of them. Empty when the recording has no
+    /// markers: the single interval would only repeat the headline numbers.
+    pub segments: Vec<SummarySegment>,
+    /// How many intervals the markers cut the session into; larger than
+    /// `segments.len()` when the list was truncated.
+    pub segments_total: usize,
     pub warnings: Vec<String>,
+}
+
+/// One marker, placed on the analysis timeline. A projection of
+/// [`MarkerRow`] without the absolute timestamp — the summary's reader wants
+/// "which stretch is this", not a wall clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryMarker {
+    /// Seconds from the start of the session.
+    pub t_s: f64,
+    pub label: String,
+}
+
+/// The few numbers of a [`SegmentReport`] worth comparing between two
+/// marked stretches, with the labels that bound the stretch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummarySegment {
+    pub index: usize,
+    /// The marker that opened this stretch; empty before the first marker.
+    pub label: String,
+    /// The marker that closes it; empty for the stretch that runs to the end
+    /// of the session.
+    pub next_label: String,
+    pub t_start_s: f64,
+    pub t_end_s: f64,
+    pub flicks: usize,
+    pub flicks_per_min: f64,
+    pub overshoot_median: f64,
+    pub settle_median_ms: f64,
+    pub tremor_rms_counts_s: f64,
+    pub path_efficiency: f64,
+    pub clicks_per_min: f64,
+}
+
+/// How many markers, and how many marker intervals, the summary lists before
+/// it stops. The point of the summary is that it stays a few KB whatever the
+/// recording holds; a session marked once a round would otherwise carry
+/// hundreds of rows. `markers_total` / `segments_total` say what was cut.
+pub const MAX_SUMMARY_MARKERS: usize = 12;
+
+/// Longest label the summary keeps, in characters. The capture agent and the
+/// panel both refuse a longer one (`MAX_MARKER_LABEL_CHARS`), so this only
+/// bites on a hand-written recording.
+pub const MAX_SUMMARY_LABEL_CHARS: usize = 120;
+
+/// The label as the summary carries it: at most [`MAX_SUMMARY_LABEL_CHARS`]
+/// characters, with an ellipsis when something was cut.
+fn clip_label(label: &str) -> String {
+    match label
+        .char_indices()
+        .nth(MAX_SUMMARY_LABEL_CHARS)
+        .map(|(i, _)| i)
+    {
+        Some(cut) => format!("{}…", &label[..cut]),
+        None => label.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,8 +299,13 @@ pub struct LiftHeadline {
     pub mean_drift_cm: f64,
 }
 
-/// Schema tag of [`ReportSummary`]; bump when a field changes meaning.
-pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/1";
+/// Schema tag of [`ReportSummary`]; bump when a field changes meaning — and
+/// when a field is *added*, because the control panel keeps a
+/// `<id>.summary.json` per recording and a recording never changes after its
+/// run, so the tag is the only thing that can retire a cache written before
+/// the field existed. `/2` added `markers`, `markers_total`, `segments` and
+/// `segments_total`.
+pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/2";
 
 /// Times one phase, logs it, and records it for the `--timing` table.
 struct Phases {
@@ -669,8 +743,57 @@ impl Report {
                 per_minute: self.lifts.per_minute,
                 mean_drift_cm: self.lifts.mean_drift_cm,
             },
+            markers: self
+                .markers
+                .iter()
+                .take(MAX_SUMMARY_MARKERS)
+                .map(|m| SummaryMarker {
+                    t_s: m.t_s,
+                    label: clip_label(&m.label),
+                })
+                .collect(),
+            markers_total: self.markers.len(),
+            segments: self.summary_segments(),
+            segments_total: if self.markers.is_empty() {
+                0
+            } else {
+                self.segments.len()
+            },
             warnings: self.warnings.clone(),
         }
+    }
+
+    /// The per-interval rows of the summary. An unmarked session has exactly
+    /// one interval covering everything, which would only repeat the
+    /// headline numbers, so it contributes nothing.
+    fn summary_segments(&self) -> Vec<SummarySegment> {
+        if self.markers.is_empty() {
+            return Vec::new();
+        }
+        self.segments
+            .iter()
+            .take(MAX_SUMMARY_MARKERS)
+            .enumerate()
+            .map(|(i, s)| SummarySegment {
+                index: s.index,
+                label: clip_label(&s.label),
+                // The marker that ends this stretch, so "sens A" is readable
+                // as the span between two labels rather than a start time.
+                next_label: self
+                    .segments
+                    .get(i + 1)
+                    .map_or_else(String::new, |n| clip_label(&n.label)),
+                t_start_s: s.t_start_s,
+                t_end_s: s.t_end_s,
+                flicks: s.flicks,
+                flicks_per_min: s.flicks_per_min,
+                overshoot_median: s.overshoot_median,
+                settle_median_ms: s.settle_median_ms,
+                tremor_rms_counts_s: s.tremor_rms_counts_s,
+                path_efficiency: s.path_efficiency,
+                clicks_per_min: s.clicks_per_min,
+            })
+            .collect()
     }
 
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
@@ -1786,6 +1909,121 @@ mod tests {
         );
         assert_eq!(plain.segments.len(), 2);
         assert!(!plain.render().contains("Between markers"));
+    }
+
+    #[test]
+    fn the_summary_names_the_stretch_every_segment_covers() {
+        let mut s = demo_session();
+        s.markers.push(marker_at(500, "sens A"));
+        s.markers.push(marker_at(1_000, "sens B"));
+        let sum = build(s, Params::default()).summary(Vec::new());
+
+        assert_eq!(sum.schema, SUMMARY_SCHEMA);
+        assert_eq!(
+            sum.markers
+                .iter()
+                .map(|m| m.label.as_str())
+                .collect::<Vec<_>>(),
+            ["sens A", "sens B"]
+        );
+        assert!((sum.markers[0].t_s - 0.5).abs() < 1e-6);
+        assert!((sum.markers[1].t_s - 1.0).abs() < 1e-6);
+        assert_eq!(sum.markers_total, 2);
+
+        // Three stretches: the warmup, then one per marker. Each says which
+        // labels bound it, so "sens A" can be compared against "sens B"
+        // without opening the full report.
+        assert_eq!(sum.segments_total, 3);
+        let bounds: Vec<(&str, &str)> = sum
+            .segments
+            .iter()
+            .map(|s| (s.label.as_str(), s.next_label.as_str()))
+            .collect();
+        assert_eq!(
+            bounds,
+            [("", "sens A"), ("sens A", "sens B"), ("sens B", "")]
+        );
+        assert!((sum.segments[1].t_start_s - 0.5).abs() < 1e-6);
+        assert!((sum.segments[1].t_end_s - 1.0).abs() < 1e-6);
+        assert_eq!(
+            sum.segments.iter().map(|s| s.flicks).sum::<usize>(),
+            sum.flicks.count
+        );
+
+        // And it stays the few-KB document its callers paste into a chat.
+        let json = serde_json::to_string_pretty(&sum).unwrap();
+        assert!(json.len() < 8_000, "summary grew to {} bytes", json.len());
+        // The marker rows survive the round-trip (the float-heavy headline
+        // fields are compared field-wise elsewhere: serde_json's parser can
+        // land 1 ULP off, so `==` over the whole document is not a promise
+        // the format makes).
+        let back: ReportSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema, sum.schema);
+        assert_eq!(back.markers_total, sum.markers_total);
+        assert_eq!(back.segments_total, sum.segments_total);
+        let labels = |s: &ReportSummary| -> Vec<String> {
+            s.markers
+                .iter()
+                .map(|m| m.label.clone())
+                .chain(s.segments.iter().map(|g| g.next_label.clone()))
+                .collect()
+        };
+        assert_eq!(labels(&back), labels(&sum));
+    }
+
+    #[test]
+    fn a_session_with_no_markers_carries_no_marker_rows() {
+        let sum = build(demo_session(), Params::default()).summary(Vec::new());
+        assert!(sum.markers.is_empty());
+        assert_eq!(sum.markers_total, 0);
+        // The lone interval would only repeat the headline numbers.
+        assert!(sum.segments.is_empty());
+        assert_eq!(sum.segments_total, 0);
+    }
+
+    #[test]
+    fn the_summary_caps_the_marker_and_segment_lists() {
+        let mut s = demo_session();
+        for i in 0..(MAX_SUMMARY_MARKERS as u64 + 5) {
+            s.markers.push(marker_at(50 + i * 50, &format!("m{i}")));
+        }
+        let long = "x".repeat(MAX_SUMMARY_LABEL_CHARS + 40);
+        s.markers.push(marker_at(20, &long));
+        let sum = build(s, Params::default()).summary(Vec::new());
+
+        assert_eq!(sum.markers.len(), MAX_SUMMARY_MARKERS);
+        assert_eq!(sum.markers_total, MAX_SUMMARY_MARKERS + 6);
+        assert_eq!(sum.segments.len(), MAX_SUMMARY_MARKERS);
+        assert_eq!(sum.segments_total, MAX_SUMMARY_MARKERS + 7);
+        // Oldest first, so the truncation drops the tail.
+        assert_eq!(sum.markers[1].label, "m0");
+        // A label longer than the rest of the system accepts is clipped, not
+        // carried whole.
+        assert_eq!(
+            sum.markers[0].label.chars().count(),
+            MAX_SUMMARY_LABEL_CHARS + 1
+        );
+        assert!(sum.markers[0].label.ends_with('…'));
+        let json = serde_json::to_string_pretty(&sum).unwrap();
+        assert!(json.len() < 8_000, "summary grew to {} bytes", json.len());
+    }
+
+    #[test]
+    fn unlabelled_hotkey_markers_are_told_apart_by_their_offsets() {
+        let mut s = demo_session();
+        s.markers.push(marker_at(400, "hotkey"));
+        s.markers.push(marker_at(1_000, "hotkey"));
+        let sum = build(s, Params::default()).summary(Vec::new());
+
+        assert_eq!(sum.markers_total, 2);
+        assert!(sum.markers.iter().all(|m| m.label == "hotkey"));
+        assert!(sum.markers[0].t_s < sum.markers[1].t_s);
+        // The segments still line up with the timeline even when nothing
+        // distinguishes the labels.
+        assert_eq!(sum.segments.len(), 3);
+        assert!((sum.segments[1].t_start_s - 0.4).abs() < 1e-6);
+        assert!((sum.segments[2].t_start_s - 1.0).abs() < 1e-6);
+        assert_eq!(sum.segments[2].next_label, "");
     }
 
     #[test]
