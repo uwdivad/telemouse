@@ -5,8 +5,10 @@
 //!
 //! Nothing here blocks on the runtime. A snapshot arrives as
 //! `WM_APP_REFRESH` (posted by the publisher's `wake`), the text view is
-//! re-rendered from `model::window_text` while it is showing, and the tray
-//! icon is modified only when its state or tooltip actually changed. Actions
+//! re-rendered from `model::window_text` while it is showing, and both it
+//! and the tray icon are written only when what they would show actually
+//! changed — `model::worth_painting` decides, since a clock that moved is
+//! not worth a full `EDIT` repaint every second. Actions
 //! are spawned through `feed::start` / `feed::stop`; Exit notifies `main`,
 //! which stops the children and then calls [`post_quit`].
 //!
@@ -87,6 +89,8 @@ const WM_APP_REFRESH: u32 = WM_APP + 2;
 const WM_APP_QUIT: u32 = WM_APP + 3;
 // Edit-control messages (fixed values from winuser.h; they live behind the
 // `Win32_UI_Controls` feature, which nothing else here needs).
+const EM_GETSEL: u32 = 0x00B0;
+const EM_SETSEL: u32 = 0x00B1;
 const EM_LINESCROLL: u32 = 0x00B6;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_GETFIRSTVISIBLELINE: u32 = 0x00CE;
@@ -114,7 +118,9 @@ pub(super) struct UiState {
     icons: [HICON; IconState::COUNT],
     tray_added: bool,
     icon_state: IconState,
-    tooltip: String,
+    /// What the text view holds, so an unchanged render is not repainted.
+    shown_text: model::Painted,
+    tooltip: model::Painted,
     /// `RegisterWindowMessageW("TaskbarCreated")`: Explorer restarted.
     taskbar_created: u32,
     pub(super) visible: bool,
@@ -361,7 +367,8 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             icons,
             tray_added: false,
             icon_state: IconState::Idle,
-            tooltip: String::new(),
+            shown_text: model::Painted::default(),
+            tooltip: model::Painted::default(),
             taskbar_created,
             visible: true,
             exiting: false,
@@ -372,7 +379,9 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
 
-        (*ptr).tooltip = model::tooltip(&(*ptr).link.state.borrow());
+        // Only the text, not the time: the first real snapshot is then
+        // always worth the one `Shell_NotifyIcon` that follows.
+        (*ptr).tooltip.text = model::tooltip(&(*ptr).link.state.borrow());
         tray_add(ptr);
         if !(*ptr).tray_added {
             warn!("tray icon unavailable; closing the window will exit the panel");
@@ -517,6 +526,7 @@ unsafe fn tray_data(s: *mut UiState) -> NOTIFYICONDATAW {
         };
         let tip: Vec<u16> = (*s)
             .tooltip
+            .text
             .encode_utf16()
             .take(d.szTip.len() - 1)
             .collect();
@@ -654,16 +664,35 @@ unsafe fn set_visible(s: *mut UiState, show: bool) {
     }
 }
 
-/// Replace the EDIT text, keeping the scroll position (SetWindowText
-/// resets it to the top).
+/// Replace the EDIT text, keeping the scroll position and the selection
+/// (SetWindowText drops both: it scrolls back to the top and deselects,
+/// which yanks a user who is reading — or copying — the log tail).
 unsafe fn set_text(edit: HWND, text: &str) {
-    // SAFETY: `edit` is our control; the wide buffer outlives the call.
+    // SAFETY: `edit` is our control; the wide buffer and the two selection
+    // slots outlive the calls that write into them.
     unsafe {
         let first = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, None, None).0;
+        let (mut sel_a, mut sel_b) = (0u32, 0u32);
+        SendMessageW(
+            edit,
+            EM_GETSEL,
+            Some(WPARAM(&raw mut sel_a as usize)),
+            Some(LPARAM(&raw mut sel_b as isize)),
+        );
         SendMessageW(edit, WM_SETREDRAW, Some(WPARAM(0)), None);
         let w = wide(text);
         if let Err(e) = SetWindowTextW(edit, PCWSTR(w.as_ptr())) {
             debug!(error = %e, "SetWindowTextW");
+        }
+        // Only a real selection is worth restoring; EM_SETSEL clamps it to
+        // the new text and does not scroll on its own.
+        if sel_b > sel_a {
+            SendMessageW(
+                edit,
+                EM_SETSEL,
+                Some(WPARAM(sel_a as usize)),
+                Some(LPARAM(sel_b as isize)),
+            );
         }
         if first > 0 {
             SendMessageW(edit, EM_LINESCROLL, Some(WPARAM(0)), Some(LPARAM(first)));
@@ -677,12 +706,22 @@ unsafe fn refresh(s: *mut UiState) {
     // SAFETY: `s` is live; the snapshot is cloned out before any Win32 call.
     unsafe {
         let snap = (*s).link.state.borrow().clone();
+        let now = snap.now_unix_s;
         // The text view is only worth rendering while it is what the user
         // sees: not behind the hosted page, not while hidden to the tray.
+        // And rewriting it is only worth it when the render actually says
+        // something new: a full repaint of this EDIT is ~0.3% of a core at
+        // one refresh a second, and the clock alone moves every time
+        // (`model::worth_painting`).
         if (*s).visible && !(*s).web.hosted() {
-            let edit = (*s).edit;
             let status = (*s).web.status();
-            set_text(edit, &model::window_text(&snap, &status));
+            let text = model::window_text(&snap, &status);
+            // The borrow of `shown_text` ends with the call, before the
+            // string it points into is replaced.
+            if model::worth_painting(&(*s).shown_text, &text, now) {
+                set_text((*s).edit, &text);
+                (*s).shown_text.set(text, now);
+            }
         }
         let icon = model::icon_state(&snap);
         let tip = if (*s).exiting {
@@ -690,12 +729,15 @@ unsafe fn refresh(s: *mut UiState) {
         } else {
             model::tooltip(&snap)
         };
-        if icon != (*s).icon_state || tip != (*s).tooltip {
-            if icon != (*s).icon_state {
+        // Same rule for the tooltip: it carries the uptime, so it differs
+        // every second while anything runs, and nobody is hovering.
+        let icon_changed = icon != (*s).icon_state;
+        if icon_changed || model::worth_painting(&(*s).tooltip, &tip, now) {
+            if icon_changed {
                 info!(?icon, "tray icon state");
+                (*s).icon_state = icon;
             }
-            (*s).icon_state = icon;
-            (*s).tooltip = tip;
+            (*s).tooltip.set(tip, now);
             tray_modify(s);
         }
     }
@@ -767,7 +809,7 @@ unsafe fn request_exit(s: *mut UiState) {
         }
         (*s).exiting = true;
         info!("exit requested from the gui");
-        (*s).tooltip = "telemouse-ctl — stopping…".into();
+        (*s).tooltip.text = "telemouse-ctl — stopping…".into();
         tray_modify(s);
         let hwnd = (*s).hwnd;
         (*s).visible = false;

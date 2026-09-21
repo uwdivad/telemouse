@@ -256,6 +256,64 @@ pub fn web_banner(status: &WebStatus, panel_url: &str) -> Vec<String> {
     }
 }
 
+/// How long a control may keep text whose *numbers* have moved on — a
+/// clock, an uptime, a CPU column — before it is rewritten anyway, so the
+/// view still reads as live. Anything that changes a word is shown at once.
+pub const SLOW_REPAINT_S: u64 = 5;
+
+/// A string that was pushed into a Win32 control, and the snapshot second
+/// it was pushed at. `at_unix_s = 0` is "so long ago it does not matter",
+/// which is also what a never-painted control gets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Painted {
+    pub text: String,
+    pub at_unix_s: u64,
+}
+
+impl Painted {
+    /// Record what the control now shows.
+    pub fn set(&mut self, text: String, now_unix_s: u64) {
+        self.text = text;
+        self.at_unix_s = now_unix_s;
+    }
+}
+
+/// Every run of ASCII digits collapsed to a single `#`: what a rendering
+/// says, with the numbers taken out.
+fn worded(s: &str) -> impl Iterator<Item = char> + '_ {
+    let mut in_digits = false;
+    s.chars().filter_map(move |c| {
+        if c.is_ascii_digit() {
+            let first = !in_digits;
+            in_digits = true;
+            first.then_some('#')
+        } else {
+            in_digits = false;
+            Some(c)
+        }
+    })
+}
+
+/// Whether `next` is worth pushing into a control that shows `shown`.
+///
+/// Both the text view and the tray tooltip carry a clock, uptimes and
+/// counters, so they differ on nearly every refresh even when nothing the
+/// reader cares about moved — and rewriting the fallback `EDIT` costs
+/// ~0.3% of a core at one refresh a second (docs/PERFORMANCE-2026-09-20.md,
+/// L2). So: identical text is never pushed again; text whose words changed
+/// (a state, a path, a new log line) is pushed at once; text where only
+/// digits moved waits until the control has been stale for
+/// [`SLOW_REPAINT_S`].
+pub fn worth_painting(shown: &Painted, next: &str, now_unix_s: u64) -> bool {
+    if shown.text == next {
+        return false;
+    }
+    if !worded(&shown.text).eq(worded(next)) {
+        return true;
+    }
+    now_unix_s.saturating_sub(shown.at_unix_s) >= SLOW_REPAINT_S
+}
+
 /// The text view: the web banner, then [`render_text`].
 pub fn window_text(s: &Snapshot, status: &WebStatus) -> String {
     let mut out = web_banner(status, &s.places.panel_url).join("\r\n");
@@ -887,6 +945,96 @@ mod tests {
             "{off}"
         );
         assert!(!off.contains("Install the WebView2 Runtime"), "{off}");
+    }
+
+    /// The repaint rule the window and the tray both obey: nothing for
+    /// unchanged text, at once for changed words, on the slow lane for a
+    /// clock that moved.
+    #[test]
+    fn only_a_changed_word_repaints_at_once() {
+        let painted = |text: &str, at: u64| Painted {
+            text: text.into(),
+            at_unix_s: at,
+        };
+        // Nothing has been painted yet: anything is worth painting.
+        assert!(worth_painting(&Painted::default(), "PANEL  -", 0));
+        // The same text, however old, is never pushed again.
+        assert!(!worth_painting(
+            &painted("up 1:01:01", 10),
+            "up 1:01:01",
+            9_999
+        ));
+        // Only digits moved: the slow lane, counted from the last paint.
+        let clock = painted("refreshed 12:00:01 UTC", 100);
+        assert!(!worth_painting(&clock, "refreshed 12:00:02 UTC", 101));
+        assert!(!worth_painting(
+            &clock,
+            "refreshed 12:00:04 UTC",
+            100 + SLOW_REPAINT_S - 1
+        ));
+        assert!(worth_painting(
+            &clock,
+            "refreshed 12:00:05 UTC",
+            100 + SLOW_REPAINT_S
+        ));
+        // A number that grew a digit is still just a number.
+        assert!(!worth_painting(&painted("9.9 MB", 100), "10.1 MB", 101));
+        // A word changed: now, whatever the clock says.
+        assert!(worth_painting(
+            &painted("viz: stopped", 100),
+            "viz: running",
+            100
+        ));
+        assert!(worth_painting(
+            &painted("line one", 100),
+            "line one\r\nline two",
+            100
+        ));
+    }
+
+    /// The same rule over real renderings: a tick that only advanced the
+    /// clock and the uptimes must not rewrite the control.
+    #[test]
+    fn a_tick_that_only_moves_the_clock_is_not_worth_a_repaint() {
+        let s = snap(true, false);
+        let shown = Painted {
+            text: window_text(&s, &WebStatus::Hosted),
+            at_unix_s: s.now_unix_s,
+        };
+        let mut later = s.clone();
+        later.now_unix_s += 1;
+        let next = window_text(&later, &WebStatus::Hosted);
+        assert_ne!(next, shown.text, "the clock and the uptime did move");
+        assert!(!worth_painting(&shown, &next, later.now_unix_s));
+
+        // Capture stopping is a word, not a number.
+        let mut stopped = later.clone();
+        stopped.components[0].running = false;
+        assert!(worth_painting(
+            &shown,
+            &window_text(&stopped, &WebStatus::Hosted),
+            stopped.now_unix_s
+        ));
+        // So is a new log line, and so is the banner the fallback wears.
+        let mut logged = later.clone();
+        logged.components[0].log.push("line three".into());
+        assert!(worth_painting(
+            &shown,
+            &window_text(&logged, &WebStatus::Hosted),
+            logged.now_unix_s
+        ));
+        assert!(worth_painting(
+            &shown,
+            &window_text(&later, &WebStatus::Loading),
+            later.now_unix_s
+        ));
+        // Tooltips go through the same rule.
+        let tip = Painted {
+            text: tooltip(&s),
+            at_unix_s: s.now_unix_s,
+        };
+        assert!(!worth_painting(&tip, &tooltip(&later), later.now_unix_s));
+        assert!(worth_painting(&tip, &tooltip(&stopped), stopped.now_unix_s));
     }
 
     #[test]
