@@ -4,6 +4,21 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **Tick→UTC conversion without 128-bit division.**
+  `QpcAnchor::qpc_to_utc_us` and `ticks_to_us` scale QPC ticks to
+  microseconds in 64-bit integers: the delta is carried as an unsigned
+  magnitude plus a sign, 10 MHz (every real Windows box) becomes a divide by
+  ten that compiles to a multiply, and odd frequencies split the ticks into
+  whole seconds and a remainder. The i128 expression stays as the fallback
+  wherever 64 bits could overflow, so results are bit-identical to before for
+  every input — checked against the old implementation over ~1.6 M
+  pseudo-random cases and an explicit edge sweep. The analyzer calls this
+  once per event: 8.6 ns → 1.9 ns per call, about −100 ms on a 15 M-event
+  report (`docs/PERFORMANCE-2026-09-20.md`, item A4; new
+  `crates/core/benches/clock.rs`).
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon
