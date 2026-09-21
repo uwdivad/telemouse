@@ -15,6 +15,14 @@
 //! borrow-based shadow struct that never allocates for the fields we only
 //! read, and process names are interned so a three-hour session holds one
 //! `"cs2.exe"` rather than half a million of them.
+//!
+//! Lines are independent, so anything past [`PARALLEL_MIN_BYTES`] is split at
+//! newline boundaries into one byte range per core and parsed on worker
+//! threads ([`load_parallel`]); the ranges are stitched back together in file
+//! order by [`assemble`]. Both paths run the same [`parse_body`] loop, so the
+//! events, batches, markers, drop counters, interned names and `BadLines`
+//! (with the file's own line numbers) come out identical either way —
+//! `the_parallel_loader_matches_the_sequential_one` asserts exactly that.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -37,6 +45,18 @@ use telemouse_core::{Envelope, GameSens, Marker, RawEvent, SessionConfig};
 /// oversized allocation, under-reserving costs a doubling — both are cheap
 /// compared to the growth series this replaces.
 const BYTES_PER_EVENT: u64 = 71;
+
+/// Smallest recording the chunk-parallel loader is used for. Below it the
+/// boundary seeks, the extra file handles and the thread spawns cost more than
+/// the parse saves — a 4 MB recording loads in ~10 ms single-threaded.
+const PARALLEL_MIN_BYTES: u64 = 8 * 1024 * 1024;
+/// Smallest byte range worth giving a worker: the number of workers is capped
+/// so no chunk is smaller than this, however many cores the box has.
+const MIN_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+/// Workers never exceed this, whatever `available_parallelism` reports. Past
+/// ~16 the loader is memory-bandwidth-bound and each extra thread only adds a
+/// file handle and a 1 MB read buffer.
+const MAX_LOAD_WORKERS: usize = 16;
 
 /// Versioned, disposable metadata cache used by [`scan_dir`]. It intentionally
 /// does not end in `.jsonl`, so it can live beside recordings without ever
@@ -482,6 +502,13 @@ impl LoadProgress {
         );
     }
 
+    /// Mark the whole file as read. The parallel path has no single place that
+    /// sees every line go by, so it reports the read in one piece at the end
+    /// instead of at the byte milestones.
+    fn complete(&mut self, bytes: u64) {
+        self.read = bytes;
+    }
+
     /// Milliseconds the read took, logged with its throughput.
     fn finish(self, path: &Path, events: usize) -> f64 {
         let secs = self.started.elapsed().as_secs_f64();
@@ -510,7 +537,7 @@ fn open(path: &Path) -> Result<(BufReader<File>, u64), LoadError> {
 /// Read one line into `buf`, stripping the trailing newline. Returns the bytes
 /// consumed *including* the line terminator, so the caller can report progress
 /// against the file length; `Ok(0)` at EOF.
-fn next_line(path: &Path, r: &mut BufReader<File>, buf: &mut String) -> Result<usize, LoadError> {
+fn next_line<R: BufRead>(path: &Path, r: &mut R, buf: &mut String) -> Result<usize, LoadError> {
     buf.clear();
     let n = r.read_line(buf).map_err(|source| LoadError::Io {
         path: path.to_path_buf(),
@@ -527,9 +554,9 @@ fn next_line(path: &Path, r: &mut BufReader<File>, buf: &mut String) -> Result<u
 
 /// Parse the session header from the first non-empty line, and report how many
 /// lines and bytes that consumed so the body's line numbers are the file's.
-fn read_header(
+fn read_header<R: BufRead>(
     path: &Path,
-    r: &mut BufReader<File>,
+    r: &mut R,
     buf: &mut String,
 ) -> Result<(SessionConfig, u64, u64), LoadError> {
     let mut lines = 0u64;
@@ -569,103 +596,221 @@ fn envelope_kind(e: &Envelope) -> &'static str {
     }
 }
 
-/// Load a recording fully into memory.
-pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
-    let (mut reader, size) = open(path)?;
-    let mut progress = LoadProgress::start(path, size);
-    let mut line = String::with_capacity(64 * 1024);
-    let (config, mut line_no, header_bytes) = read_header(path, &mut reader, &mut line)?;
-    progress.advance(header_bytes as usize, 0);
+/// One stretch of body lines, parsed. A sequential load produces exactly one
+/// of these; a parallel load produces one per byte range.
+///
+/// Line numbers in here are 1-based *within the stretch*: a worker cannot know
+/// how many lines precede its range without reading them, so [`assemble`] adds
+/// the offset once the chunk line counts are known.
+#[derive(Default)]
+struct Body {
+    events: Vec<RawEvent>,
+    markers: Vec<Marker>,
+    batches: Vec<BatchMeta>,
+    total_drops: u64,
+    total_abs_frames: u64,
+    /// Lines consumed, blank ones included.
+    lines: u64,
+    /// The highest line that parsed, or 0 when none did.
+    last_good: u64,
+    bad: BadLines,
+    games: GameInterner,
+}
 
-    let mut events: Vec<RawEvent> = Vec::with_capacity((size / BYTES_PER_EVENT) as usize);
-    let mut markers = Vec::new();
-    let mut batches: Vec<BatchMeta> = Vec::new();
-    let mut total_drops = 0u64;
-    let mut total_abs_frames = 0u64;
-    let mut bad_lines = BadLines::default();
-    let mut last_good_line = line_no;
-    let mut games = GameInterner::default();
+/// The loader's one line loop, over whatever `r` yields.
+///
+/// Both the sequential and the parallel path go through here, which is what
+/// makes the two byte-identical: the tag fast paths, the general-envelope
+/// fallback, what counts as a good line and what is recorded as a bad one are
+/// written once.
+fn parse_body<R: BufRead>(
+    path: &Path,
+    r: &mut R,
+    reserve_events: usize,
+    mut progress: Option<&mut LoadProgress>,
+) -> Result<Body, LoadError> {
+    let mut body = Body {
+        events: Vec::with_capacity(reserve_events),
+        ..Default::default()
+    };
+    let mut line = String::with_capacity(64 * 1024);
 
     loop {
-        let n = next_line(path, &mut reader, &mut line)?;
+        let n = next_line(path, r, &mut line)?;
         if n == 0 {
             break;
         }
-        line_no += 1;
-        progress.advance(n, events.len());
+        body.lines += 1;
+        let line_no = body.lines;
+        if let Some(p) = progress.as_deref_mut() {
+            p.advance(n, body.events.len());
+        }
         if line.trim().is_empty() {
             continue;
         }
         if line.starts_with(BATCH_TAG) {
             match serde_json::from_str::<BatchRef>(&line) {
                 Ok(mut b) => {
-                    last_good_line = line_no;
-                    total_drops += b.drops_since_last as u64;
-                    total_abs_frames += b.abs_frames_since_last as u64;
-                    batches.push(BatchMeta {
+                    body.last_good = line_no;
+                    body.total_drops += b.drops_since_last as u64;
+                    body.total_abs_frames += b.abs_frames_since_last as u64;
+                    body.batches.push(BatchMeta {
                         seq_no: b.seq_no,
                         ts_anchor_us: b.ts_anchor_us,
-                        game: b.game.as_deref().map(|g| games.get(g)),
+                        game: b.game.as_deref().map(|g| body.games.get(g)),
                         pointer_locked: b.pointer_locked,
                         drops_since_last: b.drops_since_last,
                         abs_frames_since_last: b.abs_frames_since_last,
                         first_event_qpc: b.events.first().map(|e| e.ts_qpc),
                         event_count: b.events.len(),
                     });
-                    events.append(&mut b.events);
+                    body.events.append(&mut b.events);
                 }
-                Err(e) => bad_lines.record(line_no, &e),
+                Err(e) => body.bad.record(line_no, &e),
             }
             continue;
         }
         if line.starts_with(MARKER_TAG) {
             match serde_json::from_str::<Marker>(&line) {
                 Ok(m) => {
-                    last_good_line = line_no;
-                    markers.push(m);
+                    body.last_good = line_no;
+                    body.markers.push(m);
                 }
-                Err(e) => bad_lines.record(line_no, &e),
+                Err(e) => body.bad.record(line_no, &e),
             }
             continue;
         }
         // A second session envelope mid-file (topic compaction replay, an
         // appended session) is informational, not fatal.
         if line.starts_with(SESSION_TAG) {
-            last_good_line = line_no;
+            body.last_good = line_no;
             continue;
         }
         // Anything whose tag is not where we expect it still gets the general
         // path before being written off as corrupt.
         match Envelope::from_json(&line) {
             Ok(Envelope::Batch(b)) => {
-                last_good_line = line_no;
-                total_drops += b.drops_since_last as u64;
-                total_abs_frames += b.abs_frames_since_last as u64;
-                batches.push(BatchMeta {
+                body.last_good = line_no;
+                body.total_drops += b.drops_since_last as u64;
+                body.total_abs_frames += b.abs_frames_since_last as u64;
+                body.batches.push(BatchMeta {
                     seq_no: b.seq_no,
                     ts_anchor_us: b.ts_anchor_us,
-                    game: b.game.as_deref().map(|g| games.get(g)),
+                    game: b.game.as_deref().map(|g| body.games.get(g)),
                     pointer_locked: b.pointer_locked,
                     drops_since_last: b.drops_since_last,
                     abs_frames_since_last: b.abs_frames_since_last,
                     first_event_qpc: b.events.first().map(|e| e.ts_qpc),
                     event_count: b.events.len(),
                 });
-                events.extend_from_slice(&b.events);
+                body.events.extend_from_slice(&b.events);
             }
             Ok(Envelope::Marker(m)) => {
-                last_good_line = line_no;
-                markers.push(m);
+                body.last_good = line_no;
+                body.markers.push(m);
             }
-            Ok(Envelope::Session(_)) => last_good_line = line_no,
-            Err(e) => bad_lines.record(line_no, &e),
+            Ok(Envelope::Session(_)) => body.last_good = line_no,
+            Err(e) => body.bad.record(line_no, &e),
         }
     }
+    Ok(body)
+}
+
+/// Stitch the parsed chunks back into one recording, in file order.
+///
+/// Three things have to be put back together that a per-chunk parse cannot get
+/// right on its own: line numbers (each chunk's are relative to its own
+/// start), the interned process names (each chunk has its own [`GameInterner`],
+/// so `"cs2.exe"` in chunk 3 is a different `Arc` from chunk 0's), and the
+/// [`BadLines`] summary, whose `tail_only` flag is a statement about the file
+/// rather than about any one chunk.
+///
+/// Chunks are consumed one at a time and dropped as they are appended, so the
+/// concatenation does not hold two copies of the event vector.
+fn assemble(
+    path: &Path,
+    config: SessionConfig,
+    size: u64,
+    header_lines: u64,
+    bodies: Vec<Body>,
+    progress: LoadProgress,
+) -> LoadedSession {
+    let total_events: usize = bodies.iter().map(|b| b.events.len()).sum();
+    let total_batches: usize = bodies.iter().map(|b| b.batches.len()).sum();
+    let total_markers: usize = bodies.iter().map(|b| b.markers.len()).sum();
+
+    // One `Arc` per distinct name across the whole file, so the per-process
+    // tally and the pointer identity the sequential loader guarantees survive
+    // the split. The earliest chunk's copy wins, which leaves a single-chunk
+    // (sequential) load with nothing to do.
+    let mut canonical: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    for b in &bodies {
+        for name in b.games.0.values() {
+            canonical
+                .entry(Arc::clone(name))
+                .or_insert_with(|| Arc::clone(name));
+        }
+    }
+
+    let mut events: Vec<RawEvent> = Vec::with_capacity(total_events);
+    let mut markers: Vec<Marker> = Vec::with_capacity(total_markers);
+    let mut batches: Vec<BatchMeta> = Vec::with_capacity(total_batches);
+    let mut total_drops = 0u64;
+    let mut total_abs_frames = 0u64;
+    let mut bad_lines = BadLines::default();
+    let mut last_good_line = header_lines;
+    let mut base = header_lines;
+
+    for mut b in bodies {
+        // A handful of names per chunk at most, so this is a couple of passes
+        // over the batch metadata and nothing per event.
+        let mut locals: Vec<Arc<str>> = Vec::new();
+        for name in b.games.0.values() {
+            if !locals.iter().any(|l| Arc::ptr_eq(l, name)) {
+                locals.push(Arc::clone(name));
+            }
+        }
+        for local in &locals {
+            let Some(canon) = canonical.get(local).map(Arc::clone) else {
+                continue;
+            };
+            if Arc::ptr_eq(local, &canon) {
+                continue;
+            }
+            for m in &mut b.batches {
+                if m.game.as_ref().is_some_and(|g| Arc::ptr_eq(g, local)) {
+                    m.game = Some(Arc::clone(&canon));
+                }
+            }
+        }
+
+        if b.last_good > 0 {
+            last_good_line = base + b.last_good;
+        }
+        bad_lines.count += b.bad.count;
+        if let Some(first) = b.bad.first_line {
+            bad_lines.first_line.get_or_insert(base + first);
+        }
+        if let Some(last) = b.bad.last_line {
+            bad_lines.last_line = Some(base + last);
+        }
+        if bad_lines.first_error.is_none() {
+            bad_lines.first_error = b.bad.first_error.take();
+        }
+        total_drops += b.total_drops;
+        total_abs_frames += b.total_abs_frames;
+        base += b.lines;
+
+        batches.append(&mut b.batches);
+        markers.append(&mut b.markers);
+        events.append(&mut b.events);
+    }
+
     bad_lines.seal(last_good_line);
     warn_bad_lines(path, &bad_lines);
     let load_ms = progress.finish(path, events.len());
 
-    Ok(LoadedSession {
+    LoadedSession {
         path: path.to_path_buf(),
         config,
         events,
@@ -676,7 +821,158 @@ pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
         bad_lines,
         bytes: size,
         load_ms,
-    })
+    }
+}
+
+/// How many workers [`load_session`] gives a recording of `size` bytes.
+/// One means the sequential path.
+fn load_workers(size: u64) -> usize {
+    if size < PARALLEL_MIN_BYTES {
+        return 1;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let by_size = (size / MIN_CHUNK_BYTES).max(1);
+    cpus.min(by_size as usize).clamp(1, MAX_LOAD_WORKERS)
+}
+
+/// Load a recording fully into memory.
+///
+/// Small recordings are read on this thread; anything past
+/// [`PARALLEL_MIN_BYTES`] is split into one byte range per core and parsed on
+/// worker threads. The result is the same either way — see [`assemble`].
+pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match load_workers(size) {
+        0 | 1 => load_sequential(path),
+        workers => load_parallel(path, workers),
+    }
+}
+
+/// The one-thread read: header, then every body line in order.
+fn load_sequential(path: &Path) -> Result<LoadedSession, LoadError> {
+    let (mut reader, size) = open(path)?;
+    let mut progress = LoadProgress::start(path, size);
+    let mut line = String::with_capacity(64 * 1024);
+    let (config, header_lines, header_bytes) = read_header(path, &mut reader, &mut line)?;
+    drop(line);
+    progress.advance(header_bytes as usize, 0);
+
+    let body = parse_body(
+        path,
+        &mut reader,
+        (size / BYTES_PER_EVENT) as usize,
+        Some(&mut progress),
+    )?;
+    Ok(assemble(
+        path,
+        config,
+        size,
+        header_lines,
+        vec![body],
+        progress,
+    ))
+}
+
+/// The chunk-parallel read: `workers` byte ranges, each starting on a line
+/// boundary, parsed on their own threads and stitched in order.
+///
+/// Progress is reported once at the end rather than at byte milestones: no
+/// thread sees the file go by in order, and a load this path is taken for
+/// finishes in a fraction of a second anyway.
+fn load_parallel(path: &Path, workers: usize) -> Result<LoadedSession, LoadError> {
+    let (mut reader, size) = open(path)?;
+    let mut progress = LoadProgress::start(path, size);
+    let mut line = String::with_capacity(64 * 1024);
+    let (config, header_lines, header_bytes) = read_header(path, &mut reader, &mut line)?;
+    drop(reader);
+    drop(line);
+
+    let bounds = chunk_bounds(path, header_bytes, size, workers)?;
+    let bodies = std::thread::scope(|scope| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .map(|w| {
+                let (from, to) = (w[0], w[1]);
+                scope.spawn(move || parse_range(path, from, to))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect::<Result<Vec<Body>, LoadError>>()
+    })?;
+
+    progress.complete(size);
+    Ok(assemble(path, config, size, header_lines, bodies, progress))
+}
+
+/// Line-aligned split points over `[start, size)`, `workers + 1` of them.
+///
+/// Each interior boundary is pushed forward to just past the next newline, so
+/// the line straddling a nominal split belongs to the chunk before it and no
+/// line is parsed twice or dropped. Boundaries are kept non-decreasing, which
+/// is what makes an empty chunk (a file with fewer lines than workers, or one
+/// enormous line) harmless rather than a panic.
+fn chunk_bounds(path: &Path, start: u64, size: u64, workers: usize) -> Result<Vec<u64>, LoadError> {
+    let mut file = File::open(path).map_err(|source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let span = size.saturating_sub(start);
+    let mut bounds = Vec::with_capacity(workers + 1);
+    bounds.push(start);
+    for i in 1..workers as u64 {
+        let nominal = start + span * i / workers as u64;
+        let at = next_line_start(path, &mut file, nominal, size)?;
+        let previous = *bounds.last().expect("seeded with start");
+        bounds.push(at.max(previous));
+    }
+    bounds.push(size.max(start));
+    Ok(bounds)
+}
+
+/// The offset just past the first newline at or after `from`, or `size` when
+/// the rest of the file has none.
+fn next_line_start(path: &Path, file: &mut File, from: u64, size: u64) -> Result<u64, LoadError> {
+    if from >= size {
+        return Ok(size);
+    }
+    let io = |source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    file.seek(SeekFrom::Start(from)).map_err(io)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut at = from;
+    loop {
+        let n = file.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            return Ok(size);
+        }
+        if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
+            return Ok(at + i as u64 + 1);
+        }
+        at += n as u64;
+    }
+}
+
+/// Parse the body lines in `[from, to)`. Both ends are line boundaries, so this
+/// is the same loop the sequential path runs, over a slice of the same file.
+fn parse_range(path: &Path, from: u64, to: u64) -> Result<Body, LoadError> {
+    if from >= to {
+        return Ok(Body::default());
+    }
+    let io = |source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = File::open(path).map_err(io)?;
+    file.seek(SeekFrom::Start(from)).map_err(io)?;
+    let span = to - from;
+    let mut reader = BufReader::with_capacity(1 << 20, file.take(span));
+    parse_body(path, &mut reader, (span / BYTES_PER_EVENT) as usize, None)
 }
 
 /// One warning per load, with what a person needs to decide whether the
@@ -991,6 +1287,165 @@ mod tests {
             buttons,
             ..Default::default()
         }
+    }
+
+    /// Everything a caller can observe about a load, compared between the two
+    /// paths. `load_ms` is wall time and `path` is the argument, so neither
+    /// says anything about the parse.
+    fn assert_same_load(path: &Path, workers: usize) {
+        let want = load_sequential(path).expect("sequential load");
+        let got = load_parallel(path, workers).expect("parallel load");
+        let at = format!("{} with {workers} workers", path.display());
+        assert_eq!(want.config, got.config, "config, {at}");
+        assert_eq!(want.events, got.events, "events, {at}");
+        assert_eq!(want.markers, got.markers, "markers, {at}");
+        assert_eq!(want.batches, got.batches, "batches, {at}");
+        assert_eq!(want.total_drops, got.total_drops, "drops, {at}");
+        assert_eq!(
+            want.total_abs_frames, got.total_abs_frames,
+            "abs frames, {at}"
+        );
+        assert_eq!(want.bad_lines, got.bad_lines, "bad lines, {at}");
+        assert_eq!(want.bytes, got.bytes, "bytes, {at}");
+
+        // The interner has to survive the split too: one allocation per
+        // distinct name across the whole file, not one per chunk.
+        let mut seen: Vec<Arc<str>> = Vec::new();
+        for b in got.batches.iter().filter_map(|b| b.game.clone()) {
+            match seen.iter().find(|s| ***s == *b) {
+                Some(first) => assert!(Arc::ptr_eq(first, &b), "interning split, {at}"),
+                None => seen.push(b),
+            }
+        }
+    }
+
+    /// A body with every shape the loader distinguishes: batches under both
+    /// spellings of one process, a blank line, a marker, a second session
+    /// envelope, a line whose tag is not where the fast path looks, interior
+    /// corruption and a cut-off tail.
+    fn mixed_lines(cfg: &SessionConfig) -> Vec<String> {
+        let mut lines = vec![Envelope::Session(cfg.clone()).to_json().unwrap()];
+        for i in 0..40u64 {
+            let game = if i % 3 == 0 { "CS2.exe" } else { "cs2.exe" };
+            let events = (0..5)
+                .map(|k| ev(cfg.anchor.qpc + i * 10_000 + k * 1_000, 1, -1, 0))
+                .collect();
+            lines.push(
+                batch_env(cfg, i, Some(game), (i % 4) as u32, events)
+                    .to_json()
+                    .unwrap(),
+            );
+            match i {
+                7 => lines.push(String::new()),
+                11 => lines.push(r#"{"type":"batch","session_id":"s-tes"#.to_string()),
+                19 => lines.push(
+                    Envelope::Marker(Marker {
+                        session_id: cfg.session_id.clone(),
+                        seq_no: 0,
+                        ts_qpc: cfg.anchor.qpc + 200_000,
+                        ts_utc_us: cfg.anchor.qpc_to_utc_us(cfg.anchor.qpc + 200_000),
+                        label: "clutch".into(),
+                    })
+                    .to_json()
+                    .unwrap(),
+                ),
+                23 => lines.push(Envelope::Session(cfg.clone()).to_json().unwrap()),
+                29 => lines.push(
+                    // Valid envelope, tag not first: takes the general path.
+                    r#"{"session_id":"s-test","type":"marker","seq_no":1,"ts_qpc":1,"ts_utc_us":1,"label":"late"}"#
+                        .to_string(),
+                ),
+                31 => lines.push("not json at all".to_string()),
+                _ => {}
+            }
+        }
+        lines.push(r#"{"type":"batch","truncated"#.to_string());
+        lines
+    }
+
+    /// The chunk-parallel loader must answer exactly what the sequential one
+    /// answers, whatever the worker count and wherever the chunk boundaries
+    /// land — including in the middle of a line, which is the normal case.
+    #[test]
+    fn the_parallel_loader_matches_the_sequential_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let lines = mixed_lines(&cfg);
+
+        let write = |name: &str, sep: &str, trailing: bool| {
+            let mut text = lines.join(sep);
+            if trailing {
+                text.push_str(sep);
+            }
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let files = [
+            write("lf.jsonl", "\n", true),
+            write("crlf.jsonl", "\r\n", true),
+            write("no-trailing-newline.jsonl", "\n", false),
+            write("crlf-no-trailing-newline.jsonl", "\r\n", false),
+        ];
+
+        // Worker counts well past the line count force empty chunks and
+        // boundaries that land inside lines.
+        for path in &files {
+            for workers in [1, 2, 3, 5, 8, 13, 64] {
+                assert_same_load(path, workers);
+            }
+        }
+
+        // The fixture is worth something only if it has the damage it claims.
+        let s = load_sequential(&files[0]).unwrap();
+        assert_eq!(s.events.len(), 200);
+        assert_eq!(s.markers.len(), 2);
+        assert_eq!(s.bad_lines.count, 3);
+        assert!(!s.bad_lines.tail_only, "corruption reaches into the body");
+        assert_eq!(s.dominant_game().as_deref(), Some("cs2.exe"));
+    }
+
+    /// A body that is one line, and a body with fewer lines than workers: both
+    /// end up with empty chunks, which must be as harmless as any other.
+    #[test]
+    fn degenerate_splits_are_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let one_batch = batch_env(
+            &cfg,
+            0,
+            Some("cs2.exe"),
+            0,
+            (0..2_000)
+                .map(|k| ev(cfg.anchor.qpc + k * 1_000, 1, 0, 0))
+                .collect(),
+        )
+        .to_json()
+        .unwrap();
+
+        let header = Envelope::Session(cfg.clone()).to_json().unwrap();
+        for (name, text) in [
+            ("one-line.jsonl", format!("{header}\n{one_batch}\n")),
+            ("no-body.jsonl", format!("{header}\n")),
+            ("header-only-unterminated.jsonl", header.clone()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            for workers in [1, 2, 7, 33] {
+                assert_same_load(&path, workers);
+            }
+        }
+    }
+
+    /// The split is only used where it pays for itself.
+    #[test]
+    fn small_recordings_stay_on_the_sequential_path() {
+        assert_eq!(load_workers(0), 1);
+        assert_eq!(load_workers(PARALLEL_MIN_BYTES - 1), 1);
+        assert!(load_workers(1 << 30) >= 1);
+        assert!(load_workers(1 << 30) <= MAX_LOAD_WORKERS);
+        // No chunk smaller than MIN_CHUNK_BYTES, whatever the core count.
+        assert!(load_workers(PARALLEL_MIN_BYTES) <= 2);
     }
 
     #[test]
