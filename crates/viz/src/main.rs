@@ -14,6 +14,7 @@
 mod hub;
 mod recordings;
 mod server;
+mod shutdown;
 mod stats;
 mod udp;
 
@@ -29,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::hub::Hub;
 use crate::server::AppState;
+use crate::shutdown::Shutdown;
 
 #[cfg(feature = "observability")]
 use std::time::Instant;
@@ -67,10 +69,23 @@ const FEATURES: &[&str] = &[
     },
 ];
 
+/// How long open connections get to finish after a stop is asked for.
+///
+/// The bridge owns no sinks — there is nothing to flush — so a stop is only
+/// the accept loop closing and every socket saying goodbye, which takes
+/// milliseconds. What this bounds is the connection that will *not* end on
+/// its own: a half-sent request, a keep-alive socket a browser is holding, a
+/// replay body still streaming a 400 MB recording. Waiting for those is how a
+/// graceful stop turns into `telemouse-ctl` terminating the process after its
+/// whole grace period (`ctl.stop_grace_secs`, 8 s by default, 3 s when
+/// Windows is the one waiting), so the deadline sits far below both.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_millis(750);
+
 /// How long a terminal console event (window close, logoff, shutdown) is held
-/// while this process tidies up. The bridge owns no sinks — there is nothing
-/// to flush — so this is only the moment it takes to say goodbye in the log.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+/// while this process tidies up. Windows takes the process the moment the
+/// handler returns, so this has to outlast [`SHUTDOWN_DEADLINE`] — otherwise
+/// the handler releases while the server is still closing sockets.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -135,13 +150,31 @@ async fn main() -> Result<()> {
     });
     telemouse_core::panic_hook::install("viz");
 
-    // Nothing here holds unflushed state, so a console close only needs to
-    // say what happened before Windows takes the process.
-    if let Err(e) =
-        telemouse_core::shutdown::install(|signal| info!(%signal, "shutting down"), SHUTDOWN_GRACE)
-    {
-        warn!(error = %e, "could not install the console control handler");
-    }
+    // The control panel stops this process with a Ctrl-Break, and a handler
+    // that reports the event as handled is also a handler that has taken
+    // responsibility for leaving: Windows' default "terminate now" no longer
+    // runs. So the handler fires the signal and the server below acts on it.
+    let stop = Shutdown::new();
+    let guard = match telemouse_core::shutdown::install(
+        {
+            let stop = stop.clone();
+            move |signal| {
+                info!(
+                    %signal,
+                    blocking = signal.is_terminal(),
+                    "console control event; stopping"
+                );
+                stop.fire();
+            }
+        },
+        SHUTDOWN_GRACE,
+    ) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            warn!(error = %e, "could not install the console control handler");
+            None
+        }
+    };
 
     #[cfg(feature = "logging")]
     if let Some(err) = &log.file_error {
@@ -152,10 +185,16 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "logging"))]
     let log_file: Option<PathBuf> = None;
 
-    serve(args, log_file).await
+    let result = serve(args, log_file, stop).await;
+    // Release a handler still blocked on a close, a logoff or a system
+    // shutdown: the sockets are closed and Windows may have the process.
+    if let Some(guard) = guard {
+        guard.finished();
+    }
+    result
 }
 
-async fn serve(args: ServeArgs, log_file: Option<PathBuf>) -> Result<()> {
+async fn serve(args: ServeArgs, log_file: Option<PathBuf>, stop: Shutdown) -> Result<()> {
     // Relative paths inside the config are relative to the config file, and a
     // config named but not found beside the working directory is looked for
     // beside the executable (see `telemouse_core::paths`).
@@ -235,6 +274,9 @@ async fn serve(args: ServeArgs, log_file: Option<PathBuf>) -> Result<()> {
             udp: udp_addr_s.clone(),
             http: http_addr_s.clone(),
         }),
+        // Every connected page holds a task of its own; each one watches this
+        // and sends a `Close` frame rather than being cut off mid-stop.
+        shutdown: stop.clone(),
     };
     // With the peer address attached, so the network gate can tell a
     // second PC from a browser on this one.
@@ -265,9 +307,58 @@ async fn serve(args: ServeArgs, log_file: Option<PathBuf>) -> Result<()> {
         "telemouse-viz serving; dashboard http://{browse}/ — OBS browser source http://{browse}/obs{lan_hint}"
     );
 
-    axum::serve(listener, app)
-        .await
-        .context("http server failed")?;
+    serve_until_stopped(listener, app, hub, stop).await
+}
+
+/// The service half of the router, with the peer address attached.
+type MakeService =
+    axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, server::Peer>;
+
+/// Serve until `stop` fires, then close.
+///
+/// Two futures race. The first is the server's own graceful shutdown: the
+/// listener stops accepting, in-flight requests finish, idle keep-alive
+/// connections are closed, and it resolves when the last connection is gone —
+/// which is the right answer, and not one that can be waited on
+/// unconditionally, because "the last connection" includes a peer that has no
+/// reason to ever go away. The second is [`SHUTDOWN_DEADLINE`] measured from
+/// the signal: when it wins, the remaining connections are dropped with the
+/// server and the process leaves anyway, on its own terms, rather than
+/// waiting to be terminated.
+///
+/// Either way `main` returns `Ok`, so a stop is exit code 0 — a clean stop,
+/// as the control panel and anything else watching this process reads it.
+async fn serve_until_stopped(
+    listener: NoDelayListener,
+    app: MakeService,
+    hub: Arc<Hub>,
+    stop: Shutdown,
+) -> Result<()> {
+    let server = axum::serve(listener, app).with_graceful_shutdown({
+        let stop = stop.clone();
+        async move { stop.wait().await }
+    });
+    let deadline = async {
+        stop.wait().await;
+        tokio::time::sleep(SHUTDOWN_DEADLINE).await;
+    };
+
+    tokio::select! {
+        result = server => {
+            result.context("http server failed")?;
+            info!("stopped; every connection closed");
+        }
+        () = deadline => {
+            // The one line that says *what* a stop was waiting on. Without it
+            // the evidence is a process that took a second longer than it
+            // should have and nothing to say why.
+            warn!(
+                ws_clients = hub.stats.snapshot().clients,
+                deadline_ms = SHUTDOWN_DEADLINE.as_millis() as u64,
+                "stopped; connections were still open at the deadline (a held keep-alive socket or a recording still streaming) and were dropped"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -519,6 +610,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            Shutdown::new(),
         )
         .await
         .expect_err("a broken config must not start the server");
@@ -534,15 +626,170 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                Shutdown::new(),
             )
             .await
             .is_err()
         );
     }
 
+    /// A running server, an ephemeral port, and the signal the console
+    /// handler fires. Returns the address, the state the handlers see, and
+    /// the task the server is running on.
+    async fn served(
+        dir: &std::path::Path,
+        stop: Shutdown,
+    ) -> (SocketAddr, Arc<Hub>, tokio::task::JoinHandle<Result<()>>) {
+        let hub = Arc::new(Hub::new());
+        let state = AppState {
+            hub: hub.clone(),
+            recordings_dir: dir.to_path_buf(),
+            pages: Arc::new(server::Pages::render(
+                &telemouse_core::config::ObsConfig::default(),
+                "127.0.0.1:7878",
+            )),
+            sessions: Arc::new(server::SessionsCache::default()),
+            addrs: Arc::new(server::Addrs::default()),
+            shutdown: stop.clone(),
+        };
+        let app = server::router(state).into_make_service_with_connect_info::<server::Peer>();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let task = tokio::spawn(serve_until_stopped(
+            NoDelayListener::new(tcp),
+            app,
+            hub.clone(),
+            stop,
+        ));
+        (addr, hub, task)
+    }
+
+    /// Read a response head (everything up to the blank line) off a raw
+    /// socket. Enough to see the `101` a WebSocket upgrade answers with.
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = sock.read(&mut byte).await.unwrap();
+            assert!(n == 1, "the server closed before answering the handshake");
+            head.push(byte[0]);
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// A dashboard tab: a real upgraded `/ws`, held open and never read from.
+    /// Hand-rolled rather than pulled in as a dependency — the server does
+    /// the interesting half, and the client only has to exist.
+    async fn connect_ws(addr: SocketAddr, hub: &Hub) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Origin: http://{addr}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let head = read_head(&mut sock).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        // The upgrade is answered before the client task has registered, so
+        // wait for the socket the stop has to let go of to exist.
+        for _ in 0..200 {
+            if hub.stats.snapshot().clients == 1 {
+                return sock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the ws client never registered");
+    }
+
+    /// The bug this guards against: viz stayed up through a graceful stop, so
+    /// `telemouse-ctl` sat out its whole grace period and terminated it. A
+    /// live WebSocket is the case that made it visible — the socket outlives
+    /// the HTTP connection it was upgraded from, so nothing but the signal
+    /// itself will ever close it.
+    #[tokio::test]
+    async fn a_stop_finishes_with_a_websocket_client_connected() {
+        use tokio::io::AsyncReadExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = Shutdown::new();
+        let (addr, hub, task) = served(tmp.path(), stop.clone()).await;
+        let mut ws = connect_ws(addr, &hub).await;
+
+        let started = std::time::Instant::now();
+        stop.fire();
+        tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), task)
+            .await
+            .expect("the server must stop, connected client or not")
+            .unwrap()
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < SHUTDOWN_DEADLINE,
+            "a client that is told to go should not cost the deadline: {took:?}"
+        );
+
+        // And the page was told, so it shows "disconnected" and reconnects
+        // instead of waiting on a socket nobody will write to again.
+        let mut frame = [0u8; 2];
+        ws.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame[0], 0x88, "a Close frame, not a dropped socket");
+    }
+
+    /// The deadline is the other half: a connection that will not finish on
+    /// its own (here a request whose headers never end — a browser holding a
+    /// keep-alive socket, or a 400 MB replay still streaming, do the same)
+    /// must not turn a stop into a termination.
+    #[tokio::test]
+    async fn a_stop_is_bounded_by_the_deadline() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = Shutdown::new();
+        let (addr, _hub, task) = served(tmp.path(), stop.clone()).await;
+
+        let mut half = tokio::net::TcpStream::connect(addr).await.unwrap();
+        half.write_all(format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        stop.fire();
+        tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), task)
+            .await
+            .expect("the deadline must end the wait")
+            .unwrap()
+            .unwrap();
+        let took = started.elapsed();
+        // Bounded, and bounded well below `ctl.stop_grace_secs`.
+        assert!(
+            took < SHUTDOWN_DEADLINE + Duration::from_secs(1),
+            "a stop must not outlast the deadline by much: {took:?}"
+        );
+        drop(half);
+    }
+
+    /// The numbers the comments above rest on: the process has to be gone
+    /// long before the panel gives up on it, including the clamped grace a
+    /// Windows shutdown gets.
+    #[test]
+    fn the_deadline_fits_inside_the_panels_grace_period() {
+        assert!(SHUTDOWN_DEADLINE < Duration::from_secs(3));
+        assert!(
+            SHUTDOWN_GRACE > SHUTDOWN_DEADLINE,
+            "a terminal console event must be held until teardown is done"
+        );
+    }
+
     /// A config that is simply not there is the zero-configuration case, and
     /// must still serve. (It gets as far as binding a port, so the test asks
-    /// for one the OS picks and then tears the process's task down with it.)
+    /// for one the OS picks and then stops it the way a Ctrl-Break would.)
     #[tokio::test]
     async fn a_missing_config_is_not_an_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -554,11 +801,17 @@ mod tests {
             log_dir: None,
         };
         // `serve` only returns when the listener stops, so give it a moment
-        // to get past config loading and the bind, then drop it.
-        let task = tokio::spawn(serve(args, None));
+        // to get past config loading and the bind, then ask it to stop.
+        let stop = Shutdown::new();
+        let task = tokio::spawn(serve(args, None, stop.clone()));
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!task.is_finished(), "the server should still be serving");
-        task.abort();
+        stop.fire();
+        tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(2), task)
+            .await
+            .expect("an idle server must stop on the signal")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
