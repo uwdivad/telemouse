@@ -105,6 +105,11 @@ pub struct Accepted<'a> {
     pub text: Frame,
     /// True for `{"type":"session"}` envelopes, which the hub caches.
     pub is_session: bool,
+    /// True for `{"type":"heartbeat"}` — the capture agent's once-a-second
+    /// "still here, hand still". Forwarded like anything else (the page needs
+    /// it to tell an idle agent from a dead one) but kept out of the
+    /// *telemetry* measurements: see [`Hub::publish_at`].
+    pub is_heartbeat: bool,
     /// `ts_anchor_us` of a `batch`, for the latency estimator. `None` on
     /// non-batches and on batches from a capture agent that omitted it.
     pub ts_anchor_us: Option<i64>,
@@ -132,10 +137,11 @@ pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted<'_>, RejectReason> {
     }
     let probe: TagProbe =
         serde_json::from_str(text).map_err(|e| RejectReason::BadEnvelope(e.to_string()))?;
-    let (is_session, ts_anchor_us) = match probe.kind.as_ref() {
-        "session" => (true, None),
-        "batch" => (false, probe.ts_anchor_us),
-        "marker" => (false, None),
+    let (is_session, is_heartbeat, ts_anchor_us) = match probe.kind.as_ref() {
+        "session" => (true, false, None),
+        "batch" => (false, false, probe.ts_anchor_us),
+        "marker" => (false, false, None),
+        "heartbeat" => (false, true, None),
         other => {
             return Err(RejectReason::BadEnvelope(format!(
                 "unknown envelope type {other:?}"
@@ -145,6 +151,7 @@ pub fn classify_datagram(bytes: &[u8]) -> Result<Accepted<'_>, RejectReason> {
     Ok(Accepted {
         text: Frame::from(text),
         is_session,
+        is_heartbeat,
         ts_anchor_us,
         session_id: probe.session_id,
         seq_no: probe.seq_no,
@@ -247,12 +254,21 @@ impl Hub {
     pub fn publish_at(&self, bytes: &[u8], now_utc_us: i64) -> Result<(), RejectReason> {
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.datagrams.fetch_add(1, Relaxed);
-        if let Some(gap_us) = self.stats.note_datagram(now_utc_us) {
-            // How evenly the agent's batches arrive, independent of how many.
-            self.stats.record_gap(gap_us);
-        }
+        // The feed clock is liveness and takes everything the agent sends,
+        // heartbeats included — that is the whole point of them, and it is
+        // what `/healthz` reports as `feed`.
+        let gap_us = self.stats.note_datagram(now_utc_us);
         match classify_datagram(bytes) {
             Ok(accepted) => {
+                // The gap histogram is a different question — how evenly the
+                // agent's *telemetry* arrives — so a once-a-second heartbeat
+                // contributes no sample. (The first batch after an idle
+                // stretch still records the real gap it ended.)
+                if let Some(gap_us) = gap_us
+                    && !accepted.is_heartbeat
+                {
+                    self.stats.record_gap(gap_us);
+                }
                 if let Some(anchor) = accepted.ts_anchor_us {
                     // End-to-end: capture stamped the batch's first event at
                     // `anchor`, we have it now. Includes batch assembly
@@ -419,6 +435,84 @@ mod tests {
         let a = classify_datagram(json.as_bytes()).unwrap();
         assert!(!a.is_session);
         assert_eq!(a.ts_anchor_us, None);
+    }
+
+    pub fn heartbeat_json() -> String {
+        Envelope::Heartbeat(telemouse_core::Heartbeat {
+            session_id: "s-1".into(),
+            ts_utc_us: 1_756_000_000_000_000,
+        })
+        .to_json()
+        .unwrap()
+    }
+
+    #[test]
+    fn heartbeat_datagram_is_accepted_and_flagged() {
+        let json = heartbeat_json();
+        let a = classify_datagram(json.as_bytes()).unwrap();
+        assert_eq!(a.text, json, "forwarded verbatim, like everything else");
+        assert!(a.is_heartbeat);
+        assert!(!a.is_session, "it must not displace the cached session");
+        assert_eq!(a.ts_anchor_us, None, "not a latency sample");
+        assert_eq!(a.seq_no, None, "not part of the batch sequence");
+    }
+
+    /// A heartbeat is liveness: it keeps `/healthz` out of "stalled" and
+    /// reaches the page, but it is not telemetry and must not turn up in the
+    /// measurements that describe telemetry.
+    #[test]
+    fn heartbeats_refresh_liveness_without_touching_the_telemetry_stats() {
+        let hub = Hub::new();
+        let (_frames, mut rx) = hub.subscribe();
+        let t0 = 1_756_000_000_000_000;
+
+        hub.publish_at(batch_json().as_bytes(), t0).unwrap();
+        // Five seconds of a still hand: one heartbeat a second.
+        for s in 1..=5i64 {
+            hub.publish_at(heartbeat_json().as_bytes(), t0 + s * 1_000_000)
+                .unwrap();
+        }
+
+        let snap = hub.stats.snapshot();
+        assert_eq!(snap.datagrams, 6);
+        assert_eq!(snap.forwarded, 6, "the page needs every one of them");
+        assert_eq!(snap.parse_errors, 0);
+        // The page gets them in order, verbatim.
+        assert_eq!(&*rx.try_recv().unwrap(), batch_json().as_str());
+        assert_eq!(&*rx.try_recv().unwrap(), heartbeat_json().as_str());
+
+        #[cfg(feature = "observability")]
+        {
+            // The feed clock moved, so the bridge does not call this stalled.
+            assert_eq!(hub.stats.last_datagram_age_s(t0 + 5_000_000), Some(0.0));
+            assert_eq!(
+                hub.stats.gap_snapshot().samples,
+                0,
+                "five one-second heartbeats are not five one-second batch gaps"
+            );
+            assert_eq!(hub.stats.latency_snapshot().samples, 1, "the batch only");
+            assert_eq!(hub.stats.seq_gaps(), 0);
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn an_idle_stretch_does_not_renumber_the_batch_sequence() {
+        // The seq-gap counter must survive heartbeats arriving between two
+        // consecutive batches — they carry no `seq_no` at all, so they are
+        // invisible to it.
+        let hub = Hub::new();
+        let batch = |seq: u64| {
+            format!(r#"{{"type":"batch","session_id":"s-1","seq_no":{seq},"events":[]}}"#)
+        };
+        hub.publish(batch(0).as_bytes()).unwrap();
+        for _ in 0..10 {
+            hub.publish(heartbeat_json().as_bytes()).unwrap();
+        }
+        hub.publish(batch(1).as_bytes()).unwrap();
+        assert_eq!(hub.stats.seq_gaps(), 0);
+        hub.publish(batch(4).as_bytes()).unwrap();
+        assert_eq!(hub.stats.seq_gaps(), 2, "2 and 3, and nothing else");
     }
 
     #[test]

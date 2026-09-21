@@ -352,7 +352,9 @@ window_ms, qpc_freq)` does the ms→ticks conversion. T2 owns one.
 
 ```rust
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Envelope { Session(SessionConfig), Batch(Batch), Marker(Marker) }
+pub enum Envelope {
+    Session(SessionConfig), Batch(Batch), Marker(Marker), Heartbeat(Heartbeat),
+}
 ```
 
 One JSON `Envelope` per UDP datagram / JSONL line / Kafka message. `topic()`
@@ -363,6 +365,15 @@ use `seq_no` rather than assuming visibility order across messages or topics.
 `EnvelopeView<'a>` is the borrowing twin for the hot path — only a `Batch`
 variant exists, wrapping a `BatchView`, because session and marker envelopes
 are rare enough to serialize from the owned type.
+
+`Heartbeat { session_id, ts_utc_us }` is the odd one out: a live-path signal,
+not telemetry. The agent sends one a second while no batch is going out, so
+that a still hand stops looking like a dead capture (§6.4, §7.2). Its
+`topic()` is `mouse.heartbeats`, which exists only so the match is total —
+nothing publishes to it, and no heartbeat ever reaches a recording either. It
+deliberately has no `seq_no` and no `ts_anchor_us`, because the viz bridge
+reads exactly those two fields off every datagram for its seq-gap and latency
+estimators; absent, a heartbeat is invisible to both.
 
 Two constants matter: `MAX_UDP_PAYLOAD = 60_000` bytes and
 `MAX_EVENTS_PER_BATCH = 448`. The test `full_batch_fits_in_udp_datagram`
@@ -616,7 +627,8 @@ actually armed the flag — so the per-report cost is a load, not a syscall.
 ### 6.4 T2 — `shipping.rs`
 
 Constants: `MAX_PARK = 25 ms`, `MIN_PARK = 500 µs`, `DRAIN_BUDGET = 8192`
-events per pass, `TICK_INTERVAL = IDLE_PARK = 1 s`, `WARN_INTERVAL = 10 s`.
+events per pass, `TICK_INTERVAL = IDLE_PARK = 1 s`, `WARN_INTERVAL = 10 s`,
+`SESSION_RESEND_INTERVAL = 5 s`, `HEARTBEAT_INTERVAL = 1 s`.
 
 `ShipperCore` wraps the core `Batcher` with the session id, anchor, two
 sequence counters (batches, markers), and two `DropAccountant`s (wrapping
@@ -635,7 +647,18 @@ The loop (`run`, `shipping.rs:343-510`):
    the datagram budget); drain the marker channel; time-based flush; every 1 s
    `tick_all` the sinks for maintenance. JSONL flush timing belongs entirely
    to its writer worker.
-3. Park: if nothing is pending, arm the waker (`begin_park`), re-check the
+3. Two things go to the **udp sink alone**, via `send_live` (never `deliver`,
+   which would put them in the recording and on Kafka): the session envelope
+   again every 5 s, so a viz started mid-session can convert counts to cm and
+   degrees; and an `Envelope::Heartbeat` once a second while nothing else is
+   going out. `HeartbeatGate` decides the second one from the batch counter
+   alone — any progress restarts its quiet clock, so heartbeats and batches
+   are never on the wire together — and it is polled every iteration rather
+   than once a tick, so the clock starts within a batch window of the last
+   batch. It only *fires* on a wake, and once the loop is confirmed idle
+   those are the 1 s `IDLE_PARK`s the sink tick already needs: an idle desk
+   costs one wakeup and one ~70-byte datagram a second, not a new timer.
+4. Park: if nothing is pending, arm the waker (`begin_park`), re-check the
    ring is empty, `park_timeout(1 s)`. If a batch is open, `park_timeout`
    for the remaining window (`park_hint`, 0.5–25 ms) *without* arming the
    waker — events pile up in the ring and are drained in bulk when the window
@@ -906,10 +929,21 @@ the page scrolls instead of squeezing the canvases.
 **Feed state** is time-driven, so the 10 Hz block of `frame()` is what
 evaluates it (nothing arrives to announce that nothing is arriving):
 `ui.refreshConn()` moves the dashboard pill between *waiting for capture on
-udp …*, *live* and *no data for N s* (`feedState`, fixed 3 s), and
-`updateStale()` drives the overlay's indicator. `ui.onBatch()` clears the
-overlay's state the instant a batch arrives. `js-tests/feed.test.mjs` drives
-`frame()` on a fake clock for both.
+udp …*, *live*, *idle · N s* and *no data for N s* (`feedState`, fixed 3 s),
+and `updateStale()` drives the overlay's indicator. `ui.onBatch()` and
+`ui.onHeartbeat()` relax the overlay's state the instant something arrives.
+`js-tests/feed.test.mjs` drives `frame()` on a fake clock for both.
+
+The page keeps **two clocks**, and the difference between them is the whole
+idle story: `ui.lastDataAt` is the last *batch* (what the badge counts), and
+`ui.lastHeartbeatAt` is the agent's last `{"type":"heartbeat"}` (§5.4).
+`ingest` returns on a heartbeat before it touches anything else — no timeline
+entry, no `seq_no` bookkeeping, no latency sample — so every number the page
+shows describes the same stream whether or not the agent is new enough to
+send them. `lastHeartbeatAt` starts at 0 and is never reset by a reconnect
+(the agent is a different process from the socket), so against a capture
+agent from v0.2.0 or earlier `heartbeatAge()` stays `Infinity` and every
+verdict below collapses to what it was.
 
 **OBS mode** (`?obs=1` or the `/obs` route): config layering is built-in
 defaults → `[viz.obs]` → URL params (`layout, bg, hud, hudpos, scale, trail,
@@ -918,14 +952,17 @@ bar, toasts suppressed, no localStorage, **not themed** (the head script pins
 the dark tokens, drops the `color-scheme` hint so the page stays see-through,
 and `PAL` keeps its built-in values; HUD and label colours are fixed light
 text with a shadow because they sit on game footage, not on the page).
-**No feed**: after `stale` seconds without a batch (`[viz.obs] stale_secs`,
-`?stale=`, 0–60, 0 = never) — counted from the last batch, or from page load
-when there has been none, and deliberately blind to the socket so a page
-that is still connecting does not flash it — `body.stale` dims the canvases
-to 40 % and shows a *no feed · 12s* badge top centre (`#feedBadge`); the
-`status` HUD item says the same. The capture agent sends nothing while the
-mouse is still, so a hand at rest for longer than `stale` reads as no feed
-too; raise `stale_secs` (or set 0) if that bothers a stream. **Hidden
+**Idle vs no feed**: after `stale` seconds without a batch (`[viz.obs]
+stale_secs`, `?stale=`, 0–60, 0 = never) — counted from the last batch, or
+from page load when there has been none, and deliberately blind to the socket
+so a page that is still connecting does not flash it — `overlayFeed()` splits
+the quiet in two using the heartbeat clock. Heartbeat within
+`AGENT_ALIVE_SECS` (3, i.e. three missed in a row): `body.idle`, an *idle ·
+12s* badge with a green dot, **canvases untouched** — a still hand is not a
+fault and dimming a stream for it was the bug. Nothing at all: `body.stale`,
+the canvases at 40 % and a *no feed · 12s* badge (`#feedBadge`). The `status`
+HUD item says whichever it is. Both recover instantly rather than at the next
+10 Hz repaint. **Hidden
 source**: `obsSourceVisibleChanged` / `obsSourceActiveChanged` (or
 `visibilitychange` in a plain browser) stop `frame()` from drawing while it
 keeps ticking; coming back repaints once. **Hidden tabs**: rAF stops but the socket
@@ -947,8 +984,11 @@ rebind). UDP capture → viz stays on loopback; only the HTTP/WS side opens up.
 ```
 UDP datagram → udp::listen → hub.publish → classify_datagram (tag probe)
   → record_latency, cache session, broadcast Arc<str> (cap 256)
+      (a heartbeat rides this path too: it refreshes the feed clock and is
+       forwarded, but records no gap, latency or seq sample)
   → client_loop → WebSocket text frame
   → ws.onmessage → JSON.parse → engine.ingest → EventColumns + metas
+      (heartbeat → ui.onHeartbeat and return: liveness, never the timeline)
   → rAF frame(): tick → advance play head → consume → applyIdx (counts→cm/°)
       → Trail/EffectRing → (if dirty) Panel.render → grid, bucketed strokes, rings, head
   → 10 Hz: refreshConn + paintStats (dashboard) / updateStale + paintHud (OBS) / transport
@@ -1210,7 +1250,7 @@ hud_position = "bottom-left"
 scale = 1.0                   # 0.5–4
 trail_secs = 3.0              # 0.3–12
 buffer_ms = 35                # 10–200
-stale_secs = 3.0              # 0–60; seconds without data before the overlay dims and says "no feed" (0 = never)
+stale_secs = 3.0              # 0–60; seconds without a batch before the overlay says "idle" (agent alive) or dims to "no feed" (0 = never)
 grid = true
 legend = false
 labels = false
@@ -1265,6 +1305,17 @@ Reading the batch: `qpc_freq` is 10 MHz, so `ts_qpc` 5000010000 is
 hand travel and, in CS2 at sens 1.0, 0.176° of yaw.
 
 A current-format motion event is just `{"ts_qpc":…,"dx":…,"dy":…}`.
+
+One envelope exists on the UDP path only and so never appears in a file:
+
+```json
+{"type":"heartbeat","session_id":"demo-session","ts_utc_us":1756000004000000}
+```
+
+One a second, and only while no batch is going out — the live viz's proof
+that a motionless trail is a motionless hand rather than a dead agent (§5.4,
+§6.4). It is not written to a recording and not produced to Kafka, so neither
+grows a line a second while somebody holds angle.
 
 Kafka: same JSON, topics `mouse.events` (batches), `mouse.sessions`
 (compacted, session records), `mouse.markers`; key = session id.

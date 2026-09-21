@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use telemouse_core::batch::total_counts;
 use telemouse_core::{
-    BatchView, Batcher, Envelope, EnvelopeView, Marker, QpcAnchor, RawEvent, SessionConfig,
+    BatchView, Batcher, Envelope, EnvelopeView, Heartbeat, Marker, QpcAnchor, RawEvent,
+    SessionConfig,
 };
 
 use crate::context::SharedContext;
@@ -43,8 +44,18 @@ const IDLE_PARK: Duration = TICK_INTERVAL;
 /// A misbehaving sink warns at most this often, with a suppressed count.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// How often the session envelope is repeated to the live viz — and only to
-/// it (see [`resend_session`]).
+/// it (see [`send_live`]).
 pub const SESSION_RESEND_INTERVAL: Duration = Duration::from_secs(5);
+/// How often an otherwise silent agent says hello to the live viz.
+///
+/// A still mouse produces no events and therefore no batches, which on the
+/// viz side is indistinguishable from a capture agent that died — the OBS
+/// overlay said "no feed" at a player who was holding angle. One second is
+/// comfortably under the overlay's smallest useful `stale_secs` (default 3),
+/// and it costs no extra wakeup: once the loop is confirmed idle it already
+/// parks exactly [`IDLE_PARK`] for the sink tick, so the heartbeat rides a
+/// wake that was happening anyway.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Longest the loop ever sleeps between drains: the configured batch window,
 /// so a partial batch is never more than one window late.
@@ -101,6 +112,54 @@ impl DropAccountant {
         let d = total.wrapping_sub(self.last);
         self.last = total;
         d
+    }
+}
+
+/// Decides when the live viz needs an idle heartbeat.
+///
+/// The batch counter is the whole input: any progress at all means the viz is
+/// already hearing from us and needs nothing extra, and the quiet clock only
+/// starts once that counter stops moving. Pure, so "no heartbeat while
+/// batches flow" is a test rather than a claim.
+///
+/// [`due`](Self::due) is meant to be called once per shipping-loop iteration
+/// rather than once per tick: while events are flowing the loop turns over
+/// every batch window, so the quiet clock starts within a window of the last
+/// batch instead of up to a second late.
+#[derive(Debug)]
+pub struct HeartbeatGate {
+    interval: Duration,
+    batches: u64,
+    quiet_since: Instant,
+}
+
+impl HeartbeatGate {
+    pub fn new(batches: u64, now: Instant) -> Self {
+        Self::with_interval(HEARTBEAT_INTERVAL, batches, now)
+    }
+
+    /// Same, at a different cadence — for the tests.
+    pub fn with_interval(interval: Duration, batches: u64, now: Instant) -> Self {
+        Self {
+            interval,
+            batches,
+            quiet_since: now,
+        }
+    }
+
+    /// True when a heartbeat is due now: the batch counter has not moved
+    /// since the last call, and it has been quiet for a full interval.
+    pub fn due(&mut self, batches: u64, now: Instant) -> bool {
+        if batches != self.batches {
+            self.batches = batches;
+            self.quiet_since = now;
+            return false;
+        }
+        if now.duration_since(self.quiet_since) < self.interval {
+            return false;
+        }
+        self.quiet_since = now;
+        true
     }
 }
 
@@ -306,6 +365,16 @@ impl ShipperCore {
         Some(batch)
     }
 
+    /// The "still here, hand still" datagram for the live viz. Carries no
+    /// sequence number by design (see [`telemouse_core::Heartbeat`]), so it
+    /// takes `&self` and has no counter to advance.
+    pub fn build_heartbeat(&self, now_qpc: u64) -> Heartbeat {
+        Heartbeat {
+            session_id: self.session_id.clone(),
+            ts_utc_us: self.anchor.qpc_to_utc_us(now_qpc),
+        }
+    }
+
     pub fn build_marker(&mut self, ts_qpc: u64, label: String) -> Marker {
         let seq_no = self.marker_seq;
         self.marker_seq += 1;
@@ -412,6 +481,7 @@ pub fn run(
 
     let mut last_tick = Instant::now();
     let mut last_resend = Instant::now();
+    let mut heartbeat = HeartbeatGate::new(stats.batches.load(Ordering::Relaxed), Instant::now());
     // Two-stage idle descent: true once an empty-ring park has already timed
     // out with the ring still empty, i.e. the loop is confirmed idle.
     let mut idle_probe_expired = false;
@@ -489,7 +559,33 @@ pub fn run(
         // convert anything to cm or degrees until it gets one.
         if last_resend.elapsed() >= SESSION_RESEND_INTERVAL {
             last_resend = Instant::now();
-            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &session_env);
+            send_live(
+                &mut enc,
+                &mut sinks,
+                &stats,
+                &mut limiter,
+                &session_env,
+                "session",
+            );
+        }
+
+        // Nothing moved for a second: tell the live viz we are still here, so
+        // a still hand does not read as a dead agent. Polled every iteration
+        // (it is two loads and a compare) so the quiet clock starts within a
+        // batch window of the last batch, but it can only *fire* on a wake,
+        // and once idle those are the once-a-second parks the tick already
+        // needs. Never while shutting down: the last thing on the wire should
+        // be the final batch.
+        if !stopping && heartbeat.due(stats.batches.load(Ordering::Relaxed), Instant::now()) {
+            let env = Envelope::Heartbeat(core.build_heartbeat(platform::qpc()));
+            send_live(
+                &mut enc,
+                &mut sinks,
+                &stats,
+                &mut limiter,
+                &env,
+                "heartbeat",
+            );
         }
 
         if stopping && drained == 0 && core.pending() == 0 {
@@ -569,22 +665,30 @@ pub fn run(
     );
 }
 
-/// Repeat the session envelope to the live viz, and *only* to it.
+/// Deliver an envelope to the live viz, and *only* to it.
 ///
-/// A viz launched mid-session otherwise shows raw counts forever: the session
-/// record carries the CPI, the device names, the monitor list and the anchor.
-/// It deliberately does not go through `deliver`: a second `session` line in a
-/// recording would change what the file means, and consumers take the first
-/// session envelope of a stream anyway.
-fn resend_session(
+/// Two things ride this path, and neither belongs anywhere else:
+///
+/// * the periodic **session re-send** — a viz launched mid-session otherwise
+///   shows raw counts forever, since the session record carries the CPI, the
+///   device names, the monitor list and the anchor. A second `session` line
+///   in a recording would change what the file means, and consumers take the
+///   first session envelope of a stream anyway.
+/// * the idle **heartbeat** — liveness, not telemetry. A line a second on
+///   disk and a message a second on the broker, both saying nothing, is
+///   exactly what the recording and Kafka do not need.
+///
+/// `what` only names the thing in the failure warning.
+fn send_live(
     enc: &mut EnvelopeEncoder,
     sinks: &mut [Box<dyn Sink>],
     stats: &Stats,
     limiter: &mut WarnLimiter,
     env: &Envelope,
+    what: &'static str,
 ) {
     if let Err(e) = enc.encode(env) {
-        tracing::error!(error = %format!("{e:#}"), "could not serialize the session envelope");
+        tracing::error!(error = %format!("{e:#}"), what, "could not serialize envelope");
         return;
     }
     let Some(failure) = send_to(sinks, "udp", env.topic(), env.key(), enc.payload()) else {
@@ -596,7 +700,8 @@ fn resend_session(
             sink = failure.sink,
             error = %failure.error,
             suppressed,
-            "session re-send failed"
+            what,
+            "live-only send failed"
         );
     }
 }
@@ -1062,7 +1167,7 @@ mod tests {
         // ...every repeat after it goes to the live viz alone, so the
         // recording keeps exactly one session line.
         for _ in 0..3 {
-            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+            send_live(&mut enc, &mut sinks, &stats, &mut limiter, &env, "session");
         }
         assert_eq!(udp.count(), 4);
         assert_eq!(jsonl.count(), 1, "the recording gained no session lines");
@@ -1081,10 +1186,115 @@ mod tests {
         let mut limiter = WarnLimiter::new();
         let env = Envelope::Session(SessionConfig::default());
         for _ in 0..4 {
-            resend_session(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+            send_live(&mut enc, &mut sinks, &stats, &mut limiter, &env, "session");
         }
         assert_eq!(stats.snapshot().udp_errors, 4);
         assert_eq!(limiter.allow("udp", Instant::now()), None);
+    }
+
+    #[test]
+    fn no_heartbeat_while_batches_flow() {
+        let t0 = Instant::now();
+        let mut gate = HeartbeatGate::new(0, t0);
+        // Batches every 25ms for two seconds: the viz is hearing from us, so
+        // there is nothing for a heartbeat to add.
+        let mut batches = 0u64;
+        for step in 1..=80u64 {
+            batches += 1;
+            assert!(
+                !gate.due(batches, t0 + Duration::from_millis(25 * step)),
+                "a heartbeat rode along with batch {batches}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_heartbeat_comes_one_interval_after_the_last_batch() {
+        let t0 = Instant::now();
+        let mut gate = HeartbeatGate::new(0, t0);
+        // Last batch at 500ms, polled by the loop right after.
+        assert!(!gate.due(1, t0 + Duration::from_millis(500)));
+        // The loop keeps turning over; nothing is due until a full interval
+        // of silence has passed, measured from that batch and not from the
+        // start of the session.
+        assert!(!gate.due(1, t0 + Duration::from_millis(525)));
+        assert!(!gate.due(1, t0 + Duration::from_millis(1_499)));
+        assert!(gate.due(1, t0 + Duration::from_millis(1_500)));
+        // ...then once per interval, no faster however often it is polled.
+        for ms in [1_600, 2_000, 2_400] {
+            assert!(!gate.due(1, t0 + Duration::from_millis(ms)));
+        }
+        assert!(gate.due(1, t0 + Duration::from_millis(2_500)));
+    }
+
+    #[test]
+    fn an_agent_that_never_sees_an_event_still_says_hello() {
+        // The case the whole thing exists for: capture is up, the hand has
+        // not moved once, and the viz must not read that as a dead agent.
+        let t0 = Instant::now();
+        let mut gate = HeartbeatGate::new(0, t0);
+        assert!(!gate.due(0, t0 + Duration::from_millis(999)));
+        assert!(gate.due(0, t0 + HEARTBEAT_INTERVAL));
+        assert!(gate.due(0, t0 + HEARTBEAT_INTERVAL * 2));
+    }
+
+    #[test]
+    fn a_resumed_feed_stops_the_heartbeat_again() {
+        let t0 = Instant::now();
+        let mut gate = HeartbeatGate::with_interval(Duration::from_secs(1), 0, t0);
+        assert!(gate.due(0, t0 + Duration::from_secs(1)));
+        assert!(gate.due(0, t0 + Duration::from_secs(2)));
+        // The hand moves: the batch counter advances and the clock restarts.
+        assert!(!gate.due(1, t0 + Duration::from_millis(2_100)));
+        assert!(!gate.due(2, t0 + Duration::from_millis(2_900)));
+        assert!(!gate.due(2, t0 + Duration::from_millis(3_800)));
+        assert!(gate.due(2, t0 + Duration::from_millis(3_900)));
+    }
+
+    /// A heartbeat is liveness for the live viz and nothing else: it must not
+    /// reach the recording or Kafka, and it must carry neither a sequence
+    /// number nor an anchor timestamp (the bridge reads both off every
+    /// datagram, for seq gaps and for latency).
+    #[test]
+    fn the_heartbeat_reaches_the_viz_alone_and_stays_out_of_the_stats() {
+        let a = anchor();
+        let udp = RecordingSink::new("udp");
+        let jsonl = RecordingSink::new("jsonl");
+        let kafka = RecordingSink::new("kafka");
+        let mut sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(udp.clone()),
+            Box::new(jsonl.clone()),
+            Box::new(kafka.clone()),
+        ];
+        let stats = Stats::default();
+        let mut enc = EnvelopeEncoder::new();
+        let mut limiter = WarnLimiter::new();
+
+        let core = ShipperCore::new("s-1".into(), a, 10, 25);
+        let hb = core.build_heartbeat(a.qpc + FREQ * 3);
+        assert_eq!(hb.session_id, "s-1");
+        assert_eq!(hb.ts_utc_us, a.utc_us + 3_000_000);
+
+        let env = Envelope::Heartbeat(hb);
+        send_live(
+            &mut enc,
+            &mut sinks,
+            &stats,
+            &mut limiter,
+            &env,
+            "heartbeat",
+        );
+        assert_eq!(udp.count(), 1);
+        assert_eq!(jsonl.count(), 0, "a recording gains no heartbeat lines");
+        assert_eq!(kafka.count(), 0, "the broker gains no heartbeat messages");
+
+        let payload = udp.payloads.lock().unwrap()[0].clone();
+        assert!(payload.starts_with(r#"{"type":"heartbeat","#));
+        assert!(!payload.contains("seq_no"));
+        assert!(!payload.contains("ts_anchor_us"));
+        // It is not a batch: nothing about the batch accounting moves.
+        assert_eq!(stats.snapshot().batches, 0);
+        assert_eq!(stats.snapshot().udp_errors, 0);
     }
 
     #[test]

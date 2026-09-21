@@ -507,6 +507,14 @@ mod tests {
         for topic in [TOPIC_EVENTS, TOPIC_SESSIONS, TOPIC_MARKERS] {
             assert!(TOPICS.contains(&topic));
         }
+        // ...with one deliberate exception. Heartbeats are liveness for the
+        // live viz; the shipping loop sends them to the udp sink alone and
+        // never fans one out, so no producer is opened for them and a
+        // message a second of "still here" never reaches the broker.
+        assert!(
+            !TOPICS.contains(&telemouse_core::wire::TOPIC_HEARTBEATS),
+            "heartbeats are live-only and must not gain a Kafka producer"
+        );
     }
 
     #[test]

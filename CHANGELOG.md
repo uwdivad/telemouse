@@ -4,6 +4,26 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **A still hand no longer looks like a dead capture agent.** The agent
+  sends a `{"type":"heartbeat", session_id, ts_utc_us}` datagram once a
+  second while no batch is going out, so the viz can tell "capture alive,
+  hand still" from "capture gone". Past `stale_secs` the OBS overlay now
+  shows *idle · 12s* with the panels at full brightness while those
+  heartbeats keep arriving, and only dims to *no feed · 12s* once they stop
+  too; the dashboard's pill says *idle · 12s* instead of *waiting for
+  capture* / *no data for 12s*. The heartbeat is live-only — it is never
+  written to a recording and never produced to Kafka — and carries neither
+  a `seq_no` nor a `ts_anchor_us`, so it cannot disturb the seq-gap counter,
+  the latency estimator or the datagram-gap histogram. It costs no new timer
+  either: the shipping loop already wakes once a second when idle for its
+  sink tick, and the heartbeat rides that wake.
+
+  A `telemouse-viz` from v0.2.0 or earlier ignores the new datagram: it
+  counts one `parse_errors` per heartbeat and logs one warning a minute,
+  and is otherwise unaffected.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon

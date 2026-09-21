@@ -60,8 +60,29 @@ Invoke-RestMethod -Method Post http://127.0.0.1:7880/api/components/capture/stop
 | `GET /api/stats` (full build) | `{ uptime_s, datagrams, datagrams_per_s, forwarded, parse_errors, lag_drops, lag_disconnects, clients, session_cached, latency: { samples, p50_us, p99_us, max_us, mean_us, negative }, seq_gaps, ... }` — the bridge's own counters. |
 | `GET /api/sessions` | `[{ id, path, bytes, modified_epoch_ms, started_utc_us, ended_utc_us, sidecar }]`, newest first. `sidecar` is the parsed `<id>.meta.json` (below) or `null`. Cached for 5 s. |
 | `GET /api/session/{id}` | The raw `.jsonl` recording, streamed. `404` for anything that is not a recording directly in the recordings directory. |
-| `GET /ws` | WebSocket. Every capture envelope (below) forwarded verbatim as a text frame, plus a `{"type":"viz_stats", ...}` frame each second. `Origin`, when present, must be local. At most 16 clients (`503` past that). |
-| `GET /`, `GET /obs` | The dashboard and the OBS overlay (HTML). `/?session=<id>` opens the dashboard straight into replay of that recording (`<id>` must pass `is_safe_id`); `/?at=<local datetime>` picks the recording running then. `/obs` layers URL parameters over `[viz.obs]`: `layout` (or `view`), `bg`, `hud`, `hudpos`, `scale`, `trail`, `buffer`, `grid`, `legend`, `labels`, and `stale` (0–60 s without a batch before the overlay dims and shows *no feed*; `0` = never; default `stale_secs` = 3). The dashboard remembers its theme in `localStorage.tmTheme` (`light`/`dark`, absent = follow the system); the overlay is never themed and stores nothing. |
+| `GET /ws` | WebSocket. Every capture envelope (below) forwarded verbatim as a text frame — including the live-only `heartbeat` — plus a `{"type":"viz_stats", ...}` frame each second. `Origin`, when present, must be local. At most 16 clients (`503` past that). |
+| `GET /`, `GET /obs` | The dashboard and the OBS overlay (HTML). `/?session=<id>` opens the dashboard straight into replay of that recording (`<id>` must pass `is_safe_id`); `/?at=<local datetime>` picks the recording running then. `/obs` layers URL parameters over `[viz.obs]`: `layout` (or `view`), `bg`, `hud`, `hudpos`, `scale`, `trail`, `buffer`, `grid`, `legend`, `labels`, and `stale` (0–60 s without a batch before the overlay stops saying nothing; `0` = never; default `stale_secs` = 3. Past it the overlay shows *idle · 12s* while the agent's heartbeats are still arriving — a still hand — and dims to *no feed · 12s* once they stop too). The dashboard remembers its theme in `localStorage.tmTheme` (`light`/`dark`, absent = follow the system); the overlay is never themed and stores nothing. |
+
+### The UDP stream into it (`[udp] addr`, default `127.0.0.1:7878`)
+
+One JSON envelope per datagram, at most 60 000 bytes, forwarded to `/ws`
+verbatim. It carries the same `session`, `batch` and `marker` envelopes as a
+recording (shapes under *Files on disk*), plus two things a file never holds:
+
+- the `session` envelope is **repeated every 5 s**, so a viz started
+  mid-session can convert counts to cm and degrees;
+- **`heartbeat`**: `{"type":"heartbeat", session_id, ts_utc_us}`, sent once a
+  second and **only while no batch has gone out**. A still mouse produces no
+  events and so no batches, which otherwise reads exactly like a capture
+  agent that died. It carries no `seq_no` and no `ts_anchor_us` on purpose:
+  it is liveness, not telemetry, and must not land in a consumer's sequence
+  or latency accounting. It reaches neither the recording nor Kafka.
+
+A consumer that does not know the tag should ignore the datagram rather than
+treat it as corruption. A `telemouse-viz` from v0.2.0 or earlier does not know
+`heartbeat`: it rejects each one as an unknown envelope type, which is a
+`parse_errors` tick and one `warn` a minute, and nothing else — the batches
+keep flowing and the overlay behaves exactly as it did before.
 
 ## Capture agent — `telemouse` (`crates/capture`)
 
@@ -167,6 +188,9 @@ default `recordings`).
     wheel_h?, device? }] }` — raw counts, zero fields omitted; `ts_qpc` is
     in `qpc_freq` ticks, mapped to UTC through the session anchor.
   - `marker`: `{ session_id, seq_no, ts_qpc, ts_utc_us, label }`.
+  - There is no `heartbeat` line: that envelope exists on the UDP path only
+    (above). A reader that meets one anyway skips it rather than counting a
+    bad line.
 - **`<id>.meta.json`** (full build) — rewritten every 5 s while running with
   `"exit":"running"`, final on a clean stop: `{ session_id,
   capture_version, capture_profile: "release"|"debug", started_utc_us,
@@ -195,7 +219,9 @@ default `recordings`).
 
 Topics `mouse.events` (batches), `mouse.sessions` (session envelopes),
 `mouse.markers`; key = session id; value = the same JSON envelope as the
-JSONL line, zstd-compressed by the producer. Created on connect with the
+JSONL line, zstd-compressed by the producer. Idle heartbeats are not among
+them — `mouse.heartbeats` is a reserved name that nothing publishes to — so
+a still hand costs the broker nothing. Created on connect with the
 broker's defaults. The sink never blocks capture: a stalled broker fills a
 bounded queue and the overflow is counted as `kafka_dropped` (stats line)
 and `sinks.kafka.dropped` (sidecar). `tools/kafka2parquet/` archives the

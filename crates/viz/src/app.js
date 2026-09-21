@@ -122,6 +122,14 @@ const OBS_STALE_MAX = 60;
 /* How long the dashboard's connection pill waits before it stops saying
    "live". Not configurable: the pill is a diagnostic, not stream content. */
 const NO_DATA_SECS = 3;
+/* An idle capture agent sends `{"type":"heartbeat"}` once a second
+   (HEARTBEAT_INTERVAL in crates/capture/src/shipping.rs) so a still hand can
+   be told from a dead agent. Three missed in a row and we stop calling it
+   alive: enough slack for a dropped datagram or a scheduling hiccup, short
+   enough that a killed agent reads as gone rather than idle. A capture agent
+   older than this page sends none, which lands on exactly the old
+   behaviour. */
+const AGENT_ALIVE_SECS = 3;
 
 /** Seconds on the page's own monotonic clock. */
 function nowSec() {
@@ -133,19 +141,24 @@ function nowSec() {
  * connection pill and the OBS stale indicator.
  *
  *   down     — the socket is not open
- *   waiting  — open, but no batch has ever arrived (capture agent not running)
- *   stale    — batches were arriving and stopped
+ *   waiting  — open, but nothing has ever arrived (capture agent not running)
+ *   idle     — no batch, but the agent's heartbeat says it is running and the
+ *              hand is simply still
+ *   stale    — batches were arriving and stopped, and nothing said hello
  *   live     — a batch arrived within `staleAfter`
  *
  * `age` is measured from the last batch, or from when the socket opened when
- * there has never been one. `staleAfter <= 0` disables the stale verdict.
+ * there has never been one. `heartbeatAge` is seconds since the capture
+ * agent's last idle heartbeat, `Infinity` when there has never been one.
+ * `staleAfter <= 0` disables the stale verdict.
  */
 function feedState(o) {
   const since = o.lastBatchAt || o.since || 0;
   const age = since ? Math.max(0, o.now - since) : 0;
+  const alive = o.heartbeatAge <= AGENT_ALIVE_SECS;
   if (!o.connected) return { kind: "down", age: age };
-  if (!o.lastBatchAt) return { kind: "waiting", age: age };
-  if (o.staleAfter > 0 && age > o.staleAfter) return { kind: "stale", age: age };
+  if (!o.lastBatchAt) return { kind: alive ? "idle" : "waiting", age: age };
+  if (o.staleAfter > 0 && age > o.staleAfter) return { kind: alive ? "idle" : "stale", age: age };
   return { kind: "live", age: age };
 }
 
@@ -165,10 +178,28 @@ function feedIsStale(quietFor, staleAfter) {
   return staleAfter > 0 && quietFor > staleAfter;
 }
 
+/**
+ * The overlay's three-state verdict, from the two clocks the page keeps:
+ * seconds since the last batch (`quietFor`) and seconds since the capture
+ * agent's last idle heartbeat (`heartbeatAge`, `Infinity` when there has
+ * never been one).
+ *
+ *   live — inside the grace period; nothing to say
+ *   idle — quiet, but the agent is still there. A still hand is not a dead
+ *          capture, so the panels keep their brightness and only the badge
+ *          speaks.
+ *   down — quiet, and nothing has said hello: no feed.
+ */
+function overlayFeed(quietFor, heartbeatAge, staleAfter) {
+  if (!feedIsStale(quietFor, staleAfter)) return "live";
+  return heartbeatAge <= AGENT_ALIVE_SECS ? "idle" : "down";
+}
+
 /** Connection-pill text for a feed state: class, and what it says. */
 function connPillState(st, udpAddr) {
   switch (st.kind) {
     case "live":    return { cls: "ok", text: "live" };
+    case "idle":    return { cls: "ok", text: "idle · " + Math.round(st.age) + "s" };
     case "waiting": return { cls: "warn", text: "waiting for capture on udp " + (udpAddr || "?") };
     case "stale":   return { cls: "warn", text: "no data for " + Math.round(st.age) + "s" };
     default:        return { cls: "err", text: "disconnected" };
@@ -727,6 +758,14 @@ const engine = {
     const type = env.type;
 
     if (type === "viz_stats") { ui.onVizStats(env); return; }
+
+    /* Liveness, not telemetry. The capture agent sends one a second while
+       nothing is moving, so "hand still" stops looking like "agent dead". It
+       must stay out of everything below: no timeline entry, no seq-gap
+       accounting, no latency sample, no drop marks — the page's numbers have
+       to describe the same stream whether or not the agent is new enough to
+       send these. */
+    if (type === "heartbeat") { ui.onHeartbeat(); return; }
 
     if (type === "session") {
       const id = env.session_id === undefined ? null : env.session_id;
@@ -1704,6 +1743,12 @@ const ui = {
      loaded while there has been none. Unlike `lastBatchAt` no socket event
      resets it; the overlay's "no feed" timer runs off this alone. */
   lastDataAt: nowSec(),
+  /* When the capture agent last said hello with nothing to report. 0 means
+     never — which is also every capture agent that predates the heartbeat,
+     so the page falls back to exactly its old behaviour against one. Not
+     reset by a reconnect: the agent is a different process from the socket,
+     and a heartbeat from half a second ago is still evidence it is alive. */
+  lastHeartbeatAt: 0,
   udpAddr: UDP_ADDR,
   /* Frames the page could not use: unparseable WebSocket messages and bad
      replay lines. Shown in the stats bar next to the bridge's own parse
@@ -1725,7 +1770,27 @@ const ui = {
     /* Recovery is instant rather than "within the next 100ms repaint": an
        overlay that stays dimmed for a tenth of a second after the feed comes
        back is a visible flicker on stream. */
-    if (OBS && staleView.on) updateStale();
+    if (OBS && staleView.kind !== "live") updateStale();
+  },
+
+  /** The capture agent is up with nothing to report.
+
+      Liveness only: it is deliberately not `lastDataAt`, because the number
+      the badge and the pill count is seconds since the hand last moved, and a
+      heartbeat is not the hand moving. */
+  onHeartbeat() {
+    this.lastHeartbeatAt = nowSec();
+    /* Same reason as `onBatch`: an overlay that keeps saying "no feed" for
+       another tenth of a second after the agent is heard from is a visible
+       flicker on stream. */
+    if (OBS && staleView.kind === "down") updateStale();
+  },
+
+  /** Seconds since the last heartbeat; Infinity when there has never been
+      one, which is what makes `AGENT_ALIVE_SECS` a one-sided test. */
+  heartbeatAge(now) {
+    if (now === undefined) now = nowSec();
+    return this.lastHeartbeatAt ? Math.max(0, now - this.lastHeartbeatAt) : Infinity;
   },
 
   /** The pill's live-mode states. The socket's own states (connecting,
@@ -1733,12 +1798,14 @@ const ui = {
       only speaks while the socket is up. */
   refreshConn() {
     if (this.mode !== "live" || !this.wsOpen) return;
+    const now = nowSec();
     const p = connPillState(
       feedState({
         connected: true,
         lastBatchAt: this.lastBatchAt,
         since: this.feedSince,
-        now: nowSec(),
+        now: now,
+        heartbeatAge: this.heartbeatAge(now),
         staleAfter: NO_DATA_SECS,
       }),
       this.udpAddr
@@ -2385,9 +2452,13 @@ function paintBridge(now) {
 /* =====================================================================
    Feed indicator (OBS) and source visibility
 
-   On stream, a dead capture agent looks exactly like a still hand: the
-   trails simply stop moving. The overlay dims its panels and says so, after
-   `?stale=` seconds (0 turns it off), and recovers the instant data returns.
+   On stream, a dead capture agent used to look exactly like a still hand:
+   the trails simply stop moving. The agent now sends a heartbeat once a
+   second while nothing else is going out, which splits that into two
+   verdicts after `?stale=` seconds of quiet (0 turns the indicator off):
+   *idle* — the agent is there, the hand is not moving, so the badge says so
+   and the panels are left alone — and *no feed*, where nothing has said
+   hello either and the panels dim. Both recover the instant data returns.
 
    Visibility is the other half: OBS keeps a hidden browser source's page
    running — script, socket and all — so the only way a source that is not on
@@ -2396,24 +2467,32 @@ function paintBridge(now) {
    fallback in a plain browser, and a page with neither is unchanged.
    ===================================================================== */
 
-const staleView = { on: false, age: 0, badge: null };
+const staleView = { kind: "live", on: false, age: 0, badge: null };
 
-/** Re-evaluate the overlay's "no feed" state. Runs from the 10Hz block of the
-    frame loop (the only thing that can turn it on) and from `ui.onBatch`
-    (which turns it off the instant data returns). While it is on, the badge
-    counts the silence in whole seconds — one text write a second. */
+/** Re-evaluate the overlay's feed verdict. Runs from the 10Hz block of the
+    frame loop (the only thing that can turn it on) and from `ui.onBatch` /
+    `ui.onHeartbeat` (which relax it the instant something arrives). While it
+    is saying anything at all, the badge counts the quiet in whole seconds —
+    one text write a second.
+
+    `staleView.on` stays the *dim* flag alone, so it keeps meaning "no feed":
+    an idle agent is not a fault, and its panels keep their brightness. */
 function updateStale() {
   if (!OBS) return;
-  staleView.age = Math.max(0, nowSec() - ui.lastDataAt);
-  const on = feedIsStale(staleView.age, OBS.stale);
-  if (on !== staleView.on) {
-    staleView.on = on;
-    document.body.classList.toggle("stale", on);
+  const now = nowSec();
+  staleView.age = Math.max(0, now - ui.lastDataAt);
+  const kind = overlayFeed(staleView.age, ui.heartbeatAge(now), OBS.stale);
+  if (kind !== staleView.kind) {
+    staleView.kind = kind;
+    staleView.on = kind === "down";
+    document.body.classList.toggle("stale", kind === "down");
+    document.body.classList.toggle("idle", kind === "idle");
     engine.dirty = true;
   }
-  if (on) {
+  if (kind !== "live") {
     if (!staleView.badge) staleView.badge = $("feedBadge");
-    setText(staleView.badge, "no feed \u00b7 " + fmtQuiet(staleView.age));
+    setText(staleView.badge,
+      (kind === "idle" ? "idle \u00b7 " : "no feed \u00b7 ") + fmtQuiet(staleView.age));
   }
 }
 
@@ -2525,7 +2604,8 @@ function hudValue(key, e) {
       return us === null ? "—" : ((Date.now() * 1000 - us) / 1000).toFixed(1);
     }
     case "status":
-      return staleView.on ? "no feed (" + fmtQuiet(staleView.age) + ")" : "live";
+      if (staleView.kind === "live") return "live";
+      return (staleView.kind === "idle" ? "idle (" : "no feed (") + fmtQuiet(staleView.age) + ")";
   }
   return "—";
 }
@@ -2874,6 +2954,6 @@ window.telemouse = {
   engine: engine, ui: ui, deskPanel: deskPanel, aimPanel: aimPanel,
   prof: prof, profiling: PROFILE, obs: OBS,
   /* For the Node tests, which have no animation frames of their own. */
-  frame: frame, staleView: staleView, feedIsStale: feedIsStale,
+  frame: frame, staleView: staleView, feedIsStale: feedIsStale, overlayFeed: overlayFeed,
   palette: PAL, paletteFromTokens: paletteFromTokens, buildRamp: buildRamp, rampCss: RAMP_CSS,
 };
