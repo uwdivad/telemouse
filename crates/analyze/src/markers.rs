@@ -165,7 +165,7 @@ pub fn segment_reports(
                 for r in p.grid.runs_in(iv.start_cell, iv.end_cell) {
                     let (lo, hi) = r.clip(iv.start_cell, iv.end_cell);
                     for j in lo..hi {
-                        acc += (r.vx[j] * kx).hypot(r.vy[j] * ky) * p.grid.dt;
+                        acc += stats::mag(r.vx[j] * kx, r.vy[j] * ky) * p.grid.dt;
                     }
                 }
                 acc

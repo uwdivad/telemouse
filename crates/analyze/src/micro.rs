@@ -263,7 +263,7 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
     let mut amps_deg = Vec::with_capacity(segs.len());
     for s in segs {
         let (dx, dy) = g.displacement(s.start, s.end);
-        let mag = dx.hypot(dy);
+        let mag = stats::mag(dx, dy);
         amps_counts.push(mag);
         amps_deg.push(p.deg_mag(dx, dy));
         let (ux, uy) = if mag > 0.0 {

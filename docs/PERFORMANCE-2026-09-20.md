@@ -306,6 +306,69 @@ is instantiated): the 10 MHz branch is `mulq` + `shrq $3` with no `div`
 instruction at all, and the one remaining `__divti3` call in the function is
 inside the cold fallback block. `ms_to_ticks` still calls `__udivti3`; it runs
 once per `Batcher`, so it was left alone.
+## Landed — 2026-09-21 (analyzer: A1, A3, A5, A7)
+
+Four of the analyzer rows above are in, all inside `crates/analyze`.
+Measurements below are on the same box but **not the same conditions**: it was
+shared with other builds throughout, so the run-to-run spread is 10–30% rather
+than the ≤3% of the survey. Each figure is the minimum of five interleaved
+before/after runs; medians move the same way and are given where they differ
+interestingly.
+
+| # | What landed | Before | After |
+|---|---|---|---|
+| A1 | Chunk-parallel load: the body is split at newline boundaries into one byte range per core (files ≥ 8 MB, chunks ≥ 4 MB, ≤ 16 workers), parsed on `std::thread::scope` workers and stitched in file order | **load 3078 ms** | **469 ms** (2.5 GB/s) |
+| A3 | `stats::mag` = `(x*x + y*y).sqrt()` at all 17 `hypot` sites | prepare 1362 ms, kinematics 2095 ms | 1177 ms, 1334 ms |
+| A5 | `main` flushes and calls `process::exit`; the library still drops | — | folded into the wall figures |
+| A7 | `trend` analyzes up to 4 sessions at once, bounded by 512 MB of recording bytes in flight | **cold 37.2 s / 29.6 s** | **17.0 s / 16.2 s** |
+
+End to end, `report --quiet` on real recordings:
+
+| Recording | wall before | wall after | Δ |
+|---|---|---|---|
+| `s-20260909-015040-c330` (1156 MB, 15.25 M events) | 6353 ms | **3273 ms** | **−48%** |
+| `s-20260824-141132-df44` (462 MB, 6.86 M events) | 3207 ms | **1805 ms** | **−44%** |
+| `trend`, 36 recordings, cold | 29.6–37.2 s | **16.2–17.0 s** | −45…−54% |
+| `trend`, 36 recordings, warm | 1401 ms | **623 ms** | −56% |
+
+Criterion, same two sizes as the table in §1:
+
+| Bench | before | after | Δ |
+|---|---|---|---|
+| `load_session` 1 M cells (3.4 MiB file — under the threshold, still sequential) | 10.18 ms | 10.68 ms | flat |
+| `load_session` 10 M cells (34 MiB file) | 102.1 ms (337 MiB/s) | **24.3 ms (1.4 GiB/s)** | **−76%** |
+| `prepare` 1 M · 10 M | 14.9 · 200.6 ms | 12.6 · 177.3 ms | −15% · −12% |
+| `flick_detect` 1 M · 10 M | 1.99 · 31.3 ms | 1.84 · 26.9 ms | −8% · −14% |
+| `savgol`, `welch` | 4.25 · 54.9 ms, 6.35 · 67.7 ms | 4.77 · 54.6 ms, 7.52 · 64.2 ms | noise (no `hypot` in either) |
+
+**The numbers do not change.** A full `--json` report from each build, compared
+line by line with the clock and timing fields excluded:
+
+- `s-20260905-065904-3279` (294 MB, 3.91 M events): 1 793 204 lines, **0
+  differing values**.
+- `s-20260909-015040-c330` (1156 MB, 15.25 M events): 2 128 631 lines, **0
+  differing values**.
+- `trend --json` over all 36 recordings: byte-identical.
+
+So the `hypot` → `sqrt` swap came out bit-identical over 19 M events, not
+merely within an ulp; `sparse_grid_matches_a_dense_grid` still asserts exact
+equality because both sides of it compute magnitudes the same way. Cached
+reports written by an earlier build stay valid, which is why nothing bumps
+`ANALYZER_VERSION` or `SCHEMA`.
+
+**Memory did not move.** Peak working set on the 1156 MB session is 2931 MiB
+before and 2932 MiB after: chunks are appended and dropped one at a time, so
+the concatenation never holds two copies of the event vector. A cold `trend`
+goes from 2938 to 2957 MiB — the byte budget does what it is for, running the
+1.2 GB recording on its own while the small ones pack four at a time.
+
+Still open from the analyzer list: A2 (`DeserializeSeed` into the chunk's
+vector), A4 (`qpc_to_utc_us` in `i64` — `telemouse-core`, not this crate), A6
+(fold `prepare`'s event-time pass into the chunk workers), A8 (`<id>.summary.json`
+for `trend`/`list`), A9 (peak memory). A5 landed only as far as the CLI: the
+~2.5 GiB `drop_glue<Prepared>` the profile blamed runs at the end of
+`report::build`, inside the library, and leaking it there would be wrong now
+that `trend` keeps several sessions in flight.
 
 ## Reproducing
 

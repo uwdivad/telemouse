@@ -37,6 +37,7 @@ use telemouse_core::{GameSens, RawEvent, event::buttons, units};
 
 use crate::load::{GameCounts, LoadedSession};
 use crate::savgol::SavGol;
+use crate::stats;
 
 /// Hard ceiling on the *span* the grid may cover, independent of
 /// [`Params::max_grid_cells`].
@@ -672,7 +673,7 @@ impl Prepared {
     /// Magnitude in degrees of a count vector.
     pub fn deg_mag(&self, x: f64, y: f64) -> f64 {
         let (a, b) = self.to_deg(x, y);
-        a.hypot(b)
+        stats::mag(a, b)
     }
 
     pub fn counts_to_cm(&self, counts: f64) -> f64 {
@@ -687,7 +688,7 @@ impl Prepared {
     /// Smoothed aim-space speed at cell `i`, deg/s.
     pub fn aim_speed(&self, i: usize) -> f64 {
         let (kx, ky) = self.aim_scale();
-        (self.grid.vxs(i) * kx).hypot(self.grid.vys(i) * ky)
+        stats::mag(self.grid.vxs(i) * kx, self.grid.vys(i) * ky)
     }
 
     /// Highest aim-space speed in `[a, b)`, deg/s.
@@ -699,7 +700,7 @@ impl Prepared {
         for r in self.grid.runs_in(a, b) {
             let (lo, hi) = r.clip(a, b);
             for j in lo..hi {
-                m = m.max((r.vxs[j] * kx).hypot(r.vys[j] * ky));
+                m = m.max(stats::mag(r.vxs[j] * kx, r.vys[j] * ky));
             }
         }
         m
@@ -1016,8 +1017,17 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
         }
         r.vxs = sg_run(&sg, &r.vx, r.start, n, params.sg_half, dt);
         r.vys = sg_run(&sg, &r.vy, r.start, n, params.sg_half, dt);
-        r.speed_raw = r.vx.iter().zip(&r.vy).map(|(x, y)| x.hypot(*y)).collect();
-        r.speed = r.vxs.iter().zip(&r.vys).map(|(x, y)| x.hypot(*y)).collect();
+        r.speed_raw =
+            r.vx.iter()
+                .zip(&r.vy)
+                .map(|(x, y)| stats::mag(*x, *y))
+                .collect();
+        r.speed = r
+            .vxs
+            .iter()
+            .zip(&r.vys)
+            .map(|(x, y)| stats::mag(*x, *y))
+            .collect();
         r.last_move = last_move_table(&r.speed, params.still_speed);
         r.prev_last_move = prev_last_move;
         if let Some(&v) = r.last_move.last()
@@ -1149,8 +1159,10 @@ mod tests {
         let sg = SavGol::smoother(p.params.sg_half, p.params.sg_order);
         let vxs = sg.apply(&vx, dt);
         let vys = sg.apply(&vy, dt);
-        let speed_raw: Vec<f64> = (0..n).map(|i| vx[i].hypot(vy[i])).collect();
-        let speed: Vec<f64> = (0..n).map(|i| vxs[i].hypot(vys[i])).collect();
+        // `stats::mag`, not `hypot`: the sparse grid uses it too, and this
+        // reference exists to prove the two agree bit for bit.
+        let speed_raw: Vec<f64> = (0..n).map(|i| stats::mag(vx[i], vy[i])).collect();
+        let speed: Vec<f64> = (0..n).map(|i| stats::mag(vxs[i], vys[i])).collect();
         Grid::from_dense(
             dt,
             vx,

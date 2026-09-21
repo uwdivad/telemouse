@@ -314,7 +314,35 @@ fn resolve_session(arg: &str, dir: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
-fn main() -> Result<()> {
+/// Exit without unwinding the heap.
+///
+/// A 1.2 GB recording leaves ~2.5 GiB of grid lanes, per-second rows and event
+/// vectors behind, and freeing them was 6.5% of the analyzer's samples —
+/// `RtlFreeHeap` and `VirtualFree` handing back pages the kernel reclaims
+/// wholesale a moment later anyway (`docs/PERFORMANCE-2026-09-20.md`, A5).
+/// This is a CLI-only shortcut: the library drops everything it owns, so
+/// anything embedding it (or `trend`, which analyzes several sessions at once)
+/// still frees as it goes.
+///
+/// Everything this process writes is flushed before it is called: the report
+/// text through an explicit `BufWriter::flush`, `println!` through `Stdout`'s
+/// line buffering, and `tracing` straight to an unbuffered stderr.
+fn finish(result: Result<()>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        // What `fn main() -> Result<()>` prints: the whole `anyhow` chain.
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn main() -> ! {
+    finish(run())
+}
+
+fn run() -> Result<()> {
     // Before anything else: a double-click from Explorer gets an explanation
     // instead of a window that flashes and vanishes. Exit 2 is what clap's
     // own "no subcommand" usage error returns.

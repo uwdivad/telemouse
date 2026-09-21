@@ -3,6 +3,26 @@
 //! Deliberately dependency-free: every metric module needs medians and
 //! percentiles over `f64` slices and nothing heavier.
 
+/// Length of the vector `(x, y)`.
+///
+/// Not `f64::hypot`: that calls the CRT's `_hypot`, which is written to be
+/// exact for arguments whose squares overflow or flush to zero, and on MSVC it
+/// was **8.5% of all analyzer CPU** — more than `kinematics` (see
+/// `docs/PERFORMANCE-2026-09-20.md`, A3). Everything this crate measures is a
+/// mouse-count quantity: displacements are at most a few thousand counts per
+/// grid cell and speeds a few hundred thousand counts/s, so `x*x + y*y` stays
+/// around 1e11 against a `f64` range that reaches 1e308. The overflow-safe
+/// path buys nothing here and costs a call.
+///
+/// The results differ from `hypot`'s by at most one ulp, so anything that
+/// compares two magnitudes must compare them to a tolerance — which is what
+/// the metric tests already do. Grid parity tests that demand exact equality
+/// compare two computations that both come through here.
+#[inline]
+pub fn mag(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
+}
+
 /// Sort a copy of `xs` ascending, dropping non-finite values.
 ///
 /// `sort_unstable_by` rather than `sort_by`: the samples are plain `f64`s with

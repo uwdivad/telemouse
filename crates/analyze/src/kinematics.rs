@@ -111,10 +111,10 @@ pub fn compute(p: &Prepared) -> Kinematics {
             }
             moving += 1;
             speeds.push(r.speed[j]);
-            accel.push(ax[j].hypot(ay[j]));
-            jerk.push(jx[j].hypot(jy[j]));
+            accel.push(stats::mag(ax[j], ay[j]));
+            jerk.push(stats::mag(jx[j], jy[j]));
             if p.aim_cell_ok(r.start + j) {
-                speeds_deg.push((r.vxs[j] * kx).hypot(r.vys[j] * ky));
+                speeds_deg.push(stats::mag(r.vxs[j] * kx, r.vys[j] * ky));
             }
         }
     }
@@ -139,9 +139,9 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let mut net_y = 0i64;
     for (i, e) in p.analysed_events().iter().enumerate() {
         let (dx, dy) = (e.dx as f64, e.dy as f64);
-        dist_counts += dx.hypot(dy);
+        dist_counts += stats::mag(dx, dy);
         if p.aim_event_ok(i) {
-            dist_deg += (dx * kx).hypot(dy * ky);
+            dist_deg += stats::mag(dx * kx, dy * ky);
             net_x += e.dx as i64;
             net_y += e.dy as i64;
         }
@@ -160,7 +160,7 @@ pub fn compute(p: &Prepared) -> Kinematics {
         if path <= 0.0 {
             continue;
         }
-        let net = dx.hypot(dy);
+        let net = stats::mag(dx, dy);
         effs.push((net / path).min(1.0));
         sum_net += net;
         sum_path += path;
@@ -244,7 +244,7 @@ pub fn path_efficiency_in(p: &Prepared, a: usize, b: usize) -> (f64, f64) {
         if path <= 0.0 {
             continue;
         }
-        let net = dx.hypot(dy);
+        let net = stats::mag(dx, dy);
         effs.push((net / path).min(1.0));
         sum_net += net;
         sum_path += path;

@@ -23,6 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::series::{Prepared, Segment};
+use crate::stats;
 
 /// One inferred repositioning lift.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,7 +75,7 @@ fn shape(p: &Prepared, seg: Segment) -> Shape {
         seg,
         dx,
         dy,
-        mag: dx.hypot(dy),
+        mag: stats::mag(dx, dy),
         peak: p.grid.peak_speed(seg.start, seg.end),
     }
 }
