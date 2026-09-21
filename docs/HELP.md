@@ -126,6 +126,34 @@ Both are changed or disabled under **Settings** (a new Ctrl+Alt+R chord
 applies on the panel's next start). Windows hands a registered chord to
 telemouse before the game sees it, so pick ones the game does not use.
 
+## Asking an AI assistant about your sessions
+
+`telemouse-mcp.exe` in the folder is an MCP server: it hands an assistant
+that speaks MCP (Claude Code, and any other client) a set of tools over your
+own recordings — list the sessions, summarise one, compare a week, check
+whether capture is healthy right now, tail a log. With them it can answer
+"which sessions lost data this week" or "is my overshoot getting better"
+without you looking anything up. For Claude Code:
+
+```powershell
+claude mcp add telemouse -- "C:\path\to\telemouse\telemouse-mcp.exe"
+```
+
+It reads your `telemouse.toml` for where the recordings and the servers are,
+and it runs only while the assistant has it open. It can also start, mark
+and stop a recording — everything it does goes through the control panel,
+with the same limits the panel has, and it can only ever reach this machine.
+Add `--read-only` after the path if you would rather it could only look:
+
+```powershell
+claude mcp add telemouse -- "C:\path\to\telemouse\telemouse-mcp.exe" --read-only
+```
+
+Nothing leaves your PC except what the assistant itself sends to its own
+service — which is the answers and the numbers it quotes, never a recording
+(they are far too large) and never raw mouse events.
+[API.md](API.md) lists every tool.
+
 ## What it writes, and how to remove it
 
 Nothing is installed, registered or scheduled. Everything is next to
@@ -136,7 +164,7 @@ Nothing is installed, registered or scheduled. Everything is next to
 | Settings | `telemouse.toml` |
 | Recordings | `recordings\<id>.jsonl`, each with a `<id>.meta.json` sidecar |
 | Report caches | `recordings\.reports\`, `recordings\.telemouse-analyze-index-v1.json` |
-| Logs | `logs\ctl.log`, `logs\<component>.log` |
+| Logs | `logs\ctl.log`, `logs\<component>.log` (including `logs\mcp.log`) |
 | The window's browser cache | `%LOCALAPPDATA%\telemouse\WebView2` (the one thing outside the folder) |
 
 Delete the folder and the WebView2 one, and it is gone. If you added the

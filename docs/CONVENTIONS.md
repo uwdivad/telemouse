@@ -12,6 +12,7 @@ the repo root.
 | `telemouse-viz` | `crates/viz` | UDP→WebSocket bridge, embedded browser viz (live + replay). |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions. |
 | `telemouse-ctl` | `crates/ctl` | Control panel: launches/stops the binaries above (fixed argument allow-lists), lists and kills telemouse processes. |
+| `telemouse-mcp` | `crates/mcp` | MCP server (stdio): the analyze library and ctl/viz HTTP as typed tools for an agent. Proxies ctl; never launches or kills anything itself. |
 
 Each workstream edits **only its own crate**. Root `Cargo.toml` already lists
 all members and shared `[workspace.dependencies]`; add crate-local deps with

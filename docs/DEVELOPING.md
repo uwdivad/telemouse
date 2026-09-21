@@ -65,6 +65,7 @@ later (its embedded Chromium).
 | `telemouse-viz` | `crates/viz` | Live browser visualization + session replay (UDP→WebSocket bridge, single-file page) |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions |
 | `telemouse-ctl` | `crates/ctl` | Control panel: a native window (WebView2) and tray icon over an HTTP JSON API; starts/stops the others, runs the tools, sees and kills telemouse processes |
+| `telemouse-mcp` | `crates/mcp` | MCP server over stdio (`rmcp`): the analyze library and the ctl/viz HTTP APIs as typed tools for an agent |
 | — | `crates/core` | Shared types, wire format, config, QPC↔UTC clock math |
 
 `tools/` holds optional extras that nothing else depends on: `cpubench`
@@ -477,7 +478,7 @@ afterwards without re-deriving it from the JSONL.
 ## Build flavours
 
 Logging, Kafka and observability are Cargo features, on by default. The
-release zip is the default build: all four binaries with everything on
+release zip is the default build: all five binaries with everything on
 (Kafka compiled in, off in the shipped config). A **minimal** flavour with
 the three features compiled out still exists as a build-it-yourself
 option; it is no longer published, but CI lints and tests it on every push

@@ -4,10 +4,11 @@ name: release
 # GitHub Release for that tag. Release notes are the matching CHANGELOG.md
 # section.
 #
-#   telemouse-vX.Y.Z-windows-x86_64.zip   the four binaries with default
+#   telemouse-vX.Y.Z-windows-x86_64.zip   the five binaries with default
 #                                         features (capture, viz, analyzer,
-#                                         control panel), the sample config,
-#                                         the user docs, the demo recording
+#                                         control panel, MCP server), the
+#                                         sample config, the user docs, the
+#                                         demo recording
 #
 # The minimal flavour (--no-default-features + quiet) is still linted and
 # tested here and in ci.yml so the feature flags keep working, but it is no
@@ -67,11 +68,11 @@ jobs:
       - name: clippy (full)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy (minimal)
-        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
+        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
       - name: Test (full)
         run: cargo test --workspace --locked
       - name: Test (minimal)
-        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
 
       - name: Build
         run: cargo build --release --workspace --locked
@@ -100,6 +101,7 @@ jobs:
             ${{ github.workspace }}\target\release\telemouse-viz.exe
             ${{ github.workspace }}\target\release\telemouse-analyze.exe
             ${{ github.workspace }}\target\release\telemouse-ctl.exe
+            ${{ github.workspace }}\target\release\telemouse-mcp.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -118,7 +120,7 @@ jobs:
         if: env.SIGNING == 'true'
         shell: pwsh
         run: |
-          foreach ($exe in 'telemouse', 'telemouse-viz', 'telemouse-analyze', 'telemouse-ctl') {
+          foreach ($exe in 'telemouse', 'telemouse-viz', 'telemouse-analyze', 'telemouse-ctl', 'telemouse-mcp') {
             $sig = Get-AuthenticodeSignature "target/release/$exe.exe"
             "{0,-22} {1}  {2}" -f "$exe.exe", $sig.Status, $sig.SignerCertificate.Subject
             if ($sig.Status -ne 'Valid') { throw "$exe.exe: signature is $($sig.Status): $($sig.StatusMessage)" }
@@ -142,7 +144,7 @@ jobs:
           # plan) and audit notes stay out; the GUIDE links to the plan on
           # GitHub.
           New-Item -ItemType Directory $dir, "$dir/docs", "$dir/recordings" | Out-Null
-          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe $dir
+          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe, target/release/telemouse-mcp.exe $dir
           Copy-Item telemouse.example.toml "$dir/telemouse.toml"
           Copy-Item LICENSE, README.md, CHANGELOG.md $dir
           Copy-Item docs/HELP.md, docs/GUIDE.md, docs/FAIR-PLAY.md, docs/API.md "$dir/docs"

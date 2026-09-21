@@ -1,0 +1,57 @@
+[package]
+name = "telemouse-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "telemouse-mcp"
+path = "src/main.rs"
+
+# Same two flavours as every other binary. `logging` is the subscriber
+# (stderr plus `<log_dir>/mcp.log`) — note that stdout is the MCP channel and
+# never carries a log line, whatever the flavour. `observability` is the
+# per-call line (tool, elapsed, bytes returned, outcome): this server's only
+# "periodic stats", since it has no loop of its own.
+[features]
+default = ["logging", "observability"]
+logging = ["telemouse-core/logging", "telemouse-analyze/logging"]
+observability = []
+quiet = ["tracing/release_max_level_off"]
+
+[dependencies]
+telemouse-core = { workspace = true }
+# The analyzer as a library: `list`, `report --summary` and `trend` are the
+# same code paths the CLI runs, not a reimplementation of them.
+telemouse-analyze = { path = "../analyze", default-features = false }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+# The official MCP SDK. Only the server half and the stdio transport: no
+# HTTP transport, no client, no auth, no reqwest (see `local.rs` for why the
+# two loopback servers are spoken to without an HTTP crate).
+rmcp = { version = "3.4.0", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
+# Explicit features, not "full": one stdin/stdout pair and two short-lived
+# loopback TCP connections per tool call.
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-std",
+    "io-util",
+    "time",
+    "sync",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"

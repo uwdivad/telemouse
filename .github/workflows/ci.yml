@@ -31,11 +31,11 @@ jobs:
       # longer published, only documented as a build-it-yourself option
       # (docs/DEVELOPING.md). These two steps keep its feature flags working.
       - name: clippy (minimal)
-        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
+        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
       - name: test (full)
         run: cargo test --workspace --locked
       - name: test (minimal)
-        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
       # The viz page's script is embedded in the binary; the Rust tests run
       # these when node is present, and this makes the requirement explicit.
       - name: viz page syntax

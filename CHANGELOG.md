@@ -148,6 +148,20 @@ publishes the section below that names that version.
   minimised window or a window in the tray stops the page's polling and its
   clock entirely (it used to fall back to a 10 s poll) and refreshes the
   moment it is looked at again.
+- **An MCP server.** `telemouse-mcp` (`crates/mcp`, the `rmcp` SDK, stdio)
+  hands an agent eleven typed tools over your own data: `sessions_list`,
+  `session_summary`, `trend`, `health`, `logs_tail` and `live_stats` read,
+  and `capture_start`, `capture_stop`, `marker`, `doctor` and `kill` go
+  through the control panel's HTTP API with its guard header — the server
+  never spawns or terminates anything itself, so ctl's flag allow-list and
+  its pid rule still decide. `--read-only` removes the last five from the
+  tool list entirely. Answers are projections sized for a model, not raw
+  dumps: `health` leaves the 120-line log rings behind, `session_summary` is
+  the ~3 KB report summary, and the analyzer runs as a library against the
+  same report cache the panel uses. Registered in the repo's `.mcp.json`;
+  the exe ships in the release zip. Tools and error shapes are in
+  [docs/API.md](docs/API.md), the user-facing note is in
+  [docs/HELP.md](docs/HELP.md).
 
 ## [0.2.0] — 2026-09-20
 
