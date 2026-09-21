@@ -414,11 +414,15 @@ struct BatchRef<'a> {
     events: Vec<RawEvent>,
 }
 
-/// The three envelope prefixes, matched before invoking serde so the hot path
-/// never pays for an internally-tagged enum's content buffering.
+/// The envelope prefixes a recording can hold, matched before invoking serde
+/// so the hot path never pays for an internally-tagged enum's content
+/// buffering. (`heartbeat` is not one of them — it is a live-path signal the
+/// agent sends to the viz alone — but it is listed so a file that somehow
+/// picked one up is skipped rather than counted as corruption.)
 const BATCH_TAG: &str = "{\"type\":\"batch\"";
 const MARKER_TAG: &str = "{\"type\":\"marker\"";
 const SESSION_TAG: &str = "{\"type\":\"session\"";
+const HEARTBEAT_TAG: &str = "{\"type\":\"heartbeat\"";
 
 /// Interns process names so a long session holds one copy of each.
 ///
@@ -593,6 +597,7 @@ fn envelope_kind(e: &Envelope) -> &'static str {
         Envelope::Session(_) => "session",
         Envelope::Batch(_) => "batch",
         Envelope::Marker(_) => "marker",
+        Envelope::Heartbeat(_) => "heartbeat",
     }
 }
 
@@ -686,6 +691,13 @@ fn parse_body<R: BufRead>(
             body.last_good = line_no;
             continue;
         }
+        // Liveness, not telemetry: the capture agent ships heartbeats on the
+        // UDP path only, so one on disk means somebody teed the live stream
+        // into a file. Nothing to analyse in it, and nothing wrong with it.
+        if line.starts_with(HEARTBEAT_TAG) {
+            body.last_good = line_no;
+            continue;
+        }
         // Anything whose tag is not where we expect it still gets the general
         // path before being written off as corrupt.
         match Envelope::from_json(&line) {
@@ -709,7 +721,7 @@ fn parse_body<R: BufRead>(
                 body.last_good = line_no;
                 body.markers.push(m);
             }
-            Ok(Envelope::Session(_)) => body.last_good = line_no,
+            Ok(Envelope::Session(_) | Envelope::Heartbeat(_)) => body.last_good = line_no,
             Err(e) => body.bad.record(line_no, &e),
         }
     }
@@ -1016,7 +1028,10 @@ pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
         if line.trim().is_empty() {
             continue;
         }
-        if line.starts_with(MARKER_TAG) || line.starts_with(SESSION_TAG) {
+        if line.starts_with(MARKER_TAG)
+            || line.starts_with(SESSION_TAG)
+            || line.starts_with(HEARTBEAT_TAG)
+        {
             last_good_line = line_no;
             continue;
         }
@@ -1601,6 +1616,65 @@ mod tests {
         // The listing scan agrees with the full load.
         let scanned = scan_session(&path).unwrap();
         assert_eq!(scanned.bad_lines, s.bad_lines);
+    }
+
+    /// Heartbeats are a live-path signal and the agent never writes one to a
+    /// recording — but a file teed off the UDP stream by hand would hold
+    /// them, and that is not corruption. Both readers skip them without
+    /// counting a bad line and without changing a single number.
+    #[test]
+    fn heartbeat_lines_are_skipped_rather_than_counted_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg();
+        let beat = Envelope::Heartbeat(telemouse_core::Heartbeat {
+            session_id: cfg.session_id.clone(),
+            ts_utc_us: cfg.anchor.utc_us + 1_000_000,
+        })
+        .to_json()
+        .unwrap();
+        let batch = |seq: u64| {
+            batch_env(
+                &cfg,
+                seq,
+                Some("cs2.exe"),
+                0,
+                vec![ev(cfg.anchor.qpc + seq * FIXTURE_FREQ / 1000, 1, 1, 0)],
+            )
+            .to_json()
+            .unwrap()
+        };
+        let with = write_lines(
+            dir.path(),
+            "s-beats.jsonl",
+            &[
+                Envelope::Session(cfg.clone()).to_json().unwrap(),
+                batch(0),
+                beat.clone(),
+                beat,
+                batch(1),
+            ],
+        );
+        let without = write_lines(
+            dir.path(),
+            "s-plain.jsonl",
+            &[
+                Envelope::Session(cfg.clone()).to_json().unwrap(),
+                batch(0),
+                batch(1),
+            ],
+        );
+
+        let s = load_session(&with).unwrap();
+        assert!(s.bad_lines.is_empty(), "{:?}", s.bad_lines);
+        let plain = load_session(&without).unwrap();
+        assert_eq!(s.events, plain.events);
+        assert_eq!(s.batches.len(), plain.batches.len());
+        assert_eq!(s.total_drops, plain.total_drops);
+
+        // The cheap listing scan agrees.
+        let scanned = scan_session(&with).unwrap();
+        assert!(scanned.bad_lines.is_empty(), "{:?}", scanned.bad_lines);
+        assert_eq!(scanned.events, scan_session(&without).unwrap().events);
     }
 
     /// A long parse error is capped before it reaches a warning, the report

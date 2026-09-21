@@ -87,10 +87,13 @@ scene becomes active* if you toggle the scene a lot. The overlay's look is
 under **Settings** in the panel; every option is also a URL parameter, see
 [GUIDE.md](GUIDE.md).
 
-The overlay dims and shows *no feed* after a few seconds without mouse
-data, which includes a hand at rest. If you would rather it never dimmed,
-add `?stale=0` to the OBS URL (or a larger number of seconds), or set
-`stale_secs` under `[viz.obs]` in `telemouse.toml`.
+After a few seconds without mouse movement the overlay puts a small badge
+top centre. *idle* means capture is running and your hand is simply still —
+nothing is wrong, and the panels stay as bright as ever. *no feed* means
+nothing is arriving at all (capture stopped, or it is shipping somewhere
+else), and the panels dim to say so. If you would rather neither ever
+appeared, add `?stale=0` to the OBS URL (or a larger number of seconds), or
+set `stale_secs` under `[viz.obs]` in `telemouse.toml`.
 
 ### OBS on a second PC
 
@@ -170,7 +173,9 @@ trim before sharing.
   refuses a file it cannot parse rather than running on defaults. Fix the
   line it names (game keys must be lowercase exe names), or delete the file
   and the panel writes the sample again on its next start.
-- **The OBS overlay says "no feed" while I hold still**: see
+- **The OBS overlay says "no feed" while I hold still**: it should say
+  *idle* instead — "no feed" means nothing is arriving. Check the capture
+  agent is running, and that it and the viz agree on the UDP port. See
   [OBS overlay](#obs-overlay).
 - **Run it elevated?** No. Nothing needs administrator rights. "Access
   denied" means the folder is protected; move telemouse to a folder you own.

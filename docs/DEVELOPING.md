@@ -226,7 +226,7 @@ parameters, so several sources can share one config and still differ:
 | `buffer` | 10–200 ms live buffer (lower = less latency, more stutter risk) | `35` |
 | `grid`, `legend`, `labels` | `0`/`1` | `1`, `0`, `0` |
 | `fps` | 5–400 — draw-rate cap; OBS composites at its own rate, so match it | `60` |
-| `stale` | 0–60 s without data before the overlay dims and shows *no feed*; `0` never | `3` |
+| `stale` | 0–60 s without a batch before the overlay shows *idle* (the agent's heartbeat is still arriving) or dims to *no feed* (it is not); `0` never | `3` |
 
 e.g. an aim-only overlay in a corner: `/obs?layout=aim&hud=aim,cpm&scale=1.6&grid=0`.
 `?obs=1` on the dashboard URL does the same thing. In this mode the page

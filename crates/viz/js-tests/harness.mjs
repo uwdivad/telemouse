@@ -173,6 +173,16 @@ export function sessionEnvelope(overrides = {}) {
   };
 }
 
+/** The capture agent's once-a-second "still here, hand still". */
+export function heartbeatEnvelope(overrides = {}) {
+  return {
+    type: "heartbeat",
+    session_id: "s-test",
+    ts_utc_us: ANCHOR_UTC_US,
+    ...overrides,
+  };
+}
+
 /** QPC ticks for `seconds` after the anchor. */
 export function qpcAt(seconds) {
   return ANCHOR_QPC + Math.round(seconds * QPC_FREQ);

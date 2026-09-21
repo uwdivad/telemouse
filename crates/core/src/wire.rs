@@ -12,6 +12,12 @@ use crate::{batch::Batch, batch::BatchView, session::Marker, session::SessionCon
 pub const TOPIC_EVENTS: &str = "mouse.events";
 pub const TOPIC_SESSIONS: &str = "mouse.sessions";
 pub const TOPIC_MARKERS: &str = "mouse.markers";
+/// Live-only. The capture agent never publishes a [`Heartbeat`] to Kafka and
+/// never writes one to a recording — it exists to keep the local viz honest
+/// while the hand is still, and a topic (or a file) full of them would say
+/// nothing a batch does not. The name is here so [`Envelope::topic`] stays
+/// total.
+pub const TOPIC_HEARTBEATS: &str = "mouse.heartbeats";
 
 /// Keep serialized batches under a single UDP datagram on loopback.
 pub const MAX_UDP_PAYLOAD: usize = 60_000;
@@ -20,12 +26,35 @@ pub const MAX_UDP_PAYLOAD: usize = 60_000;
 /// test below enforces it. At 25ms windows this cap only binds above ~17KHz.
 pub const MAX_EVENTS_PER_BATCH: usize = 448;
 
+/// "The agent is here, the hand is still."
+///
+/// A still mouse produces no events, so it produces no batches, and a live
+/// consumer cannot tell that from a capture agent that died — which is what
+/// made the viz overlay say "no feed" at a player who was simply holding
+/// angle. The agent therefore emits one of these about once a second, and
+/// **only** while no batch has gone out (see `telemouse-capture`'s shipping
+/// loop). It rides the UDP path alone: nothing here belongs in a recording or
+/// on the broker.
+///
+/// Deliberately minimal, and deliberately carrying neither a `seq_no` nor a
+/// `ts_anchor_us`: the viz bridge reads those two off every datagram for its
+/// seq-gap and latency estimators, and a heartbeat is neither telemetry nor
+/// part of the batch sequence. Absent fields keep it out of both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub session_id: String,
+    /// Wall clock when the agent sent it, mapped through the session anchor —
+    /// the same clock `ts_anchor_us` is on, so a consumer can compare them.
+    pub ts_utc_us: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Envelope {
     Session(SessionConfig),
     Batch(Batch),
     Marker(Marker),
+    Heartbeat(Heartbeat),
 }
 
 impl Envelope {
@@ -50,6 +79,7 @@ impl Envelope {
                 FastTag::Batch => serde_json::from_str(s).map(Envelope::Batch),
                 FastTag::Session => serde_json::from_str(s).map(Envelope::Session),
                 FastTag::Marker => serde_json::from_str(s).map(Envelope::Marker),
+                FastTag::Heartbeat => serde_json::from_str(s).map(Envelope::Heartbeat),
             };
         }
         serde_json::from_str(s)
@@ -61,6 +91,7 @@ impl Envelope {
             Envelope::Session(_) => TOPIC_SESSIONS,
             Envelope::Batch(_) => TOPIC_EVENTS,
             Envelope::Marker(_) => TOPIC_MARKERS,
+            Envelope::Heartbeat(_) => TOPIC_HEARTBEATS,
         }
     }
 
@@ -71,6 +102,7 @@ impl Envelope {
             Envelope::Session(s) => &s.session_id,
             Envelope::Batch(b) => &b.session_id,
             Envelope::Marker(m) => &m.session_id,
+            Envelope::Heartbeat(h) => &h.session_id,
         }
     }
 }
@@ -80,6 +112,7 @@ enum FastTag {
     Batch,
     Session,
     Marker,
+    Heartbeat,
 }
 
 /// The exact prefixes serde emits for each variant of the tagged enum, so a
@@ -88,12 +121,15 @@ fn fast_tag(s: &str) -> Option<FastTag> {
     const BATCH: &str = "{\"type\":\"batch\",";
     const SESSION: &str = "{\"type\":\"session\",";
     const MARKER: &str = "{\"type\":\"marker\",";
+    const HEARTBEAT: &str = "{\"type\":\"heartbeat\",";
     if s.starts_with(BATCH) {
         Some(FastTag::Batch)
     } else if s.starts_with(SESSION) {
         Some(FastTag::Session)
     } else if s.starts_with(MARKER) {
         Some(FastTag::Marker)
+    } else if s.starts_with(HEARTBEAT) {
+        Some(FastTag::Heartbeat)
     } else {
         None
     }
@@ -324,10 +360,15 @@ mod tests {
             ts_utc_us: 10,
             label: "round".into(),
         };
+        let hb = Heartbeat {
+            session_id: "s-1".into(),
+            ts_utc_us: 1_756_000_000_000_000,
+        };
         for e in [
             Envelope::Batch(b),
             Envelope::Session(cfg),
             Envelope::Marker(m),
+            Envelope::Heartbeat(hb),
         ] {
             let s = e.to_json().unwrap();
             assert!(
@@ -368,5 +409,42 @@ mod tests {
     #[test]
     fn unknown_type_is_an_error() {
         assert!(Envelope::from_json(r#"{"type":"bogus"}"#).is_err());
+    }
+
+    /// The idle heartbeat is a live-path signal, not telemetry: it must stay
+    /// small, it must round-trip, and it must not grow the two fields the viz
+    /// bridge reads off every datagram (`seq_no` feeds the seq-gap counter,
+    /// `ts_anchor_us` the latency estimator).
+    #[test]
+    fn heartbeat_roundtrips_and_carries_no_telemetry_fields() {
+        let hb = Heartbeat {
+            session_id: "s-1".into(),
+            ts_utc_us: 1_756_000_000_000_000,
+        };
+        let s = Envelope::Heartbeat(hb.clone()).to_json().unwrap();
+        assert_eq!(
+            s,
+            r#"{"type":"heartbeat","session_id":"s-1","ts_utc_us":1756000000000000}"#
+        );
+        assert!(!s.contains("seq_no"));
+        assert!(!s.contains("ts_anchor_us"));
+        assert!(s.len() < 128, "a heartbeat is a 1Hz datagram: {s}");
+        assert_eq!(Envelope::from_json(&s).unwrap(), Envelope::Heartbeat(hb));
+    }
+
+    /// Heartbeats are live-only, and the topic name exists purely to keep
+    /// `topic()` total — it must never collide with a topic the agent
+    /// actually publishes to, or a stray heartbeat would land in the events.
+    #[test]
+    fn heartbeat_routing_is_its_own() {
+        let e = Envelope::Heartbeat(Heartbeat {
+            session_id: "s-1".into(),
+            ts_utc_us: 7,
+        });
+        assert_eq!(e.key(), "s-1");
+        assert_eq!(e.topic(), TOPIC_HEARTBEATS);
+        for other in [TOPIC_EVENTS, TOPIC_SESSIONS, TOPIC_MARKERS] {
+            assert_ne!(e.topic(), other);
+        }
     }
 }

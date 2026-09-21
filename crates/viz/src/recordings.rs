@@ -437,6 +437,14 @@ mod tests {
                     batches += 1;
                 }
                 telemouse_core::wire::Envelope::Marker(_) => markers += 1,
+                // Heartbeats are a live-path signal only: one on disk would
+                // mean the agent started writing liveness into recordings.
+                telemouse_core::wire::Envelope::Heartbeat(_) => {
+                    panic!(
+                        "line {} is a heartbeat; those never belong in a recording",
+                        i + 1
+                    )
+                }
             }
         }
         assert_eq!(sessions, 1);

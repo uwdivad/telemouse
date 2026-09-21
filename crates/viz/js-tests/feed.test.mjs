@@ -12,7 +12,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ANCHOR_UTC_US, batchEnvelope, ev, loadApp, sessionEnvelope } from "./harness.mjs";
+import {
+  ANCHOR_UTC_US, batchEnvelope, ev, heartbeatEnvelope, loadApp, sessionEnvelope,
+} from "./harness.mjs";
 
 /** Load the page on a fake clock and return a way to let time pass: `run(s)`
     advances both clocks and runs the frame loop at 50 fps the whole way. */
@@ -31,8 +33,13 @@ function boot(opts) {
   const batch = () => app.telemouse.ui.ws.onmessage({
     data: JSON.stringify(batchEnvelope(seq++, [ev(clock.monotonicMs / 1000, 1, 0)])),
   });
+  const beat = () => app.telemouse.ui.ws.onmessage({ data: JSON.stringify(heartbeatEnvelope()) });
   const body = app.sandbox.document.body;
-  return { ...app, clock, run, batch, stale: () => body.classList.contains("stale") };
+  return {
+    ...app, clock, run, batch, beat,
+    stale: () => body.classList.contains("stale"),
+    idle: () => body.classList.contains("idle"),
+  };
 }
 
 test("the overlay says no feed after stale_secs of silence and recovers on the next batch", () => {
@@ -78,6 +85,106 @@ test("the overlay says no feed after stale_secs of silence and recovers on the n
   assert.equal(t.stale(), true, "a fresh socket with nothing on it is still no feed");
   t.batch();
   assert.equal(t.stale(), false);
+});
+
+test("a still hand under a live agent reads idle, not no feed", () => {
+  const t = boot({ search: "?hud=status,speed", config: { obs_route: true, obs: { stale_secs: 2 } } });
+  const { engine, ui } = t.telemouse;
+  ui.ws.onopen();
+  ui.ws.onmessage({ data: JSON.stringify(sessionEnvelope()) });
+
+  // A second of movement, then the hand stops but the agent keeps saying hello.
+  for (let i = 0; i < 10; i++) { t.batch(); t.run(0.1); }
+  assert.equal(t.stale(), false);
+  assert.equal(t.idle(), false);
+  for (let i = 0; i < 3; i++) { t.beat(); t.run(1); }
+
+  assert.equal(t.idle(), true, "the agent is there; the hand is not");
+  assert.equal(t.stale(), false, "idle never dims the panels");
+  assert.match(t.elements.get("feedBadge").textContent, /^idle · \ds$/);
+  assert.match(t.sandbox.hudValue("status", engine), /^idle \(\ds\)$/);
+
+  // Now the agent dies. Three missed heartbeats later it is no feed after all.
+  t.run(3.1);
+  assert.equal(t.idle(), false);
+  assert.equal(t.stale(), true, "a dead agent still dims");
+  assert.match(t.elements.get("feedBadge").textContent, /^no feed · \d+s$/);
+
+  // It comes back with the hand still: idle again, instantly, not live.
+  t.beat();
+  assert.equal(t.stale(), false, "instant recovery, exactly like a batch");
+  assert.equal(t.idle(), true);
+  assert.match(t.sandbox.hudValue("status", engine), /^idle \(\d+s\)$/);
+
+  // Only data is live.
+  t.batch();
+  assert.equal(t.idle(), false);
+  assert.equal(t.sandbox.hudValue("status", engine), "live");
+});
+
+test("a heartbeat is liveness only: it never touches the timeline or the numbers", () => {
+  const t = boot();
+  const { engine, ui } = t.telemouse;
+  ui.ws.onopen();
+  ui.ws.onmessage({ data: JSON.stringify(sessionEnvelope()) });
+  for (let i = 0; i < 4; i++) { t.batch(); t.run(0.05); }
+
+  const snap = () => ({
+    events: engine.ev.n, cursor: engine.cursor, tEnd: engine.tEnd,
+    newestEventT: engine.newestEventT, batchSpan: engine.batchSpan,
+    lastSeq: engine.lastSeq, lostBatches: engine.lostBatches,
+    drops: engine.drops, absFrames: engine.absFrames,
+    dropMarks: engine.dropMarks.length, metas: engine.metas.length,
+    latency: engine.arrivalLatencyMs, latencyAt: engine.latencyReceivedAt,
+    bad: ui.badFrames, lastBatchAt: ui.lastBatchAt, lastDataAt: ui.lastDataAt,
+  });
+  const before = snap();
+  assert.ok(before.events > 0 && before.lastSeq !== null, "there is something to disturb");
+
+  for (let i = 0; i < 20; i++) t.beat();
+  assert.deepEqual(snap(), before, "a heartbeat is not a batch of zero events");
+  assert.ok(ui.lastHeartbeatAt > 0, "but it did register as a sign of life");
+  assert.equal(ui.heartbeatAge(), 0);
+
+  // A malformed one is a bad frame like any other, not a crash.
+  ui.ws.onmessage({ data: '{"type":"heartbeat"' });
+  assert.equal(ui.badFrames, before.bad + 1);
+});
+
+test("the dashboard pill says idle when the agent is up and the hand is still", () => {
+  const t = boot({ config: { udp_addr: "127.0.0.1:7878" } });
+  const pill = () => t.elements.get("connPill").className + " | " + t.elements.get("connText").textContent;
+  t.telemouse.ui.ws.onopen();
+  assert.equal(pill(), "pill warn | waiting for capture on udp 127.0.0.1:7878");
+
+  // The agent is running; it has simply never seen the hand move. That is not
+  // "waiting for capture" any more.
+  for (let i = 0; i < 3; i++) { t.beat(); t.run(1); }
+  assert.match(pill(), /^pill ok \| idle · \ds$/);
+
+  t.batch();
+  t.run(0.2);
+  assert.equal(pill(), "pill ok | live");
+
+  // Movement stops, heartbeats continue: idle, counting from the last batch.
+  for (let i = 0; i < 5; i++) { t.beat(); t.run(1); }
+  assert.equal(pill(), "pill ok | idle · 5s");
+
+  // Heartbeats stop too: back to the old verdict.
+  t.run(3.5);
+  assert.equal(pill(), "pill warn | no data for 9s");
+});
+
+test("overlayFeed is those two clocks and nothing else", () => {
+  const { overlayFeed } = loadApp().telemouse;
+  assert.equal(overlayFeed(0, Infinity, 3), "live");
+  assert.equal(overlayFeed(3, Infinity, 3), "live", "the grace period is inclusive");
+  assert.equal(overlayFeed(3.1, Infinity, 3), "down", "no heartbeat ever: the old verdict");
+  assert.equal(overlayFeed(3.1, 0.5, 3), "idle");
+  assert.equal(overlayFeed(3.1, 3, 3), "idle", "two missed heartbeats is still alive");
+  assert.equal(overlayFeed(3.1, 3.01, 3), "down", "three, and the agent is gone");
+  assert.equal(overlayFeed(600, 0.2, 0), "live", "stale=0 turns the indicator off entirely");
+  assert.equal(overlayFeed(600, Infinity, 0), "live");
 });
 
 test("?stale= overrides [viz.obs] stale_secs, and 0 turns the indicator off", () => {

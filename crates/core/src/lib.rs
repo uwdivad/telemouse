@@ -32,4 +32,4 @@ pub use clock::{QpcAnchor, now_utc_us};
 pub use event::{RawEvent, buttons};
 pub use histogram::{LatencyHist, LatencySnapshot, Percentile};
 pub use session::{GameSens, Marker, MonitorInfo, SessionConfig};
-pub use wire::{Envelope, EnvelopeView};
+pub use wire::{Envelope, EnvelopeView, Heartbeat};

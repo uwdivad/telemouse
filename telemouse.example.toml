@@ -97,7 +97,9 @@ buffer_ms = 35
 grid = true
 legend = false
 labels = false
-# Seconds without a batch before the overlay says there is no feed; 0 = off.
+# Seconds without a batch before the overlay stops saying nothing; 0 = off.
+# Past it it shows "idle" while the capture agent's heartbeat keeps arriving
+# (a still hand), and dims to "no feed" only once that stops as well.
 stale_secs = 3.0
 
 # Per-game aim conversion: degrees = counts * sens * coeff.

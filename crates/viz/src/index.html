@@ -307,6 +307,11 @@
     border-radius: 50%; background: #ffb02e;
   }
   .obs.stale .feed-badge { display: inline-flex; }
+  /* Idle: the capture agent's heartbeat is still arriving, the hand simply is
+     not moving. Nothing is wrong, so the panels keep their brightness and only
+     the badge speaks — with a calm dot rather than the amber warning one. */
+  .obs.idle .feed-badge { display: inline-flex; }
+  .obs.idle .feed-badge::before { background: #46d68a; }
 
   .hud {
     position: absolute; z-index: 5; pointer-events: none;
