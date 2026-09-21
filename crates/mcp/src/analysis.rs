@@ -92,7 +92,7 @@ impl Analysis {
         Ok((total, entries))
     }
 
-    /// The `telemouse-report-summary/1` headline for one recording.
+    /// The `telemouse-report-summary/2` headline for one recording.
     pub fn summary(&self, id: &str) -> Result<ReportSummary, String> {
         let path = self.recording(id)?;
         let (report, _cache) = trend::report_for(&path, self.cache_dir(), Params::default())

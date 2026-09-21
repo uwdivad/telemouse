@@ -258,7 +258,7 @@ Read-only, answered from the analyzer library and `GET`s:
 | Tool | Input | Result |
 |---|---|---|
 | `sessions_list` | `limit?` (1-500, default 50) | `{ dir, total, returned, sessions: [...] }`. Each entry is a `list --json` row: `path, session_id, started_utc_us, duration_s, events, drops, games, bad_lines, losses, exit`. Newest first; `total` is how many exist, so a truncated answer says so. |
-| `session_summary` | `id` (a recording id, no `.jsonl`) | The `telemouse-report-summary/1` object (*Analyzer*, `report --summary`), ~3 KB. Uses and fills the same `recordings/.reports/<id>.report.json` cache the panel does. |
+| `session_summary` | `id` (a recording id, no `.jsonl`) | The `telemouse-report-summary/2` object (*Analyzer*, `report --summary`), ~3 KB. Uses and fills the same `recordings/.reports/<id>.report.json` cache the panel does. |
 | `trend` | `metric?: [dotted paths]`, `last?` (1-500) | `{ rows, sessions: [TrendRow] }`, oldest first — the `trend --json` rows, `last` keeping the newest. |
 | `health` | — | `{ ctl: {...}, viz: {...} }`: a projection of ctl `GET /api/state` (per component: running, pid, since, exit counts, `last_exit`, the capture agent's `stats`; plus the process table as `pid`/`name`) and of viz `/healthz` + `/api/stats`. The 120-line log rings and the bulk fields are left out. |
 | `logs_tail` | `component` (`ctl`, `capture`, `viz`, `doctor`, `trend`, `report`), `lines?` (1-500, default 50) | `{ component, source, lines }`. The panel's live ring for a component it launched, otherwise `<log_dir>/<component>.log`; ANSI stripped. |

@@ -309,7 +309,7 @@ impl Telemouse {
     }
 
     #[tool(
-        description = "The headline numbers of one recording (schema telemouse-report-summary/1, about 3 KB): data quality, flicks, micro-corrections, clicks, kinematics, lifts and the warnings. Read `warnings` and `quality.clean` first; if `session.aim_profile_missing` is true every degree-valued number uses a fallback sensitivity and is not comparable across sessions."
+        description = "The headline numbers of one recording (schema telemouse-report-summary/2, about 3 KB): data quality, flicks, micro-corrections, clicks, kinematics, lifts and the warnings. Read `warnings` and `quality.clean` first; if `session.aim_profile_missing` is true every degree-valued number uses a fallback sensitivity and is not comparable across sessions."
     )]
     async fn session_summary(
         &self,
