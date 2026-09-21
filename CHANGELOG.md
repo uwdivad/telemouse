@@ -4,6 +4,13 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **No sample games on a fresh install.** The shipped `telemouse.toml` kept
+  two example `[games]` entries, so a new panel listed two games nobody had
+  added under *Settings → Your games*. They are comments in the sample now;
+  an existing `telemouse.toml` is not touched.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon

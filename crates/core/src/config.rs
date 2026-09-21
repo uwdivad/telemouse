@@ -1156,16 +1156,15 @@ mod tests {
         let text = include_str!("../../../telemouse.example.toml");
         let sample: AppConfig = toml::from_str(text).expect("the sample must parse");
         sample.validate().expect("the sample must validate");
+        // The [games] examples stay commented out: a fresh install's
+        // Settings lists only the games its owner added.
         assert!(
-            !sample.games.is_empty(),
-            "the sample carries example [games] entries"
+            sample.games.is_empty(),
+            "the sample's [games] examples must stay commented out"
         );
-        let expected = AppConfig {
-            games: sample.games.clone(),
-            ..AppConfig::default()
-        };
         assert_eq!(
-            sample, expected,
+            sample,
+            AppConfig::default(),
             "telemouse.example.toml has drifted from AppConfig::default()"
         );
     }

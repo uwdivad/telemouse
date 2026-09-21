@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// The sample is what a fresh install runs on: it must load, it must be
-    /// the compiled defaults apart from the two example games, and it must
+    /// the compiled defaults (no games: Settings starts empty), and it must
     /// talk to nobody but this machine.
     #[test]
     fn shipped_sample_is_the_defaults_and_loopback_only() {
@@ -573,14 +573,10 @@ mod tests {
         std::fs::write(&p, SAMPLE_CONFIG).unwrap();
         let c = AppConfig::load(&p).expect("telemouse.example.toml must parse and validate");
         assert_eq!(
-            AppConfig {
-                games: Default::default(),
-                ..c.clone()
-            },
+            c,
             AppConfig::default(),
-            "the sample must be the compiled defaults apart from [games]"
+            "the sample must be the compiled defaults"
         );
-        assert_eq!(c.games.len(), 2, "two example games");
         assert!(
             !c.kafka.enabled,
             "a fresh install must not look for a broker"

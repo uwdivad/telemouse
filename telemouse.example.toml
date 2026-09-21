@@ -2,12 +2,12 @@
 #
 # This is `telemouse.toml` next to the binaries: the release zip ships it
 # under that name, and `telemouse-ctl` writes it there on first start when
-# none exists. Every field is optional; the values below are the defaults,
-# apart from the two example [games] entries — a test in telemouse-core
-# compares this file against them field by field, so it cannot drift. The
-# defaults are chosen so a fresh install talks to nobody but itself: both
-# servers on loopback, no Kafka. Set `mouse_cpi` and your games;
-# `telemouse doctor` prints the resolved configuration.
+# none exists. Every field is optional; the values below are the defaults
+# (the [games] examples at the end are commented out) — a test in
+# telemouse-core compares this file against them field by field, so it
+# cannot drift. The defaults are chosen so a fresh install talks to nobody
+# but itself: both servers on loopback, no Kafka. Set `mouse_cpi` and your
+# games; `telemouse doctor` prints the resolved configuration.
 #
 # Relative paths (recording.dir, ctl.log_dir, ctl.bin_dir) are resolved
 # against this file's own directory, not the working directory of whatever
@@ -102,15 +102,20 @@ stale_secs = 3.0
 
 # Per-game aim conversion: degrees = counts * sens * coeff.
 # Key = lowercase process name of the game (matched automatically).
-[games."cs2.exe"]
-sens = 1.0
-yaw_coeff = 0.022           # Source/Quake/Apex: 0.022
-pitch_coeff = 0.022
-
+# None by default, so the panel's Settings lists only the games you add
+# (there, or here by hand). Two worked examples; uncomment and set `sens`
+# to your in-game sensitivity:
+#
+# [games."cs2.exe"]
+# sens = 1.0
+# yaw_coeff = 0.022           # Source/Quake/Apex: 0.022
+# pitch_coeff = 0.022
+#
 # Call of Duty via the CoD HQ launcher (MW2/MW3/Warzone). Modern CoD is
 # 0.0066 deg/count at sens 1 (a third of Source's 0.022); Overwatch is the
-# same; Valorant is 0.07. Set `sens` to your in-game sensitivity.
-[games."cod.exe"]
-sens = 1.0
-yaw_coeff = 0.0066
-pitch_coeff = 0.0066
+# same; Valorant is 0.07.
+#
+# [games."cod.exe"]
+# sens = 1.0
+# yaw_coeff = 0.0066
+# pitch_coeff = 0.0066
