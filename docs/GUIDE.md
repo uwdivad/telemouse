@@ -1790,7 +1790,14 @@ pid, uptime, how the last run exited, summary), the related-processes table
 (pid, kind, name, CPU %, working set, "(this panel)"), and the log tail of
 the *focus* component — the running capture agent, else the running viz
 server, else whatever started or exited last. It is re-rendered only while
-it is showing. The tray icon is a grey disc while idle and a green one
+it is showing, and only *written* when the render says something new:
+`model::worth_painting` compares it with what the control holds, passes an
+unchanged render straight through, and puts one whose digits alone moved (a
+clock, an uptime, a CPU column) on a five-second lane, because a full
+`SetWindowTextW` + repaint of ~100 lines cost 0.3% of a core every second
+before (`docs/PERFORMANCE-2026-09-20.md`, L2). When it does write, the
+first visible line and any selection are restored afterwards, so a reader
+of the log tail is not yanked to the top. The tray icon is a grey disc while idle and a green one
 while capture runs (drawn at runtime by `icon_bitmap` and
 `CreateIconIndirect`; there is no `.ico` and no resource compiler); its
 tooltip names both services with uptime.

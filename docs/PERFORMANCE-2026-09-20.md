@@ -32,7 +32,7 @@ fallback ×1, plus one symbol smoke test). Raw live results:
    not the cheapest: the `EDIT` fallback rewrites and repaints its full text
    on every refresh whether or not it changed (ctl 0.26–0.32% idle vs 0.10%
    with WebView2, 0.03% with `--no-gui`). Hidden to the tray it drops to
-   0.02%, as designed.
+   0.02%, as designed. *(Fixed 2026-09-21 — see "Landed" under §4.)*
 6. **`window_ms = 25` actually ships ~52 batches/s, not 40**, because the
    window is measured from the first event's back-dated stamp. T2 and viz
    cost scale with batches/s, so the live path pays ~30% more than the docs'
@@ -179,6 +179,31 @@ ctl alone, no external poller, 12 s each; the window was hidden by posting
 only stops rendering: the page's timers and `/api/state` polling keep
 running and all six processes stay resident.
 
+#### Landed 2026-09-21 — L2, the text view's repaint
+
+`gui::model::worth_painting` now sits in front of both `set_text` and
+`Shell_NotifyIcon`: identical text is never written again, text whose words
+changed is written at once, and text where only digits moved (the
+`refreshed …` clock, the uptimes, the CPU column) waits until the control
+has been stale for five seconds. `--no-webview`, window open, ctl alone in a
+scratch folder, 60 s of `TotalProcessorTime` per run, three runs each,
+alternating:
+
+| Pair | before | after | Δ |
+|---|---|---|---|
+| 1 | 1.198% | 0.469% | −61% |
+| 2 | 0.859% | 0.547% | −36% |
+| 3 | 0.729% | 0.286% | −61% |
+| median | **0.859%** | **0.469%** | **−45%** |
+
+Roughly half the cost of an open text window goes away; what is left is the
+once-a-second snapshot and process scan, not GDI. **Indicative only**: the
+box was compiling for other agents throughout, which is both why the spread
+between runs is wide and why "before" sits above the 0.26–0.32% measured on
+09-20 — ctl's per-second scan walks every process on the machine, and there
+were a lot of them. Every pair was measured back to back with the same
+method, so the direction is solid even where the absolute numbers are not.
+
 ### Live profiles (1 ms sampling, 28 s under load)
 
 Threads in these processes run for tens of microseconds and go back to
@@ -248,7 +273,7 @@ Estimates are for the 1156 MB session (5.65 s) or the default live run
 | # | Change | Est. gain | Notes |
 |---|---|---|---|
 | L1 | **On hide-to-tray, `TrySuspend` the WebView (resume on show), or close the controller after a few minutes hidden and recreate it on show.** Also have the page stop polling on `visibilitychange`. | hidden: −0.32% CPU; closing also frees ~309 MiB | Hidden-to-tray is the state ctl sits in during a game, and today it is 2× the idle cost of everything else combined. `SetIsVisible(false)` alone does not stop timers. `TrySuspend` needs the controller invisible first, which `set_visible` already arranges. The `EDIT` fallback must keep working (CLAUDE.md). Relevant to the in-game hitching history: six resident Chromium processes are the kind of background load that showed up before. |
-| L2 | Fallback text view: keep the last rendered string and skip `set_text` when `model::window_text` is unchanged | ctl 0.26–0.32 → ~0.05% with the window open | `refresh` already skips hidden and hosted states; what is missing is the change check. Profile: a quarter of ctl's samples are GDI text output in `--no-webview` mode. |
+| L2 | ~~Fallback text view: keep the last rendered string and skip `set_text` when `model::window_text` is unchanged~~ **landed 2026-09-21, about −45% of ctl with the window open (see above)** | ctl 0.26–0.32 → ~0.05% with the window open | `refresh` already skips hidden and hosted states; what is missing is the change check. Profile: a quarter of ctl's samples are GDI text output in `--no-webview` mode. A plain equality check is not enough on its own — the clock and the uptimes move every tick — so digit-only changes go on a five-second lane. |
 | L3 | Make `window_ms` mean what it says: time the window from when T2 opened the batch (or align the flush to the drain cadence) | 52 → 40 batches/s: **−0.15–0.19%** (T2 + viz + each WS client scale with batches/s) | Or keep the behaviour and fix the docs' "40 batches/s". Either way the latency/CPU trade in PERFORMANCE-2026-09.md is currently computed from the wrong rate. |
 | L4 | T2: while the stream is active (a batch flushed within the last window), park on the window timer only; keep the T1 unpark for the idle→active edge | **−0.10–0.13%**, and removes T1's unpark syscall per batch | Halves T2 wake-ups (104 → 52/s). First-event latency is unchanged because the idle edge still wakes promptly. |
 | L5 | `telemouse-context`: 0.075% with ctl running vs 0.044% without | −0.03% | New since August. Worth a look at what it does per tick when the foreground window is ctl's; a snapshot only on foreground *change* should be near zero. |

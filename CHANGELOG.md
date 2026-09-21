@@ -4,6 +4,23 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **The status window stops repainting text nobody changed.** The window's
+  text view (what `--no-webview`, a missing WebView2 runtime or a page that
+  is still loading shows) rewrote and repainted its full contents on every
+  refresh, a second apart, whether or not anything had moved — 0.26–0.32%
+  of a core while the window was open, a quarter of it GDI glyph drawing.
+  It is now written only when the render says something new: an unchanged
+  one is skipped, one whose words changed (a component that started or
+  stopped, a new log line) is shown at once, and one where only digits
+  moved — the clock, an uptime, a CPU column — waits up to five seconds, so
+  the view still ticks without paying for it. The tray tooltip, which
+  carries the same uptime, follows the same rule instead of calling
+  `Shell_NotifyIcon` every second. When the text does change, the first
+  visible line *and* any selection are restored, so a reader of the log
+  tail keeps their place and a half-finished copy survives the update.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon
