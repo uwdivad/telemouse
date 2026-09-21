@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use crate::series::Prepared;
-use crate::stats::Summary;
+use crate::stats::{self, Summary};
 use telemouse_core::event::buttons;
 
 /// One detected flick.
@@ -167,7 +167,7 @@ pub fn detect(p: &Prepared) -> Vec<Flick> {
             let settle_at = g.quiet_start_after(ballistic_end, hold, prm.still_speed);
 
             let (ax, ay) = g.displacement(start, ballistic_end);
-            let amplitude_counts = ax.hypot(ay);
+            let amplitude_counts = stats::mag(ax, ay);
             if amplitude_counts <= f64::EPSILON {
                 j = le.max(j + 1);
                 continue;
@@ -197,12 +197,15 @@ pub fn detect(p: &Prepared) -> Vec<Flick> {
                 t_ballistic_end_s: g.t(ballistic_end),
                 t_end_s: g.t(settle_at),
                 duration_ms: (ballistic_end - start) as f64 * dt_ms,
-                amplitude_deg: adx.hypot(ady),
+                amplitude_deg: stats::mag(adx, ady),
                 amplitude_counts,
                 peak_velocity_deg_s: p.peak_aim_speed(start, ballistic_end),
                 peak_velocity_counts_s: g.peak_speed(start, ballistic_end),
                 overshoot_ratio: correction_counts / amplitude_counts,
-                correction_deg: (correction_counts * ux * kx).hypot(correction_counts * uy * ky),
+                correction_deg: stats::mag(
+                    correction_counts * ux * kx,
+                    correction_counts * uy * ky,
+                ),
                 settle_ms: (settle_at.saturating_sub(ballistic_end)) as f64 * dt_ms,
                 time_to_click_ms,
                 direction_deg: ady.atan2(adx).to_degrees(),

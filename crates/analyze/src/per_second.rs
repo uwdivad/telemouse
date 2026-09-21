@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::flicks::Flick;
 use crate::markers::MarkerInterval;
 use crate::series::Prepared;
+use crate::stats;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecondRow {
@@ -102,9 +103,9 @@ pub fn compute(p: &Prepared, flicks: &[Flick], intervals: &[MarkerInterval]) -> 
         let row = &mut rows[s];
         row.events += 1;
         let (dx, dy) = (e.dx as f64, e.dy as f64);
-        row.distance_counts += dx.hypot(dy);
+        row.distance_counts += stats::mag(dx, dy);
         if p.aim_event_ok(i) {
-            row.distance_deg += (dx * kx).hypot(dy * ky);
+            row.distance_deg += stats::mag(dx * kx, dy * ky);
         }
     }
 
