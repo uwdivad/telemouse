@@ -9,6 +9,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -293,7 +294,58 @@ pub fn row(report: &Report, from_cache: bool, metrics: &[String]) -> TrendRow {
     }
 }
 
+/// Most sessions `compute` analyzes at once.
+///
+/// Deliberately small. A cold `trend` over 36 recordings used to run them
+/// strictly one after another and took 22.9 s (`docs/PERFORMANCE-2026-09-20.md`,
+/// A7), but each session is already internally parallel — the loader splits the
+/// file across cores and `report::build` runs the metric groups concurrently —
+/// so a handful of sessions at a time saturates the box without
+/// oversubscribing it badly.
+const TREND_MAX_WORKERS: usize = 4;
+
+/// Recording bytes being analyzed at any one instant.
+///
+/// The real constraint is memory, not cores: a session peaks at roughly 2.5×
+/// its file size in RAM, and recordings run past a gigabyte. One session is
+/// always admitted however large it is, so a 1.2 GB recording runs on its own
+/// and the small ones still pack four at a time.
+const TREND_BYTES_IN_FLIGHT: u64 = 512 * 1024 * 1024;
+
+/// What one worker hands back for one recording: its row, or why it was
+/// skipped. Skips are logged by the caller, in path order, so a `trend` run
+/// says the same things in the same sequence however the work was scheduled.
+type SessionOutcome = Result<TrendRow, String>;
+
+/// The scheduler's shared state: whose turn it is, how many recording bytes
+/// are being worked on, and where the answers go.
+struct Schedule {
+    next: usize,
+    in_flight: u64,
+    active: usize,
+    out: Vec<Option<SessionOutcome>>,
+}
+
+fn analyze_one(
+    path: &Path,
+    json_dir: Option<&Path>,
+    params: Params,
+    metrics: &[String],
+) -> SessionOutcome {
+    match report_for(path, json_dir, params) {
+        // The report is summarized and dropped here, on the worker, so four
+        // sessions in flight never means four full reports resident.
+        Ok((report, why)) => Ok(row(&report, why == CacheOutcome::Hit, metrics)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Build the trend table over every `*.jsonl` in `dir`, oldest session first.
+///
+/// Sessions are analyzed concurrently, bounded by [`TREND_MAX_WORKERS`] and by
+/// [`TREND_BYTES_IN_FLIGHT`]. The table does not depend on the schedule: rows
+/// land in their directory-order slot and are then sorted by start time exactly
+/// as they always were.
 pub fn compute(
     dir: &Path,
     json_dir: Option<&Path>,
@@ -307,11 +359,84 @@ pub fn compute(
         .collect();
     paths.sort();
 
+    let sizes: Vec<u64> = paths
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .collect();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(TREND_MAX_WORKERS)
+        .min(paths.len());
+
+    let out = if workers <= 1 {
+        paths
+            .iter()
+            .map(|p| Some(analyze_one(p, json_dir, params, metrics)))
+            .collect()
+    } else {
+        let schedule = Mutex::new(Schedule {
+            next: 0,
+            in_flight: 0,
+            active: 0,
+            out: (0..paths.len()).map(|_| None).collect(),
+        });
+        let admitted = Condvar::new();
+        let (paths, sizes) = (&paths, &sizes);
+        let (sched, admitted) = (&schedule, &admitted);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(move || {
+                    loop {
+                        // Take the next recording, waiting while admitting it
+                        // would put too many bytes in flight. A worker with
+                        // nothing else running is always admitted, so a
+                        // recording larger than the whole budget still gets
+                        // analyzed — alone.
+                        let Some((index, size)) = ({
+                            let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if s.next >= paths.len() {
+                                    break None;
+                                }
+                                let index = s.next;
+                                let size = sizes[index];
+                                if s.active == 0 || s.in_flight + size <= TREND_BYTES_IN_FLIGHT {
+                                    s.next += 1;
+                                    s.in_flight += size;
+                                    s.active += 1;
+                                    break Some((index, size));
+                                }
+                                s = admitted.wait(s).unwrap_or_else(|e| e.into_inner());
+                            }
+                        }) else {
+                            return;
+                        };
+
+                        let outcome = analyze_one(&paths[index], json_dir, params, metrics);
+
+                        {
+                            let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                            s.out[index] = Some(outcome);
+                            s.in_flight -= size;
+                            s.active -= 1;
+                        }
+                        admitted.notify_all();
+                    }
+                });
+            }
+        });
+        schedule.into_inner().unwrap_or_else(|e| e.into_inner()).out
+    };
+
     let mut rows = Vec::with_capacity(paths.len());
-    for p in &paths {
-        match report_for(p, json_dir, params) {
-            Ok((report, why)) => rows.push(row(&report, why == CacheOutcome::Hit, metrics)),
-            Err(e) => tracing::warn!(path = %p.display(), error = %e, "skipping session"),
+    for (p, outcome) in paths.iter().zip(out) {
+        match outcome {
+            Some(Ok(r)) => rows.push(r),
+            Some(Err(error)) => {
+                tracing::warn!(path = %p.display(), %error, "skipping session")
+            }
+            None => {}
         }
     }
     rows.sort_by_key(|r| (r.started_utc_us, r.session_id.clone()));
@@ -505,6 +630,38 @@ mod tests {
         let text = render(&rows);
         assert!(text.contains("s-day1"), "{text}");
         assert!(text.contains("OVERSHOOT"), "{text}");
+    }
+
+    /// Sessions are analyzed concurrently; the table must not be able to tell.
+    /// The file names ascend while the start times descend, so directory order
+    /// and table order disagree and a completion-ordered result would show.
+    #[test]
+    fn a_concurrent_trend_is_ordered_by_start_time_not_by_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..6i64 {
+            let mut cfg = testutil::session_cfg();
+            cfg.session_id = format!("s-{i:02}");
+            cfg.started_utc_us -= i * 3_600_000_000;
+            cfg.anchor.utc_us -= i * 3_600_000_000;
+            testutil::write_session(
+                dir.path(),
+                &cfg,
+                Some("cs2.exe"),
+                &flicky_events(1 + i as usize),
+                &[],
+                64,
+            );
+        }
+
+        let first = compute(dir.path(), None, Params::default(), &[]).unwrap();
+        let ids: Vec<&str> = first.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-05", "s-04", "s-03", "s-02", "s-01", "s-00"]);
+        assert_eq!(first[0].flicks, 6);
+        assert_eq!(first[5].flicks, 1);
+
+        // Same table, run to run, whatever the scheduler did.
+        let again = compute(dir.path(), None, Params::default(), &[]).unwrap();
+        assert_eq!(first, again);
     }
 
     #[test]
