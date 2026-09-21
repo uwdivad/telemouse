@@ -59,7 +59,7 @@ per-sink undelivered envelopes (`kafka`, `udp`, `jsonl`). `exit` = null when
 no sidecar, `"running"` when the run is still going or died without a clean
 stop.
 
-**`report --summary`** → `{schema: "telemouse-report-summary/1",
+**`report --summary`** → `{schema: "telemouse-report-summary/2",
 session{session_id, started_utc, duration_s, event_count, marker_count,
 mouse_cpi, game, sens, cm_per_360, aim_profile_missing}, quality{events,
 ring_drops, lost_batches, seq_gaps, bad_lines, pct_within_1ms,
@@ -73,8 +73,17 @@ band_ratio_8_12, dominant_hz}, clicks{total, per_minute,
 still_click_fraction, click_to_still_ms_median, hold_ms_median,
 double_clicks}, kinematics{total_distance_m, distance_cm_per_min,
 moving_fraction, path_efficiency_weighted, speed_cm_per_s_median,
-speed_cm_per_s_p99}, lifts{count, per_minute, mean_drift_cm}, warnings[]}`.
-Read `warnings` first. `clean` = no data-quality warning; `threads_clean` =
+speed_cm_per_s_p99}, lifts{count, per_minute, mean_drift_cm},
+markers[] ({t_s, label}), markers_total, segments[] ({index, label,
+next_label, t_start_s, t_end_s, flicks, flicks_per_min, overshoot_median,
+settle_median_ms, tremor_rms_counts_s, path_efficiency, clicks_per_min}),
+segments_total, warnings[]}`.
+Read `warnings` first. A `segments[i]` runs from the marker `label` to the
+marker `next_label` (both empty at the ends of the session): that is how you
+tell an `"A start"` stretch from a `"B start"` one without opening the full
+JSON. At most the first 12 markers and 12 segments are listed — the `_total`
+fields say how many there really are — and an unmarked recording has both
+lists empty. `clean` = no data-quality warning; `threads_clean` =
 the capture threads all joined. If `aim_profile_missing` is true, every
 degree-valued metric uses a fallback sensitivity; say so. Overshoot median
 well above 1 suggests sens too high, well below suggests too low.
@@ -179,9 +188,12 @@ Only start, mark or stop capture when the user asked for it. Never call
   comparing. Sessions are only comparable at the same `cm_per_360`.
 - **"Run an experiment" (A/B, trials)**: start capture with `save: true`,
   send a marker at each trial boundary (`"A start"`, `"A end"`, `"B
-  start"`...), stop, then `report <id> --split-by-marker --json FILE` and
-  compare `segments[]` (one per marker interval). Ask the human to do the
-  physical part between markers; say exactly when to start.
+  start"`...), stop, then `report <id> --summary` and compare its
+  `segments[]`: each one names the markers it runs between (`label` →
+  `next_label`), so up to 12 intervals need no other file. Go to `report <id>
+  --split-by-marker --json FILE` only for more intervals than that, or for
+  the per-flick detail. Ask the human to do the physical part between
+  markers; say exactly when to start.
 - **"Is my setup right?" / "why is the dashboard empty?" / "why is nothing
   recorded?"** `telemouse.exe doctor --json`. Report every row whose
   `status` is not `pass`, with its `detail` and `hint`; if they all pass,

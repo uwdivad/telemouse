@@ -1163,14 +1163,27 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
         let cache = d.join("recordings").join(crate::manager::REPORTS_DIR);
         std::fs::create_dir_all(&cache).unwrap();
+        // A summary in a shape this panel does not know is not served: the
+        // recording will never change again, so only the schema tag can
+        // retire a cache written before the analyzer grew a field.
         std::fs::write(
             cache.join("s-1.summary.json"),
             r#"{"schema":"telemouse-report-summary/1"}"#,
         )
         .unwrap();
+        let (s, _, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "a stale summary shape is ignored");
+        std::fs::write(
+            cache.join("s-1.summary.json"),
+            format!(
+                r#"{{"schema":"{}","markers":[]}}"#,
+                crate::manager::SUMMARY_SCHEMA
+            ),
+        )
+        .unwrap();
         let (s, v, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(v["schema"], "telemouse-report-summary/1");
+        assert_eq!(v["schema"], crate::manager::SUMMARY_SCHEMA);
         let _ = std::fs::remove_dir_all(&d);
     }
 

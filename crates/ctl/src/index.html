@@ -1140,6 +1140,16 @@ function renderReport(s) {
     tile("Hand travel", fnum(k.total_distance_m, 1) + " m") +
     tile("Clicks", fnum(cl.total)) + "</div>";
 
+  // The marker labels, so a session marked "sens A" / "sens B" says which
+  // stretch was which without opening the full report.
+  const mk = s.markers || [];
+  if (mk.length) {
+    const total = s.markers_total || mk.length;
+    html += '<details class="sub" style="margin:-4px 0 12px"><summary>What you marked (' + fnum(total) + ")</summary><ul>" +
+      mk.map((m) => "<li>" + esc(durWords(m.t_s)) + " in — " + esc(m.label) + "</li>").join("") +
+      (total > mk.length ? "<li>… and " + fnum(total - mk.length) + " more</li>" : "") + "</ul></details>";
+  }
+
   if (se.aim_profile_missing) {
     html += '<div class="verdict warn"><div><b>' + (se.game ? "No sensitivity is set for " + esc(se.game) + "." : "No game was in front during this recording.") +
       "</b> Degree values below use a generic setting, so compare them only with each other. " +

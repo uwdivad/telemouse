@@ -164,6 +164,29 @@ fn full_pipeline_over_a_written_recording() {
     );
     assert!(r.per_second.iter().any(|s| s.marker_label == "round-start"));
 
+    // --- summary ----------------------------------------------------------
+    // The few-KB projection an agent reads instead of the whole document; it
+    // has to name the stretches, or a marked experiment is unreadable from it.
+    let sum = r.summary(Vec::new());
+    assert_eq!(sum.schema, report::SUMMARY_SCHEMA);
+    assert_eq!(sum.markers.len(), 1);
+    assert_eq!(sum.markers_total, 1);
+    assert_eq!(sum.markers[0].label, "round-start");
+    assert!((sum.markers[0].t_s - 1.0).abs() < 1e-6);
+    assert_eq!(sum.segments_total, 2);
+    assert_eq!(sum.segments[0].next_label, "round-start");
+    assert_eq!(sum.segments[1].label, "round-start");
+    assert_eq!(
+        sum.segments.iter().map(|s| s.flicks).sum::<usize>(),
+        r.flicks.count
+    );
+    let sum_json = serde_json::to_string_pretty(&sum).unwrap();
+    assert!(
+        sum_json.len() < 8_000,
+        "the summary is meant to stay a few KB, not {} bytes",
+        sum_json.len()
+    );
+
     // --- render -----------------------------------------------------------
     let text = r.render();
     for needle in [

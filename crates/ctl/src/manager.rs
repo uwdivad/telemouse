@@ -105,6 +105,13 @@ pub struct Component {
 /// like the analyzer's own index file, so it sorts out of the way.
 pub const REPORTS_DIR: &str = ".reports";
 
+/// The shape of `<id>.summary.json` this panel understands — the analyzer's
+/// `SUMMARY_SCHEMA` (`crates/analyze/src/report.rs`). The panel does not
+/// depend on the analyzer crate (it only ever spawns the exe), so the tag is
+/// repeated here; a cached summary carrying anything else is thrown away and
+/// computed again. Keep the two in step when the shape changes.
+pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/2";
+
 /// How long one summary run of the analyzer may take before it is given up
 /// on. A cached report answers in well under a second; an hour-long
 /// recording analysed from cold takes tens of seconds.
@@ -1044,7 +1051,14 @@ impl Manager {
     }
 
     /// The stored summary of a recording, if one was made after the
-    /// recording last changed. Reads a small file; runs nothing.
+    /// recording last changed *and* in the shape this panel knows. Reads a
+    /// small file; runs nothing.
+    ///
+    /// The mtime test alone is not enough: a recording never changes once its
+    /// run has ended, so a summary cached before the analyzer grew a field
+    /// would be served for the rest of that recording's life. The schema tag
+    /// is the only thing that can retire it, which is why an addition to
+    /// `ReportSummary` bumps it (`crates/analyze/src/report.rs`).
     pub fn stored_summary(&self, id: &str) -> Result<Option<serde_json::Value>, SummaryError> {
         let recording = self.recording_by_id(id)?;
         let path = self.reports_dir().join(format!("{id}.summary.json"));
@@ -1055,9 +1069,10 @@ impl Manager {
         if !fresh {
             return Ok(None);
         }
-        Ok(std::fs::read(&path)
+        let stored: Option<serde_json::Value> = std::fs::read(&path)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()))
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        Ok(stored.filter(|v| v["schema"] == SUMMARY_SCHEMA))
     }
 
     /// `<recordings>/<id>.jsonl` for an id that obeys the workspace rule.
