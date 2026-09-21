@@ -4,6 +4,24 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **Reports come back about twice as fast.** `telemouse-analyze report` on a
+  1156 MB recording went from 6.4 s to 3.3 s, and on a 462 MB one from 3.2 s
+  to 1.8 s. Reading the file was the bottleneck — a single-threaded JSON loop
+  while the rest of the machine idled — so recordings over 8 MB are now split
+  at line boundaries and parsed on every core: 3.1 s of loading became 0.5 s.
+  The magnitude helper behind speed, distance and overshoot no longer goes
+  through the C runtime's overflow-safe `hypot`, which was 8.5% of the
+  analyzer's CPU on its own. Peak memory is unchanged and every number in the
+  report is bit-identical to the old build's, over 19 M events of comparison.
+- **`telemouse-analyze trend` analyzes sessions at the same time.** A cold
+  trend over 36 recordings dropped from ~30 s to ~16 s, a warm one from 1.4 s
+  to 0.6 s. Up to four sessions run at once, bounded by how many recording
+  bytes are in flight, so a gigabyte-sized recording still runs on its own and
+  peak memory is where it was. The table is ordered by session start time as
+  before, whatever order the sessions happen to finish in.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon
