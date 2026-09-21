@@ -256,6 +256,84 @@ pub fn web_banner(status: &WebStatus, panel_url: &str) -> Vec<String> {
     }
 }
 
+/// What the hosted page is allowed to cost while the window is not on
+/// screen.
+///
+/// `SetIsVisible(false)` alone only stops rendering: the page's timers, its
+/// `/api/state` polling and all six `msedgewebview2` processes carry on
+/// (0.32% of a core and 309 MiB, measured in
+/// `docs/PERFORMANCE-2026-09-20.md`). Hiding to the tray therefore also asks
+/// the runtime to suspend the page, which stops the lot until it is shown
+/// again. The transitions are here so they can be tested without a runtime;
+/// `webview.rs` only carries out the [`PowerAction`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerState {
+    /// The window is on screen and the page is running.
+    #[default]
+    Visible,
+    /// Hidden; `TrySuspend` has been asked for and has not answered yet.
+    Suspending,
+    /// Hidden and suspended: no timers, no polling, no rendering.
+    Suspended,
+    /// Hidden but awake — a runtime too old for `ICoreWebView2_3`, a page
+    /// that had not finished loading, or a suspension the runtime refused.
+    /// What the window did before: rendering stops and nothing else.
+    HiddenAwake,
+}
+
+/// What `webview.rs` has to do to the controller for a transition. Every
+/// step is best-effort; nothing blocks on a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    /// The transition needs no COM call.
+    Nothing,
+    /// Tell the page to stop polling, then `SetIsVisible(false)`.
+    Hide,
+    /// The same, then `TrySuspend` — which is refused while the controller
+    /// is still visible, so the order is part of the contract.
+    HideAndSuspend,
+    /// `SetIsVisible(true)`, `Resume` first when `resume`, then focus and
+    /// one immediate refresh of the page.
+    Show { resume: bool },
+    /// `Resume` alone: a `TrySuspend` answered after the window was back,
+    /// so a page that did suspend has to be woken under a visible window.
+    Resume,
+}
+
+/// The window is being shown — tray click, tray menu, or anything else that
+/// goes through `win::set_visible`.
+pub fn power_show(state: PowerState) -> (PowerState, PowerAction) {
+    let resume = matches!(state, PowerState::Suspending | PowerState::Suspended);
+    (PowerState::Visible, PowerAction::Show { resume })
+}
+
+/// The window is being hidden to the tray. `can_suspend` is "this runtime
+/// has `ICoreWebView2_3` *and* the page has finished loading"; a page that
+/// finishes loading later is offered again from `on_navigated`, which is
+/// why [`PowerState::HiddenAwake`] is not a dead end.
+pub fn power_hide(state: PowerState, can_suspend: bool) -> (PowerState, PowerAction) {
+    match (state, can_suspend) {
+        (PowerState::Visible | PowerState::HiddenAwake, true) => {
+            (PowerState::Suspending, PowerAction::HideAndSuspend)
+        }
+        (PowerState::Visible, false) => (PowerState::HiddenAwake, PowerAction::Hide),
+        // Already hidden, and nothing new to try.
+        (s, _) => (s, PowerAction::Nothing),
+    }
+}
+
+/// `TrySuspend` answered (or was refused outright).
+pub fn power_suspended(state: PowerState, ok: bool) -> (PowerState, PowerAction) {
+    match (state, ok) {
+        (PowerState::Suspending, true) => (PowerState::Suspended, PowerAction::Nothing),
+        (PowerState::Suspending, false) => (PowerState::HiddenAwake, PowerAction::Nothing),
+        // Shown again before the answer arrived: a suspension that went
+        // through anyway would leave a frozen page in a visible window.
+        (PowerState::Visible, true) => (PowerState::Visible, PowerAction::Resume),
+        (s, _) => (s, PowerAction::Nothing),
+    }
+}
+
 /// The text view: the web banner, then [`render_text`].
 pub fn window_text(s: &Snapshot, status: &WebStatus) -> String {
     let mut out = web_banner(status, &s.places.panel_url).join("\r\n");
@@ -887,6 +965,80 @@ mod tests {
             "{off}"
         );
         assert!(!off.contains("Install the WebView2 Runtime"), "{off}");
+    }
+
+    /// Hidden to the tray the page is suspended; shown it is resumed, and
+    /// every show refreshes it whether or not it was suspended.
+    #[test]
+    fn hiding_to_the_tray_suspends_the_page_and_showing_it_resumes() {
+        let (hidden, act) = power_hide(PowerState::Visible, true);
+        assert_eq!(hidden, PowerState::Suspending);
+        assert_eq!(act, PowerAction::HideAndSuspend);
+        let (asleep, act) = power_suspended(hidden, true);
+        assert_eq!(asleep, PowerState::Suspended);
+        assert_eq!(act, PowerAction::Nothing);
+        // A second hide while already hidden asks for nothing again.
+        assert_eq!(
+            power_hide(asleep, true),
+            (PowerState::Suspended, PowerAction::Nothing)
+        );
+        assert_eq!(
+            power_show(asleep),
+            (PowerState::Visible, PowerAction::Show { resume: true })
+        );
+        // Showing a window that never left only refreshes it.
+        assert_eq!(
+            power_show(PowerState::Visible),
+            (PowerState::Visible, PowerAction::Show { resume: false })
+        );
+    }
+
+    /// A runtime without `ICoreWebView2_3` (or a page that has not loaded)
+    /// degrades to what the window always did: hide, and nothing else.
+    #[test]
+    fn a_runtime_that_cannot_suspend_just_hides() {
+        let (state, act) = power_hide(PowerState::Visible, false);
+        assert_eq!(state, PowerState::HiddenAwake);
+        assert_eq!(act, PowerAction::Hide);
+        assert_eq!(
+            power_hide(state, false),
+            (PowerState::HiddenAwake, PowerAction::Nothing),
+            "nothing new to try"
+        );
+        // The page finished loading while hidden: now it can be suspended.
+        assert_eq!(
+            power_hide(state, true),
+            (PowerState::Suspending, PowerAction::HideAndSuspend)
+        );
+        assert_eq!(
+            power_show(state),
+            (PowerState::Visible, PowerAction::Show { resume: false })
+        );
+    }
+
+    /// `TrySuspend` answers on the message loop, so the window can be back
+    /// on screen by then. A refusal is just as normal as a success.
+    #[test]
+    fn a_suspension_that_lands_after_the_window_is_back_is_undone() {
+        assert_eq!(
+            power_suspended(PowerState::Visible, true),
+            (PowerState::Visible, PowerAction::Resume)
+        );
+        assert_eq!(
+            power_suspended(PowerState::Visible, false),
+            (PowerState::Visible, PowerAction::Nothing)
+        );
+        assert_eq!(
+            power_suspended(PowerState::Suspending, false),
+            (PowerState::HiddenAwake, PowerAction::Nothing),
+            "a refusal leaves the page awake, not half-suspended"
+        );
+        // A late answer for a state nobody is waiting on changes nothing.
+        assert_eq!(
+            power_suspended(PowerState::Suspended, true),
+            (PowerState::Suspended, PowerAction::Nothing)
+        );
+        assert_eq!(PowerState::default(), PowerState::Visible);
     }
 
     #[test]

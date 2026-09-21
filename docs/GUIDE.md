@@ -1623,16 +1623,16 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --no-webview --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, the WebView2 data folder (`places::webview_data_dir`, created once, `None` → text view), Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Binds the HTTP listener *before* `gui::spawn`, so the window's first navigation finds a live server. Warns if bound to a non-loopback address. |
 | `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiDeps` carries the panel URL, the WebView2 data folder and `no_webview`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
 | `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink` (channel, `panel_url`, `webview_data_dir`, `no_webview`), `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
-| `gui/model.rs` | Pure: `render_text` (the text view's body, CRLF, fixed columns), `WebStatus` + `web_banner` (the lines above it: "Loading the panel…", or why the page is not hosted and where it is instead), `window_text` (banner + body), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text, *Open in browser*, the *Open …* items), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler). |
+| `gui/model.rs` | Pure: `render_text` (the text view's body, CRLF, fixed columns), `WebStatus` + `web_banner` (the lines above it: "Loading the panel…", or why the page is not hosted and where it is instead), `window_text` (banner + body), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text, *Open in browser*, the *Open …* items), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler), and `PowerState` + `power_show` / `power_hide` / `power_suspended` (what a hidden page is allowed to cost — see §19.5). |
 | `gui/win.rs` | `#[cfg(windows)]`: one top-level window (`telemouse`, 1120×760 scaled to DPI, minimum 720×520) that hosts the page through `webview.rs` with one read-only `EDIT` as the text fallback, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, `WM_DPICHANGED`, and the message loop. See §19.5. |
-| `gui/webview.rs` | `#[cfg(windows)]`: the WebView2 host. `begin` probes the runtime and asks for an environment; two completion handlers (`on_environment`, `on_controller`) create the controller, tune the settings and navigate; `on_navigated` retries a refused connection; `timer` (watchdog, navigation retry), `resize`, `position_changed`, `set_visible`, `close`, and `fallback` (text view + banner, browser opened once). Handlers capture the window handle, never the state pointer. |
+| `gui/webview.rs` | `#[cfg(windows)]`: the WebView2 host. `begin` probes the runtime and asks for an environment; two completion handlers (`on_environment`, `on_controller`) create the controller, tune the settings and navigate; `on_navigated` retries a refused connection; `timer` (watchdog, navigation retry), `resize`, `position_changed`, `set_visible` (suspend on hide, resume + refresh on show, over the state machine in `model`), `close`, and `fallback` (text view + banner, browser opened once). Handlers capture the window handle, never the state pointer. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` takes one Toolhelp snapshot every 30 s and answers in between with per-PID queries (about 20 µs each) for the few matching names; a process whose handle cannot be opened (an elevated one) is judged alive or gone from the `OpenProcess` error, not from a table walk; `scan_cached(ttl)` serves a short cache; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
 | `manager.rs` | The component catalogue (`COMPONENTS`), `ManagerConfig`, `StartRequest` validation (`arguments()`), spawning with piped stdout/stderr into a `LogSink` per component (a 400-line ring for the page and tray, plus `<log_dir>/<id>.log` so output survives a panel restart; rotated at 8 MB), `try_wait` reaping with exit accounting (`exits` / `unexpected_exits`; an exit nobody asked for is a `warn!` with component, pid, args, uptime and code), and the two-stage stop. |
 | `server.rs` | axum router, the `Host` check on every request, the `X-Telemouse-Ctl` guard on every `POST`, JSON error bodies, the page with its injected config (`PageConfig`: the viz link, passed through `localhost::browse_addr_str` so a `0.0.0.0` viz bind still links to loopback, `stop_grace_secs`, the marker hotkey, the build's features and the absolute `Places`). `/api/state` carries `version`, `config` (path, found, seeded, status, mtime) and `places`, and accepts `?log_since=<n>` to send only new log lines. `POST /api/open` opens one of the places by name (§19.2). |
 | `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases, and the WebView2 data folder (`webview_data_dir`: `%LOCALAPPDATA%\telemouse\WebView2`, else `%TEMP%\telemouse\WebView2`, never next to the config) — decided once at startup so the text view's header, the tray's *Open …* items, `/api/open` and the page cannot disagree. |
 | `settings.rs` | The settings editor's pure half. `Settings` is the editable subset of `AppConfig` (`mouse_cpi`, `marker_hotkey`, `[recording] enabled`/`dir`, `[ctl] hotkey`, `[games]`, the `[viz.obs]` basics); `Patch` is the change request, and its `deny_unknown_fields` shape *is* the allow-list: bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` cannot be expressed in it. `apply_patch` edits the file's text with `toml_edit` (values are replaced through the existing item so the comment lines above a key, its trailing comment, the ordering and unknown keys survive; a value that already means the same is left as written), `checked` parses the result back through `AppConfig::from_toml` + `validate` and turns the error into `{ field, reason }` without the file path, `token` is an FNV-1a fingerprint of the bytes, `write_atomic` is temp-file-plus-rename in the same directory, and `save` strings them together (token check → patch → validate → seed from the embedded sample when there is no file → write). `game_key` is a shape check on a user-typed exe name (trim, lowercase, `.exe` appended, no separators / control / reserved characters, ≤ 64 chars) — deliberately not a list of names. `changed` + `effects` say which groups moved and who only sees them later (`restart_required`: the tray's hotkey; `next_start`: a running capture or viz). Also owns `SAMPLE_CONFIG` and `seed_config`, which `main.rs` uses on first start. |
 | `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `parse_foreground_line` + `note_seen` keep the last 8 distinct programs the agent saw in front during the current run (`foreground_seen` on the capture component; never `-` or a `telemouse*` name), which is what the first-run guide offers as *Use <exe>*; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
-| `index.html` | Self-contained page (inline CSS and JS, system fonts, no external URLs — the server test rejects any): dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s (10 s while hidden), patches values in place, two-click kill (no modal dialogs). Works in the window and in a normal browser. |
+| `index.html` | Self-contained page (inline CSS and JS, system fonts, no external URLs — the server test rejects any): dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s, patches values in place, two-click kill (no modal dialogs). A page nobody is looking at — a hidden tab, or the window in the tray, which says so through the `window.telemouseSleep` / `window.telemouseWake` hooks the host calls with `ExecuteScript` (§19.5) — stops polling and stops its clock altogether, and refreshes the moment it is back. Works in the window and in a normal browser. |
 
 ### 19.2 The API
 
@@ -1685,7 +1685,10 @@ A process that reports `STATUS_CONTROL_C_EXIT` (`-1073741510`) is shown as
   `panel_url` swaps an unspecified bind address for loopback; the icon is an
   opaque disc with transparent, masked corners; `web_banner` is empty while
   hosted, names the reason and the URL in the fallback, and omits the
-  "install the runtime" line for `--no-webview`.
+  "install the runtime" line for `--no-webview`; the hidden-page state
+  machine suspends on hide and resumes on show, degrades to plain hiding on
+  a runtime that cannot suspend (and tries again once the page has loaded),
+  and undoes a suspension whose answer arrived after the window was back.
 - `places`: `webview_data_dir_in` prefers `LOCALAPPDATA`, falls back to
   `TEMP`, and is `None` when both are unset or empty.
 - `gui::feed`: a visible publisher delivers components, processes, the
@@ -1764,10 +1767,30 @@ same rule as `wndproc`: a callback that fires after the window is gone
 finds nothing and returns. `WM_SIZE` calls `SetBounds`, `WM_MOVE` /
 `WM_WINDOWPOSCHANGED` call `NotifyParentWindowPositionChanged`, and
 `WM_DPICHANGED` applies the suggested rectangle (this also fixes the text
-view, which ignored DPI changes before). Hiding the window to the tray
-calls `SetIsVisible(false)`: a hidden WebView2 stops rendering and the
-page's document reports `hidden`, so it falls to its 10 s poll and the
-window costs nothing while a game is in front.
+view, which ignored DPI changes before).
+
+**Hidden to the tray, the page is suspended.** `SetIsVisible(false)` only
+stops rendering — the page's timers, its polling and all six
+`msedgewebview2` processes carry on, which the September survey measured at
+0.32% of a core and 309 MiB for a window nobody is looking at. So hiding
+also tells the page to stop (the `window.telemouseSleep` hook, through
+`ExecuteScript`, because a hidden WebView2 document does *not* report
+`hidden`) and then asks the runtime to suspend it with
+`ICoreWebView2_3::TrySuspend`, which is refused while the controller is
+still visible and therefore comes second. Showing resumes it, focuses it and
+calls `window.telemouseWake`, so the panel is fresh at once instead of up to
+a poll period old. Which of those steps applies is decided by
+`model::power_show` / `power_hide` / `power_suspended` — a four-state
+machine (`Visible`, `Suspending`, `Suspended`, `HiddenAwake`) that is unit
+tested without a runtime, while `webview.rs` only carries the actions out.
+`TrySuspend` answers on the message loop like every other completion and is
+never waited for; an answer that arrives after the window is back on screen
+resumes the page again. A runtime without `ICoreWebView2_3` (or a page that
+has not finished loading, which cannot be suspended) degrades to
+`HiddenAwake` — `SetIsVisible(false)` alone, what the window did before —
+and is offered to the runtime again from `on_navigated` once the page is up.
+Every show/hide path — tray click, tray menu, the close button, minimise —
+goes through `win::set_visible` into `webview::set_visible`.
 
 **The fallback.** Every failure ends in `webview::fallback`: a runtime that
 is not installed, an environment or controller that fails, a watchdog timer
@@ -1877,7 +1900,10 @@ target\debug`: the window shows the dark panel within about a second
 window") + grey icon; right-click → *Start capture* → green within a second
 and the page agrees; *Stop capture* → grey, "stopped" on the page and
 "exited: Ctrl-Break" in the text view's log tail; close → hidden, icon
-click → back; *open dashboard* → the system browser, not a second window;
+click → back with numbers that are already current (with `RUST_LOG=debug`,
+`webview2 power state` says `Suspending` then `Suspended` on the way out and
+`Visible` on the way back, and the `msedgewebview2` processes' CPU time stops
+advancing in between); *open dashboard* → the system browser, not a second window;
 `--no-webview` → text view, no `msedgewebview2.exe` children;
 `$env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = "C:\nope"` → text view with the
 banner and the browser opened once; *Exit* → children stopped, icon gone. Menu choices are the return value of

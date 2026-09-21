@@ -510,6 +510,8 @@ const TOOL_TITLES = { doctor: "Check my setup", report: "Report", trend: "Trend"
 let state = null;
 let sessions = [];
 let pollTimer = null;
+let elapsedTimer = null;
+let awake = true;                // false while nobody is looking: no timers at all
 const busy = new Set();          // component ids (or "p<pid>") with a request in flight
 const armed = new Map();         // force-stop buttons awaiting a second click, key → timeout
 const chosen = { flags: new Set(), save: null, session: null }; // capture flags / save switch / report session
@@ -602,13 +604,29 @@ async function poll() {
   } catch (e) {
     setConn(false, "Panel not responding");
   }
-  pollTimer = setTimeout(poll, document.hidden ? 10000 : 2000);
+  pollTimer = awake ? setTimeout(poll, 2000) : null;
 }
-/* A hidden page polls slowly (nothing to show) and catches up the moment it
-   is visible again. Inside the native window, hiding it to the tray is
-   exactly this. */
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(pollTimer); poll(); } });
-setInterval(() => { if (sinceStartMs !== null) setText($("liveElapsed"), hms((Date.now() - sinceStartMs) / 1000)); }, 1000);
+/* A page nobody is looking at does nothing at all — no fetches, no clock —
+   and catches up the moment it is back. That is a hidden browser tab, a
+   minimised window, and the native window hidden to the tray: there
+   `SetIsVisible(false)` does not make the document `hidden`, so the window
+   calls these two hooks through ExecuteScript instead (gui/webview.rs), and
+   suspends the page on top of it. */
+function sleepPage() {
+  awake = false;
+  clearTimeout(pollTimer); pollTimer = null;
+  clearInterval(elapsedTimer); elapsedTimer = null;
+}
+function wakePage() {
+  awake = true;
+  clearTimeout(pollTimer); pollTimer = null;
+  if (elapsedTimer === null) elapsedTimer = setInterval(tickElapsed, 1000);
+  poll();
+}
+function tickElapsed() { if (sinceStartMs !== null) setText($("liveElapsed"), hms((Date.now() - sinceStartMs) / 1000)); }
+document.addEventListener("visibilitychange", () => { if (document.hidden) sleepPage(); else wakePage(); });
+window.telemouseSleep = sleepPage;
+window.telemouseWake = wakePage;
 
 /* ---------- actions ---------- */
 async function act(id, fn) {
@@ -1461,7 +1479,8 @@ document.addEventListener("toggle", (e) => {
   if (d.tagName === "DETAILS" && d.open) for (const pre of d.querySelectorAll("pre.log")) pre.scrollTop = pre.scrollHeight;
 }, true);
 
-poll();
+/* Opened in a background tab: nothing runs until it is looked at. */
+if (document.hidden) sleepPage(); else wakePage();
 </script>
 </body>
 </html>

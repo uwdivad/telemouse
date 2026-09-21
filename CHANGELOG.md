@@ -4,6 +4,21 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **The panel window costs nothing in the tray.** Hiding the window used to
+  stop it rendering and nothing else: the page kept polling and the six
+  `msedgewebview2` processes stayed as expensive as an open window (0.32% of
+  a core, measured in `docs/PERFORMANCE-2026-09-20.md`). It is now suspended
+  while it is hidden (`ICoreWebView2_3::TrySuspend`) and resumed — with an
+  immediate refresh, so nothing on screen is a poll period old — when the
+  tray icon, the menu or the close button brings it back. A WebView2 runtime
+  too old to have that interface keeps the old behaviour instead of failing.
+- **The panel page idles when nobody is looking.** A hidden browser tab, a
+  minimised window or a window in the tray stops the page's polling and its
+  clock entirely (it used to fall back to a 10 s poll) and refreshes the
+  moment it is looked at again.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon

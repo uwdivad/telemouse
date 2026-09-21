@@ -10,6 +10,12 @@
 //! exactly as `wndproc` does — a callback that fires after the window is
 //! gone finds nothing and returns.
 //!
+//! While the window is in the tray the page is suspended
+//! (`ICoreWebView2_3::TrySuspend`, decided by the state machine in
+//! `model::power_*`) so that a panel nobody is looking at costs nothing; a
+//! runtime too old for that interface falls back to what this did before,
+//! `SetIsVisible(false)` alone.
+//!
 //! Every failure ends in [`fallback`]: the read-only `EDIT` text view is
 //! shown with a banner saying why, and the page is opened in the default
 //! browser once. Nothing here panics and nothing blocks the thread; a
@@ -24,17 +30,19 @@ use tracing::{debug, info, warn};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC, COREWEBVIEW2_WEB_ERROR_STATUS,
     CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString,
-    ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment,
+    ICoreWebView2, ICoreWebView2_3, ICoreWebView2Controller, ICoreWebView2Controller2,
+    ICoreWebView2Environment,
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    NavigationCompletedEventHandler, NewWindowRequestedEventHandler, take_pwstr,
+    ExecuteScriptCompletedHandler, NavigationCompletedEventHandler, NewWindowRequestedEventHandler,
+    TrySuspendCompletedHandler, take_pwstr,
 };
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer};
 use windows::core::{BOOL, Interface, PCWSTR, PWSTR};
 
-use super::model::WebStatus;
+use super::model::{self, PowerAction, PowerState, WebStatus};
 use super::win::{self, UiState};
 
 /// `SetTimer` id: the environment or controller never answered.
@@ -56,6 +64,16 @@ const BACKGROUND: COREWEBVIEW2_COLOR = COREWEBVIEW2_COLOR {
     B: 0x16,
 };
 
+/// Told to the page when the window goes to the tray. `SetIsVisible(false)`
+/// does not make the document `hidden`, so the page cannot notice by itself
+/// that nobody is looking; these two hooks are how it is told. A page that
+/// does not have them (an older build behind a newer window) ignores both.
+const SLEEP_SCRIPT: &str = "window.telemouseSleep && window.telemouseSleep()";
+/// Told to the page when the window comes back: refresh now, then poll as
+/// usual. Without it the first thing on screen could be a poll period old,
+/// because a suspended timer resumes where it stopped.
+const WAKE_SCRIPT: &str = "window.telemouseWake && window.telemouseWake()";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Phase {
     /// `begin` has not run.
@@ -73,6 +91,12 @@ pub(super) struct WebHost {
     pub(super) phase: Phase,
     controller: Option<ICoreWebView2Controller>,
     webview: Option<ICoreWebView2>,
+    /// The same object as `webview`, through the interface that has
+    /// `TrySuspend` / `Resume`. `None` on a runtime older than that
+    /// (WebView2 1.0.864), which is then never suspended.
+    suspend: Option<ICoreWebView2_3>,
+    /// What the page costs while the window is hidden.
+    power: PowerState,
     nav_retries: u8,
     /// The first successful navigation was logged.
     page_shown: bool,
@@ -86,6 +110,8 @@ impl WebHost {
             phase: Phase::Idle,
             controller: None,
             webview: None,
+            suspend: None,
+            power: PowerState::Visible,
             nav_retries: 0,
             page_shown: false,
             browser_opened: false,
@@ -312,6 +338,22 @@ unsafe fn attach(
         let url = wide(&hosted_url(&(*s).link.panel_url));
         wv.Navigate(PCWSTR(url.as_ptr()))?;
 
+        // The interface that can suspend the page while it is in the tray.
+        // An older runtime simply does not have it.
+        let suspend = wv.cast::<ICoreWebView2_3>().ok();
+        if suspend.is_none() {
+            info!(
+                "this WebView2 runtime cannot suspend a hidden page; it will keep polling in the tray"
+            );
+        }
+        (*s).web.suspend = suspend;
+        (*s).web.power = if (*s).visible {
+            PowerState::Visible
+        } else {
+            // Hidden before the page was ready: `on_navigated` offers it to
+            // the runtime again once the first navigation succeeds.
+            PowerState::HiddenAwake
+        };
         (*s).web.controller = Some(controller.clone());
         (*s).web.webview = Some(wv);
         (*s).web.phase = Phase::Hosted;
@@ -343,6 +385,12 @@ unsafe fn on_navigated(
             if !(*s).web.page_shown {
                 (*s).web.page_shown = true;
                 info!(url = %(*s).link.panel_url, "panel page hosted in the window");
+            }
+            // The window went to the tray while this navigation was still
+            // running (or an earlier suspension was refused because of it):
+            // a loaded page can be suspended, so ask again.
+            if !(*s).visible {
+                power(s, model::power_hide((*s).web.power, can_suspend(s)));
             }
             return;
         }
@@ -420,17 +468,144 @@ pub(super) unsafe fn position_changed(s: *mut UiState) {
     }
 }
 
-/// Hidden to the tray: the page stops rendering and its document reports
-/// `hidden`, so it polls slowly — the window costs nothing while a game is
-/// in front. Shown: keyboard focus lands in the page.
+/// Hidden to the tray: the page stops rendering, stops polling and — on a
+/// runtime that can — is suspended, so the window costs nothing while a game
+/// is in front. Shown: resumed, focused, and refreshed at once so nothing on
+/// screen is a poll period old. Every show/hide path (tray click, tray menu,
+/// the close button, minimise) comes through `win::set_visible` into here.
 pub(super) unsafe fn set_visible(s: *mut UiState, show: bool) {
     // SAFETY: as `resize`.
     unsafe {
-        if let Some(c) = (*s).web.controller.clone() {
-            let _ = c.SetIsVisible(show);
-            if show {
-                let _ = c.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        let next = if show {
+            model::power_show((*s).web.power)
+        } else {
+            model::power_hide((*s).web.power, can_suspend(s))
+        };
+        power(s, next);
+    }
+}
+
+/// Whether the page may be suspended: a runtime that has `ICoreWebView2_3`
+/// and a page that has actually loaded (suspending one mid-navigation is
+/// refused, and would freeze the retry).
+unsafe fn can_suspend(s: *mut UiState) -> bool {
+    // SAFETY: plain field reads on the live state.
+    unsafe { (*s).web.suspend.is_some() && (*s).web.page_shown }
+}
+
+/// Record a decision from `model` and carry it out.
+unsafe fn power(s: *mut UiState, next: (PowerState, PowerAction)) {
+    // SAFETY: `s` is live; COM objects are cloned handles.
+    unsafe {
+        let (state, action) = next;
+        if state != (*s).web.power {
+            debug!(?state, "webview2 power state");
+        }
+        (*s).web.power = state;
+        let Some(c) = (*s).web.controller.clone() else {
+            return; // the text view is the window; nothing to suspend
+        };
+        match action {
+            PowerAction::Nothing => {}
+            PowerAction::Hide | PowerAction::HideAndSuspend => {
+                run_script(s, SLEEP_SCRIPT);
+                let _ = c.SetIsVisible(false);
+                // TrySuspend is refused while the controller is visible,
+                // which is why it comes after.
+                if action == PowerAction::HideAndSuspend {
+                    try_suspend(s);
+                }
             }
+            PowerAction::Show { resume } => {
+                if resume {
+                    resume_page(s);
+                }
+                let _ = c.SetIsVisible(true);
+                let _ = c.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                run_script(s, WAKE_SCRIPT);
+            }
+            PowerAction::Resume => resume_page(s),
+        }
+    }
+}
+
+/// Ask the runtime to suspend the page. The answer arrives on this thread's
+/// message loop like every other WebView2 completion; nothing waits for it.
+unsafe fn try_suspend(s: *mut UiState) {
+    // SAFETY: `s` is live; the handler captures only the window handle.
+    unsafe {
+        let hwnd = (*s).hwnd;
+        let Some(w3) = (*s).web.suspend.clone() else {
+            return;
+        };
+        let handler = TrySuspendCompletedHandler::create(Box::new(move |hr, ok| {
+            on_suspended(hwnd, hr, ok);
+            Ok(())
+        }));
+        if let Err(e) = w3.TrySuspend(&handler) {
+            debug!(error = %e, "TrySuspend refused");
+            suspend_answered(s, false);
+        }
+    }
+}
+
+/// `TrySuspend` finished: `ok` is false when the runtime decided the page
+/// was busy, which is a normal answer and not an error.
+unsafe fn on_suspended(hwnd: HWND, hr: windows::core::Result<()>, ok: bool) {
+    // SAFETY: as `on_environment`.
+    unsafe {
+        let s = win::state_of(hwnd);
+        if s.is_null() {
+            return;
+        }
+        if let Err(e) = &hr {
+            debug!(error = %e, "TrySuspend failed");
+        }
+        suspend_answered(s, hr.is_ok() && ok);
+    }
+}
+
+unsafe fn suspend_answered(s: *mut UiState, ok: bool) {
+    // SAFETY: `s` is live.
+    unsafe {
+        power(s, model::power_suspended((*s).web.power, ok));
+    }
+}
+
+unsafe fn resume_page(s: *mut UiState) {
+    // SAFETY: `s` is live; `Resume` on a page that is not suspended is a
+    // no-op the runtime reports, and reporting it is all we do.
+    unsafe {
+        if let Some(w3) = (*s).web.suspend.clone()
+            && let Err(e) = w3.Resume()
+        {
+            debug!(error = %e, "webview2 resume");
+        }
+    }
+}
+
+/// Run one of the two hook scripts in the page. Fire and forget: the result
+/// is only ever a log line, and a page without the hook evaluates to
+/// `undefined`.
+unsafe fn run_script(s: *mut UiState, script: &str) {
+    // SAFETY: `s` is live; the wide buffer outlives the call, which copies
+    // the script before returning.
+    unsafe {
+        let Some(wv) = (*s).web.webview.clone() else {
+            return;
+        };
+        if !(*s).web.page_shown {
+            return; // nothing has loaded that could have the hooks
+        }
+        let js = wide(script);
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|hr, _result| {
+            if let Err(e) = hr {
+                debug!(error = %e, "page hook script");
+            }
+            Ok(())
+        }));
+        if let Err(e) = wv.ExecuteScript(PCWSTR(js.as_ptr()), &handler) {
+            debug!(error = %e, "ExecuteScript refused");
         }
     }
 }
@@ -443,6 +618,8 @@ pub(super) unsafe fn close(s: *mut UiState) {
         let _ = KillTimer(Some(hwnd), TIMER_WATCHDOG);
         let _ = KillTimer(Some(hwnd), TIMER_NAV_RETRY);
         (*s).web.webview = None;
+        (*s).web.suspend = None;
+        (*s).web.power = PowerState::Visible;
         if let Some(c) = (*s).web.controller.take() {
             let _ = c.Close();
         }
