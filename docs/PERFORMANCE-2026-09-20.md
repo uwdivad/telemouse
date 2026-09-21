@@ -36,7 +36,8 @@ fallback ×1, plus one symbol smoke test). Raw live results:
 6. **`window_ms = 25` actually ships ~52 batches/s, not 40**, because the
    window is measured from the first event's back-dated stamp. T2 and viz
    cost scale with batches/s, so the live path pays ~30% more than the docs'
-   model says.
+   model says. *(Fixed 2026-09-21, with the double wake below — see "Landed:
+   L3 + L4".)*
 7. The live path itself is where the August pass left it: syscall-bound, user
    code under 3% of samples. Capture-to-ship p50 25.75 ms / p99 27.25 ms,
    viz delivery p50 26.0 / p99 27.1 ms, zero drops in every run.
@@ -192,7 +193,8 @@ the wait rows as "number of wake-ups", not time spent waiting.
 | ctl (WebView2 mode) | tokio parks 71%, GUI message pump 9.8%, **`Manager::refresh_config` → `ZwCreateFile` 5.7%**, `resolve_bin` → `ZwCreateFile` 1.7% |
 | ctl `--no-webview`, idle | **`NtGdiExtTextOutW` + `DrawStream` + `BitBlt` + glyph shaping ≈ 25% of samples** on `ctl-gui`: the fallback text view is repainting |
 
-Two things fall out of the capture profile:
+Two things fall out of the capture profile (both fixed on 2026-09-21; the
+numbers below are what this pass measured, before the fix):
 
 - **T2 wakes twice per batch.** After a flush nothing is pending, so it takes
   the "T1 will wake me" park; T1's next drain unparks it
@@ -249,12 +251,48 @@ Estimates are for the 1156 MB session (5.65 s) or the default live run
 |---|---|---|---|
 | L1 | **On hide-to-tray, `TrySuspend` the WebView (resume on show), or close the controller after a few minutes hidden and recreate it on show.** Also have the page stop polling on `visibilitychange`. | hidden: −0.32% CPU; closing also frees ~309 MiB | Hidden-to-tray is the state ctl sits in during a game, and today it is 2× the idle cost of everything else combined. `SetIsVisible(false)` alone does not stop timers. `TrySuspend` needs the controller invisible first, which `set_visible` already arranges. The `EDIT` fallback must keep working (CLAUDE.md). Relevant to the in-game hitching history: six resident Chromium processes are the kind of background load that showed up before. |
 | L2 | Fallback text view: keep the last rendered string and skip `set_text` when `model::window_text` is unchanged | ctl 0.26–0.32 → ~0.05% with the window open | `refresh` already skips hidden and hosted states; what is missing is the change check. Profile: a quarter of ctl's samples are GDI text output in `--no-webview` mode. |
-| L3 | Make `window_ms` mean what it says: time the window from when T2 opened the batch (or align the flush to the drain cadence) | 52 → 40 batches/s: **−0.15–0.19%** (T2 + viz + each WS client scale with batches/s) | Or keep the behaviour and fix the docs' "40 batches/s". Either way the latency/CPU trade in PERFORMANCE-2026-09.md is currently computed from the wrong rate. |
-| L4 | T2: while the stream is active (a batch flushed within the last window), park on the window timer only; keep the T1 unpark for the idle→active edge | **−0.10–0.13%**, and removes T1's unpark syscall per batch | Halves T2 wake-ups (104 → 52/s). First-event latency is unchanged because the idle edge still wakes promptly. |
+| L3 | **Landed 2026-09-21.** Make `window_ms` mean what it says | 52 → 40 batches/s | See the note below. |
+| L4 | **Landed 2026-09-21.** T2 parks on the window timer only while the stream is live | 104 → ~40 wakes/s | See the note below. |
 | L5 | `telemouse-context`: 0.075% with ctl running vs 0.044% without | −0.03% | New since August. Worth a look at what it does per tick when the foreground window is ctl's; a snapshot only on foreground *change* should be near zero. |
 | L6 | ctl `refresh_config` / `resolve_bin` open files on every `/api/state` poll | −0.01–0.02%; more at 500 ms polling (ctl 0.218%) | Cache on `(mtime, len)` from one `stat`, or re-read only every few seconds. |
 | L7 | Skip the UDP send while the last N failed with `WSAECONNRESET` (no viz up) | −0.19% with no viz | Still open from August; UDP send is the single largest real cost on T2 (13.6% of capture samples). |
 | L8 | Second WS client costs +0.30% | — | Known kernel floor (~47 µs/send). L3 cuts it by a quarter for free. |
+
+### Landed: L3 + L4 (2026-09-21)
+
+Both were one change, because they were one bug. The window was timed from
+the first event's `ts_qpc` and tested against the wall clock — two different
+clocks. T1's coalesced reads spread a drain's stamps back over the period
+since the previous read, so the first event of a batch is back-dated by up to
+one cadence period (`coalesce_ms + 1` = 9 ms at the defaults). Every window
+was short by that, giving a flush period of `25 − 9 + one drain gap` ≈ 19 ms:
+the 52/s measured above. The second wake fell out of the same shape — a flush
+emptied the batcher, so the loop took the idle park, T1 unparked it on the
+next drain, and it parked again on the window timer.
+
+What changed (`crates/core/src/batcher.rs`, `crates/capture/src/shipping.rs`):
+
+- The window is a wall-clock **deadline** the shipping thread sets, kept
+  apart from `first_qpc`, which stays the event's own back-dated stamp and
+  still becomes `ts_anchor_us`. Nothing on the wire changed.
+- The deadline runs on a **fixed grid** (`deadline + window_ticks`), so the
+  cadence is exactly `1000 / window_ms` however the drains land inside a
+  window. The *first* window of a burst is anchored on its first event
+  instead — after a pause that arrival was observed, not back-dated — which
+  keeps idle→first-batch latency at exactly one window.
+- The window stays open **across a flush** while the stream is live, so the
+  loop parks to the next deadline without arming the `RingWaker`.
+
+Verified on a fake clock (`Sim` in `shipping.rs`, which drives the real
+`DrainStamper` and the real `advance_window`): 10 s of 1 kHz motion at
+`window_ms = 25` gives **401 batches** (40.1/s, every gap exactly 25 ms) of
+25 events each, **404 T2 wakes** (≈1 per batch, against ~104/s before) and
+**1** T1 unpark for the whole run (against one per batch). Worst oldest-event
+wait 32.0 ms, inside the `window_ms + coalesce_ms + 1` = 34 ms bound; it was
+exactly 25 ms before, because the old window was anchored on that very event.
+8 kHz and `window_ms = 50` hold the same grid. No live `tmbench` numbers:
+the box was shared with other builds at the time, so the projected
+−0.15–0.19% (L3) and −0.10–0.13% (L4) are still estimates.
 
 ### Dashboard replay
 

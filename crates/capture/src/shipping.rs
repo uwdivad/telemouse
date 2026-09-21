@@ -5,12 +5,45 @@
 //! the sinks. All of that policy lives in [`ShipperCore`], which is pure and
 //! testable; [`run`] is only the thread + timing shell around it.
 //!
-//! The loop **parks** rather than polling: with no batch open, T1 unparks it
-//! on the first event (see [`crate::raw_input::RingWaker`]); once a batch is
-//! open it sleeps out the remainder of the batch window and drains whatever
-//! accumulated in one go. That makes the wakeup rate ~1/window rather than
-//! one per mouse report — at 1kHz the per-event wake/park cycle was most of
-//! the agent's CPU.
+//! The loop **parks** rather than polling, in one of two modes:
+//!
+//! * **Idle** — no window is open. T1 unparks the thread on the first event
+//!   of a burst (see [`crate::raw_input::RingWaker`]), and the park timeout
+//!   is only the backstop for a wake lost to that waker's race. An idle desk
+//!   costs one wakeup a second, for the sink tick.
+//! * **Live** — a window is open. Its deadline is the only thing that can
+//!   need this thread before it passes, so the loop sleeps to the deadline
+//!   *without* arming the waker, and drains everything that piled up in one
+//!   go. T1's per-event `wake()` stays a relaxed load of a `false` flag.
+//!
+//! That makes the wakeup rate ~1/window rather than one per mouse report — at
+//! 1kHz the per-event wake/park cycle was most of the agent's CPU.
+//!
+//! ## How a window opens and closes (and what changed on 2026-09-21)
+//!
+//! The window is wall-clock and runs on a fixed grid owned by the
+//! [`Batcher`]: [`ShipperCore::open_window`] sets the next deadline one
+//! window after the last one, [`ShipperCore::close_window`] stands the timer
+//! down when a whole window passes with nothing in it. Each pass ends in
+//! [`advance_window`], which is the entire policy and is pure, so the cadence
+//! can be driven by a fake clock in the tests.
+//!
+//! Before that, the window was timed from the first *event's* `ts_qpc` and
+//! compared against the wall clock. Those are not the same clock: T1
+//! coalesces raw-input reads and spreads a drain's stamps back over the
+//! period since the previous read, so the first event of a batch is
+//! back-dated by up to one cadence period (`coalesce_ms + 1`, ~9 ms at the
+//! defaults). Every window was therefore short by that amount, and the
+//! flush-to-flush period was `window_ms − back-dating + one drain gap` ≈
+//! 19 ms at the 25 ms default — the ~52 batches/s that
+//! `docs/PERFORMANCE-2026-09-20.md` measured where the docs promised 40.
+//!
+//! The same pass also cost a second wake per batch: after a flush nothing was
+//! pending, so the loop took the idle park with the waker armed, T1's next
+//! drain unparked it (a `ZwAlertThreadByThreadId` on the capture thread), it
+//! opened the batch and parked *again* on the window timer. ~104 wakes for
+//! ~52 flushes a second. Keeping the window open across a flush while the
+//! stream is live removes that park entirely.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,6 +116,30 @@ pub fn next_park_timeout(prev_timed_out: bool, ring_empty: bool, max_park: Durat
         IDLE_PARK
     } else {
         max_park
+    }
+}
+
+/// The window bookkeeping at the end of one pass of the loop — the whole of
+/// the batch-cadence policy, factored out of [`run`] so it can be driven by a
+/// fake clock (`Sim` in the tests below) instead of by real threads.
+///
+/// * `expired` — the open window's deadline has passed (read *before* the
+///   flush, which does not touch the window).
+/// * `live` — this pass saw events: something was drained, or something is
+///   still pending.
+///
+/// A live pass keeps a window open, advancing the grid when the last one just
+/// closed; a window that closes with nothing at all in it means the hand
+/// stopped, and the loop stands the timer down and goes back to waiting on
+/// T1. Nothing else changes the window: a size-forced flush partway through
+/// one leaves it running, so `max_events` cannot make the cadence drift.
+pub fn advance_window(core: &mut ShipperCore, now_qpc: u64, expired: bool, live: bool) {
+    if live {
+        if expired || !core.window_open() {
+            core.open_window(now_qpc);
+        }
+    } else if expired {
+        core.close_window();
     }
 }
 
@@ -246,7 +303,6 @@ pub struct ShipperCore {
     marker_seq: u64,
     drops: DropAccountant,
     abs_frames: DropAccountant,
-    window_ticks: u64,
     max_park: Duration,
 }
 
@@ -260,7 +316,6 @@ impl ShipperCore {
             marker_seq: 0,
             drops: DropAccountant::new(),
             abs_frames: DropAccountant::new(),
-            window_ticks: anchor.ms_to_ticks(window_ms),
             max_park: max_park(window_ms),
         }
     }
@@ -283,8 +338,31 @@ impl ShipperCore {
         self.batcher.push(ev);
     }
 
-    pub fn should_flush(&self, now_qpc: u64) -> bool {
-        self.batcher.should_flush(now_qpc)
+    /// The batch has hit `max_events`. The only condition the drain loop
+    /// tests per event: it needs no clock reading and is what keeps a batch
+    /// inside the UDP datagram budget.
+    pub fn is_full(&self) -> bool {
+        self.batcher.is_full()
+    }
+
+    /// The open window's deadline has passed (whether or not anything
+    /// accumulated in it).
+    pub fn window_expired(&self, now_qpc: u64) -> bool {
+        self.batcher.window_expired(now_qpc)
+    }
+
+    pub fn window_open(&self) -> bool {
+        self.batcher.is_window_open()
+    }
+
+    /// Put the next window on the grid (see [`Batcher::open_window`]).
+    pub fn open_window(&mut self, now_qpc: u64) {
+        self.batcher.open_window(now_qpc);
+    }
+
+    /// Stand the window timer down: the stream went quiet.
+    pub fn close_window(&mut self) {
+        self.batcher.close_window();
     }
 
     pub fn pending(&self) -> usize {
@@ -297,14 +375,17 @@ impl ShipperCore {
         self.batcher.events()
     }
 
-    /// How long the loop may park before the current batch window expires.
-    /// With nothing pending there is no deadline, so it parks the full window.
+    /// How long the loop may park before the open window closes. With no
+    /// window open there is no deadline, so it parks the full window.
+    ///
+    /// Measured against the window's own wall-clock deadline, never against
+    /// the first event's (back-dated) stamp: parking to `first_qpc + window`
+    /// is exactly what used to cut every window short.
     pub fn park_hint(&self, now_qpc: u64) -> Duration {
-        let Some(first) = self.batcher.first_qpc() else {
+        let Some(deadline) = self.batcher.deadline() else {
             return self.max_park;
         };
-        let elapsed = now_qpc.saturating_sub(first);
-        let remaining_ticks = self.window_ticks.saturating_sub(elapsed);
+        let remaining_ticks = deadline.saturating_sub(now_qpc);
         let us = (remaining_ticks as u128 * 1_000_000 / self.anchor.qpc_freq.max(1) as u128) as u64;
         Duration::from_micros(us).clamp(MIN_PARK, self.max_park)
     }
@@ -490,14 +571,17 @@ pub fn run(
         let stopping = capture_stopped.load(Ordering::Acquire);
         stats.observe_ring_slots(consumer.slots() as u64);
 
-        // Drain the ring, flushing whenever the batcher says so. Checking after
-        // every push is what keeps a batch from exceeding `max_events` (and so
-        // the UDP datagram budget) under a burst.
+        // Drain the ring. The only flush the drain itself forces is the size
+        // one — checking after every push is what keeps a batch from
+        // exceeding `max_events` (and so the UDP datagram budget) under a
+        // burst. The window is *not* tested here: an event's `ts_qpc` is a
+        // back-dated raw-input stamp, not a reading of the wall clock the
+        // window runs on, and testing the window against it is what used to
+        // close every window early (see the module docs).
         let mut drained = 0usize;
         while let Ok(ev) = consumer.pop() {
-            let ts = ev.ts_qpc;
             core.push(ev);
-            if core.should_flush(ts) {
+            if core.is_full() {
                 flush(
                     &mut core,
                     &mut sinks,
@@ -527,8 +611,14 @@ pub fn run(
             );
         }
 
-        // Time-based flush for a partial batch whose window has elapsed.
-        if core.should_flush(platform::qpc()) {
+        // The window closed: ship what accumulated in it (`flush` is a no-op
+        // on an empty batcher), then put the next window on the grid — or,
+        // if a whole window went by with no events at all, stand the timer
+        // down and go back to waiting on T1.
+        let now = platform::qpc();
+        let expired = core.window_expired(now);
+        let live = drained > 0 || core.pending() > 0;
+        if expired {
             flush(
                 &mut core,
                 &mut sinks,
@@ -539,6 +629,7 @@ pub fn run(
                 args.print,
             );
         }
+        advance_window(&mut core, now, expired, live);
 
         if last_tick.elapsed() >= TICK_INTERVAL {
             for failure in tick_all(&mut sinks) {
@@ -592,8 +683,23 @@ pub fn run(
             break;
         }
         if drained < DRAIN_BUDGET {
-            let timeout = core.park_hint(platform::qpc());
-            if core.pending() == 0 {
+            if core.window_open() {
+                // A window is open: its deadline is the only thing that can
+                // need this thread before it passes, so sleep it out and let
+                // events pile up in the ring. The waker is deliberately *not*
+                // armed, so T1's per-event `wake()` stays a relaxed load of a
+                // `false` flag — no unpark syscall on the capture thread, and
+                // one wake here per batch instead of two (one for T1's unpark
+                // after the flush, one for the window). Waking per event cost
+                // a full wake→pop→park cycle for every mouse report.
+                //
+                // Price: a marker or a shutdown that arrives mid-window rides
+                // the next deadline, at most one window (25 ms) late. Markers
+                // are rare and an idle desk — where a hotkey is actually
+                // pressed — still wakes immediately, on the branch below.
+                idle_probe_expired = false;
+                std::thread::park_timeout(core.park_hint(platform::qpc()));
+            } else {
                 // Nothing in flight: T1 wakes us on the first event (so the
                 // batch window starts promptly), markers and shutdown wake us
                 // explicitly, and the only timed work left is the sink tick.
@@ -617,13 +723,6 @@ pub fn run(
                     idle_probe_expired = false;
                 }
                 waker.end_park();
-            } else {
-                // A batch is open: its window is the only deadline that
-                // matters, so sleep it out and let events pile up in the ring.
-                // Waking per event here cost a syscall on T1 and a full
-                // wake→pop→park cycle on this thread for every mouse report.
-                idle_probe_expired = false;
-                std::thread::park_timeout(timeout);
             }
         } else {
             idle_probe_expired = false;
@@ -793,14 +892,19 @@ fn record_latency(anchor: QpcAnchor, stats: &Stats, events: &[RawEvent]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use telemouse_core::Batch;
     use telemouse_core::event::buttons;
 
     use super::*;
     use crate::context::ContextSnapshot;
+    use crate::raw_input::DrainStamper;
     use crate::sinks::mock::{FailingSink, RecordingSink};
 
     const FREQ: u64 = 10_000_000;
+    /// QPC ticks per millisecond at the test anchor's 10MHz clock.
+    const MS: u64 = FREQ / 1000;
 
     fn anchor() -> QpcAnchor {
         QpcAnchor {
@@ -884,9 +988,8 @@ mod tests {
         let mut core = ShipperCore::new("s-1".into(), anchor(), 3, 25);
         let mut batches = Vec::new();
         for i in 0..7u64 {
-            let e = ev(anchor().qpc + i, 2);
-            core.push(e);
-            if core.should_flush(e.ts_qpc) {
+            core.push(ev(anchor().qpc + i, 2));
+            if core.is_full() {
                 batches.push(core.build_batch(&ctx(), 0, 0).unwrap());
             }
         }
@@ -906,16 +1009,21 @@ mod tests {
     fn batches_break_on_the_window_and_map_ts_through_the_anchor() {
         let a = anchor();
         let mut core = ShipperCore::new("s-1".into(), a, 1_000, 25);
-        core.push(ev(a.qpc, 1));
+        // The window opens when the loop notices the stream, from *its*
+        // clock; the events it then collects are back-dated raw-input stamps
+        // and must not shorten it.
+        core.open_window(a.qpc);
+        core.push(ev(a.qpc - FREQ * 8 / 1000, 1));
         // 24ms later: still inside the 25ms window.
-        assert!(!core.should_flush(a.qpc + FREQ * 24 / 1000));
+        assert!(!core.window_expired(a.qpc + FREQ * 24 / 1000));
         core.push(ev(a.qpc + FREQ * 24 / 1000, 1));
-        // 25ms after the first event: flush.
-        assert!(core.should_flush(a.qpc + FREQ * 25 / 1000));
+        // 25ms after the window opened: flush.
+        assert!(core.window_expired(a.qpc + FREQ * 25 / 1000));
         let b = core.build_batch(&ctx(), 0, 0).unwrap();
         assert_eq!(b.events.len(), 2);
-        // ts_anchor_us is the *first* event mapped onto UTC.
-        assert_eq!(b.ts_anchor_us, a.utc_us);
+        // ts_anchor_us is the *first event's own* stamp mapped onto UTC —
+        // still the back-dated raw-input stamp, untouched by the window.
+        assert_eq!(b.ts_anchor_us, a.utc_us - 8_000);
 
         // A batch starting 1s after the anchor maps 1s later.
         core.push(ev(a.qpc + FREQ, 1));
@@ -943,24 +1051,33 @@ mod tests {
     fn the_park_hint_tracks_the_remaining_window() {
         let a = anchor();
         let mut core = ShipperCore::new("s-1".into(), a, 1_000, 25);
-        // Nothing pending: park the whole window.
+        // No window open: park the whole window (the idle backstop).
         assert_eq!(core.park_hint(a.qpc), Duration::from_millis(25));
 
-        core.push(ev(a.qpc, 1));
-        // 10ms in: 15ms of window left.
+        core.open_window(a.qpc);
+        // 10ms in: 15ms of window left. An event pushed with a stamp from
+        // before the window opened does not shorten the park.
+        core.push(ev(a.qpc - FREQ * 8 / 1000, 1));
         let hint = core.park_hint(a.qpc + FREQ * 10 / 1000);
         assert_eq!(hint, Duration::from_millis(15));
-        // Past the window: clamped to the floor, never zero (no spin).
+        // Past the deadline: clamped to the floor, never zero (no spin).
         assert_eq!(core.park_hint(a.qpc + FREQ), MIN_PARK);
 
-        // Taking the batch clears the deadline again.
+        // Flushing the batch leaves the window running — the rest of it is
+        // still this window's.
         core.build_batch(&ctx(), 0, 0).unwrap();
+        assert_eq!(
+            core.park_hint(a.qpc + FREQ * 10 / 1000),
+            Duration::from_millis(15)
+        );
+        // Standing the window down parks the full window again.
+        core.close_window();
         assert_eq!(core.park_hint(a.qpc + FREQ), Duration::from_millis(25));
 
         // A wider window parks wider: 40ms in, 10ms of a 50ms window left.
         let mut wide = ShipperCore::new("s-1".into(), a, 1_000, 50);
         assert_eq!(wide.park_hint(a.qpc), Duration::from_millis(50));
-        wide.push(ev(a.qpc, 1));
+        wide.open_window(a.qpc);
         assert_eq!(
             wide.park_hint(a.qpc + FREQ * 40 / 1000),
             Duration::from_millis(10)
@@ -1078,7 +1195,7 @@ mod tests {
                 ..Default::default()
             };
             core.push(e);
-            if core.should_flush(e.ts_qpc) {
+            if core.is_full() {
                 flush(
                     &mut core,
                     &mut sinks,
@@ -1308,5 +1425,468 @@ mod tests {
             "still inside 60s"
         );
         assert_eq!(l.allow("kafka", t0 + Duration::from_secs(60)), Some(1));
+    }
+
+    // ---- batch cadence, on a fake clock ------------------------------------
+    //
+    // The cadence is a property of two threads and a clock, so testing it
+    // means modelling both. `Sim` is that model: no threads, no real clock,
+    // no sinks, and — importantly — the *real* stamping
+    // (`DrainStamper::spread`) and the *real* window policy
+    // (`advance_window`, `ShipperCore::open_window`, `park_hint`).
+
+    fn ticks(d: Duration) -> u64 {
+        (d.as_nanos() * FREQ as u128 / 1_000_000_000) as u64
+    }
+
+    /// Hardware report arrival times for a steady `hz` stream over `[from, to)`.
+    fn arrivals(hz: u64, from: u64, to: u64) -> VecDeque<u64> {
+        let step = FREQ / hz;
+        let mut v = VecDeque::new();
+        let mut t = from;
+        while t < to {
+            v.push_back(t);
+            t += step;
+        }
+        v
+    }
+
+    /// T1 exactly as `raw_input::run` drives it with a non-zero `coalesce_ms`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum T1State {
+        /// Blocked on the message queue; the next report's arrival wakes it.
+        Waiting,
+        /// Woken at `wake` (an *observed* arrival); reads at `at`, one
+        /// coalescing window later, stamping from that wake.
+        Armed { wake: u64, at: u64 },
+        /// Live stream: periodic reads on the cadence timer, stamps spread
+        /// back over the period since the previous read.
+        Live { at: u64 },
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Flushed {
+        /// Wall QPC the batch went to the sinks.
+        wall: u64,
+        events: usize,
+        first_stamp: u64,
+        last_stamp: u64,
+    }
+
+    struct Sim {
+        core: ShipperCore,
+        now: u64,
+        arrivals: VecDeque<u64>,
+        /// Read by T1, not yet drained by T2.
+        ring: VecDeque<RawEvent>,
+        stamper: DrainStamper,
+        t1: T1State,
+        prev_drain: u64,
+        coalesce: u64,
+        cadence: u64,
+        /// T2 parked with the waker armed: T1's next push unparks it.
+        waker_armed: bool,
+        t2_wake: u64,
+        t2_woke_by_timer: bool,
+        idle_probe_expired: bool,
+        flushed: Vec<Flushed>,
+        /// Every event stamp that reached a sink, in wire order.
+        shipped: Vec<u64>,
+        t2_wakes: u64,
+        /// Times T1 had to make the `unpark` syscall.
+        t1_unparks: u64,
+    }
+
+    impl Sim {
+        fn new(window_ms: u64, coalesce_ms: u64, hz: u64, arrivals: VecDeque<u64>) -> Self {
+            let coalesce = coalesce_ms * MS;
+            // `CADENCE_SLACK` is one report interval of a 1kHz mouse.
+            let cadence = coalesce + MS;
+            Self {
+                core: ShipperCore::new("s-sim".into(), anchor(), 448, window_ms),
+                now: 0,
+                arrivals,
+                ring: VecDeque::new(),
+                stamper: DrainStamper::new(FREQ / hz, cadence, 20 * MS),
+                t1: T1State::Waiting,
+                prev_drain: 0,
+                coalesce,
+                cadence,
+                waker_armed: false,
+                t2_wake: 0,
+                t2_woke_by_timer: false,
+                idle_probe_expired: false,
+                flushed: Vec::new(),
+                shipped: Vec::new(),
+                t2_wakes: 0,
+                t1_unparks: 0,
+            }
+        }
+
+        fn t1_next(&self) -> Option<u64> {
+            match self.t1 {
+                T1State::Waiting => self.arrivals.front().copied(),
+                T1State::Armed { at, .. } | T1State::Live { at } => Some(at),
+            }
+        }
+
+        fn take_arrived(&mut self, at: u64) -> usize {
+            let mut n = 0;
+            while self.arrivals.front().is_some_and(|&t| t <= at) {
+                self.arrivals.pop_front();
+                n += 1;
+            }
+            n
+        }
+
+        fn push_report(&mut self, ts: u64, at: u64) {
+            self.ring.push_back(RawEvent {
+                ts_qpc: ts,
+                dx: 1,
+                dy: -1,
+                ..Default::default()
+            });
+            if self.waker_armed {
+                self.t1_unparks += 1;
+                self.waker_armed = false;
+                self.t2_wake = at;
+                self.t2_woke_by_timer = false;
+            }
+        }
+
+        fn t1_step(&mut self, t: u64) {
+            self.now = t;
+            match self.t1 {
+                T1State::Waiting => {
+                    // A report arrived and woke the thread; it reads one
+                    // coalescing window later.
+                    self.t1 = T1State::Armed {
+                        wake: t,
+                        at: t + self.coalesce,
+                    };
+                }
+                T1State::Armed { wake, at } => {
+                    let n = self.take_arrived(at);
+                    for i in 0..n {
+                        let ts = self.stamper.stamp(wake, at, i);
+                        self.push_report(ts, at);
+                    }
+                    self.stamper.finish(wake.min(at), n);
+                    self.finish_drain(at, n);
+                }
+                T1State::Live { at } => {
+                    let prev = self.prev_drain;
+                    let n = self.take_arrived(at);
+                    for i in 0..n {
+                        let ts = DrainStamper::spread(prev, at, n, i);
+                        self.push_report(ts, at);
+                    }
+                    self.finish_drain(at, n);
+                }
+            }
+        }
+
+        fn finish_drain(&mut self, at: u64, n: usize) {
+            self.prev_drain = at;
+            // A drain that comes back empty means the hand stopped: the
+            // cadence timer is cancelled and T1 goes back to the queue wait.
+            self.t1 = if n > 0 {
+                T1State::Live {
+                    at: at + self.cadence,
+                }
+            } else {
+                T1State::Waiting
+            };
+        }
+
+        fn record_flush(&mut self) {
+            let Some(b) = self.core.build_batch(&ctx(), 0, 0) else {
+                return;
+            };
+            self.flushed.push(Flushed {
+                wall: self.now,
+                events: b.events.len(),
+                first_stamp: b.events[0].ts_qpc,
+                last_stamp: b.events[b.events.len() - 1].ts_qpc,
+            });
+            self.shipped.extend(b.events.iter().map(|e| e.ts_qpc));
+        }
+
+        /// One pass of `run`'s loop body, in the same order.
+        fn t2_step(&mut self, t: u64) {
+            self.now = t;
+            self.t2_wakes += 1;
+            self.waker_armed = false;
+            let woke_by_timer = self.t2_woke_by_timer;
+            let ring_empty_at_wake = self.ring.is_empty();
+
+            let mut drained = 0usize;
+            while let Some(ev) = self.ring.pop_front() {
+                self.core.push(ev);
+                if self.core.is_full() {
+                    self.record_flush();
+                }
+                drained += 1;
+                if drained >= DRAIN_BUDGET {
+                    break;
+                }
+            }
+
+            let expired = self.core.window_expired(self.now);
+            let live = drained > 0 || self.core.pending() > 0;
+            if expired {
+                self.record_flush();
+            }
+            advance_window(&mut self.core, self.now, expired, live);
+
+            if drained >= DRAIN_BUDGET {
+                self.idle_probe_expired = false;
+                self.t2_wake = self.now;
+                self.t2_woke_by_timer = false;
+            } else if self.core.window_open() {
+                self.idle_probe_expired = false;
+                self.t2_wake = self.now + ticks(self.core.park_hint(self.now));
+                self.t2_woke_by_timer = true;
+            } else {
+                self.idle_probe_expired = woke_by_timer && ring_empty_at_wake;
+                let timeout =
+                    next_park_timeout(self.idle_probe_expired, true, self.core.max_park());
+                self.waker_armed = true;
+                self.t2_wake = self.now + ticks(timeout);
+                self.t2_woke_by_timer = true;
+            }
+        }
+
+        fn run_until(&mut self, end: u64) {
+            for _ in 0..2_000_000 {
+                let t1_at = self.t1_next();
+                let next = t1_at.map_or(self.t2_wake, |t| t.min(self.t2_wake));
+                if next > end {
+                    self.now = end;
+                    return;
+                }
+                // On a tie T1 goes first: its push is then visible to the
+                // drain, which is the harder case for the window policy.
+                if t1_at == Some(next) {
+                    self.t1_step(next);
+                } else {
+                    self.t2_step(next);
+                }
+            }
+            panic!("simulation did not settle");
+        }
+
+        /// Wall gaps between consecutive flushes.
+        fn periods(&self) -> Vec<u64> {
+            self.flushed
+                .windows(2)
+                .map(|w| w[1].wall - w[0].wall)
+                .collect()
+        }
+
+        /// Every event reached a sink exactly once, in stamp order.
+        fn assert_no_loss_or_reordering(&self, expected: usize) {
+            assert_eq!(
+                self.shipped.len(),
+                expected,
+                "every event that was captured must be shipped"
+            );
+            assert!(
+                self.shipped.windows(2).all(|w| w[0] < w[1]),
+                "event stamps must reach the wire strictly in order"
+            );
+        }
+
+        /// No batch waited longer than the window plus one drain cadence.
+        fn assert_latency_bound(&self, window_ms: u64) {
+            let bound = window_ms * MS + self.cadence;
+            for f in &self.flushed {
+                assert!(
+                    f.wall - f.first_stamp <= bound,
+                    "batch at {} waited {} ticks for its oldest event (bound {bound})",
+                    f.wall,
+                    f.wall - f.first_stamp
+                );
+                assert!(f.last_stamp <= f.wall, "shipped an event from the future");
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_1khz_stream_ships_exactly_one_batch_per_window() {
+        // 10s of continuous 1kHz motion at the shipped defaults.
+        let motion = (10 * MS, 10 * MS + 10_000 * MS);
+        let feed = arrivals(1000, motion.0, motion.1);
+        let captured = feed.len();
+        let mut sim = Sim::new(25, 8, 1000, feed);
+        sim.run_until(motion.1 + 500 * MS);
+
+        // 1000/25 = 40 batches a second, not the ~52 the pre-2026-09-21
+        // window produced (it closed each window ~9ms early, the back-dating
+        // of its first event, giving a ~19ms period).
+        assert!(
+            (396..=404).contains(&sim.flushed.len()),
+            "expected ~400 batches in 10s at window_ms=25, got {}",
+            sim.flushed.len()
+        );
+        // And the cadence is a grid, not an average: every gap is one window.
+        let periods = sim.periods();
+        assert!(
+            periods.iter().all(|&p| p == 25 * MS),
+            "flush periods drifted: {:?}",
+            &periods[..8.min(periods.len())]
+        );
+        sim.assert_no_loss_or_reordering(captured);
+        sim.assert_latency_bound(25);
+        // ~25 events per batch at 1kHz, where the old window carried ~18.
+        let mean = sim.shipped.len() / sim.flushed.len();
+        assert!((24..=26).contains(&mean), "mean batch size {mean}");
+    }
+
+    #[test]
+    fn a_live_8khz_stream_keeps_the_same_cadence() {
+        let motion = (10 * MS, 10 * MS + 2_000 * MS);
+        let feed = arrivals(8000, motion.0, motion.1);
+        let captured = feed.len();
+        let mut sim = Sim::new(25, 8, 8000, feed);
+        sim.run_until(motion.1 + 500 * MS);
+
+        assert!(
+            (78..=82).contains(&sim.flushed.len()),
+            "expected ~80 batches in 2s, got {}",
+            sim.flushed.len()
+        );
+        assert!(sim.periods().iter().all(|&p| p == 25 * MS));
+        sim.assert_no_loss_or_reordering(captured);
+        sim.assert_latency_bound(25);
+        // 200 events per window: still inside the 448 datagram budget, so
+        // `max_events` never breaks the grid.
+        assert!(sim.flushed.iter().all(|f| f.events < 448));
+    }
+
+    #[test]
+    fn a_wider_window_scales_the_cadence_with_it() {
+        let motion = (10 * MS, 10 * MS + 4_000 * MS);
+        let feed = arrivals(1000, motion.0, motion.1);
+        let mut sim = Sim::new(50, 8, 1000, feed);
+        sim.run_until(motion.1 + 500 * MS);
+        // 1000/50 = 20 batches a second.
+        assert!(
+            (78..=82).contains(&sim.flushed.len()),
+            "expected ~80 batches in 4s at window_ms=50, got {}",
+            sim.flushed.len()
+        );
+        assert!(sim.periods().iter().all(|&p| p == 50 * MS));
+        sim.assert_latency_bound(50);
+    }
+
+    #[test]
+    fn the_first_batch_after_idle_still_ships_within_one_window() {
+        // A flick after a long pause: the responsiveness case.
+        let first = 500 * MS;
+        let feed = arrivals(1000, first, first + 200 * MS);
+        let mut sim = Sim::new(25, 8, 1000, feed);
+        sim.run_until(1_000 * MS);
+
+        let opening = sim.flushed[0];
+        // The window is anchored on the first report's *observed* arrival, so
+        // the first batch of a burst goes out one window after the hand
+        // moved — the coalescing read does not add to it.
+        assert_eq!(
+            opening.wall - first,
+            25 * MS,
+            "idle -> first batch must stay at one window"
+        );
+        assert_eq!(opening.first_stamp, first);
+    }
+
+    #[test]
+    fn a_burst_then_silence_ships_everything_and_stands_the_timer_down() {
+        let motion = (100 * MS, 100 * MS + 120 * MS);
+        let feed = arrivals(1000, motion.0, motion.1);
+        let captured = feed.len();
+        let mut sim = Sim::new(25, 8, 1000, feed);
+        sim.run_until(3_000 * MS);
+
+        sim.assert_no_loss_or_reordering(captured);
+        assert_eq!(sim.core.pending(), 0, "nothing left in the batcher");
+        // The window was stood down, so nothing is on a timer any more...
+        assert!(!sim.core.window_open());
+        assert!(sim.waker_armed, "T2 is waiting on T1, not on a clock");
+        // ...and the long idle park is what the loop settled into: ~3s of
+        // silence costs a handful of wakes, not 40 a second.
+        let during_burst = 120 / 25 + 2;
+        assert!(
+            sim.t2_wakes <= during_burst + 10,
+            "idle desk cost {} wakes",
+            sim.t2_wakes
+        );
+        // One unpark syscall on T1 for the whole burst: the idle -> live edge.
+        assert_eq!(sim.t1_unparks, 1);
+    }
+
+    #[test]
+    fn t2_wakes_once_per_batch_while_the_stream_is_live() {
+        let motion = (10 * MS, 10 * MS + 5_000 * MS);
+        let feed = arrivals(1000, motion.0, motion.1);
+        let mut sim = Sim::new(25, 8, 1000, feed);
+        sim.run_until(motion.1 + 200 * MS);
+
+        // Before 2026-09-21 this was two: one park woken by T1 after each
+        // flush (opening the next batch) and one on the window timer. Now the
+        // window stays open across a flush while the stream is live, so the
+        // only wake is the deadline itself.
+        assert!(
+            sim.t2_wakes <= sim.flushed.len() as u64 + 6,
+            "{} wakes for {} batches",
+            sim.t2_wakes,
+            sim.flushed.len()
+        );
+        // And T1 never pays for an unpark while the stream is live.
+        assert_eq!(sim.t1_unparks, 1);
+    }
+
+    #[test]
+    fn a_partial_batch_is_flushed_at_shutdown() {
+        // `run` breaks out of its loop mid-window and flushes unconditionally.
+        let motion = (10 * MS, 10 * MS + 40 * MS);
+        let feed = arrivals(1000, motion.0, motion.1);
+        let captured = feed.len();
+        let mut sim = Sim::new(25, 8, 1000, feed);
+        // Stop 15ms into the second window: the shutdown pass drains the ring
+        // and then breaks, leaving a batch that no deadline will ever close.
+        sim.run_until(50 * MS);
+        sim.t2_step(50 * MS);
+        assert!(sim.core.pending() > 0, "a partial batch to lose");
+        let before = sim.shipped.len();
+        sim.record_flush(); // the final flush after the loop
+        assert!(sim.shipped.len() > before);
+        assert_eq!(sim.core.pending(), 0);
+        // Everything T1 had read and T2 had drained is on the wire, in order.
+        let read_by_t1 = captured - sim.arrivals.len();
+        assert_eq!(sim.shipped.len(), read_by_t1 - sim.ring.len());
+        assert!(sim.shipped.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn the_window_policy_covers_the_four_cases() {
+        let a = anchor();
+        let mut core = ShipperCore::new("s".into(), a, 448, 25);
+        // Idle and nothing happened: stay stood down.
+        advance_window(&mut core, a.qpc, false, false);
+        assert!(!core.window_open());
+        // Idle -> live: open one.
+        core.push(ev(a.qpc, 1));
+        advance_window(&mut core, a.qpc, false, true);
+        assert!(core.window_open());
+        let first_deadline = a.qpc + 25 * MS;
+        assert!(core.window_expired(first_deadline));
+        // Live and the window closed: advance the grid, not "now + window".
+        advance_window(&mut core, first_deadline + 3 * MS, true, true);
+        assert!(!core.window_expired(first_deadline + 24 * MS));
+        assert!(core.window_expired(first_deadline + 25 * MS));
+        // A window that closed with nothing in it: stand down.
+        advance_window(&mut core, first_deadline + 25 * MS, true, false);
+        assert!(!core.window_open());
     }
 }

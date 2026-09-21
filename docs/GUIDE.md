@@ -343,11 +343,44 @@ deserialize side stays on the owned `Batch`.
 
 ### 5.3 `batcher.rs` — `Batcher`
 
-Pure policy: "flush when full (`max_events`) or when `window_ticks` have
-elapsed since the batch's first event". Driven entirely by caller-supplied QPC
-values, so it is unit-tested without a clock (`flushes_on_window_elapsed`,
+Pure policy: "flush when full (`max_events`) or when the open window's
+deadline has passed". Driven entirely by caller-supplied QPC values, so it is
+unit-tested without a clock (`flushes_when_the_open_window_closes`,
 `flushes_on_max_events_regardless_of_time`). `Batcher::with_window_ms(max,
 window_ms, qpc_freq)` does the ms→ticks conversion. T2 owns one.
+
+**Two clocks, deliberately kept apart.** A batch carries a `first_qpc` — the
+stamp of its first *event*, which becomes `ts_anchor_us` — and a `deadline`,
+a wall-clock QPC the owner sets with `open_window(now)`. They are different
+clocks: T1 coalesces raw-input reads and spreads a drain's stamps back over
+the period since the previous read, so an event stamp is back-dated by up to
+one cadence period (`coalesce_ms + 1`, ~9 ms at the defaults). Until
+2026-09-21 the window was `first_qpc + window_ticks` tested against the wall
+clock, which made every window short by exactly that back-dating: 25 ms
+shipped ~52 batches/s, not 40 (see `docs/PERFORMANCE-2026-09-20.md` §4).
+
+The deadline now runs on a **fixed grid** — `open_window` advances it by one
+window from the previous deadline, not from "now" — so a live stream ships
+exactly `1000 / window_ms` batches per second however the drains land inside
+a window. Two exceptions, both deliberate:
+
+- **The first window of a burst** is anchored on the batch's first event
+  instead. After a pause T1 is blocked on the message queue, so that report's
+  arrival was *observed* and its stamp is not back-dated; anchoring there
+  keeps idle→first-batch latency at exactly one window.
+- **A loop that fell a whole window behind** restarts the grid at `now`
+  rather than working through a queue of expired deadlines.
+
+`reset()` (a flush) leaves the window alone, so a `max_events`-forced flush
+partway through a window cannot make the cadence drift. `close_window()` is
+how the owner says the stream went quiet and nothing is on a timer.
+
+**Latency**: the oldest event in a batch waits at most
+`window_ms + coalesce_ms + 1` ms to reach the wire (it was exactly
+`window_ms`, because the old window was anchored on that very event); the
+newest waits at most one cadence period. The extra is the coalescing window
+that T1 already spends, now visible in the shipping latency instead of hidden
+by a short batch window.
 
 ### 5.4 `wire.rs` — `Envelope`
 
@@ -662,10 +695,12 @@ The loop (`run`, `shipping.rs:343-510`):
    always the session record.
 2. Each pass: sample `consumer.slots()` into `ring_high_water`; pop up to
    `DRAIN_BUDGET` events, pushing each into the batcher and flushing whenever
-   `should_flush(ev.ts_qpc)` fires (checked per push so a batch never exceeds
-   the datagram budget); drain the marker channel; time-based flush; every 1 s
-   `tick_all` the sinks for maintenance. JSONL flush timing belongs entirely
-   to its writer worker.
+   `is_full()` fires (checked per push so a batch never exceeds the datagram
+   budget — and it is the *only* condition tested there, because an event's
+   `ts_qpc` is not a reading of the window's wall clock); drain the marker
+   channel; if the window's deadline has passed, flush it and call
+   `advance_window`; every 1 s `tick_all` the sinks for maintenance. JSONL
+   flush timing belongs entirely to its writer worker.
 3. Two things go to the **udp sink alone**, via `send_live` (never `deliver`,
    which would put them in the recording and on Kafka): the session envelope
    again every 5 s, so a viz started mid-session can convert counts to cm and
@@ -677,12 +712,30 @@ The loop (`run`, `shipping.rs:343-510`):
    batch. It only *fires* on a wake, and once the loop is confirmed idle
    those are the 1 s `IDLE_PARK`s the sink tick already needs: an idle desk
    costs one wakeup and one ~70-byte datagram a second, not a new timer.
-4. Park: if nothing is pending, arm the waker (`begin_park`), re-check the
-   ring is empty, `park_timeout(1 s)`. If a batch is open, `park_timeout`
-   for the remaining window (`park_hint`, 0.5–25 ms) *without* arming the
-   waker — events pile up in the ring and are drained in bulk when the window
-   expires. This is the second half of the CPU win: T2 wakes once per batch,
-   not once per report (ring high-water ~45 instead of 1).
+4. Park, in one of two modes. **Live** — a window is open: `park_timeout` to
+   its deadline (`park_hint`, 0.5–25 ms) *without* arming the waker, so
+   events pile up in the ring and are drained in bulk when the window closes,
+   and T1's per-event `wake()` stays a relaxed load of a `false` flag.
+   **Idle** — no window is open: arm the waker (`begin_park`), re-check the
+   ring is empty, `park_timeout` (one window, then 1 s once a probe park has
+   confirmed the ring is really idle). This is the second half of the CPU
+   win: T2 wakes once per batch, not once per report (ring high-water ~45
+   instead of 1).
+
+   Since 2026-09-21 the live park covers the gap after a flush too. Before
+   that, a flush emptied the batcher, so the loop fell back to the idle park,
+   T1 unparked it on the next drain (a syscall on the capture thread), and it
+   parked *again* on the window timer — two T2 wakes and one T1 unpark per
+   batch. `advance_window` keeps the window open across a flush while the
+   stream is live, so there is one wake per batch and T1 unparks once per
+   burst. Price: a marker or a shutdown handed over mid-window rides the next
+   deadline, at most one window late; an idle desk — where a hotkey is
+   actually pressed — still wakes immediately.
+
+   `advance_window(core, now, expired, live)` is the whole cadence policy and
+   is pure, so the tests drive it with a fake clock and a fake T1 (`Sim` in
+   `shipping.rs`): steady 1 kHz and 8 kHz streams, idle→first-event latency,
+   burst then silence, and the shutdown flush.
 
 `flush` (`shipping.rs:512`) reads the context `Arc` once per batch (~40×/s at
 the default window), records latency
@@ -1522,9 +1575,9 @@ tradeoffs.
 |---|---|---|
 | Live stream paced by a periodic high-res timer; the queue wait only while idle | T1 | a wake *by the raw-input queue* costs ~27 µs of kernel CPU; a timer wake plus the read ~15 µs |
 | Coalesced raw-input reads (`GetRawInputBuffer` once per period) | T1 | cost is per drain, not per report: 1000/(coalesce+1) drains/s |
-| 25 ms batch window (40 batches/s) | T2/viz | responsive live default; 50ms halves the ~150 µs-per-batch kernel cost |
+| 25 ms batch window (40 batches/s) | T2/viz | responsive live default; 50ms halves the ~150 µs-per-batch kernel cost. The window is wall-clock and on a fixed grid, so the rate really is `1000/window_ms` (§5.3) |
 | Two-tier process scan: Toolhelp enumeration every 30 s, per-PID queries per poll | ctl | the snapshot alone is ~7 ms of kernel time; sysinfo's full walk was ~16 ms |
-| Wake T2 only on empty→non-empty, then sleep out the window | T1/T2 | one wake per batch instead of per report |
+| Wake T2 only on the idle→live edge, then sleep the window out for as long as the stream lasts | T1/T2 | one wake per batch instead of per report — and, since 2026-09-21, one per batch rather than two |
 | 1 s idle park; markers/config/shutdown wake T2 explicitly | T2 | no 25 ms idle wakeups |
 | Cache-line-isolated T1 counters, relaxed stores | T1 | no false sharing, no RMWs on the hot path |
 | Serialize once, `&str` to all sinks; owned byte buffers in worker queues | T2 | one JSON encode per batch; JSONL/Kafka each copy once to leave T2 immediately |
