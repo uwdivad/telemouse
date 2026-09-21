@@ -177,7 +177,8 @@ telemouse/
     ├── capture/   src/{main,raw_input,shipping,context_thread,context,session_setup,
     │                   stats,platform,devices,pointer_lock,shutdown,sinks}.rs
     │              src/sinks/{udp,jsonl,kafka}.rs
-    ├── viz/       src/{main,udp,hub,server,recordings,stats}.rs + src/index.html
+    ├── viz/       src/{main,udp,hub,server,recordings,shutdown,stats}.rs
+    │              + src/index.html
     ├── ctl/       src/{main,procs,manager,server}.rs + src/gui/{mod,feed,model,win}.rs
     │              + src/index.html
     └── analyze/   src/{lib,main,load,series,savgol,kinematics,flicks,micro,clicks,
@@ -768,6 +769,26 @@ and one small WebSocket frame every batch window is the worst case for Nagle
 plus delayed ACK. The startup line prints the dashboard and `/obs` URLs
 through `localhost::browse_addr`, so a `0.0.0.0` bind is shown as
 `127.0.0.1` with a hint that other PCs use this machine's IP.
+
+**Stopping** (`shutdown.rs`, `serve_until_stopped`). The console control
+handler does one thing — `Shutdown::fire()`, a `watch<bool>` every clone can
+wait on. Reporting the event as *handled* is also taking responsibility for
+leaving: Windows' default "terminate now" no longer runs, so something in the
+process has to act. Three things do. `axum::serve(…).with_graceful_shutdown`
+stops accepting and lets in-flight requests finish; each `/ws` task watches
+the same signal and answers with a `Close` frame, because an upgraded socket
+outlives the HTTP connection it came from and nothing else would ever close
+it (the page then shows "disconnected" and reconnects); and a new upgrade
+arriving mid-stop gets `503 stopping`. Racing all of that is
+`SHUTDOWN_DEADLINE` (750 ms from the signal), so a connection that will not
+end on its own — a half-sent request, a held keep-alive socket, a 400 MB
+replay still streaming — is dropped and logged rather than waited on. The
+process then exits 0, well inside `ctl.stop_grace_secs` (8 s, clamped to 3 s
+when Windows is waiting); a terminal console event is held up to
+`SHUTDOWN_GRACE` (1.5 s) so teardown finishes before the process is taken.
+Until v0.2.0 the handler only logged and `axum::serve` had no shutdown future
+at all, so every "graceful" stop of viz was really the panel's grace period
+running out followed by `TerminateProcess` (exit code 1).
 
 **`udp.rs`** — `recv_from` into a buffer of `MAX_UDP_PAYLOAD + 8 KiB`, hand
 bytes to `hub.publish`. Rejections are logged with a sanitized 96-byte

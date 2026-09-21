@@ -37,6 +37,7 @@ use tracing::warn;
 
 use crate::hub::Hub;
 use crate::recordings::{self, SessionEntry};
+use crate::shutdown::Shutdown;
 #[cfg(feature = "observability")]
 use crate::stats::StatsPayload;
 use crate::stats::now_utc_us;
@@ -177,6 +178,10 @@ pub struct AppState {
     pub pages: Arc<Pages>,
     pub sessions: Arc<SessionsCache>,
     pub addrs: Arc<Addrs>,
+    /// Fired when the process is asked to stop. A live WebSocket outlives the
+    /// HTTP connection it was upgraded from, so nothing else would tell these
+    /// tasks to let go.
+    pub shutdown: Shutdown,
 }
 
 /// Layers, innermost first: the `Host` rule on every route, then the
@@ -572,6 +577,14 @@ async fn ws_upgrade(
         warn!(origin, "refusing websocket from a non-local origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+    if st.shutdown.fired() {
+        // A stop is already in flight, and a socket accepted now would be
+        // closed in the same breath — and would hold the stop open while it
+        // was. 503 puts the page straight into its reconnect backoff, which
+        // is where it wants to be: this process is going away and the next
+        // one will answer.
+        return (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response();
+    }
     let clients = st.hub.stats.snapshot().clients;
     if clients >= MAX_WS_CLIENTS {
         warn!(
@@ -611,6 +624,10 @@ async fn client_loop(
     st.hub.stats.client_connected();
     let connected_at = Instant::now();
     let mut frames_sent: u64 = 0;
+    // Did this client go because the *server* is going? The page treats every
+    // close the same (disconnect, then reconnect), but the log should not read
+    // as a browser that walked away during a stop.
+    let mut stopped = false;
     // Who is watching, and from where: on a LAN bind the answer to "why are
     // there four clients" is a second PC's OBS reconnecting, and the peer is
     // the only thing that says so.
@@ -668,6 +685,17 @@ async fn client_loop(
                     None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(_)) => {}
                 },
+                // The process is stopping. This socket was upgraded out of
+                // its HTTP connection and nothing else will close it, so say
+                // goodbye: the page then shows "disconnected" and starts
+                // reconnecting, instead of holding a socket that has gone
+                // quiet until TCP notices — and this task ends, which is what
+                // lets the stop finish in milliseconds.
+                () = st.shutdown.wait() => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    stopped = true;
+                    break;
+                },
             }
         }
     }
@@ -682,6 +710,7 @@ async fn client_loop(
         frames_sent,
         held_s = format_args!("{:.1}", connected_at.elapsed().as_secs_f64()),
         peer = peer.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        stopped,
         "ws client disconnected"
     );
     #[cfg(not(feature = "observability"))]
@@ -689,6 +718,7 @@ async fn client_loop(
         clients = st.hub.stats.snapshot().clients,
         frames_sent,
         held_s = format_args!("{:.1}", connected_at.elapsed().as_secs_f64()),
+        stopped,
         "ws client disconnected"
     );
 }
@@ -717,6 +747,7 @@ mod tests {
                 udp: TEST_UDP.into(),
                 http: TEST_HTTP.into(),
             }),
+            shutdown: Shutdown::new(),
         }
     }
 
@@ -1029,6 +1060,28 @@ mod tests {
         st.hub.stats.client_disconnected();
         let (status, _, _) = get_with(st, "/ws", &headers).await;
         assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "one slot free again");
+    }
+
+    /// While the process is stopping, a page that reconnects is told to try
+    /// again rather than handed a socket that is about to close.
+    #[tokio::test]
+    async fn a_stopping_server_refuses_new_websockets() {
+        let st = state_with(PathBuf::from("recordings"));
+        let headers = [
+            ("host", "127.0.0.1:7879"),
+            ("connection", "upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("origin", "http://127.0.0.1:7879"),
+        ];
+        let (status, _, _) = get_with(st.clone(), "/ws", &headers).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "serving normally");
+
+        st.shutdown.fire();
+        let (status, _, body) = get_with(st, "/ws", &headers).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "stopping");
     }
 
     #[test]

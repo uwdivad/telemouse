@@ -4,6 +4,22 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **The viz server actually stops when it is asked to.** Stopping *Viz
+  server* from the panel sent a Ctrl-Break that `telemouse-viz` logged and
+  then ignored: it had no shutdown path, so the panel sat out its whole
+  grace period (`ctl.stop_grace_secs`, 8 s) and terminated the process,
+  which the panel then showed as "exited: code 1". It now closes its
+  listener on the signal, tells every connected dashboard, `/obs` overlay
+  and script with a WebSocket `Close` frame (the page shows "disconnected"
+  and reconnects by itself), answers a socket that reconnects mid-stop with
+  `503`, and exits 0 — in about 100 ms in practice. A connection that will
+  not end on its own (a browser holding a keep-alive socket, a recording
+  still streaming out of `/api/session/{id}`) is bounded by a 750 ms
+  deadline and dropped, with one log line naming what was still open, so a
+  stop can no longer turn into a kill.
+
 ## [0.2.0] — 2026-09-20
 
 The control panel becomes a program with a window instead of a tray icon
