@@ -1,11 +1,12 @@
 # telemouse — the machine interfaces
 
 Everything a script, a notebook or an agent can read or drive, in one place.
-Three surfaces: the **control panel's HTTP API** (start, stop, mark, watch),
+Four surfaces: the **control panel's HTTP API** (start, stop, mark, watch),
 the **viz server's HTTP + WebSocket** (live stream, health, session files),
-and the **analyzer's CLI** with its JSON output over the **files on disk**.
-Nothing here needs a browser; nothing here has authentication beyond the
-loopback bind and the two header rules below, so keep the servers on
+the **analyzer's CLI** with its JSON output over the **files on disk**, and
+the **MCP server**, which is the first three packaged as typed tools for an
+agent. Nothing here needs a browser; nothing here has authentication beyond
+the loopback bind and the two header rules below, so keep the servers on
 loopback unless you mean otherwise.
 
 Defaults: ctl `127.0.0.1:7880`, viz `127.0.0.1:7879`, capture → viz UDP
@@ -150,6 +151,77 @@ telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]...
 Exit code is non-zero with the reason on stderr when the recording is
 missing or its first line is not a session envelope. Warnings go to stderr;
 JSON goes to stdout, so `2>$null` leaves clean JSON.
+
+## MCP server — `telemouse-mcp` (`crates/mcp`)
+
+Everything above as Model Context Protocol tools, so an agent does not have
+to know the routes, the CLI flags or the id rules. One process, **stdio
+transport only**: the client starts it, speaks JSON-RPC over its stdin and
+stdout, and stops it. There is no HTTP transport and no token yet
+([AGENTIC-2026-09-13.md](AGENTIC-2026-09-13.md), *Remote*, is the design for
+adding one).
+
+```
+telemouse-mcp [--config FILE] [--read-only] [--recordings DIR]
+              [--ctl ADDR] [--viz ADDR] [--log-dir DIR]
+```
+
+It finds `telemouse.toml` the way every other binary does (working directory
+first, then next to the exe) and takes the recordings directory from
+`[recording] dir` and the two addresses from `[ctl] http_addr` and
+`[viz] http_addr`; a wildcard bind is dialled on the loopback of the same
+family. **stdout carries the protocol and nothing else** — logging goes to
+stderr and, in a full build, to `<log_dir>/mcp.log`.
+
+Registered for Claude Code in the repo's `.mcp.json`:
+
+```json
+{ "mcpServers": { "telemouse": { "type": "stdio", "command": "target/release/telemouse-mcp.exe" } } }
+```
+
+From an unzipped release the command is `telemouse-mcp.exe` beside
+`telemouse.toml`; `claude mcp add telemouse -- <that path>` does the same
+thing without editing a file.
+
+### Tools
+
+Read-only, answered from the analyzer library and `GET`s:
+
+| Tool | Input | Result |
+|---|---|---|
+| `sessions_list` | `limit?` (1-500, default 50) | `{ dir, total, returned, sessions: [...] }`. Each entry is a `list --json` row: `path, session_id, started_utc_us, duration_s, events, drops, games, bad_lines, losses, exit`. Newest first; `total` is how many exist, so a truncated answer says so. |
+| `session_summary` | `id` (a recording id, no `.jsonl`) | The `telemouse-report-summary/1` object (*Analyzer*, `report --summary`), ~3 KB. Uses and fills the same `recordings/.reports/<id>.report.json` cache the panel does. |
+| `trend` | `metric?: [dotted paths]`, `last?` (1-500) | `{ rows, sessions: [TrendRow] }`, oldest first — the `trend --json` rows, `last` keeping the newest. |
+| `health` | — | `{ ctl: {...}, viz: {...} }`: a projection of ctl `GET /api/state` (per component: running, pid, since, exit counts, `last_exit`, the capture agent's `stats`; plus the process table as `pid`/`name`) and of viz `/healthz` + `/api/stats`. The 120-line log rings and the bulk fields are left out. |
+| `logs_tail` | `component` (`ctl`, `capture`, `viz`, `doctor`, `trend`, `report`), `lines?` (1-500, default 50) | `{ component, source, lines }`. The panel's live ring for a component it launched, otherwise `<log_dir>/<component>.log`; ANSI stripped. |
+| `live_stats` | `seconds?` (0-60, default 5) | Two `/api/stats` readings that far apart, as rates: `{ sampled_s, datagrams_per_s, forwarded_per_s, parse_errors_per_s, lag_drops_per_s, *_delta, latest }`. `seconds: 0` is a single reading. |
+
+Control, every one of them a `POST` to ctl with `X-Telemouse-Ctl: 1` — this
+server never spawns, signals or terminates anything itself, so ctl's flag
+allow-list and its pid rule are still what decide:
+
+| Tool | Input | Result |
+|---|---|---|
+| `capture_start` | `save?`, `flags?`, `session?` | ctl's `{ ok, pid }`. `flags` is checked against `--print`, `--no-kafka`, `--no-udp`, `--record`, `--no-record` here as well as there. `session` is carried through for symmetry with the route; the capture agent names its own session, so it changes nothing. |
+| `capture_stop` | `force?` | `{ ok, outcome: "graceful" \| "terminated" }`. |
+| `marker` | `label` | `{ ok, label }`. One line, trimmed, at most 120 characters. |
+| `doctor` | — | Starts the doctor component and polls until it exits, up to 30 s: `{ finished, last_exit?, note?, lines }`. |
+| `kill` | `pid` | `{ ok, killed: ProcInfo }`. ctl refuses itself and any pid its own scan would not list. |
+
+`--read-only` removes those five from the router, so `tools/list` does not
+mention them and calling one is an unknown tool.
+
+### Errors
+
+A tool that cannot do its job answers with an **error result** (`isError`
+with a sentence), never a protocol error and never by exiting: a panel that
+is not running, a viz built without `observability`, an id that names no
+recording and a flag ctl would reject are all ordinary results, and the
+session stays up. Argument problems (an unsafe id, a blank label, a flag
+outside the allow-list, a pid that is not one) are refused before any request
+is made, and the message names the allowed values. A refusal from ctl is
+relayed with its status and its own `error` text, so a `409` still reads
+*capture is already running*.
 
 ## Files on disk
 

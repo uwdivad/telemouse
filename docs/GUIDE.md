@@ -77,8 +77,10 @@ TimescaleDB/Parquet.
 
 ## 2. The 10-minute mental model
 
-There are five crates in one Cargo workspace — four binaries over one shared
-library:
+There are six crates in one Cargo workspace — five binaries over one shared
+library. The diagram below is the pipeline; `crates/mcp` (`telemouse-mcp`)
+sits outside it, an MCP server that calls the analyze library and the two
+HTTP APIs on an agent's behalf ([API.md](API.md), *MCP server*):
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -272,8 +274,9 @@ A release is a tag: bump `version` in the root `Cargo.toml`, add a
 `release.yml` lints and tests both flavours, builds the default one in
 release mode, signs the executables when the signing secrets are configured
 (`docs/DEVELOPING.md`, "Code signing") and publishes a GitHub Release with
-one zip, `telemouse-vX.Y.Z-windows-x86_64.zip`: all four binaries including
-`telemouse-analyze`, with a SHA-256 and a build-provenance attestation. The
+one zip, `telemouse-vX.Y.Z-windows-x86_64.zip`: all five binaries including
+`telemouse-analyze` and `telemouse-mcp`, with a SHA-256 and a
+build-provenance attestation. The
 release notes are that changelog section. The zip carries the loopback
 sample as `telemouse.toml`, the license, this guide, and the demo recording.
 

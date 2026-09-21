@@ -10,6 +10,30 @@ something. Prefer the CLI's JSON output over parsing terminal tables. Quote
 numbers from the JSON, and say which session id they came from. The full
 interface reference is `docs/API.md`; this file is the working subset.
 
+## If the `telemouse` MCP server is connected, use its tools instead
+
+The repo's `.mcp.json` registers `telemouse-mcp` (built to
+`target\release\telemouse-mcp.exe`). When its tools are available they are
+the shorter path to everything below — same data, already sized for reading,
+no shell quoting and no parsing:
+
+| Instead of | Call |
+|---|---|
+| `telemouse-analyze list --json` | `sessions_list` |
+| `report <id> --summary` | `session_summary(id)` |
+| `trend --json` | `trend(metric?, last?)` |
+| ctl `/api/state` + viz `/healthz` + `/api/stats` | `health` |
+| reading `logs\*.log` | `logs_tail(component, lines)` |
+| polling `/api/stats` | `live_stats(seconds)` |
+| `POST /api/components/capture/{start,stop,marker}`, `doctor`, kill | `capture_start`, `capture_stop`, `marker(label)`, `doctor`, `kill(pid)` |
+
+A tool that fails comes back with a sentence saying why (panel not running,
+unknown id, flag outside the allow-list); that is the answer, not a reason to
+fall back to the shell. Fall back to the commands below when the tools are
+not connected, when the user asks for a flag the tools do not expose
+(`--split-by-marker`, `--locked-only`, custom thresholds), or when the full
+report JSON is needed.
+
 ## Binaries and paths
 
 - Release binaries: `target\release\telemouse-analyze.exe`,
