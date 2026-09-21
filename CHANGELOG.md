@@ -4,7 +4,12 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
-## [Unreleased]
+## [0.2.2] — 2026-09-21
+
+The queue left after 0.2.0: a still hand no longer reads as a dead capture
+agent, viz stops when asked, the batch window means what it says, the
+analyzer loads recordings in parallel, the panel window is cheap in the tray,
+and telemouse gains an MCP server. There is no 0.2.1.
 
 - **No sample games on a fresh install.** The shipped `telemouse.toml` kept
   two example `[games]` entries, so a new panel listed two games nobody had
