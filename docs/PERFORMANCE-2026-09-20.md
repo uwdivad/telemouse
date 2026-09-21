@@ -236,7 +236,7 @@ Estimates are for the 1156 MB session (5.65 s) or the default live run
 | A1 | **Chunk-parallel load.** Read the file once, split at newline boundaries into N byte ranges, parse each range on its own thread into its own `Vec<RawEvent>` + `Vec<BatchMeta>`, concatenate in order. Header stays serial. | load 2.85 s → ~0.4 s; **−40% end to end** | Lines are independent. Line numbers for `BadLines` need a per-chunk newline count; `GameInterner` becomes per-chunk + merge. Supersedes the August "hand-rolled line parser" row: parallelism buys more than a faster scalar parser and keeps serde. |
 | A2 | Deserialize events straight into the shared vector (`DeserializeSeed` over `&mut Vec<RawEvent>`) instead of a fresh `Vec` per line + `append` | −5–8% of load | 0.6 M alloc/free pairs on the big session; `finish_grow` is 4.5% of samples. Composes with A1 (per-chunk vector). |
 | A3 | `hypot` → `(x*x + y*y).sqrt()` at the 7 call sites in `series.rs` and the ones in kinematics/markers/per_second/flicks/lifts | **−8% CPU, ~−250 ms wall** (177 ms of it on the serial `prepare` path) | Counts-per-second magnitudes cannot overflow a double; differs in the last ulp, so the dense/sparse parity tests need an epsilon. The August table priced this at ~50 ms; the profile says 5× that. |
-| A4 | `qpc_to_utc_us`: when `dticks` fits `i64` (always, for any real uptime) divide in `i64`; keep the `i128` path as the fallback | ~−140 ms wall in `prepare` | The "fast path" still does `i128 / 10`, which is a `__divti3` call per event. Same for `ticks_to_us`. Parity test already exists. |
+| A4 | ~~`qpc_to_utc_us`: when `dticks` fits `i64` (always, for any real uptime) divide in `i64`; keep the `i128` path as the fallback~~ | ~−140 ms wall in `prepare` | **Landed 2026-09-21**, see below. |
 | A5 | Skip teardown: `std::process::exit` after the report is flushed (or `mem::forget(prepared)`) | −250–450 ms wall | 6.5% of samples are `drop_glue` + `VirtualFree` unwinding 2.5 GiB the OS reclaims anyway. CLI only; keep drops in the library. |
 | A6 | Start `prepare`'s event-time pass while load is still running, or fold it into A1's per-chunk workers | −150 ms | Falls out of A1 almost for free. |
 | A7 | `trend`: analyze sessions concurrently (bounded by memory: ~2.5× file size each) | cold 22.9 s → ~7 s | Today 36 sessions run strictly one after another. |
@@ -271,6 +271,41 @@ Estimates are for the 1156 MB session (5.65 s) or the default live run
 - viz/ctl user-space code under load: ~1% of their samples.
 - `/api/sessions`, `list`: 1 ms / 12 ms warm.
 - Mouse rate: 1 kHz → 3.4 kHz adds only 0.13% on T1 and nothing elsewhere.
+
+## Landed since this survey
+
+### A4 — no 128-bit division in `qpc_to_utc_us` (2026-09-21)
+
+`QpcAnchor::qpc_to_utc_us` and `ticks_to_us` now scale ticks to microseconds
+in 64-bit integers. The tick delta is taken as an unsigned magnitude plus a
+sign (`to - from` either way round), so it never has to widen to 128 bits;
+at 10 MHz the conversion is `m / 10`, a constant divisor LLVM turns into a
+multiply-and-shift; other frequencies take a whole-µs divisor, a sub-MHz
+multiplier, or a seconds/remainder split (`q = m / freq`, `r = m % freq`,
+`q·1e6 + r·1e6/freq`) with both products checked. Anything that would wrap
+64 bits — including a zero frequency — falls back to the old i128 expression,
+so the result is bit-identical for every input, wrap-around casts included.
+A parity test compares the two implementations over ~1.6 M pseudo-random
+cases (11 frequencies × 6 anchors, half the probes within an hour of the
+anchor, half anywhere in `u64`) plus an explicit edge sweep at the `u64` and
+`i64` limits.
+
+| Bench (1000 event stamps, `benches/clock.rs`) | before (i128) | after (i64) | Δ |
+|---|---|---|---|
+| `qpc_to_utc_us/10mhz` | 8.62 / 8.65 µs | 1.58 / 1.87 µs | **−82% / −78%** |
+| `qpc_to_utc_us/odd_3579545` | 8.99 / 9.09 µs | 3.49 / 3.57 µs | **−61% / −61%** |
+
+Three runs, min / median, on a box that was compiling other work at the
+time: the i128 rows are stable to ±1%, the i64 rows spread ±25%. Per event
+that is 8.6 ns → 1.9 ns at 10 MHz, so ~104 ms off the 15.25 M-event session's
+`prepare` — the same order as the ~140 ms estimated above.
+
+Verified in the generated assembly (`cargo rustc --release -p telemouse-core
+--lib -- --emit asm`, and the same through a caller so the `#[inline]` body
+is instantiated): the 10 MHz branch is `mulq` + `shrq $3` with no `div`
+instruction at all, and the one remaining `__divti3` call in the function is
+inside the cold fallback block. `ms_to_ticks` still calls `__udivti3`; it runs
+once per `Batcher`, so it was left alone.
 
 ## Reproducing
 

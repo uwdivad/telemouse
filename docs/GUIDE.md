@@ -379,9 +379,13 @@ pub struct QpcAnchor { pub qpc: u64, pub utc_us: i64, pub qpc_freq: u64 }
 `QueryPerformanceCounter` is monotonic and microsecond-quality but has an
 arbitrary zero. One anchor per session (a QPC reading paired with a UTC
 reading at "the same instant") lets any consumer map QPC → UTC:
-`utc_us = anchor.utc_us + (qpc - anchor.qpc) * 1e6 / qpc_freq`, computed in
-`i128` so it cannot overflow. `ticks_to_us` and `ms_to_ticks` are the other
-two helpers. See §11 for how the anchor is measured.
+`utc_us = anchor.utc_us + (qpc - anchor.qpc) * 1e6 / qpc_freq`, truncating
+toward zero. The analyzer runs this once per event, so it is done in 64-bit
+integers — the tick delta as an unsigned magnitude plus a sign, and at the
+ubiquitous 10 MHz a divide by ten that compiles to a multiply — with the
+`i128` form kept as a bit-identical fallback for the frequencies and tick
+spans where 64 bits could overflow. `ticks_to_us` and `ms_to_ticks` are the
+other two helpers. See §11 for how the anchor is measured.
 
 ### 5.6 `units.rs`
 
