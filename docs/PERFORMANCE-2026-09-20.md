@@ -27,7 +27,8 @@ fallback ×1, plus one symbol smoke test). Raw live results:
    idle**: +0.43–0.51% of a core and ~310 MiB across six `msedgewebview2`
    processes while the window is open (its startup state), and still
    **0.32% and 309 MiB after it is hidden to the tray**. The three telemouse
-   processes together idle at 0.155% and 34 MiB.
+   processes together idle at 0.155% and 34 MiB. (Fixed on 2026-09-21: a
+   hidden window is now suspended and holds ~20 MiB — see L1 below.)
 5. **With its window open, `--no-webview` is the most expensive ctl mode**,
    not the cheapest: the `EDIT` fallback rewrites and repaints its full text
    on every refresh whether or not it changed (ctl 0.26–0.32% idle vs 0.10%
@@ -204,6 +205,41 @@ between runs is wide and why "before" sits above the 0.26–0.32% measured on
 09-20 — ctl's per-second scan walks every process on the machine, and there
 were a lot of them. Every pair was measured back to back with the same
 method, so the direction is solid even where the absolute numbers are not.
+#### Landed 2026-09-21 — the hidden window is suspended (L1)
+
+`webview::set_visible` now tells the page to stop (a `window.telemouseSleep`
+hook over `ExecuteScript`, because a hidden WebView2 document does not report
+`hidden`) and then calls `ICoreWebView2_3::TrySuspend`; showing it resumes,
+focuses and calls `window.telemouseWake` for an immediate refresh. The page
+itself no longer falls back to a 10 s poll when hidden — it stops polling and
+stops its clock, which also covers a browser tab and a minimised window.
+
+Re-measured on the same box against a `ba54d30` build of the same binary,
+same method as the table above but 60 s per phase and the six
+`msedgewebview2` children accounted together (`Get-Process` working set,
+`TotalProcessorTime` over the phase), WebView2 Runtime 153.0.4234.48, two
+runs each:
+
+| Build | Window | WebView2 CPU | WebView2 working set |
+|---|---|---|---|
+| before | open | 0.26 / 0.42% | 318 / 311 MiB |
+| before | hidden | 0.026 / 0.000% | 316 / 310 MiB |
+| **after** | open | 0.34 / 0.44% | 314 / 311 MiB |
+| **after** | **hidden (suspended)** | 0.026 / 0.052% | **20.1 / 19.3 MiB** |
+| after | 20 s after being shown again | 0.47 / 0.08% | 102 / 104 MiB |
+
+So the win is memory, not CPU: **−290 MiB, about 94% of what the six
+processes held**, and it comes back as the page is used again. The 0.32%
+hidden CPU this survey measured is *not* reproducible on runtime 153 — it
+idles at 0.00–0.05% either way, so either the runtime throttles hidden
+timers better than the one measured in September or the 12 s samples were
+too short. Suspension is fast enough not to be noticed: the log goes
+`Suspending` → `Suspended` in 11–12 ms, and the window comes back with
+current numbers because the wake hook refreshes instead of waiting out the
+poll timer. Closing and recreating the controller was the alternative; it
+would free the last ~20 MiB and the six processes, at the cost of a
+rebuild-and-navigate every time the tray icon is clicked, so `TrySuspend`
+won. A runtime without `ICoreWebView2_3` keeps the old behaviour.
 
 ### Live profiles (1 ms sampling, 28 s under load)
 
@@ -274,7 +310,7 @@ Estimates are for the 1156 MB session (5.65 s) or the default live run
 
 | # | Change | Est. gain | Notes |
 |---|---|---|---|
-| L1 | **On hide-to-tray, `TrySuspend` the WebView (resume on show), or close the controller after a few minutes hidden and recreate it on show.** Also have the page stop polling on `visibilitychange`. | hidden: −0.32% CPU; closing also frees ~309 MiB | Hidden-to-tray is the state ctl sits in during a game, and today it is 2× the idle cost of everything else combined. `SetIsVisible(false)` alone does not stop timers. `TrySuspend` needs the controller invisible first, which `set_visible` already arranges. The `EDIT` fallback must keep working (CLAUDE.md). Relevant to the in-game hitching history: six resident Chromium processes are the kind of background load that showed up before. |
+| L1 | ~~**On hide-to-tray, `TrySuspend` the WebView (resume on show), or close the controller after a few minutes hidden and recreate it on show.** Also have the page stop polling on `visibilitychange`.~~ **Landed 2026-09-21** (`TrySuspend`; −290 MiB, CPU was already near zero on the current runtime — see the section above). | hidden: −0.32% CPU; closing also frees ~309 MiB | Hidden-to-tray is the state ctl sits in during a game, and today it is 2× the idle cost of everything else combined. `SetIsVisible(false)` alone does not stop timers. `TrySuspend` needs the controller invisible first, which `set_visible` already arranges. The `EDIT` fallback must keep working (CLAUDE.md). Relevant to the in-game hitching history: six resident Chromium processes are the kind of background load that showed up before. |
 | L2 | Fallback text view: keep the last rendered string and skip `set_text` when `model::window_text` is unchanged | ctl 0.26–0.32 → ~0.05% with the window open | `refresh` already skips hidden and hosted states; what is missing is the change check. Profile: a quarter of ctl's samples are GDI text output in `--no-webview` mode. |
 | L3 | **Landed 2026-09-21.** Make `window_ms` mean what it says | 52 → 40 batches/s | See the note below. |
 | L4 | **Landed 2026-09-21.** T2 parks on the window timer only while the stream is live | 104 → ~40 wakes/s | See the note below. |
