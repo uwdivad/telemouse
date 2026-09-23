@@ -587,9 +587,10 @@ never advise running as administrator. `tmbench inject` is the one
 
 ## Releasing
 
-A release is a tag: bump `version` in the root `Cargo.toml`, rename the
-`## [Unreleased]` section of `CHANGELOG.md` to `## [X.Y.Z] — date`, commit,
-then
+A release is a tag: bump `version` in the root `Cargo.toml`, run
+`cargo check --workspace --offline` to refresh the workspace versions in
+`Cargo.lock`, and rename the `## [Unreleased]` section of `CHANGELOG.md` to
+`## [X.Y.Z] — date`. Commit all three files before tagging:
 
 ```powershell
 git tag -a vX.Y.Z -m "vX.Y.Z"

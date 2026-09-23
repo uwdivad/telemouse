@@ -14,7 +14,7 @@ jobs:
   check:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # rust-toolchain.toml is the single source of truth for the version;
       # the explicit input keeps the action from ever picking a newer stable
       # whose lints would turn the gate red on their own.
@@ -46,7 +46,12 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: 1.98.0
+      # audit-check@v2 still targets Node 20; run RustSec's CLI directly.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        run: cargo audit

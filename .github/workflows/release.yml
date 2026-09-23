@@ -47,7 +47,7 @@ jobs:
       # account are all configured; anything else is an unsigned release.
       SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' && vars.SIGNING_ENDPOINT != '' && vars.SIGNING_ACCOUNT_NAME != '' && vars.SIGNING_CERTIFICATE_PROFILE != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # rust-toolchain.toml is the single source of truth for the version.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -168,11 +168,11 @@ jobs:
       # A signed statement that this exact zip was built by this workflow from
       # this commit. It holds whether or not the executables inside carry an
       # Authenticode signature.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v3
         with:
           subject-path: telemouse-${{ github.ref_name }}-windows-x86_64.zip
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: telemouse ${{ github.ref_name }}
           body_path: notes.md

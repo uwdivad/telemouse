@@ -6,6 +6,8 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-09-23
+
 - **Panel controls line up.** Under *Tools* the report picker and its *Run*
   button drifted to the right of the other two rows; now every row keeps
   the name, the description or picker, and *Run* in the same three columns,
