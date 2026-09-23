@@ -65,8 +65,11 @@
   .pill.err .dot { background: var(--bad); }
 
   /* ---------- buttons and inputs ---------- */
-  .btn { font: 600 13px/1 var(--sans); padding: 8px 14px; border-radius: var(--r-sm); border: 1px solid var(--line-strong);
-         background: var(--surface-2); color: var(--fg); cursor: pointer; white-space: nowrap; }
+  /* Every control has a fixed height per size so buttons, links, selects and
+     inputs line up when they share a row: 36px normal, 28px small, 46px big. */
+  .btn { display: inline-flex; align-items: center; justify-content: center; font: 600 13px/1 var(--sans); height: 36px; padding: 0 14px;
+         border-radius: var(--r-sm); border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--fg);
+         cursor: pointer; white-space: nowrap; vertical-align: middle; text-decoration: none; }
   .btn:hover { border-color: var(--fg-3); }
   .btn:disabled { opacity: .45; cursor: default; border-color: var(--line); }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
@@ -74,12 +77,11 @@
   .btn.danger { background: transparent; border-color: var(--bad); color: var(--bad); }
   .btn.danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); }
   .btn.arm { background: var(--bad); color: #fff; }
-  .btn.big { font-size: 16px; padding: 12px 22px; border-radius: 8px; }
-  .btn.small { font-size: 12px; padding: 5px 10px; }
-  a.btn { display: inline-block; }
+  .btn.big { font-size: 16px; height: 46px; padding: 0 22px; border-radius: 8px; }
+  .btn.small { font-size: 12px; height: 28px; padding: 0 10px; }
   a.btn:hover { text-decoration: none; }
-  select.btn { font-weight: 500; padding: 7px 10px; max-width: 280px; }
-  input[type="text"], input[type="number"] { font: 14px/1.4 var(--sans); padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid var(--line-strong);
+  select.btn { display: inline-block; font-weight: 500; padding: 0 8px; max-width: 280px; }
+  input[type="text"], input[type="number"] { font: 14px/1.4 var(--sans); height: 36px; padding: 0 10px; border-radius: var(--r-sm); border: 1px solid var(--line-strong);
                        background: var(--surface-2); color: var(--fg); min-width: 0; }
   input[type="number"] { font-variant-numeric: tabular-nums; }
   input::placeholder { color: var(--fg-3); }
@@ -91,7 +93,7 @@
   /* ---------- layout ---------- */
   main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 80px; display: grid; gap: 24px; }
   .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px 22px; min-width: 0; }
-  .two { display: grid; grid-template-columns: 3fr 2fr; gap: 24px; }
+  .two { display: grid; grid-template-columns: 5fr 4fr; gap: 24px; }
   @media (max-width: 900px) { .two { grid-template-columns: 1fr; } main { padding: 16px 16px 60px; gap: 16px; } }
 
   /* ---------- first run ---------- */
@@ -122,11 +124,13 @@
   .foot { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
   /* ---------- tools ---------- */
-  .toolrow { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
-  .toolrow:last-of-type { border-bottom: 0; }
-  .toolrow b { min-width: 118px; font-weight: 600; }
-  .toolrow span.small { flex: 1; }
-  .toolrow .btn { margin-left: auto; }
+  /* Three columns: name, description or picker, Run. The middle column fills
+     the row so the Run buttons stack on the right edge. */
+  .toolrow { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .tools > .toolrow:last-child { border-bottom: 0; }
+  .toolrow > b { flex: 0 0 118px; font-weight: 600; }
+  .toolrow > span.small, .toolrow > select { flex: 1 1 0; min-width: 0; }
+  .toolrow > button { margin-left: auto; flex-shrink: 0; }
   .out { margin-top: 14px; }
   .out-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
   .out-head .small { flex: 1; }
@@ -150,7 +154,7 @@
   .tablewrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 12px; font-weight: 600; color: var(--fg-2); }
+  th { font-size: 12px; font-weight: 600; color: var(--fg-2); white-space: nowrap; }
   td.mono { font: 12px/1.5 var(--mono); }
   td.cmd { color: var(--fg-3); font: 11px/1.5 var(--mono); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   td.right { text-align: right; font-variant-numeric: tabular-nums; }
@@ -366,9 +370,11 @@
 
     <section class="card">
       <div class="head"><h1>Tools</h1></div>
-      <div class="toolrow"><b>Check my setup</b><span class="small">clock, monitors, mouse, ports</span><button class="btn small" data-run="doctor">Run</button></div>
-      <div class="toolrow"><b>Report</b><select class="btn small" id="reportSel"></select><button class="btn small" data-run="report">Run</button></div>
-      <div class="toolrow"><b>Trend</b><span class="small">one line per recording</span><button class="btn small" data-run="trend">Run</button></div>
+      <div class="tools">
+        <div class="toolrow"><b>Check my setup</b><span class="small">clock, monitors, mouse, ports</span><button class="btn small" data-run="doctor">Run</button></div>
+        <div class="toolrow"><b>Report</b><select class="btn small" id="reportSel" aria-label="Recording to report on"></select><button class="btn small" data-run="report">Run</button></div>
+        <div class="toolrow"><b>Trend</b><span class="small">one line per recording</span><button class="btn small" data-run="trend">Run</button></div>
+      </div>
       <div class="out" id="toolOut" hidden>
         <div class="out-head"><b id="toolTitle"></b><span class="small" id="toolStatus"></span><button class="btn small danger" id="toolStop" hidden>Stop</button></div>
         <pre class="log" id="toolLog"></pre>
@@ -449,10 +455,14 @@
           <button class="btn" type="button" id="sRevert" disabled>Undo changes</button>
           <span class="small" id="sFile"></span>
         </div>
-        <div class="help">Network addresses, Kafka and the program and log folders are not editable here on purpose: they decide what can
-          reach this PC. Those stay in the file:
-          <button class="btn small" type="button" data-open="config">Edit telemouse.toml</button>
-          <button class="btn small" type="button" id="sWizard">Run setup again</button></div>
+        <div>
+          <div class="help">Network addresses, Kafka and the program and log folders are not editable here on purpose: they decide what can
+            reach this PC. Those stay in the file.</div>
+          <div class="foot" style="margin-top:8px">
+            <button class="btn small" type="button" data-open="config">Edit telemouse.toml</button>
+            <button class="btn small" type="button" id="sWizard">Run setup again</button>
+          </div>
+        </div>
       </form>
     </div>
   </details>

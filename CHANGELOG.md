@@ -4,6 +4,17 @@ Releases are cut by pushing a `vX.Y.Z` tag that matches `[workspace.package]
 version` in `Cargo.toml`; the `release` workflow builds, tests, packages and
 publishes the section below that names that version.
 
+## [Unreleased]
+
+- **Panel controls line up.** Under *Tools* the report picker and its *Run*
+  button drifted to the right of the other two rows; now every row keeps
+  the name, the description or picker, and *Run* in the same three columns,
+  and the two cards share the width more evenly so a recording id fits in
+  the picker. Buttons, links, selects and text inputs have one fixed height
+  per size, so a control next to a text field or a pill no longer sits a few
+  pixels off, and the two file buttons under *Settings* moved out of the
+  help sentence onto their own row.
+
 ## [0.2.2] — 2026-09-21
 
 The queue left after 0.2.0: a still hand no longer reads as a dead capture
