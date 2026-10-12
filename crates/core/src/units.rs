@@ -3,9 +3,12 @@
 
 use crate::session::GameSens;
 
+/// Centimetres in an inch (exact by definition).
+pub const CM_PER_INCH: f64 = 2.54;
+
 /// Hand travel in centimeters for a given count total at a mouse CPI.
 pub fn counts_to_cm(counts: f64, cpi: f64) -> f64 {
-    counts / cpi * 2.54
+    counts / cpi * CM_PER_INCH
 }
 
 /// Aim-space yaw degrees for a horizontal count total.
@@ -36,7 +39,7 @@ mod tests {
     #[test]
     fn cm_conversion() {
         // 1600 counts at 1600 CPI = 1 inch = 2.54cm.
-        assert!((counts_to_cm(1600.0, 1600.0) - 2.54).abs() < 1e-12);
+        assert!((counts_to_cm(1600.0, 1600.0) - CM_PER_INCH).abs() < 1e-12);
     }
 
     #[test]

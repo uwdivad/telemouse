@@ -7,3 +7,6 @@
 /target-bench*
 crates/*/target-bench/
 /logs/
+# This machine's live config (LAN binds, broker address); the ctl Settings card
+# rewrites it. ctl seeds a first-run copy from telemouse.example.toml.
+/telemouse.toml

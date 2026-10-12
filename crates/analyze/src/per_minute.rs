@@ -60,7 +60,7 @@ pub fn compute(
         return Vec::new();
     }
     let flicks = crate::flicks::ordered_by_start(flicks);
-    let per_sec = (1.0 / p.grid.dt).round() as usize;
+    let per_sec = p.grid.cells_per_second();
     let n_min = seconds.len().div_ceil(60);
     let mut out = Vec::with_capacity(n_min);
     let mut flick_from = 0usize;
@@ -159,7 +159,8 @@ pub fn write_csv<W: Write>(w: &mut W, rows: &[MinuteRow]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn to_csv(rows: &[MinuteRow]) -> String {
+#[cfg(test)]
+pub(crate) fn to_csv(rows: &[MinuteRow]) -> String {
     let mut buf = Vec::new();
     write_csv(&mut buf, rows).expect("writing to a Vec cannot fail");
     String::from_utf8(buf).expect("ASCII/UTF-8 output")
@@ -170,7 +171,6 @@ mod tests {
     use super::*;
     use crate::testutil::{StreamBuilder, prep};
     use crate::{flicks, micro, per_second};
-    use telemouse_core::event::buttons;
 
     /// Three minutes of flick-and-click, so the bucketing has something to
     /// split and the boundaries can be checked exactly.
@@ -178,14 +178,7 @@ mod tests {
         let mut b = StreamBuilder::new();
         // One 500ms cycle; 120 cycles per minute, 360 for three minutes.
         for _ in 0..362 {
-            b.move_ms(25, 60, 0)
-                .idle_ms(10)
-                .move_ms(10, -10, 0)
-                .idle_ms(5)
-                .button(buttons::LEFT_DOWN)
-                .idle_ms(39)
-                .button(buttons::LEFT_UP)
-                .idle_ms(409);
+            b.flick_cycle(1, 0, 409);
         }
         prep(b.into_events())
     }

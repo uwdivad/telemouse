@@ -51,6 +51,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use telemouse_core::batch::total_counts;
+use telemouse_core::clock::ticks_to_us_u64;
 use telemouse_core::{
     BatchView, Batcher, Envelope, EnvelopeView, Heartbeat, Marker, QpcAnchor, RawEvent,
     SessionConfig,
@@ -59,8 +60,10 @@ use telemouse_core::{
 use crate::context::SharedContext;
 use crate::platform;
 use crate::raw_input::RingWaker;
-use crate::sinks::{EnvelopeEncoder, Sink, fan_out, send_to, tick_all};
-use crate::stats::Stats;
+use crate::sinks::{
+    EnvelopeEncoder, Sink, SinkFailure, SinkKind, close_within, fan_out, send_to, tick_all,
+};
+use crate::stats::{Stats, WarnLimiter};
 
 /// Shortest park, so a nearly-expired window does not turn into a spin.
 const MIN_PARK: Duration = Duration::from_micros(500);
@@ -71,13 +74,14 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Park length once the loop is *confirmed* idle: only the once-a-second sink
 /// tick needs a timer then, so an idle desk costs one wakeup a second instead
 /// of forty. Reached via a two-stage descent (see [`next_park_timeout`]): the
-/// first empty-ring park is only [`MAX_PARK`], so a wake lost to the
-/// [`RingWaker`] race costs at most one batch window, never a full second.
+/// first empty-ring park is only [`max_park`] (one batch window), so a wake
+/// lost to the [`RingWaker`] race costs at most one window, never a full
+/// second.
 const IDLE_PARK: Duration = TICK_INTERVAL;
 /// A misbehaving sink warns at most this often, with a suppressed count.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// How often the session envelope is repeated to the live viz — and only to
-/// it (see [`send_live`]).
+/// it (see [`Shipper::send_live`]).
 pub const SESSION_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 /// How often an otherwise silent agent says hello to the live viz.
 ///
@@ -220,70 +224,6 @@ impl HeartbeatGate {
     }
 }
 
-/// Rate limiter for per-sink failure warnings.
-///
-/// With no viz running, a broken sink can fail on every batch (~40/s). One
-/// warning per sink per [`WARN_INTERVAL`], carrying how many were suppressed,
-/// says the same thing without drowning the log.
-#[derive(Debug)]
-pub struct WarnLimiter {
-    interval: Duration,
-    entries: Vec<WarnEntry>,
-}
-
-impl Default for WarnLimiter {
-    fn default() -> Self {
-        Self::with_interval(WARN_INTERVAL)
-    }
-}
-
-#[derive(Debug)]
-struct WarnEntry {
-    sink: &'static str,
-    next_at: Instant,
-    suppressed: u64,
-}
-
-impl WarnLimiter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Same, at a different cadence — for a caller whose failures are rarer
-    /// or noisier than a per-batch sink send.
-    pub fn with_interval(interval: Duration) -> Self {
-        Self {
-            interval,
-            entries: Vec::new(),
-        }
-    }
-
-    /// Should this failure be logged now? `Some(suppressed)` says yes and
-    /// reports how many were swallowed since the last one; `None` says no.
-    pub fn allow(&mut self, sink: &'static str, now: Instant) -> Option<u64> {
-        let interval = self.interval;
-        match self.entries.iter_mut().find(|e| e.sink == sink) {
-            None => {
-                self.entries.push(WarnEntry {
-                    sink,
-                    next_at: now + interval,
-                    suppressed: 0,
-                });
-                Some(0)
-            }
-            Some(entry) if now >= entry.next_at => {
-                let suppressed = std::mem::take(&mut entry.suppressed);
-                entry.next_at = now + interval;
-                Some(suppressed)
-            }
-            Some(entry) => {
-                entry.suppressed += 1;
-                None
-            }
-        }
-    }
-}
-
 /// The per-batch header values [`ShipperCore::next_batch_meta`] hands out
 /// alongside the borrowed events when a batch is flushed.
 #[derive(Debug, Clone, Copy)]
@@ -386,7 +326,7 @@ impl ShipperCore {
             return self.max_park;
         };
         let remaining_ticks = deadline.saturating_sub(now_qpc);
-        let us = (remaining_ticks as u128 * 1_000_000 / self.anchor.qpc_freq.max(1) as u128) as u64;
+        let us = ticks_to_us_u64(remaining_ticks, self.anchor.qpc_freq);
         Duration::from_micros(us).clamp(MIN_PARK, self.max_park)
     }
 
@@ -418,7 +358,7 @@ impl ShipperCore {
 
     /// Assemble the accumulated events into an owned batch. `None` when empty.
     /// Test convenience only — the production flush path serializes a
-    /// borrowing [`BatchView`] instead (see [`flush`]).
+    /// borrowing [`BatchView`] instead (see [`Shipper::flush`]).
     #[cfg(test)]
     pub fn build_batch(
         &mut self,
@@ -469,48 +409,197 @@ impl ShipperCore {
     }
 }
 
-/// Deliver one envelope everywhere, isolating and counting sink failures.
-///
-/// `payload` is the envelope already serialized once for the whole fan-out;
-/// `topic`/`key` carry its routing.
-pub fn deliver(
-    sinks: &mut [Box<dyn Sink>],
-    stats: &Stats,
-    limiter: &mut WarnLimiter,
-    topic: &'static str,
-    key: &str,
-    payload: &str,
-) {
-    for failure in fan_out(sinks, topic, key, payload) {
-        stats.count_sink_error(failure.sink);
-        if let Some(suppressed) = limiter.allow(failure.sink, Instant::now()) {
+/// Everything one delivery touches — the sinks, the counters, the context,
+/// the reused encoder and the warning limiter — bundled so the loop in
+/// [`run`] reads as policy rather than as seven-argument calls.
+pub struct Shipper<'a> {
+    sinks: Vec<Box<dyn Sink>>,
+    stats: &'a Stats,
+    ctx: &'a SharedContext,
+    enc: EnvelopeEncoder,
+    limiter: WarnLimiter,
+    /// Log a one-line summary per batch (the `--print` flag).
+    print: bool,
+}
+
+impl<'a> Shipper<'a> {
+    pub fn new(
+        sinks: Vec<Box<dyn Sink>>,
+        stats: &'a Stats,
+        ctx: &'a SharedContext,
+        print: bool,
+    ) -> Self {
+        Self {
+            sinks,
+            stats,
+            ctx,
+            enc: EnvelopeEncoder::new(),
+            limiter: WarnLimiter::with_interval(WARN_INTERVAL),
+            print,
+        }
+    }
+
+    /// Count a sink failure, and warn about it at most once per
+    /// [`WARN_INTERVAL`] per sink, with how many were swallowed. `op` says
+    /// what was being attempted (`send`, `tick`, `session`, `heartbeat`).
+    fn report_failure(&mut self, failure: &SinkFailure, op: &'static str) {
+        self.stats.count_sink_error(failure.sink);
+        if let Some(suppressed) = self.limiter.allow(failure.sink.as_str(), Instant::now()) {
             tracing::warn!(
-                sink = failure.sink,
+                sink = failure.sink.as_str(),
+                op,
                 error = %failure.error,
                 suppressed,
-                "sink send failed"
+                "sink failed"
             );
         }
     }
-}
 
-/// Serialize then deliver an owned envelope (sessions and markers — batches go
-/// through the borrowing view in [`flush`]). Returns false if the envelope
-/// could not be encoded at all (which is a bug, not a sink failure, so it is
-/// logged loudly).
-fn encode_and_deliver(
-    enc: &mut EnvelopeEncoder,
-    sinks: &mut [Box<dyn Sink>],
-    stats: &Stats,
-    limiter: &mut WarnLimiter,
-    env: &Envelope,
-) -> bool {
-    if let Err(e) = enc.encode(env) {
-        tracing::error!(error = %format!("{e:#}"), "could not serialize envelope");
-        return false;
+    /// Serialize into the reused buffer. False when the envelope cannot be
+    /// encoded at all — a bug, not a sink failure, so it is logged loudly.
+    fn encode<T: serde::Serialize>(&mut self, env: &T, what: &'static str) -> bool {
+        match self.enc.encode(env) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), what, "could not serialize envelope");
+                false
+            }
+        }
     }
-    deliver(sinks, stats, limiter, env.topic(), env.key(), enc.payload());
-    true
+
+    /// Fan the last encoded payload out to every sink, isolating and
+    /// counting failures.
+    fn deliver_encoded(&mut self, topic: &'static str, key: &str) {
+        for failure in fan_out(&mut self.sinks, topic, key, self.enc.payload()) {
+            self.report_failure(&failure, "send");
+        }
+    }
+
+    /// Serialize then deliver an owned envelope everywhere (sessions and
+    /// markers — batches go through the borrowing view in [`Self::flush`]).
+    /// Returns false if the envelope could not be encoded.
+    pub fn deliver(&mut self, env: &Envelope) -> bool {
+        if !self.encode(env, env.topic()) {
+            return false;
+        }
+        self.deliver_encoded(env.topic(), env.key());
+        true
+    }
+
+    /// Deliver an envelope to the live viz, and *only* to it.
+    ///
+    /// Two things ride this path, and neither belongs anywhere else:
+    ///
+    /// * the periodic **session re-send** — a viz launched mid-session
+    ///   otherwise shows raw counts forever, since the session record carries
+    ///   the CPI, the device names, the monitor list and the anchor. A second
+    ///   `session` line in a recording would change what the file means, and
+    ///   consumers take the first session envelope of a stream anyway.
+    /// * the idle **heartbeat** — liveness, not telemetry. A line a second on
+    ///   disk and a message a second on the broker, both saying nothing, is
+    ///   exactly what the recording and Kafka do not need.
+    ///
+    /// `what` names the thing in the failure warning.
+    pub fn send_live(&mut self, env: &Envelope, what: &'static str) {
+        if !self.encode(env, what) {
+            return;
+        }
+        if let Some(failure) = send_to(
+            &mut self.sinks,
+            SinkKind::Udp,
+            env.topic(),
+            env.key(),
+            self.enc.payload(),
+        ) {
+            self.report_failure(&failure, what);
+        }
+    }
+
+    /// Periodic housekeeping on every sink.
+    pub fn tick(&mut self) {
+        for failure in tick_all(&mut self.sinks) {
+            self.report_failure(&failure, "tick");
+        }
+    }
+
+    /// Ship whatever `core` has accumulated as one batch. A no-op when empty.
+    pub fn flush(&mut self, core: &mut ShipperCore) {
+        // The context is only needed here (~40×/s), never per drained event.
+        let snapshot = self.ctx.get();
+        let Some(meta) = core.next_batch_meta(self.stats.ring_drops(), self.stats.abs_frames())
+        else {
+            return;
+        };
+        self.stats.batches.fetch_add(1, Ordering::Relaxed);
+        if self.print {
+            let (dx, dy) = total_counts(core.events());
+            tracing::info!(
+                seq = meta.seq_no,
+                events = core.events().len(),
+                dx,
+                dy,
+                drops = meta.drops_since_last,
+                abs_frames = meta.abs_frames_since_last,
+                game = snapshot.game.as_deref().unwrap_or("-"),
+                locked = snapshot.pointer_locked,
+                "batch"
+            );
+        }
+        // Steady-state allocation-free: the view borrows the session id, the
+        // context snapshot and the batcher's events in place — no `String`
+        // clones, no fresh `Vec` — and serializes into the encoder's reused
+        // buffer.
+        let (cursor_x, cursor_y) = snapshot.batch_cursor();
+        let view = EnvelopeView::Batch(BatchView {
+            session_id: core.session_id(),
+            seq_no: meta.seq_no,
+            ts_anchor_us: meta.ts_anchor_us,
+            game: snapshot.game.as_deref(),
+            pointer_locked: snapshot.pointer_locked,
+            screen_w: snapshot.screen_w,
+            screen_h: snapshot.screen_h,
+            cursor_x,
+            cursor_y,
+            drops_since_last: meta.drops_since_last,
+            abs_frames_since_last: meta.abs_frames_since_last,
+            events: core.events(),
+        });
+        if self.encode(&view, "batch") {
+            self.deliver_encoded(view.topic(), view.key());
+        }
+        // Measured *after* the fan-out, not before it: capture→ship is
+        // supposed to include the ship. Taken before, it left out the one
+        // part of the path that can actually stall (a slow JSONL flush, a
+        // Kafka queue backing up) and reported a flattering number precisely
+        // when things were going wrong.
+        #[cfg(feature = "observability")]
+        record_latency(core.anchor(), self.stats, core.events());
+        core.finish_batch();
+    }
+
+    /// Close the sinks in two stages, inside one shutdown budget.
+    ///
+    /// Everything but Kafka goes first, because the JSONL writer's final
+    /// flush is what makes the recording complete; `on_recording_closed` then
+    /// writes the sidecar with the counters as they stand. Only after that
+    /// does Kafka's *bounded* drain run — it can time out and abandon
+    /// envelopes, and if it does, the sidecar on disk is already accurate
+    /// about everything else. The draining sinks share `budget` rather than
+    /// each spending its own full timeout, so the whole close stays inside
+    /// the time Windows grants a closing console.
+    pub fn close(self, budget: Duration, on_recording_closed: Option<Box<dyn FnOnce() + Send>>) {
+        let deadline = Instant::now() + budget;
+        let (kafka, rest): (Vec<_>, Vec<_>) = self
+            .sinks
+            .into_iter()
+            .partition(|s| s.kind() == SinkKind::Kafka);
+        let kafka_draining = kafka.iter().filter(|s| s.drains_on_close()).count();
+        close_within(rest, deadline, kafka_draining);
+        if let Some(closed) = on_recording_closed {
+            closed();
+        }
+        close_within(kafka, deadline, 0);
+    }
 }
 
 pub struct ShippingArgs {
@@ -528,6 +617,8 @@ pub struct ShippingArgs {
     /// drain. The sidecar is written here so a drain that runs out of time
     /// still leaves a document whose counters match the recording on disk.
     pub on_recording_closed: Option<Box<dyn FnOnce() + Send>>,
+    /// How long closing the sinks may take in all (see [`Shipper::close`]).
+    pub drain_budget: Duration,
 }
 
 /// The T2 thread body. Returns when `capture_stopped` is set and the ring has
@@ -535,7 +626,7 @@ pub struct ShippingArgs {
 pub fn run(
     mut consumer: rtrb::Consumer<RawEvent>,
     marker_rx: Receiver<MarkerSignal>,
-    mut sinks: Vec<Box<dyn Sink>>,
+    sinks: Vec<Box<dyn Sink>>,
     ctx: Arc<SharedContext>,
     stats: Arc<Stats>,
     mut args: ShippingArgs,
@@ -551,14 +642,13 @@ pub fn run(
         args.max_events,
         args.window_ms,
     );
-    let mut enc = EnvelopeEncoder::new();
-    let mut limiter = WarnLimiter::new();
+    let mut shipper = Shipper::new(sinks, &stats, &ctx, args.print);
 
     // The session record goes out first, so a recording's first line is always
     // the session envelope. It is kept, because the live viz gets it again
-    // every few seconds (see `resend_session`).
+    // every few seconds (see `Shipper::send_live`).
     let session_env = Envelope::Session(args.session.clone());
-    encode_and_deliver(&mut enc, &mut sinks, &stats, &mut limiter, &session_env);
+    shipper.deliver(&session_env);
 
     let mut last_tick = Instant::now();
     let mut last_resend = Instant::now();
@@ -582,15 +672,7 @@ pub fn run(
         while let Ok(ev) = consumer.pop() {
             core.push(ev);
             if core.is_full() {
-                flush(
-                    &mut core,
-                    &mut sinks,
-                    &stats,
-                    &ctx,
-                    &mut enc,
-                    &mut limiter,
-                    args.print,
-                );
+                shipper.flush(&mut core);
             }
             drained += 1;
             if drained >= DRAIN_BUDGET {
@@ -602,13 +684,7 @@ pub fn run(
             let marker = core.build_marker(sig.ts_qpc, sig.label);
             stats.markers.fetch_add(1, Ordering::Relaxed);
             tracing::info!(seq = marker.seq_no, label = %marker.label, "marker");
-            encode_and_deliver(
-                &mut enc,
-                &mut sinks,
-                &stats,
-                &mut limiter,
-                &Envelope::Marker(marker),
-            );
+            shipper.deliver(&Envelope::Marker(marker));
         }
 
         // The window closed: ship what accumulated in it (`flush` is a no-op
@@ -619,30 +695,12 @@ pub fn run(
         let expired = core.window_expired(now);
         let live = drained > 0 || core.pending() > 0;
         if expired {
-            flush(
-                &mut core,
-                &mut sinks,
-                &stats,
-                &ctx,
-                &mut enc,
-                &mut limiter,
-                args.print,
-            );
+            shipper.flush(&mut core);
         }
         advance_window(&mut core, now, expired, live);
 
         if last_tick.elapsed() >= TICK_INTERVAL {
-            for failure in tick_all(&mut sinks) {
-                stats.count_sink_error(failure.sink);
-                if let Some(suppressed) = limiter.allow(failure.sink, Instant::now()) {
-                    tracing::warn!(
-                        sink = failure.sink,
-                        error = %failure.error,
-                        suppressed,
-                        "sink tick failed"
-                    );
-                }
-            }
+            shipper.tick();
             last_tick = Instant::now();
         }
 
@@ -650,14 +708,7 @@ pub fn run(
         // convert anything to cm or degrees until it gets one.
         if last_resend.elapsed() >= SESSION_RESEND_INTERVAL {
             last_resend = Instant::now();
-            send_live(
-                &mut enc,
-                &mut sinks,
-                &stats,
-                &mut limiter,
-                &session_env,
-                "session",
-            );
+            shipper.send_live(&session_env, "session");
         }
 
         // Nothing moved for a second: tell the live viz we are still here, so
@@ -669,14 +720,7 @@ pub fn run(
         // be the final batch.
         if !stopping && heartbeat.due(stats.batches.load(Ordering::Relaxed), Instant::now()) {
             let env = Envelope::Heartbeat(core.build_heartbeat(platform::qpc()));
-            send_live(
-                &mut enc,
-                &mut sinks,
-                &stats,
-                &mut limiter,
-                &env,
-                "heartbeat",
-            );
+            shipper.send_live(&env, "heartbeat");
         }
 
         if stopping && drained == 0 && core.pending() == 0 {
@@ -713,7 +757,7 @@ pub fn run(
                     // Descend to the long idle park only once a batch-window
                     // park has confirmed the ring is really idle: a wake lost
                     // to the RingWaker race (see its docs) then costs at most
-                    // MAX_PARK, not IDLE_PARK, for one extra wakeup per
+                    // one `max_park`, not IDLE_PARK, for one extra wakeup per
                     // descent into idle.
                     let idle_timeout = next_park_timeout(idle_probe_expired, true, core.max_park());
                     let parked_at = Instant::now();
@@ -729,32 +773,10 @@ pub fn run(
         }
     }
 
-    // Final flush of whatever is left.
-    flush(
-        &mut core,
-        &mut sinks,
-        &stats,
-        &ctx,
-        &mut enc,
-        &mut limiter,
-        args.print,
-    );
-    for failure in tick_all(&mut sinks) {
-        stats.count_sink_error(failure.sink);
-    }
-
-    // Close the sinks in two stages. Everything but Kafka goes first, because
-    // the JSONL writer's final flush is what makes the recording complete;
-    // the callback then writes the sidecar with the counters as they stand.
-    // Only after that does Kafka's *bounded* drain run — it can time out and
-    // abandon envelopes, and if it does, the sidecar on disk is already
-    // accurate about everything else.
-    let (kafka, rest): (Vec<_>, Vec<_>) = sinks.into_iter().partition(|s| s.name() == "kafka");
-    drop(rest);
-    if let Some(closed) = args.on_recording_closed.take() {
-        closed();
-    }
-    drop(kafka);
+    // Final flush of whatever is left, a last tick, then the sinks.
+    shipper.flush(&mut core);
+    shipper.tick();
+    shipper.close(args.drain_budget, args.on_recording_closed.take());
 
     tracing::info!(
         batches = stats.batches.load(Ordering::Relaxed),
@@ -762,117 +784,6 @@ pub fn run(
         drops = stats.ring_drops(),
         "shipping thread finished"
     );
-}
-
-/// Deliver an envelope to the live viz, and *only* to it.
-///
-/// Two things ride this path, and neither belongs anywhere else:
-///
-/// * the periodic **session re-send** — a viz launched mid-session otherwise
-///   shows raw counts forever, since the session record carries the CPI, the
-///   device names, the monitor list and the anchor. A second `session` line
-///   in a recording would change what the file means, and consumers take the
-///   first session envelope of a stream anyway.
-/// * the idle **heartbeat** — liveness, not telemetry. A line a second on
-///   disk and a message a second on the broker, both saying nothing, is
-///   exactly what the recording and Kafka do not need.
-///
-/// `what` only names the thing in the failure warning.
-fn send_live(
-    enc: &mut EnvelopeEncoder,
-    sinks: &mut [Box<dyn Sink>],
-    stats: &Stats,
-    limiter: &mut WarnLimiter,
-    env: &Envelope,
-    what: &'static str,
-) {
-    if let Err(e) = enc.encode(env) {
-        tracing::error!(error = %format!("{e:#}"), what, "could not serialize envelope");
-        return;
-    }
-    let Some(failure) = send_to(sinks, "udp", env.topic(), env.key(), enc.payload()) else {
-        return;
-    };
-    stats.count_sink_error(failure.sink);
-    if let Some(suppressed) = limiter.allow(failure.sink, Instant::now()) {
-        tracing::warn!(
-            sink = failure.sink,
-            error = %failure.error,
-            suppressed,
-            what,
-            "live-only send failed"
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flush(
-    core: &mut ShipperCore,
-    sinks: &mut [Box<dyn Sink>],
-    stats: &Stats,
-    ctx: &SharedContext,
-    enc: &mut EnvelopeEncoder,
-    limiter: &mut WarnLimiter,
-    print: bool,
-) {
-    // The context is only needed here (~40×/s), never per drained event.
-    let snapshot = ctx.get();
-    let Some(meta) = core.next_batch_meta(stats.ring_drops(), stats.abs_frames()) else {
-        return;
-    };
-    stats.batches.fetch_add(1, Ordering::Relaxed);
-    if print {
-        let (dx, dy) = total_counts(core.events());
-        tracing::info!(
-            seq = meta.seq_no,
-            events = core.events().len(),
-            dx,
-            dy,
-            drops = meta.drops_since_last,
-            abs_frames = meta.abs_frames_since_last,
-            game = snapshot.game.as_deref().unwrap_or("-"),
-            locked = snapshot.pointer_locked,
-            "batch"
-        );
-    }
-    // Steady-state allocation-free: the view borrows the session id, the
-    // context snapshot and the batcher's events in place — no `String` clones,
-    // no fresh `Vec` — and serializes into the encoder's reused buffer.
-    let (cursor_x, cursor_y) = snapshot.batch_cursor();
-    let view = EnvelopeView::Batch(BatchView {
-        session_id: core.session_id(),
-        seq_no: meta.seq_no,
-        ts_anchor_us: meta.ts_anchor_us,
-        game: snapshot.game.as_deref(),
-        pointer_locked: snapshot.pointer_locked,
-        screen_w: snapshot.screen_w,
-        screen_h: snapshot.screen_h,
-        cursor_x,
-        cursor_y,
-        drops_since_last: meta.drops_since_last,
-        abs_frames_since_last: meta.abs_frames_since_last,
-        events: core.events(),
-    });
-    if let Err(e) = enc.encode(&view) {
-        tracing::error!(error = %format!("{e:#}"), "could not serialize envelope");
-    } else {
-        deliver(
-            sinks,
-            stats,
-            limiter,
-            view.topic(),
-            view.key(),
-            enc.payload(),
-        );
-    }
-    // Measured *after* the fan-out, not before it: capture→ship is supposed
-    // to include the ship. Taken before, it left out the one part of the path
-    // that can actually stall (a slow JSONL flush, a Kafka queue backing up)
-    // and reported a flattering number precisely when things were going
-    // wrong.
-    #[cfg(feature = "observability")]
-    record_latency(core.anchor(), stats, core.events());
-    core.finish_batch();
 }
 
 /// Record how long the batch's oldest and newest events waited to be shipped.
@@ -899,7 +810,7 @@ mod tests {
 
     use super::*;
     use crate::context::ContextSnapshot;
-    use crate::raw_input::DrainStamper;
+    use crate::raw_input::{CADENCE_SLACK, DrainStamper};
     use crate::sinks::mock::{FailingSink, RecordingSink};
 
     const FREQ: u64 = 10_000_000;
@@ -1135,55 +1046,22 @@ mod tests {
         assert_eq!(m0.label, "hotkey");
     }
 
-    #[test]
-    fn warnings_are_rate_limited_per_sink_with_a_suppressed_count() {
-        let mut l = WarnLimiter::new();
-        let t0 = Instant::now();
-        // First failure for a sink always warns.
-        assert_eq!(l.allow("udp", t0), Some(0));
-        // Everything inside the window is swallowed...
-        for i in 1..=5 {
-            assert_eq!(l.allow("udp", t0 + Duration::from_millis(i * 100)), None);
-        }
-        // ...and the next one past it reports the backlog.
-        assert_eq!(l.allow("udp", t0 + WARN_INTERVAL), Some(5));
-        // The counter resets after being reported.
-        assert_eq!(
-            l.allow("udp", t0 + WARN_INTERVAL + Duration::from_secs(1)),
-            None
-        );
-        assert_eq!(l.allow("udp", t0 + WARN_INTERVAL * 2), Some(1));
-    }
-
-    #[test]
-    fn each_sink_gets_its_own_warn_budget() {
-        let mut l = WarnLimiter::new();
-        let t0 = Instant::now();
-        assert_eq!(l.allow("udp", t0), Some(0));
-        // A different sink is not silenced by udp's warning.
-        assert_eq!(l.allow("kafka", t0), Some(0));
-        assert_eq!(l.allow("udp", t0), None);
-        assert_eq!(l.allow("kafka", t0), None);
-        assert_eq!(l.allow("jsonl", t0), Some(0));
-    }
-
     /// The shipping loop's core, exercised end to end without threads: feed
     /// synthetic events through the batcher and the sink fan-out.
     #[test]
     fn shipping_core_drives_sinks_with_correct_boundaries() {
         let a = anchor();
         let stats = Stats::default();
-        let good = RecordingSink::new("udp");
-        let other = RecordingSink::new("jsonl");
-        let mut sinks: Vec<Box<dyn Sink>> = vec![
+        let good = RecordingSink::new(SinkKind::Udp);
+        let other = RecordingSink::new(SinkKind::Jsonl);
+        let sinks: Vec<Box<dyn Sink>> = vec![
             Box::new(good.clone()),
-            Box::new(FailingSink::new("kafka")),
+            Box::new(FailingSink::new(SinkKind::Kafka)),
             Box::new(other.clone()),
         ];
         let mut core = ShipperCore::new("s-1".into(), a, 4, 25);
         let context = shared_ctx();
-        let mut enc = EnvelopeEncoder::new();
-        let mut limiter = WarnLimiter::new();
+        let mut shipper = Shipper::new(sinks, &stats, &context, false);
 
         // 10 events, one per ms: max_events (4) decides the boundaries.
         for i in 0..10u64 {
@@ -1196,34 +1074,18 @@ mod tests {
             };
             core.push(e);
             if core.is_full() {
-                flush(
-                    &mut core,
-                    &mut sinks,
-                    &stats,
-                    &context,
-                    &mut enc,
-                    &mut limiter,
-                    false,
-                );
+                shipper.flush(&mut core);
             }
         }
         // Final partial.
-        flush(
-            &mut core,
-            &mut sinks,
-            &stats,
-            &context,
-            &mut enc,
-            &mut limiter,
-            false,
-        );
+        shipper.flush(&mut core);
 
         assert_eq!(good.count(), 3); // 4 + 4 + 2
         assert_eq!(other.count(), 3); // the failing sink starved nobody
         assert_eq!(stats.snapshot().kafka_errors, 3);
         assert_eq!(stats.snapshot().batches, 3);
         // Three failures, one warning: the rest were rate-limited away.
-        assert_eq!(limiter.allow("kafka", Instant::now()), None);
+        assert_eq!(shipper.limiter.allow("kafka", Instant::now()), None);
 
         let received = good.received.lock().unwrap().clone();
         let batches: Vec<Batch> = received
@@ -1265,12 +1127,12 @@ mod tests {
 
     #[test]
     fn the_session_re_send_reaches_the_viz_and_nothing_else() {
-        let udp = RecordingSink::new("udp");
-        let jsonl = RecordingSink::new("jsonl");
-        let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(udp.clone()), Box::new(jsonl.clone())];
+        let udp = RecordingSink::new(SinkKind::Udp);
+        let jsonl = RecordingSink::new(SinkKind::Jsonl);
+        let sinks: Vec<Box<dyn Sink>> = vec![Box::new(udp.clone()), Box::new(jsonl.clone())];
         let stats = Stats::default();
-        let mut enc = EnvelopeEncoder::new();
-        let mut limiter = WarnLimiter::new();
+        let context = shared_ctx();
+        let mut shipper = Shipper::new(sinks, &stats, &context, false);
         let env = Envelope::Session(SessionConfig {
             session_id: "s-1".into(),
             mouse_cpi: 1600.0,
@@ -1278,13 +1140,13 @@ mod tests {
         });
 
         // The startup delivery goes everywhere...
-        encode_and_deliver(&mut enc, &mut sinks, &stats, &mut limiter, &env);
+        assert!(shipper.deliver(&env));
         assert_eq!((udp.count(), jsonl.count()), (1, 1));
 
         // ...every repeat after it goes to the live viz alone, so the
         // recording keeps exactly one session line.
         for _ in 0..3 {
-            send_live(&mut enc, &mut sinks, &stats, &mut limiter, &env, "session");
+            shipper.send_live(&env, "session");
         }
         assert_eq!(udp.count(), 4);
         assert_eq!(jsonl.count(), 1, "the recording gained no session lines");
@@ -1297,16 +1159,69 @@ mod tests {
 
     #[test]
     fn a_failing_viz_re_send_is_counted_but_rate_limited() {
-        let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(FailingSink::new("udp"))];
+        let sinks: Vec<Box<dyn Sink>> = vec![Box::new(FailingSink::new(SinkKind::Udp))];
         let stats = Stats::default();
-        let mut enc = EnvelopeEncoder::new();
-        let mut limiter = WarnLimiter::new();
+        let context = shared_ctx();
+        let mut shipper = Shipper::new(sinks, &stats, &context, false);
         let env = Envelope::Session(SessionConfig::default());
         for _ in 0..4 {
-            send_live(&mut enc, &mut sinks, &stats, &mut limiter, &env, "session");
+            shipper.send_live(&env, "session");
         }
         assert_eq!(stats.snapshot().udp_errors, 4);
-        assert_eq!(limiter.allow("udp", Instant::now()), None);
+        assert_eq!(shipper.limiter.allow("udp", Instant::now()), None);
+    }
+
+    #[test]
+    fn a_failing_tick_is_counted_against_its_sink() {
+        let ok = RecordingSink::new(SinkKind::Jsonl);
+        let sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(FailingSink::new(SinkKind::Kafka)),
+            Box::new(ok.clone()),
+        ];
+        let stats = Stats::default();
+        let context = shared_ctx();
+        let mut shipper = Shipper::new(sinks, &stats, &context, false);
+        shipper.tick();
+        shipper.tick();
+        assert_eq!(stats.snapshot().kafka_errors, 2);
+        assert_eq!(*ok.ticks.lock().unwrap(), 2);
+    }
+
+    /// The recording is closed (and the callback run) before Kafka is.
+    #[test]
+    fn closing_runs_the_callback_between_the_recording_and_kafka() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Noting(SinkKind, Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Sink for Noting {
+            fn kind(&self) -> SinkKind {
+                self.0
+            }
+            fn send(&mut self, _: &'static str, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for Noting {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0.as_str());
+            }
+        }
+        let sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(Noting(SinkKind::Kafka, Arc::clone(&order))),
+            Box::new(Noting(SinkKind::Udp, Arc::clone(&order))),
+            Box::new(Noting(SinkKind::Jsonl, Arc::clone(&order))),
+        ];
+        let stats = Stats::default();
+        let context = shared_ctx();
+        let shipper = Shipper::new(sinks, &stats, &context, false);
+        let noted = Arc::clone(&order);
+        shipper.close(
+            Duration::from_secs(1),
+            Some(Box::new(move || noted.lock().unwrap().push("callback"))),
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["udp", "jsonl", "callback", "kafka"]
+        );
     }
 
     #[test]
@@ -1375,17 +1290,17 @@ mod tests {
     #[test]
     fn the_heartbeat_reaches_the_viz_alone_and_stays_out_of_the_stats() {
         let a = anchor();
-        let udp = RecordingSink::new("udp");
-        let jsonl = RecordingSink::new("jsonl");
-        let kafka = RecordingSink::new("kafka");
-        let mut sinks: Vec<Box<dyn Sink>> = vec![
+        let udp = RecordingSink::new(SinkKind::Udp);
+        let jsonl = RecordingSink::new(SinkKind::Jsonl);
+        let kafka = RecordingSink::new(SinkKind::Kafka);
+        let sinks: Vec<Box<dyn Sink>> = vec![
             Box::new(udp.clone()),
             Box::new(jsonl.clone()),
             Box::new(kafka.clone()),
         ];
         let stats = Stats::default();
-        let mut enc = EnvelopeEncoder::new();
-        let mut limiter = WarnLimiter::new();
+        let context = shared_ctx();
+        let mut shipper = Shipper::new(sinks, &stats, &context, false);
 
         let core = ShipperCore::new("s-1".into(), a, 10, 25);
         let hb = core.build_heartbeat(a.qpc + FREQ * 3);
@@ -1393,14 +1308,7 @@ mod tests {
         assert_eq!(hb.ts_utc_us, a.utc_us + 3_000_000);
 
         let env = Envelope::Heartbeat(hb);
-        send_live(
-            &mut enc,
-            &mut sinks,
-            &stats,
-            &mut limiter,
-            &env,
-            "heartbeat",
-        );
+        shipper.send_live(&env, "heartbeat");
         assert_eq!(udp.count(), 1);
         assert_eq!(jsonl.count(), 0, "a recording gains no heartbeat lines");
         assert_eq!(kafka.count(), 0, "the broker gains no heartbeat messages");
@@ -1412,19 +1320,6 @@ mod tests {
         // It is not a batch: nothing about the batch accounting moves.
         assert_eq!(stats.snapshot().batches, 0);
         assert_eq!(stats.snapshot().udp_errors, 0);
-    }
-
-    #[test]
-    fn warn_limiters_can_run_at_a_different_cadence() {
-        let mut l = WarnLimiter::with_interval(Duration::from_secs(60));
-        let t0 = Instant::now();
-        assert_eq!(l.allow("kafka", t0), Some(0));
-        assert_eq!(
-            l.allow("kafka", t0 + WARN_INTERVAL),
-            None,
-            "still inside 60s"
-        );
-        assert_eq!(l.allow("kafka", t0 + Duration::from_secs(60)), Some(1));
     }
 
     // ---- batch cadence, on a fake clock ------------------------------------
@@ -1500,8 +1395,8 @@ mod tests {
     impl Sim {
         fn new(window_ms: u64, coalesce_ms: u64, hz: u64, arrivals: VecDeque<u64>) -> Self {
             let coalesce = coalesce_ms * MS;
-            // `CADENCE_SLACK` is one report interval of a 1kHz mouse.
-            let cadence = coalesce + MS;
+            // T1's own cadence: the window plus `CADENCE_SLACK`.
+            let cadence = coalesce + ticks(CADENCE_SLACK);
             Self {
                 core: ShipperCore::new("s-sim".into(), anchor(), 448, window_ms),
                 now: 0,

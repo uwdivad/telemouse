@@ -1,3 +1,13 @@
+//! Time: the wall clock every binary stamps with, and the QPC↔UTC anchor
+//! that maps a session's monotonic tick counts onto it.
+//!
+//! All conversions here are pure integer arithmetic and never panic: a QPC
+//! frequency of zero (only reachable from a corrupt or hand-edited
+//! recording, since the capture agent maps 0 → 1 when it builds the anchor)
+//! is treated as 1 tick per second rather than dividing by zero. Loaders
+//! that want to refuse such a recording outright call
+//! [`QpcAnchor::is_valid`] or [`crate::session::SessionConfig::validate`].
+
 use serde::{Deserialize, Serialize};
 
 /// UTC microseconds since the Unix epoch, right now. Every binary stamps
@@ -28,14 +38,40 @@ pub struct QpcAnchor {
     pub qpc_freq: u64,
 }
 
+/// The frequency every conversion actually divides by: `freq`, or 1 when it
+/// is 0, so a corrupt anchor yields a wrong-but-finite answer instead of a
+/// divide-by-zero panic in whoever is reading the file.
+#[inline]
+fn effective_freq(freq: u64) -> u64 {
+    freq.max(1)
+}
+
+/// Convert a duration in milliseconds to ticks at `freq` ticks per second,
+/// rounding down. Never panics: a zero `freq` is treated as 1, and a result
+/// too large for `u64` saturates.
+pub fn ms_to_ticks(ms: u64, freq: u64) -> u64 {
+    let ticks = ms as u128 * effective_freq(freq) as u128 / 1_000;
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+/// Convert a tick count at `freq` ticks per second to whole microseconds,
+/// rounding down. Never panics: a zero `freq` is treated as 1, and a result
+/// too large for `u64` saturates.
+pub fn ticks_to_us_u64(ticks: u64, freq: u64) -> u64 {
+    let freq = effective_freq(freq);
+    us_from_ticks_mag(ticks, freq).unwrap_or_else(|| {
+        u64::try_from(ticks as u128 * 1_000_000 / freq as u128).unwrap_or(u64::MAX)
+    })
+}
+
 /// Scale a tick *magnitude* to whole microseconds in 64-bit arithmetic:
 /// `⌊m × 1_000_000 ÷ freq⌋`, or `None` when 64 bits cannot carry it.
 ///
-/// `None` means "ask i128": a zero frequency (the caller's i128 form panics on
-/// it, as it always has) or an intermediate product that would wrap. Working
-/// on the magnitude keeps every value unsigned, and since i128 division
-/// truncates toward zero, `|trunc(x)| == trunc(|x|)` — the caller puts the
-/// sign back afterwards.
+/// `None` means "ask i128": an intermediate product that would wrap. Callers
+/// pass a non-zero `freq` (see [`effective_freq`]). Working on the magnitude
+/// keeps every value unsigned, and since i128 division truncates toward
+/// zero, `|trunc(x)| == trunc(|x|)` — the caller puts the sign back
+/// afterwards.
 #[inline]
 fn us_from_ticks_mag(m: u64, freq: u64) -> Option<u64> {
     // The ubiquitous Windows frequency, checked first: `m × 1e6 ÷ 1e7` is
@@ -45,6 +81,7 @@ fn us_from_ticks_mag(m: u64, freq: u64) -> Option<u64> {
         return Some(m / 10);
     }
     if freq == 0 {
+        // Unreachable through the public API; refuse rather than divide.
         return None;
     }
     // Whole-µs frequencies (1 MHz, 24 MHz, …): one exact division.
@@ -92,39 +129,52 @@ fn tick_delta(from: u64, to: u64) -> (u64, bool) {
 }
 
 impl QpcAnchor {
+    /// Whether the anchor can map ticks to time at all: a non-zero
+    /// frequency. The conversions below never panic either way (a zero
+    /// frequency is treated as 1), but a loader should refuse an anchor that
+    /// fails this rather than report numbers built on it.
+    pub fn is_valid(&self) -> bool {
+        self.qpc_freq > 0
+    }
+
     /// Map a QPC reading to UTC microseconds since the Unix epoch.
     ///
     /// Works for readings before the anchor too (negative delta). The scaling
     /// is done in 64-bit integers, with the i128 form kept as a fallback for
     /// the frequencies and tick spans where 64 bits could overflow, so the
     /// result is identical for every input but costs no `__divti3` call on the
-    /// path the analyzer walks once per event.
+    /// path the analyzer walks once per event. A zero `qpc_freq` is treated
+    /// as 1 (see [`Self::is_valid`]).
     #[inline]
     pub fn qpc_to_utc_us(&self, qpc: u64) -> i64 {
+        let freq = effective_freq(self.qpc_freq);
         let (m, neg) = tick_delta(self.qpc, qpc);
-        if let Some(dus) = us_from_ticks(m, neg, self.qpc_freq) {
+        if let Some(dus) = us_from_ticks(m, neg, freq) {
             // `wrapping_add` is what `(utc_us as i128 + dus) as i64` did: the
             // cast keeps the low 64 bits, which is addition modulo 2^64.
             return self.utc_us.wrapping_add(dus);
         }
         let dticks = qpc as i128 - self.qpc as i128;
-        (self.utc_us as i128 + dticks * 1_000_000 / self.qpc_freq as i128) as i64
+        (self.utc_us as i128 + dticks * 1_000_000 / freq as i128) as i64
     }
 
     /// Microseconds elapsed from `from_qpc` to `to_qpc` (may be negative).
+    /// A zero `qpc_freq` is treated as 1 (see [`Self::is_valid`]).
     #[inline]
     pub fn ticks_to_us(&self, from_qpc: u64, to_qpc: u64) -> i64 {
+        let freq = effective_freq(self.qpc_freq);
         let (m, neg) = tick_delta(from_qpc, to_qpc);
-        if let Some(us) = us_from_ticks(m, neg, self.qpc_freq) {
+        if let Some(us) = us_from_ticks(m, neg, freq) {
             return us;
         }
         let dticks = to_qpc as i128 - from_qpc as i128;
-        (dticks * 1_000_000 / self.qpc_freq as i128) as i64
+        (dticks * 1_000_000 / freq as i128) as i64
     }
 
-    /// Convert a duration in milliseconds to QPC ticks (rounds down).
+    /// Convert a duration in milliseconds to QPC ticks (rounds down); the
+    /// free [`ms_to_ticks`] at this anchor's frequency.
     pub fn ms_to_ticks(&self, ms: u64) -> u64 {
-        (ms as u128 * self.qpc_freq as u128 / 1_000) as u64
+        ms_to_ticks(ms, self.qpc_freq)
     }
 }
 
@@ -313,17 +363,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "divide by zero")]
-    fn zero_frequency_still_panics_like_the_i128_form() {
-        // Not reachable in practice (`session_setup` maps 0 → 1), but the
-        // 64-bit path must not quietly invent an answer where the old one
-        // divided by zero.
-        let a = QpcAnchor {
+    fn a_zero_frequency_is_treated_as_one_instead_of_panicking() {
+        // `qpc_freq` comes straight off a recording's session line, so a
+        // corrupt file must not take the analyzer down. The capture agent
+        // maps 0 → 1 when it builds the anchor; the conversions do the same.
+        let zero = QpcAnchor {
             qpc: 10,
             utc_us: 0,
             qpc_freq: 0,
         };
-        let _ = a.qpc_to_utc_us(20);
+        let one = QpcAnchor {
+            qpc_freq: 1,
+            ..zero
+        };
+        assert!(!zero.is_valid());
+        assert!(one.is_valid());
+        for probe in [0, 9, 10, 20, u64::MAX] {
+            assert_eq!(zero.qpc_to_utc_us(probe), one.qpc_to_utc_us(probe));
+            assert_eq!(zero.ticks_to_us(10, probe), one.ticks_to_us(10, probe));
+        }
+        assert_eq!(zero.qpc_to_utc_us(20), 10_000_000);
+        assert_eq!(zero.ms_to_ticks(25_000), 25);
+        assert_eq!(ticks_to_us_u64(3, 0), 3_000_000);
+    }
+
+    #[test]
+    fn free_conversions_match_the_anchor_and_saturate() {
+        assert_eq!(ms_to_ticks(25, FREQ), 250_000);
+        assert_eq!(ms_to_ticks(25, FREQ), anchor().ms_to_ticks(25));
+        assert_eq!(ms_to_ticks(0, FREQ), 0);
+        assert_eq!(ms_to_ticks(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(ticks_to_us_u64(250_000, FREQ), 25_000);
+        assert_eq!(ticks_to_us_u64(4, 3_579_545), 1);
+        assert_eq!(ticks_to_us_u64(u64::MAX, 1), u64::MAX);
+        for freq in SWEEP_FREQS {
+            for ticks in [0, 1, 999_999, 1 << 40, u64::MAX] {
+                let want = (ticks as u128 * 1_000_000 / freq as u128).min(u64::MAX as u128);
+                assert_eq!(
+                    ticks_to_us_u64(ticks, freq) as u128,
+                    want,
+                    "freq={freq} ticks={ticks}"
+                );
+            }
+        }
     }
 
     fn anchor() -> QpcAnchor {

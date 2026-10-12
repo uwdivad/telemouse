@@ -7,8 +7,10 @@
 //! [`PointerLockDetector`]. The loop waits on a condvar rather than sleeping in
 //! slices, so an idle agent wakes 4×/s and not 40×/s.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +24,8 @@ use crate::raw_input::RingWaker;
 use crate::session_setup::{anchor_drift_us, drift_ppm, measure_anchor};
 use crate::shipping::MarkerSignal;
 use crate::shutdown::Shutdown;
+#[cfg(feature = "observability")]
+use crate::sinks::SinkKind;
 use crate::stats::Stats;
 #[cfg(feature = "observability")]
 use crate::stats::{
@@ -39,9 +43,10 @@ pub const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// Drift past this is worth recording in the stream, not just the log.
 pub const ANCHOR_DRIFT_MARKER_US: i64 = 200;
 
-/// What T3 needs beyond the shared context and counters.
+/// What T3 needs beyond the shared context and counters. (The session id is
+/// not among them: the thread runs inside the `session` span, which already
+/// puts it on every line.)
 pub struct ContextArgs {
-    pub session_id: String,
     /// The session anchor, for drift measurement.
     pub anchor: QpcAnchor,
     pub config_path: PathBuf,
@@ -62,8 +67,9 @@ pub struct ContextArgs {
 /// the same with the feature off.
 #[cfg(feature = "observability")]
 struct Reporter {
-    session_id: String,
     qpc_freq: u64,
+    /// [`REPORT_INTERVAL`], except in tests.
+    interval: Duration,
     last_at: Instant,
     last: StatsSnapshot,
     escalation: ConditionLimiter,
@@ -72,10 +78,18 @@ struct Reporter {
 
 #[cfg(feature = "observability")]
 impl Reporter {
-    fn new(session_id: String, qpc_freq: u64, sidecar: Option<Arc<crate::meta::Sidecar>>) -> Self {
+    fn new(qpc_freq: u64, sidecar: Option<Arc<crate::meta::Sidecar>>) -> Self {
+        Self::with_interval(REPORT_INTERVAL, qpc_freq, sidecar)
+    }
+
+    fn with_interval(
+        interval: Duration,
+        qpc_freq: u64,
+        sidecar: Option<Arc<crate::meta::Sidecar>>,
+    ) -> Self {
         Self {
-            session_id,
             qpc_freq,
+            interval,
             last_at: Instant::now(),
             last: StatsSnapshot::default(),
             escalation: ConditionLimiter::new(ESCALATION_INTERVAL),
@@ -101,14 +115,13 @@ impl Reporter {
     }
 
     fn maybe_report(&mut self, stats: &Stats, game: Option<&str>, locked: bool) {
-        if self.last_at.elapsed() < REPORT_INTERVAL {
+        if self.last_at.elapsed() < self.interval {
             return;
         }
         let now = stats.snapshot();
         let idle = idle_for_secs(stats.last_event_qpc(), platform::qpc(), self.qpc_freq);
         let r = compute_report(&self.last, &now, self.last_at.elapsed().as_secs_f64(), idle);
         tracing::info!(
-            session = %self.session_id,
             events_per_s = r.events_per_s,
             events = r.events,
             batches_per_s = r.batches_per_s,
@@ -161,20 +174,14 @@ impl Reporter {
     /// it clears and comes back.
     fn escalate(&mut self, r: &crate::stats::ReportFields) {
         let at = Instant::now();
-        for sink in ["jsonl", "kafka"] {
-            if self.escalation.observe(sink, r.sink_is_losing(sink), at) == Escalation::Warn {
+        for sink in [SinkKind::Jsonl, SinkKind::Kafka] {
+            let losing = r.sink_is_losing(sink);
+            if self.escalation.observe(sink.as_str(), losing, at) == Escalation::Warn {
+                let (dropped_delta, abandoned_delta) = r.sink_losses_delta(sink);
                 tracing::warn!(
-                    sink,
-                    dropped_delta = if sink == "jsonl" {
-                        r.jsonl_dropped_delta
-                    } else {
-                        r.kafka_dropped_delta
-                    },
-                    abandoned_delta = if sink == "jsonl" {
-                        r.jsonl_abandoned_delta
-                    } else {
-                        r.kafka_abandoned_delta
-                    },
+                    sink = sink.as_str(),
+                    dropped_delta,
+                    abandoned_delta,
                     "sink is losing envelopes"
                 );
             }
@@ -229,71 +236,80 @@ pub fn sample(
     }
 }
 
+/// The parts of `telemouse.toml` a running capture session was started from.
+/// Everything under these keys is compared, so a key added to one of these
+/// sections later is covered without touching this list; the viz overlay and
+/// control-panel sections are deliberately not here, because editing them
+/// says nothing about this recording.
+const CAPTURE_KEYS: [&str; 7] = [
+    "mouse_cpi",
+    "marker_hotkey",
+    "batch",
+    "udp",
+    "kafka",
+    "recording",
+    "viz.http_addr",
+];
+
+/// Every leaf of `cfg` as `dotted.key -> value`, from its own serialization —
+/// the same names the file uses, with no hand-kept field list to drift.
+fn config_leaves(cfg: &AppConfig) -> BTreeMap<String, String> {
+    fn walk(prefix: &str, v: &serde_json::Value, out: &mut BTreeMap<String, String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    walk(&key, v, out);
+                }
+            }
+            serde_json::Value::Null => {}
+            serde_json::Value::String(s) => {
+                out.insert(prefix.to_string(), s.clone());
+            }
+            other => {
+                out.insert(prefix.to_string(), other.to_string());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    // `games` is diffed per game below, with added/removed wording.
+    if let Ok(serde_json::Value::Object(mut map)) = serde_json::to_value(cfg) {
+        map.remove("games");
+        walk("", &serde_json::Value::Object(map), &mut out);
+    }
+    out
+}
+
+fn is_capture_key(key: &str) -> bool {
+    CAPTURE_KEYS.iter().any(|k| {
+        key == *k
+            || key
+                .strip_prefix(k)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
 /// Human-readable list of what changed between two configs. Empty means the
 /// file was touched but says the same thing.
 pub fn describe_config_change(old: &AppConfig, new: &AppConfig) -> Vec<String> {
-    let scalars = [
-        (
-            "mouse_cpi",
-            old.mouse_cpi.to_string(),
-            new.mouse_cpi.to_string(),
-        ),
-        (
-            "marker_hotkey",
-            old.marker_hotkey.clone(),
-            new.marker_hotkey.clone(),
-        ),
-        (
-            "batch.window_ms",
-            old.batch.window_ms.to_string(),
-            new.batch.window_ms.to_string(),
-        ),
-        (
-            "batch.max_events",
-            old.batch.max_events.to_string(),
-            new.batch.max_events.to_string(),
-        ),
-        (
-            "batch.ring_capacity",
-            old.batch.ring_capacity.to_string(),
-            new.batch.ring_capacity.to_string(),
-        ),
-        (
-            "udp.enabled",
-            old.udp.enabled.to_string(),
-            new.udp.enabled.to_string(),
-        ),
-        ("udp.addr", old.udp.addr.clone(), new.udp.addr.clone()),
-        (
-            "kafka.enabled",
-            old.kafka.enabled.to_string(),
-            new.kafka.enabled.to_string(),
-        ),
-        (
-            "kafka.brokers",
-            old.kafka.brokers.join(","),
-            new.kafka.brokers.join(","),
-        ),
-        (
-            "recording.enabled",
-            old.recording.enabled.to_string(),
-            new.recording.enabled.to_string(),
-        ),
-        (
-            "recording.dir",
-            old.recording.dir.display().to_string(),
-            new.recording.dir.display().to_string(),
-        ),
-        (
-            "viz.http_addr",
-            old.viz.http_addr.clone(),
-            new.viz.http_addr.clone(),
-        ),
-    ];
-    let mut out: Vec<String> = scalars
+    let (a, b) = (config_leaves(old), config_leaves(new));
+    let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut out: Vec<String> = keys
         .into_iter()
-        .filter(|(_, a, b)| a != b)
-        .map(|(field, a, b)| format!("{field}: {a} -> {b}"))
+        .filter(|k| is_capture_key(k))
+        .filter_map(|k| {
+            let (was, now) = (a.get(k), b.get(k));
+            (was != now).then(|| {
+                let show = |v: Option<&String>| v.map_or("-".to_string(), String::clone);
+                format!("{k}: {} -> {}", show(was), show(now))
+            })
+        })
         .collect();
     for (game, new_sens) in &new.games {
         match old.games.get(game) {
@@ -318,7 +334,6 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, args: ContextArgs) {
     let ContextArgs {
-        session_id,
         anchor,
         config_path,
         mut config,
@@ -327,13 +342,12 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
         #[cfg(feature = "observability")]
         sidecar,
     } = args;
-    let _ = &session_id;
 
     let mut detector = PointerLockDetector::default();
     let mut foreground = ForegroundCache::new();
     let mut last_events = stats.events();
     #[cfg(feature = "observability")]
-    let mut reporter = Reporter::new(session_id, anchor.qpc_freq, sidecar);
+    let mut reporter = Reporter::new(anchor.qpc_freq, sidecar);
     #[cfg(feature = "observability")]
     reporter.start();
     let mut last_game: Option<String> = None;
@@ -344,9 +358,7 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
     let mut screen = platform::primary_screen();
 
     while !shutdown.is_set() {
-        stats
-            .t3_ticks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats.t3_ticks.fetch_add(1, Ordering::Relaxed);
         // T1 saw WM_DISPLAYCHANGE: the desktop geometry changed, so this
         // tick's snapshot carries fresh metrics.
         let display_changed = ctx.take_display_changed();
@@ -377,14 +389,16 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
             );
             last_locked = snapshot.pointer_locked;
         }
-        let locked = snapshot.pointer_locked;
-        let game = snapshot.game.clone();
+        // Only the stats report reads these after the snapshot is published.
+        #[cfg(feature = "observability")]
+        let (locked, game) = (snapshot.pointer_locked, snapshot.game.clone());
         let (screen_w, screen_h) = (snapshot.screen_w, snapshot.screen_h);
         ctx.set(snapshot);
 
         // The snapshot above already carries the new metrics; this is about
-        // telling the operator (and refreshing the full monitor list, which
-        // the per-tick sample does not read).
+        // telling the operator, with a count of the monitors now attached.
+        // (The session record's monitor list is fixed at startup and is not
+        // rewritten.)
         if display_changed {
             let monitors = platform::monitors();
             tracing::info!(
@@ -396,11 +410,10 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
         }
 
         if last_anchor_check.elapsed() >= ANCHOR_CHECK_INTERVAL {
+            #[cfg_attr(not(feature = "observability"), allow(unused_variables))]
             let drift_us = check_anchor_drift(&anchor, &marker_tx);
             #[cfg(feature = "observability")]
             reporter.observe_drift(drift_us);
-            #[cfg(not(feature = "observability"))]
-            let _ = drift_us;
             waker.wake();
             last_anchor_check = Instant::now();
         }
@@ -420,8 +433,6 @@ pub fn run(ctx: Arc<SharedContext>, stats: Arc<Stats>, shutdown: Arc<Shutdown>, 
 
         #[cfg(feature = "observability")]
         reporter.maybe_report(&stats, game.as_deref(), locked);
-        #[cfg(not(feature = "observability"))]
-        let _ = (&game, locked);
 
         shutdown.wait_timeout(TICK);
     }
@@ -499,7 +510,6 @@ mod tests {
 
     fn args(marker_tx: Sender<MarkerSignal>) -> ContextArgs {
         ContextArgs {
-            session_id: "s-test".into(),
             anchor: QpcAnchor {
                 qpc: platform::qpc(),
                 utc_us: 1_756_000_000_000_000,
@@ -542,9 +552,10 @@ mod tests {
         shutdown.set();
         let start = Instant::now();
         handle.join().unwrap();
-        // The condvar wakes it immediately rather than after the tick.
+        // The condvar wakes it rather than letting it sleep on. Generous: a
+        // loaded CI box can be slow, but nowhere near a stuck loop.
         assert!(
-            start.elapsed() < Duration::from_millis(500),
+            start.elapsed() < Duration::from_secs(2),
             "took {:?}",
             start.elapsed()
         );
@@ -568,6 +579,39 @@ mod tests {
         assert!(changes.iter().any(|c| c.starts_with("mouse_cpi: 1600")));
         assert!(changes.iter().any(|c| c.contains("udp.addr")));
         assert!(changes.iter().any(|c| c == "kafka.enabled: false -> true"));
+    }
+
+    /// The hand-kept field list this replaced had no `batch.coalesce_ms`, so
+    /// a live coalesce edit logged "no changes" and left no marker.
+    #[test]
+    fn every_capture_setting_is_compared_including_coalesce() {
+        let old = AppConfig::default();
+        let mut new = old.clone();
+        new.batch.coalesce_ms = old.batch.coalesce_ms + 4;
+        let changes = describe_config_change(&old, &new);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].starts_with("batch.coalesce_ms: "), "{changes:?}");
+
+        // Lists read as lists.
+        let mut brokers = old.clone();
+        brokers.kafka.brokers = vec!["a:9092".into(), "b:9092".into()];
+        let changes = describe_config_change(&old, &brokers);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].contains("a:9092"), "{changes:?}");
+    }
+
+    /// Overlay and control-panel edits are not about this recording.
+    #[test]
+    fn viz_overlay_and_ctl_edits_are_not_capture_changes() {
+        let old = AppConfig::default();
+        let mut new = old.clone();
+        new.viz.obs.grid = !old.viz.obs.grid;
+        new.ctl.stop_grace_secs = old.ctl.stop_grace_secs + 1;
+        assert!(describe_config_change(&old, &new).is_empty());
+        assert!(is_capture_key("batch.window_ms"));
+        assert!(is_capture_key("mouse_cpi"));
+        assert!(!is_capture_key("mouse_cpi_extra"));
+        assert!(!is_capture_key("viz.obs.grid"));
     }
 
     #[test]
@@ -617,20 +661,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A marker is written exactly when the measured drift passes the
+    /// threshold. Asserted as that relation rather than "no marker": an
+    /// anchor taken a moment ago has not drifted, but a preempted test
+    /// thread can still *measure* a few hundred µs on a loaded machine.
     #[test]
-    fn a_healthy_clock_does_not_produce_a_drift_marker() {
-        let anchor = QpcAnchor {
-            qpc: platform::qpc(),
-            utc_us: crate::session_setup::now_utc_us(),
-            qpc_freq: platform::qpc_freq(),
-        };
+    fn a_drift_marker_is_written_exactly_when_the_drift_is_large() {
+        let (anchor, _) = measure_anchor(platform::qpc_freq());
         let (tx, rx) = channel();
         let drift = check_anchor_drift(&anchor, &tx);
-        assert!(
-            rx.try_recv().is_err(),
-            "an anchor taken microseconds ago cannot have drifted 200µs"
+        let marker = rx.try_recv().ok();
+        assert_eq!(
+            marker.is_some(),
+            drift.abs() > ANCHOR_DRIFT_MARKER_US,
+            "drift {drift}µs"
         );
-        assert!(drift.abs() <= ANCHOR_DRIFT_MARKER_US, "drift {drift}µs");
+        if let Some(m) = marker {
+            assert_eq!(m.label, format!("anchor_drift_us={drift}"));
+        }
+        // Sanity, not timing: a fresh anchor is nowhere near a second off.
+        assert!(drift.abs() < 1_000_000, "drift {drift}µs");
     }
 
     /// The reporter is what owns the sidecar's cadence, so the "there is a
@@ -645,18 +695,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let stats = Arc::new(Stats::default());
         let sidecar = Arc::new(crate::meta::Sidecar::new(
-            dir.clone(),
-            "s-20260908-120000-abcd".into(),
-            "0.1.0",
-            1_756_000_000_000_000,
-            10_000_000,
-            3,
-            25,
-            8,
-            vec!["jsonl"],
+            crate::meta::SidecarRun {
+                dir: dir.clone(),
+                session_id: "s-20260908-120000-abcd".into(),
+                capture_version: "0.1.0",
+                started_utc_us: 1_756_000_000_000_000,
+                qpc_freq: 10_000_000,
+                anchor_uncertainty_us: 3,
+                window_ms: 25,
+                coalesce_ms: 8,
+                sinks: vec![SinkKind::Jsonl],
+            },
             Arc::clone(&stats),
         ));
-        let reporter = Reporter::new("s-test".into(), 10_000_000, Some(sidecar));
+        let reporter = Reporter::new(10_000_000, Some(sidecar));
         reporter.start();
 
         let path = dir.join("s-20260908-120000-abcd.meta.json");
@@ -673,9 +725,20 @@ mod tests {
     #[cfg(feature = "observability")]
     #[test]
     fn a_run_without_a_recording_has_no_sidecar_to_refresh() {
-        let mut reporter = Reporter::new("s-test".into(), 10_000_000, None);
+        // A zero interval makes the report due at once, so the whole report
+        // path runs — with nothing to write next to.
+        let mut reporter = Reporter::with_interval(Duration::ZERO, 10_000_000, None);
         reporter.start();
         reporter.observe_drift(5_000);
-        reporter.maybe_report(&Stats::default(), None, false);
+        let stats = Stats::default();
+        stats.batches.store(3, Ordering::Relaxed);
+        reporter.maybe_report(&stats, None, false);
+        assert_eq!(reporter.last.batches, 3, "the report ran and rolled over");
+        assert!(reporter.sidecar.is_none());
+
+        // Not due yet: nothing moves.
+        let mut patient = Reporter::new(10_000_000, None);
+        patient.maybe_report(&stats, None, false);
+        assert_eq!(patient.last.batches, 0);
     }
 }

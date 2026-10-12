@@ -3,22 +3,28 @@
 //! The plan's session-level metrics (fatigue, warmup, consistency, sensitivity
 //! experiments) are all "the same number, across sessions". That needs the
 //! per-session reports to be *cheap to get at*, which is what the JSON cache
-//! here is for: a report is recomputed only when the analyzer version has moved
-//! on or the recording is newer than its cached report.
+//! here is for: a cached report is reused only while its analyzer version and
+//! schema, its detector parameters, the recording it describes, and that
+//! recording's [`FileSignature`](crate::load::FileSignature) all still match
+//! (see [`read_cache`]). The sidecar-derived fields are re-read on every hit,
+//! because the capture agent writes its final sidecar after the recording's
+//! last flush.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
+use telemouse_core::recordings;
 
-use crate::load::file_signature;
+use crate::error::AnalyzeError;
+use crate::load::{file_signature, read_sidecar};
 use crate::report::{ANALYZER_VERSION, Report, SCHEMA};
 use crate::series::Params;
 use crate::timefmt::{format_duration, format_utc_us};
 
-static CACHE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Schema tag on every row of `trend --json`.
+pub const TREND_SCHEMA: &str = "telemouse-trend/1";
 
 /// Why a session's report was (or was not) recomputed. Logged so a surprising
 /// `trend` runtime is explainable.
@@ -121,10 +127,7 @@ pub fn read_cache(
 /// shared between recording directories, or a renamed file, must not answer
 /// for the wrong session.
 fn describes(report: &Report, recording: &Path) -> bool {
-    let stem_ok = recording
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_none_or(|stem| stem == report.session.session_id);
+    let stem_ok = recording_id(recording).is_none_or(|id| id == report.session.session_id);
     // Compared by file name, not by the whole path: the same recording is
     // legitimately reached as `recordings/x.jsonl` and `C:\...\x.jsonl`.
     let name_ok = Path::new(&report.session.path)
@@ -133,75 +136,84 @@ fn describes(report: &Report, recording: &Path) -> bool {
     stem_ok && name_ok
 }
 
+/// The session id a recording's file name spells (`<id>.jsonl`), or `None`
+/// when the name does not follow the recording-id rule.
+fn recording_id(recording: &Path) -> Option<&str> {
+    recordings::id_from_file_name(recording.file_name()?.to_str()?)
+}
+
 /// Publish a report into the cache atomically: a reader either sees the
 /// previous document or this one, never a half-written one, even if two
 /// analyzers race on the same session.
-fn write_cache(path: &Path, report: &Report) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let seq = CACHE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
-    let result = (|| -> anyhow::Result<()> {
-        report.write_json(&temp)?;
-        std::fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
+fn write_cache(path: &Path, report: &Report) -> Result<(), AnalyzeError> {
+    crate::atomic::write_atomic(path, |w| report.write_json_to(w))
+        .map_err(AnalyzeError::io("writing the report cache", path))
 }
 
 /// Load `recording`, reusing `json_dir`'s cached report when it is current.
 /// Writes the cache back on a miss when `json_dir` is set.
+///
+/// A cached report is only cached for its recording: the sidecar-derived
+/// fields (quality's sidecar summary, `clean`, the warnings) are re-read
+/// from the sidecar on every hit, so a report cached while the run was going
+/// stops saying "unfinished" once the agent has written its final sidecar.
+///
+/// A recording whose file name is not `<session id>.jsonl` is analyzed but
+/// never cached: the cache is keyed by that id.
 pub fn report_for(
     recording: &Path,
     json_dir: Option<&Path>,
     params: Params,
-) -> anyhow::Result<(Report, CacheOutcome)> {
-    if let Some(dir) = json_dir {
-        // The session id is the file stem for recordings written by the agent;
-        // fall back to loading if that guess misses.
-        if let Some(stem) = recording.file_stem().and_then(|s| s.to_str()) {
-            let path = cache_path(dir, stem);
-            let (hit, why) = read_cache(&path, recording, params);
-            if let Some(r) = hit {
-                tracing::info!(
-                    session = %stem,
-                    cache = %path.display(),
-                    check = why.as_str(),
-                    "reusing cached report"
-                );
-                return Ok((r, why));
-            }
-            tracing::info!(
-                session = %stem,
-                cache = %path.display(),
-                check = why.as_str(),
-                "recomputing report"
+) -> Result<(Report, CacheOutcome), AnalyzeError> {
+    let cache = json_dir.and_then(|dir| match recording_id(recording) {
+        Some(id) => Some((id, cache_path(dir, id))),
+        None => {
+            tracing::debug!(
+                path = %recording.display(),
+                "recording name is not a session id; not using the report cache"
             );
-            let before = file_signature(recording).ok().flatten();
-            let loaded = crate::load::load_session(recording)?;
-            let mut report = crate::report::build(loaded, params);
-            // A signature on both sides of the read: a recording capture was
-            // still appending to is analyzed and returned, but never published
-            // under an identity that does not describe what was read.
-            match (before, file_signature(recording).ok().flatten()) {
-                (Some(a), Some(b)) if a == b => {
-                    report.recording_signature = Some(a);
-                    write_cache(&path, &report)?;
-                }
-                _ => tracing::debug!(
-                    session = %stem,
-                    "recording changed while it was being read; not caching the report"
-                ),
-            }
-            return Ok((report, why));
+            None
         }
+    });
+    let Some((id, path)) = cache else {
+        let loaded = crate::load::load_session(recording)?;
+        return Ok((crate::report::build(loaded, params)?, CacheOutcome::Missing));
+    };
+
+    let (hit, why) = read_cache(&path, recording, params);
+    if let Some(mut r) = hit {
+        tracing::info!(
+            session = %id,
+            cache = %path.display(),
+            check = why.as_str(),
+            "reusing cached report"
+        );
+        r.refresh_sidecar(read_sidecar(recording).as_ref());
+        return Ok((r, why));
     }
+    tracing::info!(
+        session = %id,
+        cache = %path.display(),
+        check = why.as_str(),
+        "recomputing report"
+    );
+    let before = file_signature(recording).ok().flatten();
     let loaded = crate::load::load_session(recording)?;
-    Ok((crate::report::build(loaded, params), CacheOutcome::Missing))
+    let mut report = crate::report::build(loaded, params)?;
+    // A signature on both sides of the read: a recording capture was still
+    // appending to is analyzed and returned, but never published under an
+    // identity that does not describe what was read.
+    match (before, file_signature(recording).ok().flatten()) {
+        (Some(a), Some(b)) if a == b => {
+            report.recording_signature = Some(a);
+            write_cache(&path, &report)?;
+        }
+        _ => tracing::debug!(
+            session = %id,
+            "recording changed while it was being read; not caching the report"
+        ),
+    }
+    Ok((report, why))
 }
 
 /// One session's line in the longitudinal table.
@@ -236,16 +248,10 @@ pub struct TrendRow {
     pub extra: Vec<(String, Option<f64>)>,
 }
 
-/// Resolve a dotted path such as `micro.band_ratio_8_12` in a report.
-///
-/// Serializing the report to a `Value` is the expensive half — a three-hour
-/// session's report is tens of megabytes of `per_second` rows — so a caller
-/// with several metrics should use [`metrics_at`], which does it once.
-pub fn metric_at(report: &Report, path: &str) -> Option<f64> {
-    lookup(&serde_json::to_value(report).ok()?, path)
-}
-
-/// Resolve several dotted paths against one serialization of `report`.
+/// Resolve dotted paths such as `micro.band_ratio_8_12` in a report, against
+/// one serialization of it: turning the report into a `Value` is the
+/// expensive half (a three-hour session's report is tens of megabytes of
+/// `per_second` rows), so it is done once for all of them.
 pub fn metrics_at(report: &Report, paths: &[String]) -> Vec<(String, Option<f64>)> {
     if paths.is_empty() {
         return Vec::new();
@@ -336,28 +342,53 @@ fn analyze_one(
         // The report is summarized and dropped here, on the worker, so four
         // sessions in flight never means four full reports resident.
         Ok((report, why)) => Ok(row(&report, why == CacheOutcome::Hit, metrics)),
-        Err(e) => Err(e.to_string()),
+        // The whole chain: the outer message alone is "failed to read x",
+        // without the reason it failed.
+        Err(e) => Err(crate::load::error_chain(&e)),
     }
 }
 
-/// Build the trend table over every `*.jsonl` in `dir`, oldest session first.
+/// The recordings in `dir` by the recording-id rule, in path order. A
+/// `.jsonl` whose name is not a session id is skipped with a debug line, as
+/// [`crate::load::scan_dir`] skips it.
+fn recording_paths(dir: &Path) -> Result<Vec<PathBuf>, AnalyzeError> {
+    let rd = std::fs::read_dir(dir).map_err(AnalyzeError::io("reading the directory", dir))?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(recordings::RECORDING_SUFFIX) {
+            continue;
+        }
+        if recordings::id_from_file_name(name).is_none() {
+            tracing::debug!(path = %p.display(), "skipping a .jsonl whose name is not a session id");
+            continue;
+        }
+        paths.push(p);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Build the trend table over every recording in `dir`, oldest session first.
 ///
 /// Sessions are analyzed concurrently, bounded by [`TREND_MAX_WORKERS`] and by
 /// [`TREND_BYTES_IN_FLIGHT`]. The table does not depend on the schedule: rows
 /// land in their directory-order slot and are then sorted by start time exactly
-/// as they always were.
+/// as they always were. A session that cannot be analyzed is skipped with a
+/// warning; only an unreadable `dir`, or parameters that do not validate, fail
+/// the whole table.
 pub fn compute(
     dir: &Path,
     json_dir: Option<&Path>,
     params: Params,
     metrics: &[String],
-) -> anyhow::Result<Vec<TrendRow>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .collect();
-    paths.sort();
+) -> Result<Vec<TrendRow>, AnalyzeError> {
+    // Checked once here rather than failing every session the same way.
+    params.validate()?;
+    let paths = recording_paths(dir)?;
 
     let sizes: Vec<u64> = paths
         .iter()
@@ -439,8 +470,17 @@ pub fn compute(
             None => {}
         }
     }
-    rows.sort_by_key(|r| (r.started_utc_us, r.session_id.clone()));
+    rows.sort_by(|a, b| {
+        a.started_utc_us
+            .cmp(&b.started_utc_us)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     Ok(rows)
+}
+
+/// `trend --json`: the rows, each tagged with [`TREND_SCHEMA`].
+pub fn to_json(rows: &[TrendRow]) -> serde_json::Result<String> {
+    crate::tagged_rows_json(TREND_SCHEMA, rows)
 }
 
 pub fn write_csv<W: Write>(w: &mut W, rows: &[TrendRow]) -> io::Result<()> {
@@ -495,7 +535,8 @@ clicks_per_min,distance_m,lifts,cm_per_360"
     Ok(())
 }
 
-pub fn to_csv(rows: &[TrendRow]) -> String {
+#[cfg(test)]
+pub(crate) fn to_csv(rows: &[TrendRow]) -> String {
     let mut buf = Vec::new();
     write_csv(&mut buf, rows).expect("writing to a Vec cannot fail");
     String::from_utf8(buf).expect("UTF-8 output")
@@ -530,7 +571,9 @@ pub fn render(rows: &[TrendRow]) -> String {
         o.push_str(&format!(
             "{:<22} {:<20} {:>10} {:>10} {:>7} {:>7} {:>9.4} {:>9.1} {:>8.0} {:>8.3} {:>9}",
             truncate(&r.session_id, 22),
-            &r.started_utc[..19.min(r.started_utc.len())],
+            // Characters, not bytes: the cache is hand-editable, and a byte
+            // index into a non-ASCII string can land inside a character.
+            r.started_utc.chars().take(19).collect::<String>(),
             format_duration(r.duration_s),
             r.events,
             r.drops,
@@ -560,9 +603,13 @@ pub fn render(rows: &[TrendRow]) -> String {
     o
 }
 
+/// `s` cut to at most `n` characters, the last one an ellipsis when
+/// anything was cut. `n == 0` is the empty string.
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
+    } else if n == 0 {
+        String::new()
     } else {
         s.chars().take(n - 1).chain(std::iter::once('…')).collect()
     }
@@ -572,22 +619,128 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::testutil;
-    use telemouse_core::event::buttons;
 
     fn flicky_events(n: usize) -> Vec<telemouse_core::RawEvent> {
         let mut b = testutil::StreamBuilder::new();
         b.idle_ms(200);
         for _ in 0..n {
-            b.move_ms(25, 60, 0)
-                .idle_ms(10)
-                .move_ms(10, -10, 0)
-                .idle_ms(5)
-                .button(buttons::LEFT_DOWN)
-                .idle_ms(39)
-                .button(buttons::LEFT_UP)
-                .idle_ms(500);
+            b.flick_cycle(1, 0, 500);
         }
         b.into_events()
+    }
+
+    /// A report cached while the run was still going must not say
+    /// "unfinished" forever: the recording never changes again, so only the
+    /// sidecar can bring it up to date, and a cache hit re-reads it.
+    #[test]
+    fn a_cache_hit_picks_up_a_sidecar_written_after_the_report() {
+        use telemouse_core::recordings::{ExitReason, SessionMeta};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        two_sessions(dir.path());
+        let recording = dir.path().join("s-day1.jsonl");
+        let sidecar = dir.path().join("s-day1.meta.json");
+        let meta = |exit: ExitReason| SessionMeta {
+            session_id: "s-day1".into(),
+            exit: exit.as_str().into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            &sidecar,
+            meta(ExitReason::Running).to_json_pretty().unwrap(),
+        )
+        .unwrap();
+
+        let (first, why) = report_for(&recording, Some(&cache), Params::default()).unwrap();
+        assert_eq!(why, CacheOutcome::Missing);
+        assert!(first.quality.sidecar.as_ref().unwrap().unfinished);
+        assert!(!first.quality.clean);
+
+        // The agent stops and writes its final sidecar. The recording is
+        // untouched, so the cache is still valid — and must say so.
+        std::fs::write(
+            &sidecar,
+            meta(ExitReason::Interrupt).to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        let (second, why) = report_for(&recording, Some(&cache), Params::default()).unwrap();
+        assert_eq!(why, CacheOutcome::Hit);
+        let sc = second.quality.sidecar.as_ref().unwrap();
+        assert!(!sc.unfinished);
+        assert_eq!(sc.exit, "interrupt");
+        assert!(second.quality.clean, "{:?}", second.warnings);
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    }
+
+    /// Bad parameters fail the table up front, with the field named, rather
+    /// than skipping every session one by one.
+    #[test]
+    fn a_trend_with_invalid_params_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        two_sessions(dir.path());
+        let err = compute(
+            dir.path(),
+            None,
+            Params {
+                grid_dt_s: 3.0,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::Params(ref p) if p.field == "grid_dt_s"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_json_rows_carry_their_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        two_sessions(dir.path());
+        let rows = compute(dir.path(), None, Params::default(), &[]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&to_json(&rows).unwrap()).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.iter().all(|r| r["schema"] == TREND_SCHEMA));
+        assert_eq!(arr[0]["session_id"], "s-day1");
+        assert_eq!(arr[1]["flicks"], 6);
+    }
+
+    #[test]
+    fn rendering_survives_hand_edited_strings() {
+        assert_eq!(truncate("abcdef", 0), "");
+        assert_eq!(truncate("abcdef", 3), "ab…");
+        assert_eq!(truncate("abc", 3), "abc");
+        let mut row = TrendRow {
+            session_id: "é".repeat(40),
+            path: String::new(),
+            started_utc_us: 0,
+            // Multi-byte characters straddling byte 19.
+            started_utc: "2026-09-12 21:46:5é€€€".into(),
+            duration_s: 1.0,
+            events: 0,
+            drops: 0,
+            game: None,
+            flicks: 0,
+            flicks_per_min: 0.0,
+            overshoot_median: 0.0,
+            settle_median_ms: 0.0,
+            tremor_rms_counts_s: 0.0,
+            path_efficiency: 0.0,
+            clicks_per_min: 0.0,
+            distance_m: 0.0,
+            lifts: 0,
+            cm_per_360: None,
+            from_cache: false,
+            extra: Vec::new(),
+        };
+        let text = render(std::slice::from_ref(&row));
+        assert!(text.contains("2026-09-12 21:46:5é "), "{text}");
+        assert!(!text.contains('€'), "{text}");
+        row.started_utc.clear();
+        assert!(render(&[row]).contains("1 session(s)"));
     }
 
     /// Two synthetic sessions in a temp dir, the second starting a day later
@@ -597,10 +750,7 @@ mod tests {
         a.session_id = "s-day1".into();
         testutil::write_session(dir, &a, Some("cs2.exe"), &flicky_events(3), &[], 256);
 
-        let mut b = testutil::session_cfg();
-        b.session_id = "s-day2".into();
-        b.started_utc_us += 86_400_000_000;
-        b.anchor.utc_us += 86_400_000_000;
+        let b = testutil::session_cfg_at("s-day2", testutil::FIXTURE_UTC0 + 86_400_000_000);
         testutil::write_session(dir, &b, Some("cs2.exe"), &flicky_events(6), &[], 256);
     }
 

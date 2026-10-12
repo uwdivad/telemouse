@@ -24,7 +24,10 @@ logging = ["telemouse-core/logging"]
 # / byte accounting, ws connect-disconnect detail, and the feed fields of
 # `/healthz`. The page renders correctly when the push never arrives.
 observability = []
-# Compile every `tracing` macro below `error` out of a release build.
+# `quiet` compiles every `tracing` event out of a release build: all levels,
+# `error!` and `warn!` included (debug builds keep them). Cargo unifies
+# `tracing`'s features, so it applies to every binary built in the same cargo
+# invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
 
 [dependencies]
@@ -34,7 +37,7 @@ tracing = { workspace = true }
 # Explicit features, not "full": this process is one UDP socket, one HTTP
 # listener and a couple of WebSockets — it has no use for process/signal/io-std
 # machinery, and the runtime is pinned to 2 workers in main.rs.
-tokio = { version = "1.53.1", features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -43,7 +46,7 @@ tokio = { version = "1.53.1", features = [
     "time",
     "sync",
 ] }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 serde_json.workspace = true
 serde.workspace = true
@@ -51,8 +54,11 @@ clap.workspace = true
 tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }
+tempfile.workspace = true
+tower.workspace = true
 
 [target."cfg(windows)".build-dependencies]
-winresource = "0.1.31"
+winresource.workspace = true
+
+[lints]
+workspace = true

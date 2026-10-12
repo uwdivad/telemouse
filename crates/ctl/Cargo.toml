@@ -21,17 +21,21 @@ path = "src/main.rs"
 default = ["logging", "observability"]
 logging = ["telemouse-core/logging"]
 observability = []
+# `quiet` compiles every `tracing` event out of a release build: all levels,
+# `error!` and `warn!` included (debug builds keep them). Cargo unifies
+# `tracing`'s features, so it applies to every binary built in the same cargo
+# invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
-
 [dependencies]
 telemouse-core = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 # This process spawns children and polls them: `process` is the point.
-tokio = { version = "1.53.1", features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -41,7 +45,7 @@ tokio = { version = "1.53.1", features = [
     "time",
     "sync",
 ] }
-axum = { version = "0.8.9" }
+axum.workspace = true
 # The settings editor (settings.rs) changes values in the user's
 # telemouse.toml in place: comments, ordering and keys the form does not
 # know survive a save.
@@ -50,7 +54,7 @@ toml_edit = "0.25.15"
 # The process table is read with a Toolhelp snapshot plus per-process
 # queries for the few matching names (see procs.rs for why not sysinfo).
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
@@ -83,7 +87,8 @@ windows = { version = "0.62.2", features = [
 webview2-com = "0.39.1"
 
 [target.'cfg(windows)'.build-dependencies]
-winresource = "0.1.31"
+winresource.workspace = true
+
 
 # Off Windows the same three calls go through sysinfo; capture is
 # Windows-only, this just keeps `cargo test` portable.
@@ -91,4 +96,7 @@ winresource = "0.1.31"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [dev-dependencies]
-tower = { version = "0.5.3", features = ["util"] }
+tower.workspace = true
+
+[lints]
+workspace = true

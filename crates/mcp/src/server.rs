@@ -165,33 +165,38 @@ const NO_STATS: &str =
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SessionsListArgs {
     /// How many recordings to return, newest first. 1-500, default 50.
-    #[serde(default)]
+    /// (`last` is accepted as another spelling; `limit` is preferred.)
+    #[serde(default, alias = "last")]
     pub limit: Option<u32>,
 }
 
 /// `session_summary`
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionSummaryArgs {
-    /// The recording id, as `sessions_list` returns it, without `.jsonl`.
+    /// The recording id, as `sessions_list` returns it. A trailing `.jsonl`
+    /// is accepted and ignored.
     pub id: String,
 }
 
 /// `trend`
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct TrendArgs {
-    /// Extra columns: dotted paths into the full report, such as
-    /// `micro.band_ratio_8_12` or `quality.poll_hz`.
-    #[serde(default)]
+    /// Extra columns, a list: dotted paths into the full report, such as
+    /// `micro.band_ratio_8_12` or `quality.poll_hz`. (`metrics` is accepted
+    /// as another spelling; `metric` is preferred.)
+    #[serde(default, alias = "metrics")]
     pub metric: Option<Vec<String>>,
     /// Keep only the last N sessions (the rows are oldest first). 1-500.
-    #[serde(default)]
+    /// (`limit` is accepted as another spelling; `last` is preferred.)
+    #[serde(default, alias = "limit")]
     pub last: Option<u32>,
 }
 
 /// `logs_tail`
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LogsTailArgs {
-    /// `ctl`, `capture`, `viz`, `doctor`, `trend` or `report`.
+    /// `ctl`, `capture`, `viz`, `mcp`, `analyze`, `doctor`, `trend` or
+    /// `report`.
     pub component: String,
     /// How many trailing lines. 1-500, default 50.
     #[serde(default)]
@@ -218,11 +223,6 @@ pub struct CaptureStartArgs {
     /// `--no-udp`, `--record` and `--no-record` are accepted.
     #[serde(default)]
     pub flags: Option<Vec<String>>,
-    /// A recording to act on. The capture agent names its own session, so
-    /// this is only carried through for symmetry with the panel's API; it
-    /// changes nothing about a capture run.
-    #[serde(default)]
-    pub session: Option<String>,
 }
 
 /// `capture_stop`
@@ -317,11 +317,13 @@ impl Telemouse {
     ) -> Result<CallToolResult, McpError> {
         let call = Call::start("session_summary");
         let id = a.id.trim().to_string();
-        call.finish(
-            self.blocking(move |an| an.summary(&id))
-                .await
-                .and_then(|s| serde_json::to_value(s).map_err(|e| e.to_string())),
-        )
+        call.finish(self.blocking(move |an| {
+            let summary = an.summary(&id)?;
+            serde_json::to_value(summary).map_err(|e| {
+                format!("session_summary: the summary of recording {id:?} could not be turned into JSON: {e}")
+            })
+        })
+        .await)
     }
 
     #[tool(
@@ -375,7 +377,7 @@ impl Telemouse {
     }
 
     #[tool(
-        description = "Start the capture agent through the control panel. Only do this when the user asked for it. Returns the new process id."
+        description = "Start the capture agent through the control panel. Only do this when the user asked for it. The agent names its own session (sessions_list shows it once it is written). Returns the new process id."
     )]
     async fn capture_start(
         &self,
@@ -420,7 +422,7 @@ impl Telemouse {
     }
 
     #[tool(
-        description = "Run `telemouse doctor` through the control panel and return what it printed: the resolved config and the clock, monitor, device, UDP and Kafka checks. Waits up to 30 seconds for the run to finish."
+        description = "Run `telemouse doctor` through the control panel and return its telemouse-doctor/1 report under `report`: `verdict` (pass/warn/fail), one `checks` row per clock, monitor, device, UDP, recording and Kafka check (id, status, title, detail, hint), and the resolved `config`. Decide on `verdict`, not on the exit code. If the structured report cannot be had, `lines` carries the text report instead and `note` says why. Waits up to 30 seconds."
     )]
     async fn doctor(&self) -> Result<CallToolResult, McpError> {
         let call = Call::start("doctor");
@@ -491,7 +493,7 @@ impl Telemouse {
         let mut tried = Vec::new();
         // The panel's ring is the live output of the child it launched —
         // including the one-shot tasks, which have no log file of their own.
-        if component != "ctl" {
+        if args::RING_COMPONENTS.contains(&component) {
             match self.deps.ctl.get("/api/state").await {
                 Ok(state) => match digest::component_log(&state, component, lines) {
                     Some(l) if !l.is_empty() => {
@@ -566,55 +568,171 @@ impl Telemouse {
         if let Some(save) = a.save {
             body.insert("save".into(), json!(save));
         }
-        if let Some(session) = a.session {
-            body.insert("session".into(), json!(args::session_file(&session)?));
-        }
         self.ctl_post("/api/components/capture/start", &Value::Object(body))
             .await
             .map_err(|e| local_message(e, ""))
     }
 
+    /// `doctor`: the structured `telemouse-doctor/1` report when it can be
+    /// had, the text report otherwise.
+    ///
+    /// The document comes back through the panel's output ring like any
+    /// other child output, and `/api/state` hands out at most the last 120
+    /// lines of it per component, so a pretty-printed document longer than
+    /// that arrives without its head and does not parse. Rather than guess
+    /// at a fragment, that case — and a panel too old to accept `--json` —
+    /// runs doctor once more in text mode inside the same 30-second budget.
     async fn doctor_impl(&self) -> Result<Value, String> {
-        match self
-            .ctl_post("/api/components/doctor/start", &json!({}))
-            .await
-        {
-            Ok(_) => {}
-            // Already running: there is a check in flight, so wait for it
-            // rather than telling the caller to try again.
-            Err(LocalError::Refused { status: 409, .. }) => {}
-            Err(e) => return Err(local_message(e, "")),
-        }
         let deadline = std::time::Instant::now() + DOCTOR_TIMEOUT;
+        let why_text = match self.doctor_run(&["--json"], deadline).await {
+            Ok(run) if !run.finished => return Ok(run.unfinished()),
+            Ok(run) => match doctor_document(&run.lines) {
+                Some(report) => {
+                    return Ok(json!({
+                        "finished": true,
+                        "last_exit": run.last_exit,
+                        "report": report,
+                    }));
+                }
+                // Somebody else's run was in flight and we waited for it:
+                // whatever it printed is the answer, not a reason to start
+                // a second one.
+                None if run.joined => {
+                    return Ok(run.finished_text(
+                        "a doctor run was already in progress; this is its output",
+                    ));
+                }
+                None => {
+                    "the telemouse-doctor/1 document did not come through the control panel's output intact (it keeps the last 120 lines per component); this is the text report instead"
+                }
+            },
+            Err(DoctorError::Start(e @ LocalError::Refused { status: 400, .. })) => {
+                tracing::debug!(error = %e, "ctl refused doctor --json; running the text report");
+                "this control panel does not accept `doctor --json`; this is the text report"
+            }
+            Err(DoctorError::Start(e)) => return Err(local_message(e, "")),
+            Err(DoctorError::Other(e)) => return Err(e),
+        };
+        match self.doctor_run(&[], deadline).await {
+            Ok(run) if !run.finished => Ok(run.unfinished()),
+            Ok(run) => Ok(run.finished_text(why_text)),
+            Err(DoctorError::Start(e)) => Err(local_message(e, "")),
+            Err(DoctorError::Other(e)) => Err(e),
+        }
+    }
+
+    /// Start the doctor component with `flags` (or join the run already in
+    /// flight), wait until it exits or `deadline` passes, and collect what
+    /// that run printed.
+    async fn doctor_run(
+        &self,
+        flags: &[&str],
+        deadline: std::time::Instant,
+    ) -> Result<DoctorRun, DoctorError> {
+        let local = |e: LocalError| DoctorError::Other(local_message(e, ""));
+        // Where this run's output will start in the ring, so earlier runs'
+        // lines are not mistaken for this one's.
+        let before = self.deps.ctl.get("/api/state").await.map_err(local)?;
+        let cursor = digest::component(&before, "doctor")
+            .ok_or_else(|| {
+                DoctorError::Other("the control panel does not know a `doctor` component".into())
+            })?
+            .get("log_seq")
+            .and_then(Value::as_u64);
+
+        let body = if flags.is_empty() {
+            json!({})
+        } else {
+            json!({ "flags": flags })
+        };
+        let joined = match self.ctl_post("/api/components/doctor/start", &body).await {
+            Ok(_) => false,
+            // Already running: there is a check in flight, so wait for it
+            // rather than telling the caller to try again. Its output began
+            // before the cursor, so read the whole ring instead.
+            Err(LocalError::Refused { status: 409, .. }) => true,
+            Err(e) => return Err(DoctorError::Start(e)),
+        };
+        let path = match cursor {
+            Some(n) if !joined => format!("/api/state?log_since={n}"),
+            _ => "/api/state".to_string(),
+        };
         loop {
             tokio::time::sleep(DOCTOR_POLL).await;
-            let state = self
-                .deps
-                .ctl
-                .get("/api/state")
-                .await
-                .map_err(|e| local_message(e, ""))?;
+            let state = self.deps.ctl.get(&path).await.map_err(local)?;
             let Some(c) = digest::component(&state, "doctor") else {
-                return Err("the control panel does not know a `doctor` component".into());
+                return Err(DoctorError::Other(
+                    "the control panel does not know a `doctor` component".into(),
+                ));
             };
             let running = c.get("running").and_then(Value::as_bool).unwrap_or(false);
-            let lines = digest::component_log(&state, "doctor", 200).unwrap_or_default();
-            if !running {
-                return Ok(json!({
-                    "finished": true,
-                    "last_exit": c.get("last_exit").cloned().unwrap_or(Value::Null),
-                    "lines": lines,
-                }));
-            }
-            if std::time::Instant::now() >= deadline {
-                return Ok(json!({
-                    "finished": false,
-                    "note": format!("doctor was still running after {}s; this is what it had printed", DOCTOR_TIMEOUT.as_secs()),
-                    "lines": lines,
-                }));
+            if !running || std::time::Instant::now() >= deadline {
+                return Ok(DoctorRun {
+                    finished: !running,
+                    joined,
+                    last_exit: c.get("last_exit").cloned().unwrap_or(Value::Null),
+                    lines: digest::component_log(&state, "doctor", usize::MAX).unwrap_or_default(),
+                });
             }
         }
     }
+}
+
+/// What one doctor run left behind.
+struct DoctorRun {
+    finished: bool,
+    /// The run was already in flight; we waited for it rather than starting
+    /// it, so its flags are not known.
+    joined: bool,
+    last_exit: Value,
+    lines: Vec<String>,
+}
+
+impl DoctorRun {
+    fn finished_text(self, note: &str) -> Value {
+        json!({
+            "finished": true,
+            "last_exit": self.last_exit,
+            "note": note,
+            "lines": self.lines,
+        })
+    }
+
+    fn unfinished(self) -> Value {
+        json!({
+            "finished": false,
+            "note": format!("doctor was still running after {}s; this is what it had printed", DOCTOR_TIMEOUT.as_secs()),
+            "lines": self.lines,
+        })
+    }
+}
+
+/// Why [`Telemouse::doctor_run`] produced no run.
+enum DoctorError {
+    /// ctl refused to start it (not counting "already running").
+    Start(LocalError),
+    /// Anything else, already worded for the model.
+    Other(String),
+}
+
+/// The `telemouse-doctor/1` document in a run's output, if it is all there.
+///
+/// The output is the panel's view of the child: its own `--- started ---`
+/// and `--- exited ---` lines around whatever doctor printed. The document
+/// runs from the first line that opens an object to the last that closes
+/// one; a document missing its head starts at a nested `{` and does not
+/// parse, which is the point — a fragment is never passed off as the report.
+fn doctor_document(lines: &[String]) -> Option<Value> {
+    let start = lines.iter().position(|l| l.trim_start().starts_with('{'))?;
+    let end = lines.iter().rposition(|l| l.trim_end().ends_with('}'))?;
+    if end < start {
+        return None;
+    }
+    let doc: Value = serde_json::from_str(&lines[start..=end].join("\n")).ok()?;
+    doc.get("schema")?
+        .as_str()?
+        .starts_with("telemouse-doctor/")
+        .then_some(doc)
 }
 
 /// The last `lines` lines of `path`, reading only the tail of the file.
@@ -624,18 +742,13 @@ impl Telemouse {
 fn tail_file(path: &Path, lines: usize) -> Result<Vec<String>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
-        .len();
+    let cannot = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let mut file = std::fs::File::open(path).map_err(cannot)?;
+    let len = file.metadata().map_err(cannot)?.len();
     let from = len.saturating_sub(TAIL_WINDOW);
-    file.seek(SeekFrom::Start(from))
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(from)).map_err(cannot)?;
     let mut buf = Vec::with_capacity(TAIL_WINDOW.min(len) as usize + 1);
-    file.read_to_end(&mut buf)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    file.read_to_end(&mut buf).map_err(cannot)?;
     let text = String::from_utf8_lossy(&buf);
     let mut all: Vec<&str> = text.lines().collect();
     // The seek almost certainly landed mid-line; that fragment is not a line.
@@ -701,21 +814,120 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let (tx, seen) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
-                let head = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                let request = read_request(&mut sock).await;
+                let _ = tx.send(request);
+                respond(&mut sock, status, body).await;
             });
             Self { addr, seen }
         }
+    }
+
+    /// Read one whole request: the headers, then as many body bytes as its
+    /// `Content-Length` says — however the client's writes were split.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if seen.len() >= end + 4 + len {
+                    break;
+                }
+            }
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    async fn respond(sock: &mut tokio::net::TcpStream, status: u16, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.write_all(body.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    }
+
+    /// A stand-in for ctl that answers any number of requests, each from
+    /// `answer(request)`, and records every request it saw.
+    struct FakeCtl {
+        addr: SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeCtl {
+        async fn start<F>(answer: F) -> Self
+        where
+            F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let request = read_request(&mut sock).await;
+                    let (status, body) = answer(&request);
+                    log.lock().unwrap().push(request);
+                    respond(&mut sock, status, &body).await;
+                }
+            });
+            Self { addr, seen }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// `/api/state` with only a doctor component in it.
+    fn doctor_state(running: bool, log: &[&str]) -> String {
+        json!({
+            "components": [{
+                "id": "doctor",
+                "running": running,
+                "last_exit": if running { Value::Null } else { json!({ "code": 0 }) },
+                "log": log,
+                "log_seq": 7,
+            }]
+        })
+        .to_string()
+    }
+
+    /// A pretty-printed `telemouse-doctor/1` document as ctl's ring holds
+    /// it: one line per line, between the panel's own markers.
+    fn doctor_json_output() -> Vec<String> {
+        let doc = json!({
+            "schema": "telemouse-doctor/1",
+            "capture_version": "0.0.0",
+            "verdict": "warn",
+            "checks": [
+                { "id": "build", "status": "warn", "title": "Build", "detail": "debug" },
+                { "id": "udp", "status": "pass", "title": "UDP sink", "detail": "ready" },
+            ],
+            "config": { "mouse_cpi": 1600.0 },
+        });
+        let mut out = vec!["--- started pid 9: telemouse.exe doctor --json ---".to_string()];
+        out.extend(
+            serde_json::to_string_pretty(&doc)
+                .unwrap()
+                .lines()
+                .map(str::to_string),
+        );
+        out.push("--- exited: code 0 ---".into());
+        out
     }
 
     /// An address nothing is listening on.
@@ -728,7 +940,7 @@ mod tests {
 
     fn deps(ctl: SocketAddr, viz: SocketAddr, read_only: bool) -> Deps {
         Deps {
-            analysis: Analysis::new(PathBuf::from("recordings")),
+            analysis: Analysis::new(PathBuf::from("recordings"), read_only),
             ctl: Local::ctl(ctl),
             viz: Local::viz(viz),
             log_dir: None,
@@ -821,7 +1033,6 @@ mod tests {
             .capture_start(Parameters(CaptureStartArgs {
                 save: Some(true),
                 flags: Some(vec!["--no-kafka".into()]),
-                session: None,
             }))
             .await
             .unwrap();
@@ -992,6 +1203,162 @@ mod tests {
             .unwrap();
         assert_eq!(out.is_error, Some(true));
         assert!(text(&out).contains("not a recording id"), "{}", text(&out));
+    }
+
+    #[test]
+    fn the_other_spellings_of_count_and_metric_are_accepted() {
+        let t: TrendArgs =
+            serde_json::from_value(json!({ "metrics": ["quality.poll_hz"], "limit": 3 })).unwrap();
+        assert_eq!(t.metric, Some(vec!["quality.poll_hz".to_string()]));
+        assert_eq!(t.last, Some(3));
+        let t: TrendArgs = serde_json::from_value(json!({ "metric": ["a"], "last": 2 })).unwrap();
+        assert_eq!((t.metric.unwrap().len(), t.last), (1, Some(2)));
+        let s: SessionsListArgs = serde_json::from_value(json!({ "last": 4 })).unwrap();
+        assert_eq!(s.limit, Some(4));
+        let s: SessionsListArgs = serde_json::from_value(json!({ "limit": 5 })).unwrap();
+        assert_eq!(s.limit, Some(5));
+    }
+
+    #[test]
+    fn a_capture_start_that_still_names_a_session_is_not_refused() {
+        // `session` was dropped from the schema; an older client sending it
+        // must still get its capture.
+        let a: CaptureStartArgs =
+            serde_json::from_value(json!({ "save": true, "session": "s-1" })).unwrap();
+        assert_eq!(a.save, Some(true));
+    }
+
+    #[test]
+    fn the_doctor_document_is_found_whole_or_not_at_all() {
+        let whole = doctor_json_output();
+        let doc = doctor_document(&whole).expect("the whole document parses");
+        assert_eq!(doc["schema"], "telemouse-doctor/1");
+        assert_eq!(doc["checks"][1]["id"], "udp");
+
+        // What a 120-line ring keeps of a longer document: no head.
+        let headless: Vec<String> = whole[6..].to_vec();
+        assert!(doctor_document(&headless).is_none());
+
+        // The same document on one line works too.
+        let one_line = vec![
+            "--- started ---".to_string(),
+            serde_json::to_string(&doc).unwrap(),
+            "--- exited: code 0 ---".into(),
+        ];
+        assert_eq!(doctor_document(&one_line), Some(doc));
+
+        // Text output, or JSON that is not a doctor report, is not one.
+        assert!(doctor_document(&["  pass  OS : Windows".to_string()]).is_none());
+        assert!(doctor_document(&[r#"{"schema":"other/1"}"#.to_string()]).is_none());
+        assert!(doctor_document(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn doctor_asks_for_json_and_returns_the_structured_report() {
+        let output = doctor_json_output();
+        let ctl = FakeCtl::start(move |req| {
+            if req.starts_with("POST /api/components/doctor/start") {
+                (200, r#"{"ok":true,"pid":9}"#.into())
+            } else if req.starts_with("GET /api/state?log_since=7 ") {
+                let lines: Vec<&str> = output.iter().map(String::as_str).collect();
+                (200, doctor_state(false, &lines))
+            } else {
+                (200, doctor_state(false, &["an earlier run"]))
+            }
+        })
+        .await;
+        let s = Telemouse::new(deps(ctl.addr, dead().await, false));
+        let out = s.doctor().await.unwrap();
+        assert_ne!(out.is_error, Some(true), "{}", text(&out));
+        let v = value(&out);
+        assert_eq!(v["finished"], true);
+        assert_eq!(v["report"]["schema"], "telemouse-doctor/1");
+        assert_eq!(v["report"]["verdict"], "warn");
+        assert!(v.get("lines").is_none(), "{v:#}");
+
+        let posts: Vec<String> = ctl
+            .requests()
+            .into_iter()
+            .filter(|r| r.starts_with("POST"))
+            .collect();
+        assert_eq!(posts.len(), 1, "one run: {posts:?}");
+        assert!(posts[0].contains("X-Telemouse-Ctl: 1"), "{}", posts[0]);
+        assert!(
+            posts[0].ends_with(r#"{"flags":["--json"]}"#),
+            "{}",
+            posts[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_falls_back_to_text_when_the_document_does_not_survive_the_ring() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let output = doctor_json_output();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = posts.clone();
+        let ctl = FakeCtl::start(move |req| {
+            if req.starts_with("POST /api/components/doctor/start") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                (200, r#"{"ok":true,"pid":9}"#.into())
+            } else if req.starts_with("GET /api/state?log_since=") {
+                if counted.load(Ordering::SeqCst) == 1 {
+                    // The ring kept only the tail of the document.
+                    let lines: Vec<&str> = output[6..].iter().map(String::as_str).collect();
+                    (200, doctor_state(false, &lines))
+                } else {
+                    (
+                        200,
+                        doctor_state(false, &["  pass  OS : Windows", "verdict: pass"]),
+                    )
+                }
+            } else {
+                (200, doctor_state(false, &[]))
+            }
+        })
+        .await;
+        let s = Telemouse::new(deps(ctl.addr, dead().await, false));
+        let out = s.doctor().await.unwrap();
+        assert_ne!(out.is_error, Some(true), "{}", text(&out));
+        let v = value(&out);
+        assert_eq!(v["finished"], true);
+        assert!(v.get("report").is_none(), "{v:#}");
+        assert_eq!(v["lines"][1], "verdict: pass");
+        assert!(v["note"].as_str().unwrap().contains("120 lines"), "{v:#}");
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        let last_post = ctl
+            .requests()
+            .into_iter()
+            .rfind(|r| r.starts_with("POST"))
+            .unwrap();
+        assert!(last_post.ends_with("\r\n\r\n{}"), "{last_post}");
+    }
+
+    #[tokio::test]
+    async fn doctor_runs_the_text_report_on_a_panel_that_refuses_json() {
+        let ctl = FakeCtl::start(|req| {
+            if req.starts_with("POST /api/components/doctor/start") {
+                if req.contains("--json") {
+                    (400, r#"{"error":"flag \"--json\" is not allowed"}"#.into())
+                } else {
+                    (200, r#"{"ok":true,"pid":9}"#.into())
+                }
+            } else {
+                (200, doctor_state(false, &["verdict: pass"]))
+            }
+        })
+        .await;
+        let s = Telemouse::new(deps(ctl.addr, dead().await, false));
+        let v = value(&s.doctor().await.unwrap());
+        assert_eq!(v["lines"][0], "verdict: pass");
+        assert!(v["note"].as_str().unwrap().contains("--json"), "{v:#}");
+    }
+
+    #[tokio::test]
+    async fn doctor_with_the_panel_down_says_so() {
+        let s = Telemouse::new(deps(dead().await, dead().await, false));
+        let out = s.doctor().await.unwrap();
+        assert_eq!(out.is_error, Some(true));
+        assert!(text(&out).contains("not answering"), "{}", text(&out));
     }
 
     #[test]

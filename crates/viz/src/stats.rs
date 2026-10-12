@@ -40,15 +40,45 @@ pub const VIZ_STATS_TYPE: &str = "viz_stats";
 #[cfg(feature = "observability")]
 pub const FEED_STALL_AFTER_S: f64 = 10.0;
 
-/// How the live feed looks from here, for `/healthz` and the stall log:
-/// `never` (nothing has ever arrived), `live`, or `stalled`.
+/// How the live feed looks from here, for `/healthz` and the stall log.
+/// Serialized as `never` (nothing has ever arrived), `live`, or `stalled`.
 #[cfg(feature = "observability")]
-pub fn feed_state(udp_bound: bool, age_s: Option<f64>) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedState {
+    Never,
+    Live,
+    Stalled,
+}
+
+#[cfg(feature = "observability")]
+impl FeedState {
+    /// The serialized spelling, for log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedState::Never => "never",
+            FeedState::Live => "live",
+            FeedState::Stalled => "stalled",
+        }
+    }
+}
+
+#[cfg(feature = "observability")]
+impl std::fmt::Display for FeedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The feed state given whether the listener is bound and how long ago the
+/// last datagram arrived.
+#[cfg(feature = "observability")]
+pub fn feed_state(udp_bound: bool, age_s: Option<f64>) -> FeedState {
     match age_s {
-        _ if !udp_bound => "never",
-        None => "never",
-        Some(age) if age > FEED_STALL_AFTER_S => "stalled",
-        Some(_) => "live",
+        _ if !udp_bound => FeedState::Never,
+        None => FeedState::Never,
+        Some(age) if age > FEED_STALL_AFTER_S => FeedState::Stalled,
+        Some(_) => FeedState::Live,
     }
 }
 
@@ -89,27 +119,66 @@ impl GapSnapshot {
     }
 }
 
+/// A cumulative histogram read as windows: each window is the delta since the
+/// last close, plus the exact maximum observed in it (the histogram gives
+/// percentiles; a bucket edge cannot give an outlier's real magnitude).
+#[cfg(feature = "observability")]
+#[derive(Debug, Default)]
+struct HistWindow {
+    hist: LatencyHist,
+    prev: Mutex<HistSnapshot>,
+    max_us: AtomicU64,
+}
+
+#[cfg(feature = "observability")]
+impl HistWindow {
+    /// Record one observation; true if it was negative (and clamped to 0).
+    fn record(&self, us: i64) -> bool {
+        self.max_us.fetch_max(us.max(0) as u64, Ordering::Relaxed);
+        self.hist.record_clamped(us)
+    }
+
+    /// The window since the last close, and its exact max. `close` advances
+    /// the baseline and clears the max, ending the window.
+    fn window(&self, close: bool) -> (HistSnapshot, u64) {
+        let cur = self.hist.snapshot();
+        let mut prev = self.prev.lock().unwrap_or_else(|p| p.into_inner());
+        let window = cur.delta(&prev);
+        if close {
+            *prev = cur;
+        }
+        drop(prev);
+        (window, take_or_read(&self.max_us, close))
+    }
+}
+
+/// An atomic counter read for a window: swapped to zero when the window is
+/// being closed, merely loaded otherwise.
+#[cfg(feature = "observability")]
+fn take_or_read(counter: &AtomicU64, close: bool) -> u64 {
+    if close {
+        counter.swap(0, Ordering::Relaxed)
+    } else {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
 /// The counters only the `observability` feature has a consumer for.
 #[cfg(feature = "observability")]
 #[derive(Debug, Default)]
 struct Obs {
-    /// Bridge latency, cumulative. Windows are deltas against `latency_prev`.
-    latency: LatencyHist,
-    latency_prev: Mutex<HistSnapshot>,
-    /// Exact sum / max / negative count for the *current* window: the
-    /// histogram gives percentiles, these give the numbers a bucket edge
-    /// cannot (a mean, and an outlier's real magnitude).
+    /// Bridge latency, as windows.
+    latency: HistWindow,
+    /// Exact sum / negative count for the *current* latency window (a mean
+    /// is not something a histogram can give).
     win_sum_us: AtomicU64,
-    win_max_us: AtomicU64,
     win_negative: AtomicU64,
     /// The most recently *completed* latency window, so `/api/stats` and the
     /// pushed frame report a stable number instead of one that resets to
     /// near-empty every reporting interval.
     last_latency: Mutex<LatencySnapshot>,
     /// Time between consecutive datagrams, same treatment.
-    gaps: LatencyHist,
-    gaps_prev: Mutex<HistSnapshot>,
-    win_gap_max_us: AtomicU64,
+    gaps: HistWindow,
     last_gap: Mutex<GapSnapshot>,
     /// Bytes of accepted envelope text handed to the broadcast channel.
     bytes_forwarded: AtomicU64,
@@ -125,20 +194,22 @@ struct Obs {
     kb_bits: AtomicU64,
 }
 
+/// Every counter is private and moved through a method, so the hub, the
+/// server and the reporter all touch them the same way.
 #[derive(Debug)]
 pub struct Stats {
     /// UDP datagrams received (parseable or not).
-    pub datagrams: AtomicU64,
+    datagrams: AtomicU64,
     /// Datagrams rejected by [`crate::hub::classify_datagram`].
-    pub parse_errors: AtomicU64,
+    parse_errors: AtomicU64,
     /// Envelopes accepted and handed to the broadcast channel.
-    pub forwarded: AtomicU64,
+    forwarded: AtomicU64,
     /// Envelopes a WebSocket client missed because it could not keep up.
-    pub lag_drops: AtomicU64,
+    lag_drops: AtomicU64,
     /// WebSocket clients that were disconnected for lagging.
-    pub lag_disconnects: AtomicU64,
-    /// Currently connected WebSocket clients.
-    pub clients: AtomicI64,
+    lag_disconnects: AtomicU64,
+    /// WebSocket client slots in use (reserved before the handshake).
+    clients: AtomicI64,
     #[cfg(feature = "observability")]
     obs: Obs,
     /// The UDP listener is bound and receiving. False until the bind
@@ -180,22 +251,25 @@ pub struct HealthPayload {
     pub ok: bool,
     pub udp_bound: bool,
     pub uptime_s: f64,
+    /// The `observability` fields, flattened into the same JSON object.
+    #[cfg(feature = "observability")]
+    #[serde(flatten)]
+    pub detail: HealthDetail,
+}
+
+/// The part of [`HealthPayload`] only the `observability` build reports.
+#[cfg(feature = "observability")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HealthDetail {
     /// Seconds since the last datagram, `None` before the first one.
-    #[cfg(feature = "observability")]
     pub last_datagram_age_s: Option<f64>,
-    #[cfg(feature = "observability")]
     pub clients: i64,
     /// Bound, but nothing has arrived for [`FEED_STALL_AFTER_S`].
-    #[cfg(feature = "observability")]
     pub stalled: bool,
     /// `never` | `live` | `stalled`.
-    #[cfg(feature = "observability")]
-    pub feed: &'static str,
-    #[cfg(feature = "observability")]
+    pub feed: FeedState,
     pub udp_addr: String,
-    #[cfg(feature = "observability")]
     pub http_addr: String,
-    #[cfg(feature = "observability")]
     pub version: &'static str,
 }
 
@@ -223,12 +297,30 @@ impl Stats {
         }
     }
 
-    pub fn client_connected(&self) {
-        self.clients.fetch_add(1, Ordering::Relaxed);
+    /// Take one client slot if fewer than `max` are in use. The increment is
+    /// the check, so two upgrades racing for the last slot cannot both win.
+    pub fn try_reserve_client(&self, max: i64) -> bool {
+        if self.clients.fetch_add(1, Ordering::AcqRel) >= max {
+            self.clients.fetch_sub(1, Ordering::AcqRel);
+            false
+        } else {
+            true
+        }
     }
 
-    pub fn client_disconnected(&self) {
-        self.clients.fetch_sub(1, Ordering::Relaxed);
+    /// Give back a slot taken by [`Stats::try_reserve_client`].
+    pub fn release_client(&self) {
+        self.clients.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// An envelope was accepted and handed to the broadcast channel.
+    pub fn note_forwarded(&self) {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A datagram was rejected.
+    pub fn note_parse_error(&self) {
+        self.parse_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_lag(&self, missed: u64) {
@@ -248,9 +340,11 @@ impl Stats {
         self.udp_bound.load(Ordering::Relaxed)
     }
 
-    /// A datagram arrived (parseable or not) at wall-clock `now_utc_us`.
-    /// Returns the gap since the previous one in µs, or `None` for the first.
+    /// A datagram arrived (parseable or not) at wall-clock `now_utc_us`:
+    /// counts it and moves the feed clock. Returns the gap since the previous
+    /// one in µs, or `None` for the first.
     pub fn note_datagram(&self, now_utc_us: i64) -> Option<i64> {
+        self.datagrams.fetch_add(1, Ordering::Relaxed);
         let prev = self
             .last_datagram_utc_us
             .swap(now_utc_us, Ordering::Relaxed);
@@ -265,29 +359,35 @@ impl Stats {
     }
 
     /// The `/healthz` body at wall-clock `now_utc_us`.
+    #[cfg_attr(not(feature = "observability"), allow(unused_variables))]
     pub fn health(&self, now_utc_us: i64, udp_addr: &str, http_addr: &str) -> HealthPayload {
         let udp_bound = self.udp_bound();
-        #[cfg(feature = "observability")]
-        let age = self.last_datagram_age_s(now_utc_us);
-        #[cfg(not(feature = "observability"))]
-        let _ = (now_utc_us, udp_addr, http_addr);
         HealthPayload {
             ok: udp_bound,
             udp_bound,
             uptime_s: self.uptime_s(),
             #[cfg(feature = "observability")]
+            detail: self.health_detail(udp_bound, now_utc_us, udp_addr, http_addr),
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    fn health_detail(
+        &self,
+        udp_bound: bool,
+        now_utc_us: i64,
+        udp_addr: &str,
+        http_addr: &str,
+    ) -> HealthDetail {
+        let age = self.last_datagram_age_s(now_utc_us);
+        let feed = feed_state(udp_bound, age);
+        HealthDetail {
             last_datagram_age_s: age,
-            #[cfg(feature = "observability")]
             clients: self.clients.load(Ordering::Relaxed),
-            #[cfg(feature = "observability")]
-            stalled: feed_state(udp_bound, age) == "stalled",
-            #[cfg(feature = "observability")]
-            feed: feed_state(udp_bound, age),
-            #[cfg(feature = "observability")]
+            stalled: feed == FeedState::Stalled,
+            feed,
             udp_addr: udp_addr.to_string(),
-            #[cfg(feature = "observability")]
             http_addr: http_addr.to_string(),
-            #[cfg(feature = "observability")]
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -303,20 +403,17 @@ impl Stats {
     /// clamped to zero rather than thrown away — a nonzero `negative` is the
     /// tell that the numbers need a grain of salt.
     pub fn record_latency(&self, us: i64) {
-        if self.obs.latency.record_clamped(us) {
+        if self.obs.latency.record(us) {
             self.obs.win_negative.fetch_add(1, Ordering::Relaxed);
         }
-        let v = us.max(0) as u64;
-        self.obs.win_sum_us.fetch_add(v, Ordering::Relaxed);
-        self.obs.win_max_us.fetch_max(v, Ordering::Relaxed);
+        self.obs
+            .win_sum_us
+            .fetch_add(us.max(0) as u64, Ordering::Relaxed);
     }
 
     /// One inter-datagram gap, in µs.
     pub fn record_gap(&self, us: i64) {
-        self.obs.gaps.record_clamped(us);
-        self.obs
-            .win_gap_max_us
-            .fetch_max(us.max(0) as u64, Ordering::Relaxed);
+        self.obs.gaps.record(us);
     }
 
     /// Bytes of one forwarded envelope.
@@ -403,30 +500,9 @@ impl Stats {
     /// The window since the last roll. `reset` advances the baseline and
     /// clears the exact counters, closing the window.
     fn latency_window(&self, reset: bool) -> LatencySnapshot {
-        let cur = self.obs.latency.snapshot();
-        let mut prev = self
-            .obs
-            .latency_prev
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let window = cur.delta(&prev);
-        if reset {
-            *prev = cur;
-        }
-        drop(prev);
-        let (sum_us, max_us, negative) = if reset {
-            (
-                self.obs.win_sum_us.swap(0, Ordering::Relaxed),
-                self.obs.win_max_us.swap(0, Ordering::Relaxed),
-                self.obs.win_negative.swap(0, Ordering::Relaxed),
-            )
-        } else {
-            (
-                self.obs.win_sum_us.load(Ordering::Relaxed),
-                self.obs.win_max_us.load(Ordering::Relaxed),
-                self.obs.win_negative.load(Ordering::Relaxed),
-            )
-        };
+        let (window, max_us) = self.obs.latency.window(reset);
+        let sum_us = take_or_read(&self.obs.win_sum_us, reset);
+        let negative = take_or_read(&self.obs.win_negative, reset);
         let samples = window.total();
         LatencySnapshot {
             samples,
@@ -441,18 +517,7 @@ impl Stats {
     }
 
     fn gap_window(&self, reset: bool) -> GapSnapshot {
-        let cur = self.obs.gaps.snapshot();
-        let mut prev = self.obs.gaps_prev.lock().unwrap_or_else(|p| p.into_inner());
-        let window = cur.delta(&prev);
-        if reset {
-            *prev = cur;
-        }
-        drop(prev);
-        let max_us = if reset {
-            self.obs.win_gap_max_us.swap(0, Ordering::Relaxed)
-        } else {
-            self.obs.win_gap_max_us.load(Ordering::Relaxed)
-        };
+        let (window, max_us) = self.obs.gaps.window(reset);
         GapSnapshot {
             samples: window.total(),
             p99_us: window.percentile_us(0.99).min(max_us),
@@ -582,10 +647,42 @@ mod tests {
     #[test]
     fn client_gauge_tracks_connect_disconnect() {
         let s = Stats::default();
-        s.client_connected();
-        s.client_connected();
-        s.client_disconnected();
+        assert!(s.try_reserve_client(i64::MAX));
+        assert!(s.try_reserve_client(i64::MAX));
+        s.release_client();
         assert_eq!(s.snapshot().clients, 1);
+    }
+
+    #[test]
+    fn client_slots_are_reserved_up_to_the_cap_and_no_further() {
+        let s = Stats::default();
+        assert!(s.try_reserve_client(2));
+        assert!(s.try_reserve_client(2));
+        assert!(!s.try_reserve_client(2), "the cap holds");
+        assert_eq!(s.snapshot().clients, 2, "a refused reservation is undone");
+        s.release_client();
+        assert!(s.try_reserve_client(2));
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_the_cap() {
+        let s = std::sync::Arc::new(Stats::default());
+        let won = std::sync::Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let (s, won) = (s.clone(), won.clone());
+                std::thread::spawn(move || {
+                    if s.try_reserve_client(16) {
+                        won.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(won.load(Ordering::Relaxed), 16);
+        assert_eq!(s.snapshot().clients, 16);
     }
 
     #[test]
@@ -608,16 +705,18 @@ mod tests {
     #[cfg(feature = "observability")]
     #[test]
     fn feed_state_says_never_live_or_stalled() {
-        assert_eq!(feed_state(false, None), "never");
-        assert_eq!(
-            feed_state(false, Some(0.1)),
-            "never",
-            "no listener, no feed"
-        );
-        assert_eq!(feed_state(true, None), "never");
-        assert_eq!(feed_state(true, Some(0.1)), "live");
-        assert_eq!(feed_state(true, Some(FEED_STALL_AFTER_S)), "live");
-        assert_eq!(feed_state(true, Some(FEED_STALL_AFTER_S + 0.1)), "stalled");
+        use FeedState::*;
+        assert_eq!(feed_state(false, None), Never);
+        assert_eq!(feed_state(false, Some(0.1)), Never, "no listener, no feed");
+        assert_eq!(feed_state(true, None), Never);
+        assert_eq!(feed_state(true, Some(0.1)), Live);
+        assert_eq!(feed_state(true, Some(FEED_STALL_AFTER_S)), Live);
+        assert_eq!(feed_state(true, Some(FEED_STALL_AFTER_S + 0.1)), Stalled);
+        // The wire spelling `/healthz` has always used.
+        for (state, text) in [(Never, "never"), (Live, "live"), (Stalled, "stalled")] {
+            assert_eq!(serde_json::to_value(state).unwrap(), text);
+            assert_eq!(state.to_string(), text);
+        }
     }
 
     #[test]
@@ -645,8 +744,8 @@ mod tests {
         let s = Stats::default();
         let now = 1_756_000_000_000_000;
         s.set_udp_bound(true);
-        let h = s.health(now, "127.0.0.1:7878", "0.0.0.0:7879");
-        assert_eq!(h.feed, "never");
+        let h = s.health(now, "127.0.0.1:7878", "0.0.0.0:7879").detail;
+        assert_eq!(h.feed, FeedState::Never);
         assert!(!h.stalled);
         assert_eq!(h.last_datagram_age_s, None);
         assert_eq!(h.udp_addr, "127.0.0.1:7878");
@@ -654,9 +753,9 @@ mod tests {
         assert_eq!(h.version, env!("CARGO_PKG_VERSION"));
 
         s.note_datagram(now - 2_500_000);
-        s.client_connected();
-        let h = s.health(now, "u", "h");
-        assert_eq!(h.feed, "live");
+        assert!(s.try_reserve_client(i64::MAX));
+        let h = s.health(now, "u", "h").detail;
+        assert_eq!(h.feed, FeedState::Live);
         assert!(!h.stalled);
         assert!((h.last_datagram_age_s.unwrap() - 2.5).abs() < 1e-9);
         assert_eq!(h.clients, 1);
@@ -667,9 +766,38 @@ mod tests {
 
         s.note_datagram(now - 30_000_000);
         let h = s.health(now, "u", "h");
-        assert_eq!(h.feed, "stalled");
-        assert!(h.stalled);
+        assert_eq!(h.detail.feed, FeedState::Stalled);
+        assert!(h.detail.stalled);
         assert!(h.ok, "a stalled feed is still a bound listener");
+    }
+
+    /// Flattening the feature-gated fields must not change the JSON: one
+    /// flat object, every documented key at the top level.
+    #[cfg(feature = "observability")]
+    #[test]
+    fn health_json_is_one_flat_object() {
+        let s = Stats::default();
+        s.set_udp_bound(true);
+        let v = serde_json::to_value(s.health(1_756_000_000_000_000, "u", "h")).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = vec![
+            "ok",
+            "udp_bound",
+            "uptime_s",
+            "last_datagram_age_s",
+            "clients",
+            "stalled",
+            "feed",
+            "udp_addr",
+            "http_addr",
+            "version",
+        ];
+        let mut got = keys.clone();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert_eq!(v["feed"], "never");
+        assert!(v["last_datagram_age_s"].is_null());
     }
 
     #[cfg(feature = "observability")]
@@ -680,7 +808,7 @@ mod tests {
         s.datagrams.fetch_add(200, Ordering::Relaxed);
         s.forwarded.fetch_add(198, Ordering::Relaxed);
         s.parse_errors.fetch_add(2, Ordering::Relaxed);
-        s.client_connected();
+        assert!(s.try_reserve_client(i64::MAX));
         let b = s.snapshot();
 
         let d = b.delta(&a, 5.0);

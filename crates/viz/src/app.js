@@ -7,7 +7,12 @@
 
        engine.ingest(envelope)   // session | batch | marker, wire JSON
        engine.tick(nowSeconds)   // advance the play head, consume events
-       engine.draw()             // render both panels from engine state
+       engine.draw()             // render every panel from engine state
+
+   The engine never reaches into the UI: what it needs from it (mode, live
+   buffer, replay transport) arrives as a small `ctx` argument, and what it
+   has to say (a session restarted, data was lost, a marker passed) goes out
+   through `engine.hooks`, which the UI fills in once at start-up.
 
    The wire carries raw HID counts only; every physical unit below is
    derived here from the session envelope (mouse_cpi, games table, the
@@ -31,12 +36,204 @@ const BTN = {
 };
 BTN.ANY_DOWN = BTN.LEFT_DOWN | BTN.RIGHT_DOWN | BTN.MIDDLE_DOWN | BTN.X1_DOWN | BTN.X2_DOWN;
 BTN.ANY_UP = BTN.ANY_DOWN << 1;   // every *_UP bit is its *_DOWN bit shifted left
-/* Ring colour per button: left, right, everything else. */
+/* Ring colour per button: left, right, everything else. The second number
+   is an index into PAL.ring (see "Palette" below). */
 const BTN_KIND = [[BTN.LEFT_DOWN, 0], [BTN.RIGHT_DOWN, 1], [BTN.MIDDLE_DOWN, 2], [BTN.X1_DOWN, 2], [BTN.X2_DOWN, 2]];
-/* Index into PAL.ring (see "Palette" below). */
 
 /* Used when the session has no profile for the foreground process. */
 const FALLBACK_SENS = { sens: 1.0, yaw_coeff: 0.022, pitch_coeff: 0.022, fallback: true };
+/* Used until a session envelope says otherwise. */
+const DEFAULT_CPI = 800;
+const DEFAULT_QPC_FREQ = 1e7;
+
+/* =====================================================================
+   Limits and defaults of the user-facing knobs, defined once. The sliders
+   in index.html get their min/max/step from here at start-up, and the OBS
+   parameters are clamped to the same ranges.
+
+   They mirror telemouse-core's config validator (crates/core/src/config.rs):
+   BUFFER_MS ↔ OBS_BUFFER_MS_RANGE, TRAIL_SECS ↔ OBS_TRAIL_SECS_RANGE,
+   OBS_SCALE ↔ OBS_SCALE_RANGE, and the defaults ↔ ObsConfig::default().
+   A Rust test in crates/viz/src/server.rs checks that they still agree.
+   ===================================================================== */
+const BUFFER_MS = Object.freeze({ min: 10, max: 200, step: 5, dflt: 35 });
+const TRAIL_SECS = Object.freeze({ min: 0.3, max: 12, step: 0.1, dflt: 3 });
+const OBS_SCALE = Object.freeze({ min: 0.5, max: 4, dflt: 1 });
+/* The overlay's built-in defaults: what an `/obs` page uses for anything
+   the server's [viz.obs] table and the URL leave unsaid. */
+const OBS_DEFAULTS = Object.freeze({
+  layout: "split", background: "transparent", hud: Object.freeze(["speed", "aim", "cpm"]),
+  hud_position: "bottom-left", scale: OBS_SCALE.dflt, trail_secs: TRAIL_SECS.dflt,
+  buffer_ms: BUFFER_MS.dflt, grid: true, legend: false, labels: false, stale_secs: 3,
+});
+
+/** The same rule as telemouse-core's `recordings::is_safe_id`: 1–128
+    characters of `[A-Za-z0-9_-]`. A `?session=` that fails it is ignored. */
+function isSafeId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+}
+
+/** True for `null` and `undefined`: the two ways the wire says "absent". */
+const isNil = (v) => v === null || v === undefined;
+
+/* =====================================================================
+   Windows pointer ballistics — the "pointer" panel
+
+   The wire is raw input: HID counts before Windows touches them, which is
+   what a game reading raw input sees. The desktop cursor sees something
+   else — the counts after "Enhance pointer precision" and the pointer speed
+   slider — and the pointer panel shows *that*, by re-running Windows'
+   transfer function over every event. The inputs Windows had (the
+   precision switch, the slider, the SmoothMouse{X,Y}Curve registry curve,
+   the system DPI) ride in the session envelope's `pointer` field; a
+   recording that predates it gets a fresh install's defaults and a hint.
+
+   The algorithm, per mouse report (Microsoft's "Pointer Ballistics for
+   Windows XP" paper, with the Windows 7 correction that replaced the
+   refresh-rate term by a fixed 150):
+
+     mouse speed    v  = |(dx, dy)| / 3.5                 "inches/s"
+     pointer speed  y  = curve(v)     piecewise-linear through the five
+                                      registry points, extrapolated past
+                                      the last one
+     pixels         p  = y · dpi / 150 · slider,  in the direction of (dx, dy)
+
+   so with the default curve, 96 dpi and the slider in the middle, one count
+   is 0.58 px at a crawl, 0.78 px at 1.25 in/s (the third point), 1:1 at
+   about 2.1 in/s and 2.2 px at 12 in/s. Without
+   precision the pixels are counts × the slider's linear multiplier. Either
+   way the cursor moves whole pixels and Windows keeps the remainder, which
+   is why a slow hand moves it in steps: the model keeps it too.
+
+   What is *not* modelled, and why the panel is a close reconstruction and
+   not a recording of the cursor: the report-rate dependence (3.5 assumes
+   Windows' 125 Hz era; a 1000 Hz mouse sends the same distance as eight
+   smaller reports, each of which lands lower on the curve — exactly as the
+   real cursor does, since the counts are the real reports), and any
+   smoothing across reports the paper hints at, which is not documented
+   well enough to copy.
+   ===================================================================== */
+
+/** A fresh Windows install; the curves are the registry's exact 16.16 values. */
+const WIN_POINTER_DEFAULTS = Object.freeze({
+  enhance_pointer_precision: true,
+  speed: 10,
+  curve_x: Object.freeze([0, 0x6e15 / 65536, 1.25, 0x3dc29 / 65536, 40]),
+  curve_y: Object.freeze([0, 0x15eb8 / 65536, 0x54ccd / 65536, 0x184ccd / 65536, 568]),
+  screen_dpi: 96,
+});
+/* Windows' two hard-coded scale factors: counts per (inch/second) on the way
+   into the curve, and the "mouse update rate" on the way out of it. */
+const EPP_MOUSE_SCALE = 3.5;
+const EPP_POINTER_RATE = 150;
+/* The pointer-speed slider's eleven notches as SPI_GETMOUSESPEED values, and
+   the multiplier each applies: one table with precision off (the classic
+   1/32 … 3.5) and another with it on. A registry-set value between two
+   notches is interpolated. */
+const SPEED_NOTCHES = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20];
+const SPEED_MULT_LINEAR = [1 / 32, 1 / 16, 1 / 4, 1 / 2, 3 / 4, 1, 1.5, 2, 2.5, 3, 3.5];
+const SPEED_MULT_EPP = [0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0];
+
+/** The slider's multiplier for a 1..20 speed value. */
+function speedMultiplier(speed, epp) {
+  const table = epp ? SPEED_MULT_EPP : SPEED_MULT_LINEAR;
+  const s = clamp(+speed || 10, 1, 20);
+  let i = 0;
+  while (i < SPEED_NOTCHES.length - 1 && SPEED_NOTCHES[i + 1] <= s) i++;
+  if (i === SPEED_NOTCHES.length - 1 || SPEED_NOTCHES[i] === s) return table[i];
+  const f = (s - SPEED_NOTCHES[i]) / (SPEED_NOTCHES[i + 1] - SPEED_NOTCHES[i]);
+  return table[i] + (table[i + 1] - table[i]) * f;
+}
+
+/** A five-point curve from the wire, or null when it is not one the model
+    can run: five finite non-decreasing numbers starting at 0. */
+function pointerCurve(raw) {
+  if (!Array.isArray(raw) || raw.length !== 5) return null;
+  const out = new Array(5);
+  for (let i = 0; i < 5; i++) {
+    const v = +raw[i];
+    if (!Number.isFinite(v) || v < 0 || (i > 0 && v < out[i - 1])) return null;
+    out[i] = v;
+  }
+  return out[0] === 0 ? out : null;
+}
+
+/** Settings for the model from a session envelope's `pointer` (or anything
+    else): every field defaults on its own, so a partial or garbled object
+    still yields a runnable set. `assumed` says whether *anything* was taken
+    from the input. */
+function pointerSettingsFrom(raw) {
+  const d = WIN_POINTER_DEFAULTS;
+  const r = raw && typeof raw === "object" ? raw : {};
+  const speed = Math.round(+r.speed);
+  const dpi = Math.round(+r.screen_dpi);
+  return {
+    enhance_pointer_precision: r.enhance_pointer_precision === undefined
+      ? d.enhance_pointer_precision : !!r.enhance_pointer_precision,
+    speed: speed >= 1 && speed <= 20 ? speed : d.speed,
+    curve_x: pointerCurve(r.curve_x) || d.curve_x,
+    curve_y: pointerCurve(r.curve_y) || d.curve_y,
+    screen_dpi: dpi >= 24 && dpi <= 1000 ? dpi : d.screen_dpi,
+    assumed: !(raw && typeof raw === "object"),
+  };
+}
+
+/** Windows' pointer transfer function, one instance per session. The
+    per-event path allocates nothing: results land in `outX`/`outY` (whole
+    pixels, what the cursor did) and `moveX`/`moveY` (the movement before
+    truncation, for speed readouts that should not see the pixel steps). */
+class PointerModel {
+  constructor(settings) {
+    this.s = settings;
+    this.epp = !!settings.enhance_pointer_precision;
+    this.mult = speedMultiplier(settings.speed, this.epp);
+    /* pixels per curve-unit of pointer speed */
+    this.pxScale = settings.screen_dpi / EPP_POINTER_RATE;
+    this.rx = 0; this.ry = 0;        // sub-pixel remainders
+    this.outX = 0; this.outY = 0;
+    this.moveX = 0; this.moveY = 0;
+  }
+
+  reset() { this.rx = 0; this.ry = 0; this.outX = this.outY = this.moveX = this.moveY = 0; }
+
+  /** Pointer speed for a mouse speed, off the curve (both in Windows'
+      "inches/s"). Linear between points; the last segment continues. */
+  curve(v) {
+    const X = this.s.curve_x, Y = this.s.curve_y;
+    if (v <= 0) return 0;
+    let i = 1;
+    while (i < 4 && X[i] < v) i++;
+    const x0 = X[i - 1], x1 = X[i];
+    if (x1 <= x0) return Y[i];
+    return Y[i - 1] + (Y[i] - Y[i - 1]) * (v - x0) / (x1 - x0);
+  }
+
+  /** Pixels per count for a report of `mag` counts. */
+  gain(mag) {
+    if (!(mag > 0)) return 0;
+    if (!this.epp) return this.mult;
+    const v = mag / EPP_MOUSE_SCALE;
+    return this.curve(v) * this.pxScale / mag * this.mult;
+  }
+
+  /** One report. Whole pixels in `outX`/`outY`, the remainder carried. */
+  apply(dx, dy) {
+    const g = this.gain(Math.sqrt(dx * dx + dy * dy));
+    const mx = dx * g, my = dy * g;
+    this.moveX = mx; this.moveY = my;
+    const ax = this.rx + mx, ay = this.ry + my;
+    /* `|| 0` turns Math.trunc's -0 into 0. */
+    const ix = Math.trunc(ax) || 0, iy = Math.trunc(ay) || 0;
+    this.rx = ax - ix; this.ry = ay - iy;
+    this.outX = ix; this.outY = iy;
+  }
+
+  /** "precision on · 10/20 · 96 dpi", for the panel subtitle. */
+  describe() {
+    const s = this.s;
+    return "precision " + (this.epp ? "on" : "off") + " · " + s.speed + "/20 · " + s.screen_dpi + " dpi";
+  }
+}
 
 const RING_LIFE = 0.55;      // seconds a click ring stays visible
 const WHEEL_LIFE = 1.2;      // seconds a wheel tick stays visible
@@ -71,11 +268,19 @@ const PROFILE = QUERY.get("profile") === "1";
    rate (60 by default), so anything above that is wasted there. */
 const FPS_DEFAULT = 120, FPS_OBS_DEFAULT = 60, FPS_BACKGROUND = 30;
 const fpsQ = parseFloat(QUERY.get("fps"));
-const VIEWS = ["both", "desk", "aim"];
+/* both is desk + aim (the original pair); pointer is Windows' cursor on
+   its own; compare puts the raw hand path and the cursor side by side. */
+const VIEWS = ["both", "desk", "aim", "pointer", "compare"];
 const VIEW = VIEWS.indexOf(QUERY.get("view")) >= 0 ? QUERY.get("view") : "both";
 
 /* ---------- small helpers ---------- */
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+/* One cached formatter for grouped integers: bare toLocaleString()
+   constructs a fresh Intl formatter per call, and the readouts run at 10Hz.
+   Same locale, same default options — output is identical. */
+const INT_FMT = new Intl.NumberFormat();
+const fmtInt = (n) => INT_FMT.format(n);
 
 /* =====================================================================
    OBS browser-source mode
@@ -104,6 +309,7 @@ const UDP_ADDR = typeof SERVER_CFG.udp_addr === "string" ? SERVER_CFG.udp_addr :
 const HUD_ITEMS = {
   speed:   { k: "speed",     unit: "cm/s" },
   aim:     { k: "aim speed", unit: "°/s" },
+  pointer: { k: "pointer",   unit: "px/s" },
   cpm:     { k: "clicks/min" },
   eps:     { k: "events/s" },
   dist:    { k: "hand dist", unit: "m" },
@@ -206,24 +412,26 @@ function connPillState(st, udpAddr) {
   }
 }
 
+/** "#rgb" | "#rrggbb" (and, with `alpha`, "#rrggbbaa"), leading `#`
+    optional → [r, g, b, a] with a in 0..1, or null when it is not hex. */
+function hexChannels(s, alpha) {
+  let h = String(s || "").trim().toLowerCase().replace(/^#/, "");
+  if (h.length === 3) h = h.replace(/./g, (c) => c + c);
+  if (!(alpha ? /^[0-9a-f]{6}([0-9a-f]{2})?$/ : /^[0-9a-f]{6}$/).test(h)) return null;
+  const ch = (k) => parseInt(h.slice(k, k + 2), 16);
+  return [ch(0), ch(2), ch(4), h.length === 8 ? ch(6) / 255 : 1];
+}
+
 /** "transparent" | "rrggbb" | "#rrggbbaa" | "rgb" → { css, alpha }. */
 function parseBg(s) {
   s = String(s || "").trim().toLowerCase();
-  if (!s || s === "transparent" || s === "none") return { css: "transparent", alpha: 0 };
-  let hex = s[0] === "#" ? s.slice(1) : s;
-  if (hex.length === 3) hex = hex.replace(/./g, (c) => c + c);
-  if (!/^[0-9a-f]{6}([0-9a-f]{2})?$/.test(hex)) return { css: "transparent", alpha: 0 };
-  const r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
-  const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
-  return { css: "rgba(" + r + "," + g + "," + b + "," + a.toFixed(3) + ")", alpha: a };
+  const c = s && s !== "transparent" && s !== "none" ? hexChannels(s, true) : null;
+  if (!c) return { css: "transparent", alpha: 0 };
+  return { css: "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + c[3].toFixed(3) + ")", alpha: c[3] };
 }
 
 const OBS = OBS_MODE ? (() => {
-  const d = Object.assign({
-    layout: "split", background: "transparent", hud: ["speed", "aim", "cpm"],
-    hud_position: "bottom-left", scale: 1, trail_secs: 3, buffer_ms: 35,
-    grid: true, legend: false, labels: false, stale_secs: 3,
-  }, SERVER_CFG.obs || {});
+  const d = Object.assign({}, OBS_DEFAULTS, SERVER_CFG.obs || {});
   const str = (name, dflt, allowed) => {
     const v = QUERY.get(name);
     const pick = v === null ? dflt : v;
@@ -236,23 +444,24 @@ const OBS = OBS_MODE ? (() => {
   const num = (name, dflt, lo, hi) => {
     const v = QUERY.get(name);
     const n = v === null ? +dflt : parseFloat(v);
-    return isFinite(n) ? clamp(n, lo, hi) : clamp(+dflt, lo, hi);
+    return Number.isFinite(n) ? clamp(n, lo, hi) : clamp(+dflt, lo, hi);
   };
   const hudRaw = QUERY.get("hud");
   const hud = (hudRaw === null ? (Array.isArray(d.hud) ? d.hud : []) : hudRaw.split(","))
     .map((s) => String(s).trim().toLowerCase())
     .filter((s) => Object.prototype.hasOwnProperty.call(HUD_ITEMS, s));
   return {
-    /* `view=desk|aim|both` (the dashboard's spelling) is accepted here too,
-       so the same URL suffix works on both routes. */
-    layout: str("layout", { desk: "desk", aim: "aim", both: "split" }[QUERY.get("view")] || d.layout,
-                ["split", "stack", "desk", "aim"]),
+    /* `view=` (the dashboard's spelling) is accepted here too, so the same
+       URL suffix works on both routes. `pointer` is Windows' cursor as the
+       whole overlay; `compare` is the raw hand path beside it. */
+    layout: str("layout", { desk: "desk", aim: "aim", both: "split", pointer: "pointer", compare: "compare" }[QUERY.get("view")] || d.layout,
+                ["split", "stack", "desk", "aim", "pointer", "compare"]),
     bg: parseBg(QUERY.get("bg") === null ? d.background : QUERY.get("bg")),
     hud: hud,
     hudPos: str("hudpos", d.hud_position, ["bottom-left", "top-left", "top-right", "bottom-right"]),
-    scale: num("scale", d.scale, 0.5, 4),
-    trail: num("trail", d.trail_secs, 0.3, 12),
-    buffer: num("buffer", d.buffer_ms, 10, 200) / 1000,
+    scale: num("scale", d.scale, OBS_SCALE.min, OBS_SCALE.max),
+    trail: num("trail", d.trail_secs, TRAIL_SECS.min, TRAIL_SECS.max),
+    buffer: num("buffer", d.buffer_ms, BUFFER_MS.min, BUFFER_MS.max) / 1000,
     grid: bool("grid", d.grid),
     legend: bool("legend", d.legend),
     labels: bool("labels", d.labels),
@@ -263,7 +472,7 @@ const OBS = OBS_MODE ? (() => {
   };
 })() : null;
 
-const MAX_FPS = isFinite(fpsQ) && fpsQ > 0 ? clamp(fpsQ, 5, 400) : (OBS ? FPS_OBS_DEFAULT : FPS_DEFAULT);
+const MAX_FPS = Number.isFinite(fpsQ) && fpsQ > 0 ? clamp(fpsQ, 5, 400) : (OBS ? FPS_OBS_DEFAULT : FPS_DEFAULT);
 
 /* Stroke / marker size multiplier: 1 on the dashboard, `scale` in OBS mode. */
 const S = OBS ? OBS.scale : 1;
@@ -305,10 +514,8 @@ if (OBS) {
 
 /** "#rgb" | "#rrggbb" → "r,g,b", or null when it is not a hex colour. */
 function hexToRgb(hex) {
-  let h = String(hex || "").trim().replace(/^#/, "");
-  if (h.length === 3) h = h.replace(/./g, (c) => c + c);
-  if (!/^[0-9a-f]{6}$/i.test(h)) return null;
-  return parseInt(h.slice(0, 2), 16) + "," + parseInt(h.slice(2, 4), 16) + "," + parseInt(h.slice(4, 6), 16);
+  const c = hexChannels(hex, false);
+  return c === null ? null : c[0] + "," + c[1] + "," + c[2];
 }
 
 /** Overwrite PAL from a token lookup (`name` → value, "" when unset). A token
@@ -337,7 +544,7 @@ function paletteFromTokens(get) {
 
 
 function niceStep(raw) {
-  if (!(raw > 0) || !isFinite(raw)) return 1;
+  if (!(raw > 0) || !Number.isFinite(raw)) return 1;
   const exp = Math.floor(Math.log10(raw));
   const base = Math.pow(10, exp);
   const m = raw / base;
@@ -346,7 +553,7 @@ function niceStep(raw) {
 }
 
 function fmtTime(s) {
-  if (!isFinite(s) || s < 0) s = 0;
+  if (!Number.isFinite(s) || s < 0) s = 0;
   const m = Math.floor(s / 60);
   const rest = s - m * 60;
   return m + ":" + (rest < 10 ? "0" : "") + rest.toFixed(2);
@@ -409,6 +616,13 @@ class Rolling {
    and never spliced.
    ===================================================================== */
 
+/* The timeline's columns, by name and element type: time, the deltas, the
+   button/wheel words, and the index of the batch meta the event belongs to. */
+const EVENT_COLUMNS = [
+  ["t", Float64Array], ["dx", Int32Array], ["dy", Int32Array],
+  ["b", Int32Array], ["w", Int32Array], ["wh", Int32Array], ["mi", Int32Array],
+];
+
 /** Event timeline as parallel typed arrays, growable by doubling. */
 class EventColumns {
   constructor(cap) {
@@ -417,29 +631,18 @@ class EventColumns {
     this._alloc(this.cap);
   }
   _alloc(cap) {
-    this.t = new Float64Array(cap);
-    this.dx = new Int32Array(cap);
-    this.dy = new Int32Array(cap);
-    this.b = new Int32Array(cap);
-    this.w = new Int32Array(cap);
-    this.wh = new Int32Array(cap);
-    this.mi = new Int32Array(cap);
+    for (const [name, Type] of EVENT_COLUMNS) this[name] = new Type(cap);
     this.cap = cap;
   }
   _grow(need) {
     let cap = this.cap;
     while (cap < need) cap *= 2;
-    const old = { t: this.t, dx: this.dx, dy: this.dy, b: this.b, w: this.w, wh: this.wh, mi: this.mi };
+    const old = EVENT_COLUMNS.map(([name]) => this[name]);
     const n = this.n;
     this._alloc(cap);
-    this.t.set(old.t.subarray(0, n));
-    this.dx.set(old.dx.subarray(0, n));
-    this.dy.set(old.dy.subarray(0, n));
-    this.b.set(old.b.subarray(0, n));
-    this.w.set(old.w.subarray(0, n));
-    this.wh.set(old.wh.subarray(0, n));
-    this.mi.set(old.mi.subarray(0, n));
+    EVENT_COLUMNS.forEach(([name], k) => this[name].set(old[k].subarray(0, n)));
   }
+  /* The hot path stays spelled out: one store per column, no loop. */
   push(t, dx, dy, b, w, wh, mi) {
     if (this.n === this.cap) this._grow(this.cap + 1);
     const i = this.n++;
@@ -451,16 +654,29 @@ class EventColumns {
     if (k <= 0) return;
     if (k >= this.n) { this.n = 0; return; }
     const n = this.n;
-    this.t.copyWithin(0, k, n);
-    this.dx.copyWithin(0, k, n);
-    this.dy.copyWithin(0, k, n);
-    this.b.copyWithin(0, k, n);
-    this.w.copyWithin(0, k, n);
-    this.wh.copyWithin(0, k, n);
-    this.mi.copyWithin(0, k, n);
+    for (const [name] of EVENT_COLUMNS) this[name].copyWithin(0, k, n);
     this.n = n - k;
   }
   clear() { this.n = 0; }
+}
+
+/* Ring index arithmetic shared by Trail and EffectRing: both are
+   `{ cap, head, n }` with the oldest entry at `head`. */
+
+/** The slot the next push writes, evicting the oldest entry when full. */
+function ringClaim(r) {
+  if (r.n === r.cap) {
+    const i = r.head;
+    r.head = r.head + 1 === r.cap ? 0 : r.head + 1;
+    return i;
+  }
+  return (r.head + r.n++) % r.cap;
+}
+
+/** Forget the oldest entry. */
+function ringShift(r) {
+  r.head = r.head + 1 === r.cap ? 0 : r.head + 1;
+  r.n--;
 }
 
 /** Fixed-capacity ring of trail points. Oldest is evicted, never spliced. */
@@ -477,18 +693,11 @@ class Trail {
   }
   clear() { this.head = 0; this.n = 0; }
   push(x, y, t, v, brk) {
-    const cap = this.cap;
-    let i;
-    if (this.n === cap) { i = this.head; this.head = this.head + 1 === cap ? 0 : this.head + 1; }
-    else { i = (this.head + this.n) % cap; this.n++; }
+    const i = ringClaim(this);
     this.x[i] = x; this.y[i] = y; this.t[i] = t; this.v[i] = v; this.brk[i] = brk ? 1 : 0;
   }
   trim(cutoff) {
-    const cap = this.cap;
-    while (this.n > 0 && this.t[this.head] < cutoff) {
-      this.head = this.head + 1 === cap ? 0 : this.head + 1;
-      this.n--;
-    }
+    while (this.n > 0 && this.t[this.head] < cutoff) ringShift(this);
   }
 }
 
@@ -497,18 +706,12 @@ class EffectRing {
   constructor(cap) { this.cap = cap; this.buf = new Array(cap); this.head = 0; this.n = 0; }
   clear() { this.head = 0; this.n = 0; this.buf.fill(undefined); }
   push(o) {
-    const cap = this.cap;
-    let i;
-    if (this.n === cap) { i = this.head; this.head = this.head + 1 === cap ? 0 : this.head + 1; }
-    else { i = (this.head + this.n) % cap; this.n++; }
-    this.buf[i] = o;
+    this.buf[ringClaim(this)] = o;
   }
   trim(cutoff) {
-    const cap = this.cap;
     while (this.n > 0 && this.buf[this.head].t < cutoff) {
       this.buf[this.head] = undefined;
-      this.head = this.head + 1 === cap ? 0 : this.head + 1;
-      this.n--;
+      ringShift(this);
     }
   }
   at(k) { return this.buf[(this.head + k) % this.cap]; }
@@ -569,129 +772,136 @@ const ALEVELS = 7;
    Engine
    ===================================================================== */
 
+/** Everything a session accumulates, as it is before the first envelope.
+    Used once to build the engine and again by `reset()`, so a field added
+    here is reset by construction — the hand-kept list it replaces had
+    drifted (the CPI and the colour scale of the previous session survived a
+    restart). Options the user set (`decay`) and the UI wiring (`hooks`,
+    `panels`) are not session state and live on the engine itself. */
+function initialEngineState() {
+  return {
+    /* session context */
+    session: null,
+    sessionId: null,
+    cpi: DEFAULT_CPI,
+    qpcFreq: DEFAULT_QPC_FREQ,
+    anchorQpc: null,
+    anchorUtcUs: null,
+    anchorUncertaintyUs: null,
+    devices: [],
+    sensCache: new Map(),
+    game: null,
+    sens: FALLBACK_SENS,
+    pointerLocked: false,
+    cursorX: null, cursorY: null, screenW: 0, screenH: 0,
+    /* The session's `pointer` field as received (null when it had none), and
+       the Windows transfer function built from it — or from the defaults. */
+    pointerSettings: null,
+    pointer: new PointerModel(pointerSettingsFrom(null)),
+
+    /* timeline (shared by live and replay) */
+    ev: new EventColumns(),
+    metas: [],
+    metaBase: 0,
+    cursor: 0,
+    markers: [],
+    markerCursor: 0,
+    tStart: 0,
+    tEnd: 0,
+    /* Seconds of events one live batch covers; floors the live buffer. */
+    batchSpan: 0,
+    haveTimeline: false,
+    newestEventT: null,
+    arrivalLatencyMs: null,
+    latencyReceivedAt: null,
+
+    /* integrator checkpoints, built at load; empty in live mode */
+    checkpoints: [],
+    cpBuilt: 0,
+    _cpNextT: 0,
+
+    /* play head */
+    playT: 0,
+    clockStarted: false,
+    lastWall: 0,
+    /* True while a replay load is streaming in. The loader owns the
+       integrator state during that window (it is building checkpoints with
+       it), so the render loop must not also be consuming events. */
+    loading: false,
+
+    /* integrators */
+    deskX: 0, deskY: 0,
+    yawRaw: 0, pitch: 0,
+    /* Where Windows' cursor would be, in whole screen pixels from "recenter". */
+    ptrX: 0, ptrY: 0,
+    lastEventT: null,
+
+    /* visuals */
+    deskTrail: new Trail(TRAIL_CAP),
+    aimTrail: new Trail(TRAIL_CAP),
+    ptrTrail: new Trail(TRAIL_CAP),
+    rings: new EffectRing(EFFECT_CAP),
+    wheelTicks: new EffectRing(EFFECT_CAP),
+    dirty: true,
+
+    /* stats */
+    totalCm: 0,
+    totalDeg: 0,
+    totalPx: 0,
+    totalClicks: 0,
+    held: 0,            // *_DOWN bits of buttons currently pressed (steady ring at the head)
+    drops: 0,
+    lostBatches: 0,
+    absFrames: 0,
+    lastSeq: null,
+    dropMarks: [],
+    clickRate: new Rolling(60, 60),
+    eventRate: new Rolling(2, 20),
+    speedCm: 0,
+    speedDeg: 0,
+    speedPx: 0,
+    vrefDesk: 30,
+    vrefAim: 300,
+    /* px/s: a 25 cm/s hand at 800 cpi is ~8000 counts/s, more once the curve
+       bites, so the pointer ramp starts hotter than the desk one. */
+    vrefPtr: 6000,
+    _tickCm: 0,
+    _tickDeg: 0,
+    _tickPx: 0,
+    _quiet: false,
+  };
+}
+
+/** What the engine needs to know about the UI, as the UI last said it. The
+    frame loop passes one in; a direct call (a test, the devtools console)
+    gets `engine.hooks.ctx()`. */
+function defaultEngineCtx() {
+  return { mode: "live", liveBuffer: BUFFER_MS.dflt / 1000, replayPlaying: false, replaySpeed: 1 };
+}
+
+/** The engine's outbound events. No-ops until the UI installs its own. */
+function defaultEngineHooks() {
+  const none = () => {};
+  return {
+    ctx: defaultEngineCtx,
+    onVizStats: none, onHeartbeat: none, onBatch: none, onDataLoss: none,
+    onSessionRestart: none, onSessionChanged: none, onMarker: none, onReplayEnd: none,
+  };
+}
+
 const engine = {
-  /* session context */
-  session: null,
-  sessionId: null,
-  cpi: 800,
-  qpcFreq: 1e7,
-  anchorQpc: null,
-  anchorUtcUs: null,
-  anchorUncertaintyUs: null,
-  devices: [],
-  sensCache: new Map(),
-  game: null,
-  sens: FALLBACK_SENS,
-  pointerLocked: false,
-  cursorX: null, cursorY: null, screenW: 0, screenH: 0,
-
-  /* timeline (shared by live and replay) */
-  ev: new EventColumns(),
-  metas: [],
-  metaBase: 0,
-  cursor: 0,
-  markers: [],
-  markerCursor: 0,
-  tStart: 0,
-  tEnd: 0,
-  /* Seconds of events one live batch covers; floors the live buffer. */
-  batchSpan: 0,
-  haveTimeline: false,
-  newestEventT: null,
-  arrivalLatencyMs: null,
-  latencyReceivedAt: null,
-
-  /* integrator checkpoints, built at load; empty in live mode */
-  checkpoints: [],
-  cpBuilt: 0,
-  _cpNextT: 0,
-
-  /* play head */
-  playT: 0,
-  clockStarted: false,
-  lastWall: 0,
-  /* True while a replay load is streaming in. The loader owns the
-     integrator state during that window (it is building checkpoints with
-     it), so the render loop must not also be consuming events. */
-  loading: false,
-
-  /* integrators */
-  deskX: 0, deskY: 0,
-  yawRaw: 0, pitch: 0,
-  lastEventT: null,
-
-  /* visuals */
-  deskTrail: new Trail(TRAIL_CAP),
-  aimTrail: new Trail(TRAIL_CAP),
-  rings: new EffectRing(EFFECT_CAP),
-  wheelTicks: new EffectRing(EFFECT_CAP),
-  dirty: true,
-
-  /* stats */
-  totalCm: 0,
-  totalDeg: 0,
-  totalClicks: 0,
-  held: 0,            // *_DOWN bits of buttons currently pressed (steady ring at the head)
-  drops: 0,
-  lostBatches: 0,
-  absFrames: 0,
-  lastSeq: null,
-  dropMarks: [],
-  clickRate: new Rolling(60, 60),
-  eventRate: new Rolling(2, 20),
-  speedCm: 0,
-  speedDeg: 0,
-  vrefDesk: 30,
-  vrefAim: 300,
-  _tickCm: 0,
-  _tickDeg: 0,
-  _quiet: false,
-
   /* options */
-  decay: 3,
+  decay: TRAIL_SECS.dflt,
+  /* wiring, set once at start-up */
+  hooks: defaultEngineHooks(),
+  /* what draw() renders into; Panel instances, set once at start-up */
+  panels: [],
 
   /* ------------------------------------------------------------------ */
 
   /** Full teardown: nothing from a previous session survives. */
   reset() {
-    this.session = null;
-    this.sessionId = null;
-    this.anchorQpc = null;
-    this.anchorUtcUs = null;
-    this.anchorUncertaintyUs = null;
-    this.devices = [];
-    this.sensCache.clear();
-    this.game = null;
-    this.sens = FALLBACK_SENS;
-    this.pointerLocked = false;
-    this.cursorX = null; this.cursorY = null;
-    this.screenW = 0; this.screenH = 0;
-    this.ev.clear();
-    this.metas.length = 0;
-    this.metaBase = 0;
-    this.cursor = 0;
-    this.held = 0;
-    this.markers.length = 0;
-    this.markerCursor = 0;
-    this.tStart = 0; this.tEnd = 0;
-    this.batchSpan = 0;
-    this.haveTimeline = false;
-    this.newestEventT = null;
-    this.arrivalLatencyMs = null;
-    this.latencyReceivedAt = null;
-    this.checkpoints.length = 0;
-    this.cpBuilt = 0;
-    this._cpNextT = 0;
-    this.playT = 0;
-    this.clockStarted = false;
-    this.drops = 0;
-    this.lostBatches = 0;
-    this.absFrames = 0;
-    this.lastSeq = null;
-    this.dropMarks.length = 0;
-    this.resetTotals();
-    this.resetIntegrators();
-    this.dirty = true;
+    Object.assign(this, initialEngineState());
   },
 
   /** Session totals derived by integration. Cleared before any full
@@ -703,6 +913,7 @@ const engine = {
   resetTotals() {
     this.totalCm = 0;
     this.totalDeg = 0;
+    this.totalPx = 0;
     this.totalClicks = 0;
     this.clickRate.reset();
     this.eventRate.reset();
@@ -713,12 +924,17 @@ const engine = {
   resetIntegrators() {
     this.deskX = 0; this.deskY = 0;
     this.yawRaw = 0; this.pitch = 0;
+    this.ptrX = 0; this.ptrY = 0;
+    /* The sub-pixel remainder is position too: a recentred cursor starts
+       on a pixel. */
+    this.pointer.reset();
     this.lastEventT = null;
     this.deskTrail.clear();
     this.aimTrail.clear();
+    this.ptrTrail.clear();
     this.rings.clear();
     this.wheelTicks.clear();
-    this.speedCm = 0; this.speedDeg = 0;
+    this.speedCm = 0; this.speedDeg = 0; this.speedPx = 0;
     this.dirty = true;
   },
 
@@ -752,73 +968,110 @@ const engine = {
 
   metaAt(i) { return this.metas[this.ev.mi[i] - this.metaBase]; },
 
-  /** Feed one wire envelope. Identical path for WebSocket and JSONL. */
-  ingest(env, receivedUtcMs = null, receivedAt = nowSec()) {
+  /** Feed one wire envelope. Identical path for WebSocket and JSONL.
+      `receivedUtcMs` / `receivedAt` are the live arrival stamps (wall clock
+      and page clock); `ctx` is the UI state the batch path consults. */
+  ingest(env, receivedUtcMs = null, receivedAt = nowSec(), ctx = this.hooks.ctx()) {
     if (!env || typeof env !== "object") return;
-    const type = env.type;
-
-    if (type === "viz_stats") { ui.onVizStats(env); return; }
-
-    /* Liveness, not telemetry. The capture agent sends one a second while
-       nothing is moving, so "hand still" stops looking like "agent dead". It
-       must stay out of everything below: no timeline entry, no seq-gap
-       accounting, no latency sample, no drop marks — the page's numbers have
-       to describe the same stream whether or not the agent is new enough to
-       send these. */
-    if (type === "heartbeat") { ui.onHeartbeat(); return; }
-
-    if (type === "session") {
-      const id = env.session_id === undefined ? null : env.session_id;
-      /* A different session id on the same feed means the capture agent
-         restarted: new QPC anchor, new device table, new seq numbering.
-         Keeping any of the old state would silently mix two timelines —
-         the old events would sit at nonsense offsets against the new
-         anchor and the play head would chase a tEnd that no longer exists.
-         Tear everything down first, then adopt. */
-      if (this.sessionId !== null && id !== null && id !== this.sessionId) {
-        const from = this.sessionId;
-        this.reset();
-        ui.onSessionRestart(from, id);
-      }
-      this.session = env;
-      this.sessionId = id;
-      this.cpi = +env.mouse_cpi > 0 ? +env.mouse_cpi : 800;
-      const anchor = env.anchor || {};
-      this.qpcFreq = +(anchor.qpc_freq || env.qpc_freq) || 1e7;
-      this.anchorQpc = anchor.qpc !== undefined ? +anchor.qpc : null;
-      /* utc_us is what makes the timing tiles possible: it maps event
-         offsets back onto this browser's wall clock. */
-      this.anchorUtcUs = anchor.utc_us !== undefined ? +anchor.utc_us
-        : (env.started_utc_us !== undefined ? +env.started_utc_us : null);
-      this.anchorUncertaintyUs = env.anchor_uncertainty_us === undefined
-        ? null : +env.anchor_uncertainty_us;
-      this.devices = Array.isArray(env.devices) ? env.devices : [];
-      this.sensCache.clear();
-      this.sens = this.sensFor(this.game);
-      this.dirty = true;
-      ui.onSessionChanged();
-      return;
+    switch (env.type) {
+      case "viz_stats": this.hooks.onVizStats(env); return;
+      /* Liveness, not telemetry. The capture agent sends one a second while
+         nothing is moving, so "hand still" stops looking like "agent dead".
+         It must stay out of everything the batch path does: no timeline
+         entry, no seq-gap accounting, no latency sample, no drop marks — the
+         page's numbers have to describe the same stream whether or not the
+         agent is new enough to send these. */
+      case "heartbeat": this.hooks.onHeartbeat(); return;
+      case "session": this.ingestSession(env); return;
+      case "marker": this.ingestMarker(env); return;
+      case "batch": this.ingestBatch(env, receivedUtcMs, receivedAt, ctx); return;
+      default: return;
     }
+  },
 
-    if (type === "marker") {
-      const t = this.qpcToT(env.ts_qpc);
-      this.markers.push({ t: t, label: env.label || "marker" });
-      this.noteTime(t);
-      return;
+  ingestSession(env) {
+    const id = env.session_id === undefined ? null : env.session_id;
+    /* A different session id on the same feed means the capture agent
+       restarted: new QPC anchor, new device table, new seq numbering.
+       Keeping any of the old state would silently mix two timelines — the
+       old events would sit at nonsense offsets against the new anchor and the
+       play head would chase a tEnd that no longer exists. Tear everything
+       down first, then adopt. */
+    if (this.sessionId !== null && id !== null && id !== this.sessionId) {
+      const from = this.sessionId;
+      this.reset();
+      this.hooks.onSessionRestart(from, id);
     }
+    this.session = env;
+    this.sessionId = id;
+    this.cpi = +env.mouse_cpi > 0 ? +env.mouse_cpi : DEFAULT_CPI;
+    const anchor = env.anchor || {};
+    this.qpcFreq = +(anchor.qpc_freq || env.qpc_freq) || DEFAULT_QPC_FREQ;
+    this.anchorQpc = anchor.qpc !== undefined ? +anchor.qpc : null;
+    /* utc_us is what makes the timing tiles possible: it maps event offsets
+       back onto this browser's wall clock. */
+    this.anchorUtcUs = anchor.utc_us !== undefined ? +anchor.utc_us
+      : (env.started_utc_us !== undefined ? +env.started_utc_us : null);
+    this.anchorUncertaintyUs = env.anchor_uncertainty_us === undefined
+      ? null : +env.anchor_uncertainty_us;
+    this.devices = Array.isArray(env.devices) ? env.devices : [];
+    this.sensCache.clear();
+    this.sens = this.sensFor(this.game);
+    /* What the desktop did with the counts. A session from a capture agent
+       that did not record it (or not on Windows) gets a fresh install's
+       settings, and the pointer panel says so. */
+    this.pointerSettings = env.pointer && typeof env.pointer === "object" ? env.pointer : null;
+    this.pointer = new PointerModel(pointerSettingsFrom(this.pointerSettings));
+    this.dirty = true;
+    this.hooks.onSessionChanged();
+  },
 
-    if (type !== "batch") return;
+  ingestMarker(env) {
+    const t = this.qpcToT(env.ts_qpc);
+    this.markers.push({ t: t, label: env.label || "marker" });
+    this.noteTime(t);
+  },
 
+  ingestBatch(env, receivedUtcMs, receivedAt, ctx) {
     /* A batch — of any size, including empty — is the feed being alive.
        Everything that says "waiting for capture" or "no feed" hangs off this
        one timestamp. */
-    ui.onBatch();
+    this.hooks.onBatch();
 
     /* Data-quality accounting happens even for an empty batch. */
+    const loss = this.accountLoss(env);
+    const evs = env.events;
+    const have = Array.isArray(evs) && evs.length > 0;
+    if (have) {
+      const tSum = this.appendEvents(env, evs);
+      /* Replay has no arrival timestamp and must never produce a sample. */
+      if (ctx.mode === "live" && receivedUtcMs !== null) {
+        this.sampleLatency(receivedUtcMs, tSum / evs.length * 1000, receivedAt);
+      }
+    }
+
+    if (loss.drops > 0 || loss.lost > 0) {
+      const t = have ? this.qpcToT(evs[0].ts_qpc) : this.tEnd;
+      this.dropMarks.push({ t: t, drops: loss.drops, lost: loss.lost });
+      if (this.dropMarks.length > MAX_DROP_MARKS) this.dropMarks.shift();
+      this.hooks.onDataLoss(loss.drops, loss.lost);
+    }
+
+    /* Hard cap, applied at ingest rather than at consume: a backgrounded tab
+       stops running rAF but keeps receiving ~1000 events/s, and a trim that
+       only the render loop can reach is a trim that never runs. */
+    if (ctx.mode === "live" && this.ev.n > HARD_EVENT_CAP) {
+      this.dropFront(this.ev.n - MAX_LIVE_EVENTS);
+    }
+  },
+
+  /** Ring drops the agent reported, batches missing from the `seq_no`
+      sequence (a number that goes backwards is a late arrival, not a gap),
+      and discarded absolute frames: counted, and returned for the marks. */
+  accountLoss(env) {
     const drops = env.drops_since_last | 0;
     this.drops += drops;
     this.absFrames += (env.abs_frames_since_last | 0);
-
     let lost = 0;
     const seq = typeof env.seq_no === "number" ? env.seq_no : null;
     if (seq !== null) {
@@ -826,72 +1079,61 @@ const engine = {
       if (this.lastSeq === null || seq > this.lastSeq) this.lastSeq = seq;
     }
     this.lostBatches += lost;
+    return { drops: drops, lost: lost };
+  },
 
-    const evs = env.events;
-    const have = Array.isArray(evs) && evs.length > 0;
+  /** Put a batch's events on the timeline. Returns the sum of their times
+      (seconds), which the latency sample averages. */
+  appendEvents(env, evs) {
+    /* One shared meta object per batch keeps per-event memory to seven
+       typed-array slots while still letting a seek replay the batch context
+       exactly. */
+    const meta = {
+      game: isNil(env.game) ? null : env.game,
+      locked: !!env.pointer_locked,
+      sens: null,
+      cx: isNil(env.cursor_x) ? null : +env.cursor_x,
+      cy: isNil(env.cursor_y) ? null : +env.cursor_y,
+      sw: env.screen_w | 0,
+      sh: env.screen_h | 0,
+    };
+    const mi = this.metaBase + this.metas.length;
+    this.metas.push(meta);
 
-    if (have) {
-      /* One shared meta object per batch keeps per-event memory to seven
-         typed-array slots while still letting a seek replay the batch
-         context exactly. */
-      const meta = {
-        game: env.game === undefined || env.game === null ? null : env.game,
-        locked: !!env.pointer_locked,
-        sens: null,
-        cx: env.cursor_x === undefined || env.cursor_x === null ? null : +env.cursor_x,
-        cy: env.cursor_y === undefined || env.cursor_y === null ? null : +env.cursor_y,
-        sw: env.screen_w | 0,
-        sh: env.screen_h | 0,
-      };
-      const mi = this.metaBase + this.metas.length;
-      this.metas.push(meta);
-
-      const cols = this.ev;
-      let tFirst = 0, tLast = 0, tSum = 0;
-      for (let i = 0; i < evs.length; i++) {
-        const e = evs[i];
-        const t = this.qpcToT(e.ts_qpc);
-        if (i === 0) tFirst = t;
-        tLast = t;
-        tSum += t;
-        this.newestEventT = this.newestEventT === null ? t : Math.max(this.newestEventT, t);
-        /* `| 0` is doing real work here: buttons/wheel/wheel_h are omitted
-           from the JSON when zero, so these are routinely undefined. */
-        cols.push(t, e.dx | 0, e.dy | 0, e.buttons | 0, e.wheel | 0, e.wheel_h | 0, mi);
-        this.noteTime(t);
-      }
-      /* How much time one batch covers (≈ the agent's batch window while the
-         mouse is moving). The live buffer is floored at this so a longer
-         window on the agent can never turn into a stutter here; it decays
-         so a quiet feed does not pin the floor at a stale value. */
-      const span = Math.max(0, tLast - tFirst);
-      this.batchSpan = Math.max(span, this.batchSpan * 0.9);
-      /* Sample once at delivery, before playback or paint. Averaging the
-         event capture times includes the wait inside the capture batch.
-         Replay has no arrival timestamp and must never produce a sample. */
-      if (ui.mode === "live" && receivedUtcMs !== null && this.anchorUtcUs !== null) {
-        const ms = receivedUtcMs - (this.anchorUtcUs / 1000 + tSum / evs.length * 1000);
-        if (Number.isFinite(ms)) {
-          const idle = this.latencyReceivedAt === null || receivedAt - this.latencyReceivedAt >= NO_DATA_SECS;
-          this.arrivalLatencyMs = idle ? ms : this.arrivalLatencyMs + (ms - this.arrivalLatencyMs) * 0.25;
-          this.latencyReceivedAt = receivedAt;
-        }
-      }
+    const cols = this.ev;
+    let tFirst = 0, tLast = 0, tSum = 0;
+    for (let i = 0; i < evs.length; i++) {
+      const e = evs[i];
+      const t = this.qpcToT(e.ts_qpc);
+      if (i === 0) tFirst = t;
+      tLast = t;
+      tSum += t;
+      this.newestEventT = this.newestEventT === null ? t : Math.max(this.newestEventT, t);
+      /* `| 0` is doing real work here: buttons/wheel/wheel_h are omitted
+         from the JSON when zero, so these are routinely undefined. */
+      cols.push(t, e.dx | 0, e.dy | 0, e.buttons | 0, e.wheel | 0, e.wheel_h | 0, mi);
+      this.noteTime(t);
     }
+    /* How much time one batch covers (≈ the agent's batch window while the
+       mouse is moving). The live buffer is floored at this so a longer window
+       on the agent can never turn into a stutter here; it decays so a quiet
+       feed does not pin the floor at a stale value. */
+    this.batchSpan = Math.max(Math.max(0, tLast - tFirst), this.batchSpan * 0.9);
+    return tSum;
+  },
 
-    if (drops > 0 || lost > 0) {
-      const t = have ? this.qpcToT(evs[0].ts_qpc) : this.tEnd;
-      this.dropMarks.push({ t: t, drops: drops, lost: lost });
-      if (this.dropMarks.length > MAX_DROP_MARKS) this.dropMarks.shift();
-      ui.onDataLoss(drops, lost);
-    }
-
-    /* Hard cap, applied at ingest rather than at consume: a backgrounded tab
-       stops running rAF but keeps receiving ~1000 events/s, and a trim that
-       only the render loop can reach is a trim that never runs. */
-    if (ui.mode === "live" && this.ev.n > HARD_EVENT_CAP) {
-      this.dropFront(this.ev.n - MAX_LIVE_EVENTS);
-    }
+  /** One delivery-latency sample: arrival wall clock minus the batch's mean
+      capture time (`meanOffsetMs` after the session anchor). Sampled once at
+      delivery, before playback or paint; averaging the capture times
+      includes the wait inside the capture batch. Smoothed, except after an
+      idle gap, where the first sample starts fresh. */
+  sampleLatency(receivedUtcMs, meanOffsetMs, receivedAt) {
+    if (this.anchorUtcUs === null) return;
+    const ms = receivedUtcMs - (this.anchorUtcUs / 1000 + meanOffsetMs);
+    if (!Number.isFinite(ms)) return;
+    const idle = this.latencyReceivedAt === null || receivedAt - this.latencyReceivedAt >= NO_DATA_SECS;
+    this.arrivalLatencyMs = idle ? ms : this.arrivalLatencyMs + (ms - this.arrivalLatencyMs) * 0.25;
+    this.latencyReceivedAt = receivedAt;
   },
 
   /** Discard the oldest `k` events and everything indexed by them. */
@@ -934,8 +1176,8 @@ const engine = {
   /** The live buffer actually applied: the user's/OBS setting, but never
       less than one batch span plus a frame of slack — the play head must
       not reach the end of a batch before the next one can have arrived. */
-  effectiveLiveBuffer() {
-    return Math.max(ui.liveBuffer, Math.min(0.2, this.batchSpan + 0.01));
+  effectiveLiveBuffer(ctx = this.hooks.ctx()) {
+    return Math.max(ctx.liveBuffer, Math.min(BUFFER_MS.max / 1000, this.batchSpan + 0.01));
   },
 
   /** UTC µs the newest received event was captured at, or null if the
@@ -978,10 +1220,15 @@ const engine = {
       i: i, t: this.ev.t[i],
       deskX: this.deskX, deskY: this.deskY,
       yawRaw: this.yawRaw, pitch: this.pitch,
+      /* The pixel position and the model's carried remainder: without the
+         remainder a seek would land the cursor a pixel off from a
+         straight play-through. */
+      ptrX: this.ptrX, ptrY: this.ptrY, ptrRx: this.pointer.rx, ptrRy: this.pointer.ry,
       lastEventT: this.lastEventT,
-      totalCm: this.totalCm, totalDeg: this.totalDeg, totalClicks: this.totalClicks,
+      totalCm: this.totalCm, totalDeg: this.totalDeg, totalPx: this.totalPx,
+      totalClicks: this.totalClicks,
       held: this.held,
-      vrefDesk: this.vrefDesk, vrefAim: this.vrefAim,
+      vrefDesk: this.vrefDesk, vrefAim: this.vrefAim, vrefPtr: this.vrefPtr,
       clickRate: this.clickRate.save(), eventRate: this.eventRate.save(),
     };
   },
@@ -990,16 +1237,18 @@ const engine = {
     this.cursor = cp.i;
     this.deskX = cp.deskX; this.deskY = cp.deskY;
     this.yawRaw = cp.yawRaw; this.pitch = cp.pitch;
+    this.ptrX = cp.ptrX; this.ptrY = cp.ptrY;
+    this.pointer.rx = cp.ptrRx; this.pointer.ry = cp.ptrRy;
     this.lastEventT = cp.lastEventT;
-    this.totalCm = cp.totalCm; this.totalDeg = cp.totalDeg;
+    this.totalCm = cp.totalCm; this.totalDeg = cp.totalDeg; this.totalPx = cp.totalPx;
     this.totalClicks = cp.totalClicks;
     this.held = cp.held | 0;
-    this.vrefDesk = cp.vrefDesk; this.vrefAim = cp.vrefAim;
+    this.vrefDesk = cp.vrefDesk; this.vrefAim = cp.vrefAim; this.vrefPtr = cp.vrefPtr;
     this.clickRate.load(cp.clickRate);
     this.eventRate.load(cp.eventRate);
-    this.deskTrail.clear(); this.aimTrail.clear();
+    this.deskTrail.clear(); this.aimTrail.clear(); this.ptrTrail.clear();
     this.rings.clear(); this.wheelTicks.clear();
-    this.speedCm = 0; this.speedDeg = 0;
+    this.speedCm = 0; this.speedDeg = 0; this.speedPx = 0;
     this.markerCursor = 0;
     while (this.markerCursor < this.markers.length &&
            this.markers[this.markerCursor].t <= cp.t) this.markerCursor++;
@@ -1026,14 +1275,14 @@ const engine = {
   /** Live: track the newest event with a small buffer so batches (25–50ms
       of events each) are spread smoothly across frames instead of landing
       as one jump. */
-  advanceLive(wallSec, dt) {
+  advanceLive(dt, ctx) {
     if (!this.haveTimeline) return;
     if (!this.clockStarted) {
       this.playT = this.tStart;
       this.clockStarted = true;
       return;
     }
-    const target = this.tEnd - this.effectiveLiveBuffer();
+    const target = this.tEnd - this.effectiveLiveBuffer(ctx);
     const err = target - this.playT;
     if (err > 0.75) {
       /* Way behind — a stall just ended, the tab was hidden, or the stream
@@ -1080,20 +1329,21 @@ const engine = {
   },
 
   /** Advance the play head to `nowSeconds` and apply every event it passed. */
-  tick(nowSec) {
+  tick(nowSec, ctx = this.hooks.ctx()) {
     const dt = this.lastWall ? clamp(nowSec - this.lastWall, 0, 0.25) : 0;
     this.lastWall = nowSec;
     if (this.loading) return this;
 
-    if (ui.mode === "live") {
-      this.advanceLive(nowSec, dt);
-    } else if (ui.replayPlaying) {
-      this.playT = Math.min(this.tEnd, this.playT + dt * ui.replaySpeed);
-      if (this.playT >= this.tEnd) ui.setReplayPlaying(false);
+    if (ctx.mode === "live") {
+      this.advanceLive(dt, ctx);
+    } else if (ctx.replayPlaying) {
+      this.playT = Math.min(this.tEnd, this.playT + dt * ctx.replaySpeed);
+      if (this.playT >= this.tEnd) this.hooks.onReplayEnd();
     }
 
     this._tickCm = 0;
     this._tickDeg = 0;
+    this._tickPx = 0;
     this.consume(MAX_CONSUME_PER_TICK);
 
     /* ~100ms smoothing on the readouts. */
@@ -1101,14 +1351,16 @@ const engine = {
       const a = 1 - Math.exp(-dt / 0.1);
       this.speedCm += (this._tickCm / dt - this.speedCm) * a;
       this.speedDeg += (this._tickDeg / dt - this.speedDeg) * a;
+      this.speedPx += (this._tickPx / dt - this.speedPx) * a;
       /* Colour reference decays slowly so a single flick does not wash the
          palette out for the rest of the session. */
       const k = Math.pow(0.5, dt / 8);
       this.vrefDesk = Math.max(25, this.vrefDesk * k);
       this.vrefAim = Math.max(250, this.vrefAim * k);
+      this.vrefPtr = Math.max(5000, this.vrefPtr * k);
     }
 
-    this.trim();
+    this.trim(ctx);
     return this;
   },
 
@@ -1126,24 +1378,16 @@ const engine = {
     while (this.markerCursor < this.markers.length &&
            this.markers[this.markerCursor].t <= this.playT) {
       const m = this.markers[this.markerCursor++];
-      if (!this._quiet && m.t >= this.playT - 1.0) ui.onMarker(m);
+      if (!this._quiet && m.t >= this.playT - 1.0) this.hooks.onMarker(m);
     }
     return applied;
   },
 
+  /** Integrate event `i`: its batch context, then motion, then buttons and
+      wheel. */
   applyIdx(i) {
     const ev = this.ev;
-    const meta = this.metaAt(i);
-    if (meta) {
-      if (meta.sens === null) meta.sens = this.sensFor(meta.game);
-      this.sens = meta.sens;
-      this.game = meta.game;
-      this.pointerLocked = meta.locked;
-      this.cursorX = meta.cx;
-      this.cursorY = meta.cy;
-      this.screenW = meta.sw;
-      this.screenH = meta.sh;
-    }
+    this.applyMeta(this.metaAt(i));
     const et = ev.t[i];
     const dt = this.lastEventT === null ? 0 : et - this.lastEventT;
     this.lastEventT = et;
@@ -1158,69 +1402,108 @@ const engine = {
 
     const edx = ev.dx[i], edy = ev.dy[i];
     if (edx !== 0 || edy !== 0) {
-      const s = this.sens;
-      const dxcm = edx / this.cpi * CM_PER_INCH;
-      const dycm = edy / this.cpi * CM_PER_INCH;
-      const dcm = Math.hypot(dxcm, dycm);
-      this.deskX += dxcm;
-      this.deskY += dycm;
-      this.totalCm += dcm;
-      this._tickCm += dcm;
-
-      const dyaw = edx * s.sens * s.yaw_coeff;
-      const dpitch = edy * s.sens * s.pitch_coeff;
-      const ddeg = Math.hypot(dyaw, dpitch);
-      this.yawRaw += dyaw;
-      this.pitch = clamp(this.pitch + dpitch, -PITCH_LIMIT, PITCH_LIMIT);
-      this.totalDeg += ddeg;
-      this._tickDeg += ddeg;
-
-      const vCm = dt > 0 ? dcm / dt : 0;
-      const vDeg = dt > 0 ? ddeg / dt : 0;
-      if (vCm > this.vrefDesk) this.vrefDesk = vCm;
-      if (vDeg > this.vrefAim) this.vrefAim = vDeg;
-
-      /* Yaw is kept unwrapped in panel space: the head glides across the
-         ±180° seam (drawn as a dashed line) instead of teleporting to the
-         far edge, and the camera follows it continuously. */
-      if (visible) {
-        this.deskTrail.push(this.deskX, this.deskY, et, vCm, false);
-        this.aimTrail.push(this.yawRaw, this.pitch, et, vDeg, false);
-      }
+      this.applyMotion(edx, edy, et, dt, visible);
+      this.applyPointer(edx, edy, et, dt, visible);
     }
+    this.applyButtons(ev.b[i], et, fresh);
+    if (fresh) this.applyWheel(ev.w[i], ev.wh[i], et);
+  },
 
-    const b = ev.b[i];
-    if (b & (BTN.ANY_DOWN | BTN.ANY_UP)) {
-      /* Press: one expanding ring (the click flash) plus the button joins
-         `held`, which draws a steady ring at the head until its release. */
-      this.held = (this.held | (b & BTN.ANY_DOWN)) & ~((b & BTN.ANY_UP) >> 1);
-      this.dirty = true;
-      if (b & BTN.ANY_DOWN) {
-        this.totalClicks++;
-        this.clickRate.add(et, 1);
-        if (fresh) {
-          const kind = (b & BTN.LEFT_DOWN) ? 0 : (b & BTN.RIGHT_DOWN) ? 1 : 2;
-          this.rings.push({
-            t: et, kind: kind,
-            dx: this.deskX, dy: this.deskY,
-            ax: this.yawRaw, ay: this.pitch,
-          });
-        }
-      }
+  /** The batch context an event was captured in: game, sens, cursor. */
+  applyMeta(meta) {
+    if (!meta) return;
+    if (meta.sens === null) meta.sens = this.sensFor(meta.game);
+    this.sens = meta.sens;
+    this.game = meta.game;
+    this.pointerLocked = meta.locked;
+    this.cursorX = meta.cx;
+    this.cursorY = meta.cy;
+    this.screenW = meta.sw;
+    this.screenH = meta.sh;
+  },
+
+  /** One report into the hand (cm) and the crosshair (degrees). */
+  applyMotion(edx, edy, et, dt, visible) {
+    const s = this.sens;
+    const dxcm = edx / this.cpi * CM_PER_INCH;
+    const dycm = edy / this.cpi * CM_PER_INCH;
+    const dcm = Math.hypot(dxcm, dycm);
+    this.deskX += dxcm;
+    this.deskY += dycm;
+    this.totalCm += dcm;
+    this._tickCm += dcm;
+
+    const dyaw = edx * s.sens * s.yaw_coeff;
+    const dpitch = edy * s.sens * s.pitch_coeff;
+    const ddeg = Math.hypot(dyaw, dpitch);
+    this.yawRaw += dyaw;
+    this.pitch = clamp(this.pitch + dpitch, -PITCH_LIMIT, PITCH_LIMIT);
+    this.totalDeg += ddeg;
+    this._tickDeg += ddeg;
+
+    const vCm = dt > 0 ? dcm / dt : 0;
+    const vDeg = dt > 0 ? ddeg / dt : 0;
+    if (vCm > this.vrefDesk) this.vrefDesk = vCm;
+    if (vDeg > this.vrefAim) this.vrefAim = vDeg;
+
+    /* Yaw is kept unwrapped in panel space: the head glides across the ±180°
+       seam (drawn as a dashed line) instead of teleporting to the far edge,
+       and the camera follows it continuously. */
+    if (visible) {
+      this.deskTrail.push(this.deskX, this.deskY, et, vCm, false);
+      this.aimTrail.push(this.yawRaw, this.pitch, et, vDeg, false);
     }
+  },
 
+  /** The same report through Windows' pointer ballistics. The position moves
+      by whole pixels, as the cursor does; the speed readout and the trail
+      colour use the movement before truncation, or a crawl would read as a
+      burst of 1000 px/s steps. */
+  applyPointer(edx, edy, et, dt, visible) {
+    const pm = this.pointer;
+    pm.apply(edx, edy);
+    const dpx = Math.hypot(pm.moveX, pm.moveY);
+    this.totalPx += dpx;
+    this._tickPx += dpx;
+    const vPx = dt > 0 ? dpx / dt : 0;
+    if (vPx > this.vrefPtr) this.vrefPtr = vPx;
+    if (pm.outX !== 0 || pm.outY !== 0) {
+      this.ptrX += pm.outX;
+      this.ptrY += pm.outY;
+      if (visible) this.ptrTrail.push(this.ptrX, this.ptrY, et, vPx, false);
+    }
+  },
+
+  /** Press: one expanding ring (the click flash) plus the button joins
+      `held`, which draws a steady ring at the head until its release. */
+  applyButtons(b, et, fresh) {
+    if (!(b & (BTN.ANY_DOWN | BTN.ANY_UP))) return;
+    this.held = (this.held | (b & BTN.ANY_DOWN)) & ~((b & BTN.ANY_UP) >> 1);
+    this.dirty = true;
+    if (!(b & BTN.ANY_DOWN)) return;
+    this.totalClicks++;
+    this.clickRate.add(et, 1);
     if (fresh) {
-      const w = ev.w[i], wh = ev.wh[i];
-      if (w !== 0) this.wheelTicks.push({ t: et, dir: w > 0 ? 1 : -1, axis: 0 });
-      if (wh !== 0) this.wheelTicks.push({ t: et, dir: wh > 0 ? 1 : -1, axis: 1 });
+      const kind = (b & BTN.LEFT_DOWN) ? 0 : (b & BTN.RIGHT_DOWN) ? 1 : 2;
+      this.rings.push({
+        t: et, kind: kind,
+        dx: this.deskX, dy: this.deskY,
+        ax: this.yawRaw, ay: this.pitch,
+        px: this.ptrX, py: this.ptrY,
+      });
     }
+  },
+
+  applyWheel(w, wh, et) {
+    if (w !== 0) this.wheelTicks.push({ t: et, dir: w > 0 ? 1 : -1, axis: 0 });
+    if (wh !== 0) this.wheelTicks.push({ t: et, dir: wh > 0 ? 1 : -1, axis: 1 });
   },
 
   /** Bound memory: drop consumed events in live mode and expire visuals.
       Reachable from the render loop *and* from a timer, so a hidden tab
       still reclaims. */
-  trim() {
-    if (ui.mode === "live") {
+  trim(ctx = this.hooks.ctx()) {
+    if (ctx.mode === "live") {
       if (this.cursor >= LIVE_TRIM_TRIGGER) {
         this.dropFront(this.cursor - MAX_LIVE_EVENTS);
       }
@@ -1236,25 +1519,44 @@ const engine = {
     const cutoff = this.playT - this.decay;
     this.deskTrail.trim(cutoff);
     this.aimTrail.trim(cutoff);
+    this.ptrTrail.trim(cutoff);
     this.rings.trim(this.playT - RING_LIFE);
     this.wheelTicks.trim(this.playT - WHEEL_LIFE);
   },
 
   /** True while anything on screen is still animating. */
   visualsAlive() {
-    return this.deskTrail.n > 0 || this.aimTrail.n > 0 ||
+    return this.deskTrail.n > 0 || this.aimTrail.n > 0 || this.ptrTrail.n > 0 ||
            this.rings.n > 0 || this.wheelTicks.n > 0;
   },
 
   draw() {
-    deskPanel.render(this);
-    aimPanel.render(this);
+    for (const p of this.panels) p.render(this);
   },
 };
+Object.assign(engine, initialEngineState());
 
 /* =====================================================================
    Panel rendering
    ===================================================================== */
+
+/* What each panel reads off the engine, chosen once per panel instead of a
+   string compare per frame: the trail, the head position, the colour scale,
+   and where a click ring sits in this space. */
+const PANEL_SPACES = {
+  desk: {
+    trail: (e) => e.deskTrail, x: (e) => e.deskX, y: (e) => e.deskY, vref: (e) => e.vrefDesk,
+    ringX: (r) => r.dx, ringY: (r) => r.dy,
+  },
+  aim: {
+    trail: (e) => e.aimTrail, x: (e) => e.yawRaw, y: (e) => e.pitch, vref: (e) => e.vrefAim,
+    ringX: (r) => r.ax, ringY: (r) => r.ay,
+  },
+  ptr: {
+    trail: (e) => e.ptrTrail, x: (e) => e.ptrX, y: (e) => e.ptrY, vref: (e) => e.vrefPtr,
+    ringX: (r) => r.px, ringY: (r) => r.py,
+  },
+};
 
 class Panel {
   constructor(canvasId, opts) {
@@ -1270,7 +1572,17 @@ class Panel {
     this.bg = OBS ? OBS.bg : null;
     this.hidden = false;
     this.ctx = this.canvas.getContext("2d", { alpha: !this.opaque, desynchronized: true });
-    this.unit = opts.unit;             // "cm" | "deg"
+    /* Which of the engine's three integrations this panel draws: the hand
+       in cm, the crosshair in degrees, or Windows' cursor in pixels. */
+    this.space = opts.space;           // "desk" | "aim" | "ptr"
+    this.of = PANEL_SPACES[opts.space];
+    this.isDesk = opts.space === "desk";
+    this.isAim = opts.space === "aim";
+    this._head = { x: 0, y: 0 };
+    /* A resized canvas is a blank canvas: whoever owns the frame loop is told
+       so it repaints even when nothing else changed. */
+    this.onResize = opts.onResize || (() => {});
+    this.unit = opts.unit;             // "cm" | "deg" | "px"
     this.minHalf = opts.minHalf;       // smallest half-extent, in data units
     this.subEl = document.getElementById(opts.subId);
     this.hintEl = document.getElementById(opts.hintId);
@@ -1294,9 +1606,7 @@ class Panel {
     this.h = Math.max(1, Math.round(r.height));
     this.canvas.width = Math.round(this.w * this.dpr);
     this.canvas.height = Math.round(this.h * this.dpr);
-    /* A resized canvas is a blank canvas: force a repaint even if the
-       engine is idle. */
-    engine.dirty = true;
+    this.onResize();
   }
 
   toX(x) { return this.w / 2 + (x - this.cx) * this.scale; }
@@ -1324,22 +1634,20 @@ class Panel {
       (this.w * 0.44) / hx,
       (this.h * 0.44) / hy
     );
-    if (!isFinite(target) || target <= 0) return;
+    if (!Number.isFinite(target) || target <= 0) return;
     const ratio = target / this.scale;
     if (ratio > 4 || ratio < 0.25) this.scale = target;
     else this.scale += (target - this.scale) * 0.07;
   }
 
   render(eng) {
-    const ctx = this.ctx;
-    const isDesk = this.unit === "cm";
-    const trail = isDesk ? eng.deskTrail : eng.aimTrail;
-    const head = isDesk
-      ? { x: eng.deskX, y: eng.deskY }
-      : { x: eng.yawRaw, y: eng.pitch };
-    const vref = isDesk ? eng.vrefDesk : eng.vrefAim;
-
     if (this.hidden) return;
+    const ctx = this.ctx;
+    const of = this.of;
+    const trail = of.trail(eng);
+    const head = this._head;
+    head.x = of.x(eng); head.y = of.y(eng);
+    const vref = of.vref(eng);
     this.autoScale(head, trail);
 
     ctx.save();
@@ -1355,27 +1663,35 @@ class Panel {
       }
     }
 
-    if (!OBS || OBS.grid) this.drawGrid(ctx, isDesk);
+    if (!OBS || OBS.grid) this.drawGrid(ctx, eng, this.isAim);
     this.drawTrail(ctx, trail, eng, vref);
-    this.drawRings(ctx, eng, isDesk);
+    this.drawRings(ctx, eng);
     if (eng.held) this.drawHeld(ctx, eng, head);
     this.drawHead(ctx, head);
-    if (isDesk) {
+    if (this.isDesk) {
       this.drawWheel(ctx, eng);
       /* The desktop-cursor miniature is a debugging aid, not stream content. */
       if (!OBS) this.drawCursorGhost(ctx, eng);
     }
-    if (!OBS || OBS.legend) this.drawLegend(ctx, vref, isDesk);
+    if (!OBS || OBS.legend) this.drawLegend(ctx, vref);
 
     ctx.restore();
   }
 
-  drawGrid(ctx, isDesk) {
+  /** The unit as the labels print it, after a number. */
+  unitLabel() {
+    return this.unit === "cm" ? " cm" : this.unit === "deg" ? "°" : " px";
+  }
+
+  drawGrid(ctx, eng, isAim) {
     const halfX = this.w / 2 / this.scale;
     const halfY = this.h / 2 / this.scale;
     const step = niceStep(halfX * 2 / 7);
     const stepText = step >= 1 ? step.toFixed(0) : step.toFixed(2);
-    const label = "grid " + stepText + (isDesk ? " cm" : "°");
+    /* The pointer panel's subtitle also says which Windows it is showing:
+       the same recording reads differently with precision off. */
+    const label = "grid " + stepText + this.unitLabel() +
+      (this.space === "ptr" ? " · " + eng.pointer.describe() : "");
     if (this.subEl && this.subEl.textContent !== label) this.subEl.textContent = label;
 
     ctx.lineWidth = 1;
@@ -1405,7 +1721,7 @@ class Panel {
     ctx.strokeStyle = PAL.gridAxis;
     const oy = Math.round(this.toY(0)) + 0.5;
     ctx.moveTo(0, oy); ctx.lineTo(this.w, oy);
-    if (isDesk) {
+    if (!isAim) {
       const ox = Math.round(this.toX(0)) + 0.5;
       ctx.moveTo(ox, 0); ctx.lineTo(ox, this.h);
     } else {
@@ -1416,7 +1732,7 @@ class Panel {
     }
     ctx.stroke();
 
-    if (!isDesk) {
+    if (isAim) {
       /* Yaw seams: the ±180° boundary of each turn, i.e. every odd multiple
          of 180°. Crossing one means you are now facing directly behind
          where "recenter" left you. */
@@ -1502,16 +1818,17 @@ class Panel {
     }
   }
 
-  drawRings(ctx, eng, isDesk) {
+  drawRings(ctx, eng) {
     const colors = PAL.ring;
     const now = eng.playT;
+    const of = this.of;
     for (let k = 0; k < eng.rings.n; k++) {
       const r = eng.rings.at(k);
       const age = now - r.t;
       if (age < 0 || age > RING_LIFE) continue;
       const f = age / RING_LIFE;
-      const x = this.toX(isDesk ? r.dx : r.ax);
-      const y = this.toY(isDesk ? r.dy : r.ay);
+      const x = this.toX(of.ringX(r));
+      const y = this.toY(of.ringY(r));
       const rad = (4 + 34 * (1 - Math.pow(1 - f, 2.2))) * S;
       const col = colors[r.kind];
       ctx.strokeStyle = "rgba(" + col + "," + (0.9 * (1 - f)).toFixed(3) + ")";
@@ -1646,7 +1963,7 @@ class Panel {
     ctx.restore();
   }
 
-  drawLegend(ctx, vref, isDesk) {
+  drawLegend(ctx, vref) {
     const x = 12, y = this.h - 22 * S, w = 108 * S, h = 6 * S;
     for (let i = 0; i < VLEVELS; i++) {
       ctx.fillStyle = RAMP_CSS[i];
@@ -1655,9 +1972,7 @@ class Panel {
     ctx.fillStyle = PAL.textDim;
     ctx.font = Math.round(10 * S) + "px ui-monospace, monospace";
     ctx.fillText("0", x, y + 16 * S);
-    const top = isDesk
-      ? Math.round(vref) + " cm/s"
-      : Math.round(vref) + "°/s";
+    const top = Math.round(vref) + this.unitLabel() + "/s";
     ctx.fillText(top, x + w - ctx.measureText(top).width, y + 16 * S);
   }
 
@@ -1673,12 +1988,22 @@ class Panel {
   }
 }
 
+const repaint = () => { engine.dirty = true; };
 const deskPanel = new Panel("deskCanvas", {
-  unit: "cm", minHalf: 1.2, subId: "deskSub", hintId: "deskHint", flashId: "deskFlash",
+  space: "desk", unit: "cm", minHalf: 1.2, subId: "deskSub", hintId: "deskHint", flashId: "deskFlash",
+  onResize: repaint,
 });
 const aimPanel = new Panel("aimCanvas", {
-  unit: "deg", minHalf: 6, subId: "aimSub", hintId: "aimHint", flashId: "aimFlash",
+  space: "aim", unit: "deg", minHalf: 6, subId: "aimSub", hintId: "aimHint", flashId: "aimFlash",
+  onResize: repaint,
 });
+/* 1.2 cm of hand at 800 cpi is ~380 counts, about that many pixels 1:1. */
+const ptrPanel = new Panel("ptrCanvas", {
+  space: "ptr", unit: "px", minHalf: 200, subId: "ptrSub", hintId: "ptrHint", flashId: "ptrFlash",
+  onResize: repaint,
+});
+const PANELS = [deskPanel, aimPanel, ptrPanel];
+engine.panels = PANELS;
 
 /* =====================================================================
    UI: mode switching, live socket, replay transport, stats
@@ -1707,8 +2032,15 @@ function warn(kind, detail) {
   return true;
 }
 
-const LIVE_BUFFER_DEFAULT = 0.035;
+const LIVE_BUFFER_DEFAULT = BUFFER_MS.dflt / 1000;
 const LIVE_BUFFER_KEY = "telemouse.liveBuffer";
+
+/** A two-state button: the `on` class the stylesheet keys on, and the
+    `aria-pressed` a screen reader announces, always together. */
+function setPressed(el, on) {
+  el.classList.toggle("on", !!on);
+  el.setAttribute("aria-pressed", on ? "true" : "false");
+}
 
 const ui = {
   mode: "live",
@@ -1822,12 +2154,13 @@ const ui = {
   setMode(mode) {
     if (mode === this.mode) return;
     this.mode = mode;
-    for (const b of $("modeSwitch").children) b.classList.toggle("on", b.dataset.mode === mode);
+    for (const b of $("modeSwitch").children) setPressed(b, b.dataset.mode === mode);
     $("transport").classList.toggle("hidden", mode !== "replay");
     $("bufCtl").style.display = mode === "live" ? "" : "none";
     this.paused = false;
     this.lossToastShown = false;
     $("btnPause").classList.remove("on");
+    $("btnPause").firstChild.nodeValue = "Pause";
     /* Cancel any replay load still streaming, and hand the integrator back
        to the render loop. */
     this.loadToken++;
@@ -1837,11 +2170,9 @@ const ui = {
     if (mode === "live") {
       this.setReplayPlaying(false);
       this.connect();
-      $("btnPause").firstChild.nodeValue = "Pause";
     } else {
       this.disconnect();
       this.setConn("", "replay");
-      $("btnPause").firstChild.nodeValue = "Pause";
       this.loadSessionList();
     }
     this.renderTransport();
@@ -1849,7 +2180,7 @@ const ui = {
   },
 
   setLiveBuffer(seconds) {
-    this.liveBuffer = clamp(seconds, 0.01, 0.2);
+    this.liveBuffer = clamp(seconds, BUFFER_MS.min / 1000, BUFFER_MS.max / 1000);
     $("buf").value = String(Math.round(this.liveBuffer * 1000));
     $("bufVal").textContent = Math.round(this.liveBuffer * 1000) + "ms";
     /* An OBS source's buffer comes from its URL/config; it must not
@@ -1917,13 +2248,21 @@ const ui = {
     const sel = $("sessionSel");
     sel.innerHTML = "<option value=''>— loading —</option>";
     let list = [];
+    let failed = false;
     try {
       const r = await fetch("/api/sessions");
+      if (!r.ok) throw new Error("http " + r.status);
       list = await r.json();
-    } catch (e) { list = []; }
+    } catch (e) {
+      failed = true;
+      list = [];
+      warn("session list", e && e.message);
+    }
     if (!Array.isArray(list) || !list.length) {
-      sel.innerHTML = "<option value=''>no recordings found</option>";
-      this.setConn("warn", "no recordings");
+      sel.innerHTML = failed
+        ? "<option value=''>could not list recordings</option>"
+        : "<option value=''>no recordings found</option>";
+      this.setConn(failed ? "err" : "warn", failed ? "recording list failed" : "no recordings");
       return;
     }
     sel.innerHTML = "";
@@ -1934,9 +2273,9 @@ const ui = {
       const kb = (s.bytes / 1024).toFixed(0);
       /* Prefer the recording's own clock over the file's mtime: the id and
          the anchor are UTC, the user thinks in local time. */
-      const startMs = s.started_utc_us != null ? s.started_utc_us / 1000 : s.modified_epoch_ms;
+      const startMs = !isNil(s.started_utc_us) ? s.started_utc_us / 1000 : s.modified_epoch_ms;
       const when = startMs ? new Date(startMs).toLocaleString() : "";
-      const span = (s.started_utc_us != null && s.ended_utc_us != null)
+      const span = (!isNil(s.started_utc_us) && !isNil(s.ended_utc_us))
         ? ", " + fmtTime((s.ended_utc_us - s.started_utc_us) / 1e6).replace(/\.\d+$/, "") : "";
       o.textContent = s.id + "  (" + (when ? when + span + ", " : "") + kb + " KB)";
       sel.appendChild(o);
@@ -1963,7 +2302,7 @@ const ui = {
       real end (the server reads it off the file's tail), so a missing one
       means an envelope with no batches yet: it ends where it starts. */
   sessionEnd(s) {
-    return s.ended_utc_us == null ? s.started_utc_us : s.ended_utc_us;
+    return isNil(s.ended_utc_us) ? s.started_utc_us : s.ended_utc_us;
   },
 
   /** Which recording was running at `utcUs`: one whose span contains it
@@ -1972,7 +2311,7 @@ const ui = {
   sessionAt(utcUs) {
     let best = null;
     for (const s of this.sessions || []) {
-      if (s.started_utc_us == null || s.started_utc_us > utcUs) continue;
+      if (isNil(s.started_utc_us) || s.started_utc_us > utcUs) continue;
       if (utcUs <= this.sessionEnd(s) + 1e6) return s;
       if (!best || this.sessionEnd(s) > this.sessionEnd(best)) best = s;
     }
@@ -1983,7 +2322,7 @@ const ui = {
       not the loaded one, then seek there. Returns false (with a toast) when
       no recording could plausibly hold it. */
   gotoUtcUs(utcUs) {
-    if (!isFinite(utcUs)) return false;
+    if (!Number.isFinite(utcUs)) return false;
     const s = this.sessionAt(utcUs);
     if (!s) {
       this.toast("go to time", "no recording from before " + new Date(utcUs / 1000).toLocaleString(), true);
@@ -2019,13 +2358,9 @@ const ui = {
     return engine.anchorUtcUs + engine.playT * 1e6;
   },
 
-  /** Stream a recording in and parse it as it arrives.
-      Sessions are hundreds of megabytes; `await response.text()` would hold
-      the whole file as one string *and* a second copy as an array of lines
-      before a single event existed. Reading the body incrementally keeps
-      peak memory at one chunk plus the typed-array columns, and yields to
-      the event loop often enough that the page stays interactive (and can
-      show progress) while it loads. */
+  /** Stream a recording in and parse it as it arrives (see `streamLines`),
+      building seek checkpoints between slices so the page stays interactive
+      and shows progress while a large session loads. */
   async loadSession(id) {
     if (!id) return;
     const token = ++this.loadToken;
@@ -2046,62 +2381,50 @@ const ui = {
     }
 
     const total = +res.headers.get("content-length") || 0;
-    let bytes = 0, lines = 0, bad = 0;
+    let bad = 0;
 
+    /* A line that is not JSON is a bad frame: counted, logged rarely, and
+       skipped. Anything `ingest` throws is a bug in this page, not in the
+       recording, and is left to surface. */
     const consumeLine = (line) => {
-      if (!line) return;
-      try { ingest(JSON.parse(line)); } catch (e) { bad++; }
+      let env;
+      try { env = JSON.parse(line); } catch (e) {
+        bad++;
+        this.noteBad("replay line", e && e.message);
+        return;
+      }
+      ingest(env);
+    };
+    const onSlice = async (lines, bytes) => {
+      this.setConn("warn", "loading " + id + " · " +
+        INT_FMT.format(lines) + " lines" +
+        (total ? " · " + Math.round(100 * bytes / total) + "%" : ""));
+      await nextTask();
+      if (token !== this.loadToken) return false;
+      engine.extendCheckpoints();
+      return true;
     };
 
+    let finished;
     try {
-      if (!res.body || !res.body.getReader) {
-        /* No streams (very old browser): fall back to one big string. */
-        const text = await res.text();
-        for (const line of text.split("\n")) consumeLine(line.trim());
-        lines = 1;
-      } else {
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
-        let carry = "";
-        for (;;) {
-          const chunk = await reader.read();
-          if (token !== this.loadToken) { try { await reader.cancel(); } catch (e) {} return; }
-          if (chunk.done) break;
-          bytes += chunk.value.length;
-          carry += dec.decode(chunk.value, { stream: true });
-          let start = 0, nl;
-          while ((nl = carry.indexOf("\n", start)) >= 0) {
-            consumeLine(carry.slice(start, nl).trim());
-            start = nl + 1;
-            if (++lines % 20000 === 0) {
-              carry = carry.slice(start);
-              start = 0;
-              this.setConn("warn", "loading " + id + " · " +
-                lines.toLocaleString() + " lines" +
-                (total ? " · " + Math.round(100 * bytes / total) + "%" : ""));
-              await nextTask();
-              if (token !== this.loadToken) { try { await reader.cancel(); } catch (e) {} return; }
-              engine.extendCheckpoints();
-            }
-          }
-          carry = carry.slice(start);
-        }
-        carry += dec.decode();
-        consumeLine(carry.trim());
-      }
+      finished = await streamLines(res, consumeLine, onSlice, () => token === this.loadToken);
     } catch (e) {
       if (token === this.loadToken) { engine.loading = false; this.setConn("err", "load interrupted"); }
+      /* A read that failed is the network's doing; anything else came out of
+         the engine and must not vanish into "load interrupted". */
+      if (!(e instanceof StreamReadError)) throw e;
+      warn("replay load", e.message);
       return;
     }
 
-    if (token !== this.loadToken) return;
+    if (!finished || token !== this.loadToken) return;
 
     engine.extendCheckpoints();
     engine.rewind();
     engine.loading = false;
     this.loadedSession = id;
     engine.seek(engine.tStart);
-    this.setConn("ok", id + " · " + engine.ev.n.toLocaleString() + " events" +
+    this.setConn("ok", id + " · " + INT_FMT.format(engine.ev.n) + " events" +
                        (bad ? " (" + bad + " bad lines)" : ""));
     this.renderNotches();
     if (this.seekAfterLoadUtcUs !== null) {
@@ -2116,6 +2439,7 @@ const ui = {
   setReplayPlaying(on) {
     this.replayPlaying = !!on && this.mode === "replay";
     $("btnPlay").textContent = this.replayPlaying ? "Pause" : "Play";
+    /* The label already says what a press does; no aria-pressed on top. */
     $("btnPlay").classList.toggle("on", this.replayPlaying);
   },
 
@@ -2192,8 +2516,7 @@ const ui = {
   },
 
   onMarker(m) {
-    deskPanel.flash();
-    aimPanel.flash();
+    for (const p of PANELS) p.flash();
     this.toast("marker", m.label);
   },
 
@@ -2228,7 +2551,7 @@ const ui = {
 
   onVizStats(env) {
     this.bridge = env;
-    this.bridgeAt = performance.now() / 1000;
+    this.bridgeAt = nowSec();
   },
 
   refreshSensHint() {
@@ -2240,7 +2563,37 @@ const ui = {
     if (aimPanel.hintEl.textContent !== hint) aimPanel.hintEl.textContent = hint;
     const dh = engine.session ? "" : "no session envelope yet — CPI assumed " + engine.cpi;
     if (deskPanel.hintEl.textContent !== dh) deskPanel.hintEl.textContent = dh;
+    /* The pointer panel is only as true as the settings it was given. */
+    const ph = engine.pointerSettings ? ""
+      : (engine.session ? "no pointer settings in this session" : "no session envelope yet") +
+        " — assuming a fresh Windows install (precision on, 10/20, 96 dpi)";
+    if (ptrPanel.hintEl.textContent !== ph) ptrPanel.hintEl.textContent = ph;
   },
+};
+
+/* The engine's view of the UI: one object, refreshed on each call rather
+   than allocated (a replay load ingests millions of lines). */
+const uiCtx = defaultEngineCtx();
+function uiContext() {
+  uiCtx.mode = ui.mode;
+  uiCtx.liveBuffer = ui.liveBuffer;
+  uiCtx.replayPlaying = ui.replayPlaying;
+  uiCtx.replaySpeed = ui.replaySpeed;
+  return uiCtx;
+}
+
+/* The engine's outbound events land on `ui`. Each hook looks its handler up
+   at call time, so a handler replaced later (the tests do) is the one used. */
+engine.hooks = {
+  ctx: uiContext,
+  onVizStats: (env) => ui.onVizStats(env),
+  onHeartbeat: () => ui.onHeartbeat(),
+  onBatch: () => ui.onBatch(),
+  onDataLoss: (drops, lost) => ui.onDataLoss(drops, lost),
+  onSessionRestart: (from, to) => ui.onSessionRestart(from, to),
+  onSessionChanged: () => ui.onSessionChanged(),
+  onMarker: (m) => ui.onMarker(m),
+  onReplayEnd: () => ui.setReplayPlaying(false),
 };
 
 function escapeHtml(s) {
@@ -2252,6 +2605,62 @@ function escapeHtml(s) {
     microtask: a microtask would not let the renderer or the socket run. */
 function nextTask() {
   return new Promise((r) => setTimeout(r, 0));
+}
+
+/* Lines parsed between two yields to the event loop during a replay load. */
+const LOAD_SLICE_LINES = 20000;
+
+/** A response body that could not be read: the network's fault, not the
+    page's, and the one failure a replay load reports as "interrupted". */
+class StreamReadError extends Error {}
+
+/** Feed every non-empty line of a fetch Response to `onLine` (trimmed) as
+    the body streams in.
+
+    Sessions are hundreds of megabytes; `await response.text()` would hold
+    the whole file as one string *and* a second copy as an array of lines
+    before a single event existed. Reading incrementally keeps peak memory at
+    one chunk, and every `sliceLines` lines `onSlice(lines, bytes)` is awaited
+    so the caller can yield, show progress, or say stop (by returning false).
+    `alive()` is asked after every read; false cancels the read too.
+
+    Returns true when the whole body was read, false when it was stopped.
+    A failed read throws `StreamReadError`; whatever `onLine` throws
+    propagates unchanged. */
+async function streamLines(res, onLine, onSlice, alive = () => true, sliceLines = LOAD_SLICE_LINES) {
+  const feed = (line) => { if (line) onLine(line); };
+  if (!res.body || !res.body.getReader) {
+    /* No streams (very old browser): fall back to one big string. */
+    let text;
+    try { text = await res.text(); } catch (e) { throw new StreamReadError(e && e.message); }
+    for (const line of text.split("\n")) feed(line.trim());
+    return true;
+  }
+  const reader = res.body.getReader();
+  const stop = async () => { try { await reader.cancel(); } catch (e) { /* already closed */ } return false; };
+  const dec = new TextDecoder();
+  let carry = "", bytes = 0, lines = 0;
+  for (;;) {
+    let chunk;
+    try { chunk = await reader.read(); } catch (e) { throw new StreamReadError(e && e.message); }
+    if (!alive()) return stop();
+    if (chunk.done) break;
+    bytes += chunk.value.length;
+    carry += dec.decode(chunk.value, { stream: true });
+    let start = 0, nl;
+    while ((nl = carry.indexOf("\n", start)) >= 0) {
+      feed(carry.slice(start, nl).trim());
+      start = nl + 1;
+      if (++lines % sliceLines === 0) {
+        carry = carry.slice(start);
+        start = 0;
+        if (!(await onSlice(lines, bytes)) || !alive()) return stop();
+      }
+    }
+    carry = carry.slice(start);
+  }
+  feed((carry + dec.decode()).trim());
+  return true;
 }
 
 /* =====================================================================
@@ -2289,9 +2698,10 @@ function profileRoll(now) {
 
 /** The single ingest entry point, so profiling wraps both sources. */
 function ingest(env, receivedUtcMs = null, receivedAt = nowSec()) {
-  if (!PROFILE) { engine.ingest(env, receivedUtcMs, receivedAt); return; }
+  const ctx = uiContext();
+  if (!PROFILE) { engine.ingest(env, receivedUtcMs, receivedAt, ctx); return; }
   performance.mark("ig0");
-  engine.ingest(env, receivedUtcMs, receivedAt);
+  engine.ingest(env, receivedUtcMs, receivedAt, ctx);
   performance.mark("ig1");
   measure("ingest", "ig0", "ig1", "ingest");
 }
@@ -2309,7 +2719,7 @@ let refreshEst = 60;
    were most of what the function did. */
 const SE = {};
 for (const id of [
-  "sSpeedCm", "sSpeedDeg", "sDistM", "sDistDeg", "sCpm", "sClicks", "sEps",
+  "sSpeedCm", "sSpeedDeg", "sSpeedPx", "sDistM", "sDistDeg", "sCpm", "sClicks", "sEps",
   "sLat", "sLatUnit", "statLat", "sAge", "statAge", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
   "sDrops", "statDrops", "sLost", "statLost", "sAbs", "statAbs",
   "sBad", "statBad", "statBridge", "sBridge", "sBridgeSub",
@@ -2332,23 +2742,22 @@ function setTitle(el, v) {
 let cpiTipKey = null;
 let bridgeTipKey = null;
 
+/* Stats-bar tiles that show exactly a HUD readout: element id → hudValue key. */
+const SHARED_READOUTS = [
+  ["sSpeedCm", "speed"], ["sSpeedDeg", "aim"], ["sSpeedPx", "pointer"], ["sDistM", "dist"],
+  ["sDistDeg", "aimdist"], ["sCpm", "cpm"], ["sEps", "eps"], ["sAge", "eventage"],
+];
+
 function paintStats(now) {
   const e = engine;
-  setText(SE.sSpeedCm, e.speedCm.toFixed(e.speedCm < 100 ? 1 : 0));
-  setText(SE.sSpeedDeg, Math.round(e.speedDeg).toLocaleString());
-  setText(SE.sDistM, (e.totalCm / 100).toFixed(2));
-  setText(SE.sDistDeg, Math.round(e.totalDeg).toLocaleString());
-  setText(SE.sCpm, String(Math.round(e.clickRate.total(e.playT))));
-  setText(SE.sClicks, e.totalClicks + " total");
-  setText(SE.sEps, Math.round(e.eventRate.perSecond(e.playT)).toLocaleString());
+  for (const [id, key] of SHARED_READOUTS) setText(SE[id], hudValue(key, e, now));
+  setText(SE.sClicks, hudValue("clicks", e, now) + " total");
 
   /* Event age keeps increasing during normal inactivity. Delivery latency
      only changes on arrival; old samples become idle. Neither is a replay metric. */
   const live = ui.mode === "live";
-  const capturedUs = live ? e.newestUtcUs() : null;
-  setText(SE.sAge, capturedUs === null ? "—" : ((Date.now() * 1000 - capturedUs) / 1000).toFixed(1));
   SE.statAge.classList.toggle("dim", !live);
-  const latency = latencyValue(e, now);
+  const latency = hudValue("latency", e, now);
   const measured = latency !== "—" && latency !== "idle";
   setText(SE.sLat, latency);
   setText(SE.sLatUnit, measured ? "ms" : "");
@@ -2362,7 +2771,7 @@ function paintStats(now) {
     SE.statLag.classList.add("dim");
   } else {
     const lagMs = e.haveTimeline ? Math.max(0, (e.tEnd - e.playT) * 1000) : 0;
-    setText(SE.sLag, Math.round(lagMs).toLocaleString());
+    setText(SE.sLag, fmtInt(Math.round(lagMs)));
     SE.statLag.classList.remove("dim");
     SE.statLag.classList.toggle("alert", lagMs > 250);
   }
@@ -2371,13 +2780,13 @@ function paintStats(now) {
   setText(SE.sFpsRef, "/ ~" + Math.round(refreshEst) + "Hz");
   SE.statFps.classList.toggle("alert", fpsEma < 0.8 * refreshEst);
 
-  setText(SE.sDrops, e.drops.toLocaleString());
+  setText(SE.sDrops, fmtInt(e.drops));
   SE.statDrops.classList.toggle("alert", e.drops > 0);
-  setText(SE.sLost, e.lostBatches.toLocaleString());
+  setText(SE.sLost, fmtInt(e.lostBatches));
   SE.statLost.classList.toggle("alert", e.lostBatches > 0);
-  setText(SE.sAbs, e.absFrames.toLocaleString());
+  setText(SE.sAbs, fmtInt(e.absFrames));
   SE.statAbs.classList.toggle("dim", e.absFrames === 0);
-  setText(SE.sBad, ui.badFrames.toLocaleString());
+  setText(SE.sBad, fmtInt(ui.badFrames));
   SE.statBad.classList.toggle("dim", ui.badFrames === 0);
   SE.statBad.classList.toggle("alert", ui.badFrames > 0);
 
@@ -2423,7 +2832,7 @@ function paintBridge(now) {
   const stale = now - ui.bridgeAt > 5;
   const p50 = (b.latency && b.latency.p50_us) || 0;
   const p99 = (b.latency && b.latency.p99_us) || 0;
-  setText(SE.sBridge, Math.round(b.datagrams_per_s || 0).toLocaleString());
+  setText(SE.sBridge, fmtInt(Math.round(b.datagrams_per_s || 0)));
   setText(SE.sBridgeSub, "/s · p50 " + (p50 / 1000).toFixed(1) + "ms");
   tile.classList.toggle("dim", stale);
   tile.classList.toggle("alert", !stale && (b.parse_errors > 0 || b.lag_drops > 0));
@@ -2524,7 +2933,6 @@ function setVisible(channel, on) {
 (function watchVisibility() {
   const detail = (e) => (e && e.detail) || {};
   if (typeof window.obsstudio === "object" && window.obsstudio !== null) {
-    visibility.obs = true;
     window.addEventListener("obsSourceVisibleChanged", (e) => setVisible("source", detail(e).visible));
     window.addEventListener("obsSourceActiveChanged", (e) => setVisible("active", detail(e).active));
     return;
@@ -2577,28 +2985,27 @@ function buildHud() {
   }
 }
 
-/* One cached formatter for the HUD's grouped integers: bare toLocaleString()
-   constructs a fresh Intl formatter per call, and hudValue runs at 10Hz.
-   Same locale, same default options — output is identical. */
-const hudIntFmt = new Intl.NumberFormat();
-
 function latencyValue(e, now = nowSec()) {
   if (ui.mode !== "live" || e.arrivalLatencyMs === null) return "—";
   if (now - e.latencyReceivedAt >= NO_DATA_SECS) return "idle";
   return e.arrivalLatencyMs.toFixed(1);
 }
 
-function hudValue(key, e) {
+/** One readout as text. The HUD's whole vocabulary, and the stats bar's
+    shared part: both surfaces format a number the same way because they
+    format it here. */
+function hudValue(key, e, now = nowSec()) {
   switch (key) {
     case "speed": return e.speedCm.toFixed(e.speedCm < 100 ? 1 : 0);
-    case "aim": return hudIntFmt.format(Math.round(e.speedDeg));
+    case "aim": return fmtInt(Math.round(e.speedDeg));
+    case "pointer": return fmtInt(Math.round(e.speedPx));
     case "cpm": return String(Math.round(e.clickRate.total(e.playT)));
-    case "eps": return hudIntFmt.format(Math.round(e.eventRate.perSecond(e.playT)));
+    case "eps": return fmtInt(Math.round(e.eventRate.perSecond(e.playT)));
     case "dist": return (e.totalCm / 100).toFixed(2);
-    case "aimdist": return hudIntFmt.format(Math.round(e.totalDeg));
-    case "clicks": return hudIntFmt.format(e.totalClicks);
+    case "aimdist": return fmtInt(Math.round(e.totalDeg));
+    case "clicks": return fmtInt(e.totalClicks);
     case "game": return e.game ? e.game.replace(/\.exe$/i, "") : "—";
-    case "latency": return latencyValue(e);
+    case "latency": return latencyValue(e, now);
     case "eventage": {
       const us = ui.mode === "live" ? e.newestUtcUs() : null;
       return us === null ? "—" : ((Date.now() * 1000 - us) / 1000).toFixed(1);
@@ -2658,7 +3065,7 @@ function frame(msNow) {
   /* Pausing freezes the picture, never the data: tick() still runs so
      nothing is dropped while the display is held. */
   if (PROFILE) performance.mark("tk0");
-  engine.tick(now);
+  engine.tick(now, uiContext());
   if (PROFILE) { performance.mark("tk1"); measure("tick", "tk0", "tk1", "tick"); }
 
   /* Keep drawing while anything is still decaying, and draw one final frame
@@ -2710,15 +3117,14 @@ let view = "both";
 function setView(v) {
   if (VIEWS.indexOf(v) < 0) v = "both";
   view = v;
-  document.body.classList.remove("view-desk", "view-aim");
+  document.body.classList.remove("view-desk", "view-aim", "view-pointer", "view-compare");
   if (v !== "both") document.body.classList.add("view-" + v);
-  for (const b of $("viewSwitch").children) b.classList.toggle("on", b.dataset.view === v);
+  for (const b of $("viewSwitch").children) setPressed(b, b.dataset.view === v);
   const q = new URLSearchParams(location.search);
   if (v === "both") q.delete("view"); else q.set("view", v);
   const qs = q.toString();
   history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash);
-  deskPanel.resize();
-  aimPanel.resize();
+  for (const p of PANELS) p.resize();
   engine.dirty = true;
 }
 $("viewSwitch").addEventListener("click", (e) => {
@@ -2761,7 +3167,7 @@ function gotoPickedTime() {
   const v = $("gotoTime").value;
   if (!v) return;
   const ms = new Date(v).getTime();
-  if (!isFinite(ms)) { ui.toast("go to time", "unreadable date/time", true); return; }
+  if (!Number.isFinite(ms)) { ui.toast("go to time", "unreadable date/time", true); return; }
   ui.gotoUtcUs(ms * 1000);
 }
 $("btnGoto").addEventListener("click", gotoPickedTime);
@@ -2801,8 +3207,7 @@ window.addEventListener("keydown", (e) => {
    because it is pinned to the ratio that was current when it was made. */
 let dprQuery = null;
 function onDprChange() {
-  deskPanel.resize();
-  aimPanel.resize();
+  for (const p of PANELS) p.resize();
   engine.dirty = true;
   armDprWatch();
 }
@@ -2833,6 +3238,9 @@ armDprWatch();
    PAL and repaints once. The overlay is never themed and never gets here.
    ===================================================================== */
 
+/* The storage key, and the OBS test at the top of this file, are repeated in
+   index.html's pre-paint script, which has to run before this file exists;
+   change them together. */
 const THEME_KEY = "tmTheme";
 let lightQuery = null;
 try { lightQuery = matchMedia("(prefers-color-scheme: light)"); } catch (e) { lightQuery = null; }
@@ -2863,6 +3271,9 @@ function applyTheme(repaint) {
   const root = document.documentElement;
   if (t === "light" || t === "dark") root.dataset.theme = t;
   else delete root.dataset.theme;
+  /* What the system prefers, for the stylesheet's "no pick" case (see the
+     token rules in index.html). */
+  root.dataset.sys = lightQuery && lightQuery.matches ? "light" : "dark";
   setText($("themeBtn"), currentTheme() === "dark" ? "Light theme" : "Dark theme");
   /* A paused picture is not redrawn by the frame loop; repaint it here so
      the canvases never sit in the old theme under new chrome. */
@@ -2893,7 +3304,18 @@ if (!OBS) {
 /* A trim the render loop cannot starve. rAF is suspended in a background
    tab but the socket is not, so this is the timer that keeps a hidden tab
    from growing without bound. */
-setInterval(() => engine.trim(), 250);
+setInterval(() => engine.trim(uiContext()), 250);
+
+/** A range input's limits and starting value, from the one definition at the
+    top of this file rather than from the markup's copy of it. */
+function configureSlider(el, spec, value) {
+  el.min = String(spec.min);
+  el.max = String(spec.max);
+  el.step = String(spec.step);
+  el.value = String(value);
+}
+configureSlider($("buf"), BUFFER_MS, BUFFER_MS.dflt);
+configureSlider($("decay"), TRAIL_SECS, OBS ? OBS.trail : TRAIL_SECS.dflt);
 
 if (OBS) {
   /* Body classes drive the CSS (chrome hidden, layout, labels); the panels
@@ -2902,10 +3324,8 @@ if (OBS) {
   document.body.classList.add("obs", "layout-" + OBS.layout);
   if (OBS.labels) document.body.classList.add("labels");
   document.documentElement.style.setProperty("--s", String(OBS.scale));
-  $("decay").value = String(OBS.trail);
   buildHud();
-  deskPanel.resize();
-  aimPanel.resize();
+  for (const p of PANELS) p.resize();
 }
 if (!OBS && VIEW !== "both") setView(VIEW);
 engine.decay = +$("decay").value;
@@ -2916,7 +3336,7 @@ if (OBS) {
 } else {
   try {
     const v = +localStorage.getItem(LIVE_BUFFER_KEY);
-    if (isFinite(v) && v >= 0.01 && v <= 0.2) savedBuffer = v;
+    if (Number.isFinite(v) && v >= BUFFER_MS.min / 1000 && v <= BUFFER_MS.max / 1000) savedBuffer = v;
   } catch (e) { /* storage blocked */ }
 }
 ui.setLiveBuffer(savedBuffer);
@@ -2929,14 +3349,14 @@ const AT = QUERY.get("at");
 let atMs = NaN;
 if (AT && !OBS) {
   atMs = /^\d{11,}$/.test(AT) ? +AT : new Date(AT).getTime();
-  if (!isFinite(atMs)) ui.toast("?at=", "unreadable date/time: " + AT, true);
+  if (!Number.isFinite(atMs)) ui.toast("?at=", "unreadable date/time: " + AT, true);
 }
 /* ?session=<id> opens that recording in replay: what the control panel's
-   Recordings list links to. The id must look like one (the server 404s
-   anything else anyway). */
+   Recordings list links to. The id must pass the server's own rule
+   (`isSafeId`); the server 404s anything else anyway. */
 const SESSION = QUERY.get("session");
-const wantSession = !!SESSION && !OBS && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(SESSION);
-if (isFinite(atMs)) {
+const wantSession = !OBS && isSafeId(SESSION);
+if (Number.isFinite(atMs)) {
   ui.pendingUtcUs = atMs * 1000;
   $("gotoTime").value = toDatetimeLocal(atMs);
   ui.setMode("replay");
@@ -2951,9 +3371,18 @@ requestAnimationFrame(frame);
 
 /* Handy from the devtools console when tuning: telemouse.engine.playT, etc. */
 window.telemouse = {
-  engine: engine, ui: ui, deskPanel: deskPanel, aimPanel: aimPanel,
+  engine: engine, ui: ui, deskPanel: deskPanel, aimPanel: aimPanel, ptrPanel: ptrPanel,
   prof: prof, profiling: PROFILE, obs: OBS,
+  /* The Windows pointer model on its own, for the tests and for tuning. */
+  PointerModel: PointerModel, pointerSettingsFrom: pointerSettingsFrom, speedMultiplier: speedMultiplier,
+  WIN_POINTER_DEFAULTS: WIN_POINTER_DEFAULTS,
   /* For the Node tests, which have no animation frames of their own. */
   frame: frame, staleView: staleView, feedIsStale: feedIsStale, overlayFeed: overlayFeed,
   palette: PAL, paletteFromTokens: paletteFromTokens, buildRamp: buildRamp, rampCss: RAMP_CSS,
+};
+/* What the Node tests reach for beyond the devtools handle: page-level
+   functions that would otherwise only be reachable as leaked VM globals. */
+window.telemouse._test = {
+  paintStats: paintStats, hudValue: hudValue, setView: setView, isSafeId: isSafeId,
+  streamLines: streamLines, limits: { BUFFER_MS: BUFFER_MS, TRAIL_SECS: TRAIL_SECS, OBS_SCALE: OBS_SCALE },
 };

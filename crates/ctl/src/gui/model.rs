@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 
 use crate::gui::feed::Snapshot;
-use crate::manager::{ComponentState, Kind, clip, describe_exit, short_hint};
+use crate::manager::{CAPTURE, ComponentState, Kind, VIZ, clip, describe_exit, short_hint};
 
 /// `NOTIFYICONDATAW.szTip` is 128 UTF-16 units including the terminator.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
@@ -54,7 +54,7 @@ fn component<'a>(s: &'a Snapshot, id: &str) -> Option<&'a ComponentState> {
 }
 
 pub fn icon_state(s: &Snapshot) -> IconState {
-    let Some(c) = component(s, "capture").filter(|c| c.running) else {
+    let Some(c) = component(s, CAPTURE).filter(|c| c.running) else {
         return IconState::Idle;
     };
     #[cfg(feature = "observability")]
@@ -126,12 +126,12 @@ fn failure_note(s: &Snapshot) -> String {
 
 /// Tray tooltip, never longer than [`TOOLTIP_MAX_CHARS`].
 pub fn tooltip(s: &Snapshot) -> String {
-    let cap = component(s, "capture");
+    let cap = component(s, CAPTURE);
     let mut text = format!(
         "telemouse-ctl — capture: {}{}, viz: {}",
         service_status(cap, s.now_unix_s),
         saving_note(cap),
-        service_status(component(s, "viz"), s.now_unix_s),
+        service_status(component(s, VIZ), s.now_unix_s),
     );
     for extra in [capture_note(cap), failure_note(s)] {
         if !extra.is_empty() {
@@ -146,7 +146,7 @@ pub fn tooltip(s: &Snapshot) -> String {
 /// Whose log tail the window shows: the running capture agent, else the
 /// running viz server, else whatever started or exited most recently.
 pub fn focus_component(components: &[ComponentState]) -> Option<&ComponentState> {
-    for id in ["capture", "viz"] {
+    for id in [CAPTURE, VIZ] {
         if let Some(c) = components.iter().find(|c| c.id == id && c.running) {
             return Some(c);
         }
@@ -451,7 +451,7 @@ pub fn render_text(s: &Snapshot) -> String {
         }
     }
     out.push(String::new());
-    let cap = component(s, "capture");
+    let cap = component(s, CAPTURE);
     let default = if s.recording_enabled {
         format!("on → {}", s.recording_dir)
     } else {
@@ -520,7 +520,6 @@ fn exit_notes(c: &ComponentState) -> Vec<String> {
     let Some(e) = c.last_exit.as_ref().filter(|e| e.failed()) else {
         return Vec::new();
     };
-    #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
     let mut out = Vec::new();
     if let Some(h) = &e.hint {
         out.push(h.clone());
@@ -617,7 +616,7 @@ fn capture_items(s: &Snapshot) -> Vec<MenuEntry> {
     } else {
         format!("\t{}", s.hotkey)
     };
-    match component(s, "capture") {
+    match component(s, CAPTURE) {
         Some(c) if c.running => vec![
             item(
                 MENU_STOP_CAPTURE,
@@ -667,7 +666,7 @@ pub fn menu(s: &Snapshot, window_visible: bool) -> Vec<MenuEntry> {
     v.extend(capture_items(s));
     v.extend([
         service_items(
-            component(s, "viz"),
+            component(s, VIZ),
             "viz server",
             MENU_START_VIZ,
             MENU_STOP_VIZ,
@@ -740,11 +739,15 @@ impl IconPixels {
 /// A filled disc with a darker 1-px ring: grey when idle, green while the
 /// capture agent runs, amber while it runs but reports trouble.
 pub fn icon_bitmap(state: IconState, size: u32) -> IconPixels {
+    // A 32-bpp `CreateBitmap` row is B, G, R, A bytes in memory; read as a
+    // little-endian `u32` that is `0xAARRGGBB`, so every constant here is
+    // written as alpha then the ordinary `#RRGGBB`.
     let (fill, ring) = match state {
         IconState::Idle => (0xFF80_8080u32, 0xFF50_5050u32),
+        // #2EA043 green, #1F6F2E ring.
         IconState::CaptureRunning => (0xFF2E_A043u32, 0xFF1F_6F2Eu32),
-        // BGRA: amber is a lot of blue-channel-zero, so this is 0xFFB02E RGB.
-        IconState::Degraded => (0xFF2E_B0FFu32, 0xFF1F_78B0u32),
+        // #FFB02E amber, #B0781F ring.
+        IconState::Degraded => (0xFFFF_B02Eu32, 0xFFB0_781Fu32),
     };
     let n = size as usize;
     let stride = IconPixels::mask_stride(size);
@@ -1537,5 +1540,22 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), IconState::COUNT);
+        // And the colour each one claims to be, read through the same
+        // 0xAARRGGBB layout `CreateBitmap` sees as B, G, R, A bytes.
+        let rgb = |s: IconState| {
+            let px = icon_bitmap(s, 16).bgra[8 * 16 + 8];
+            let [b, g, r, a] = px.to_le_bytes();
+            assert_eq!(a, 0xFF);
+            (r, g, b)
+        };
+        let (r, g, b) = rgb(IconState::CaptureRunning);
+        assert!(g > r && g > b, "running is green: {r:02x}{g:02x}{b:02x}");
+        let (r, g, b) = rgb(IconState::Degraded);
+        assert!(
+            r > g && g > b && r > b.saturating_add(0x80),
+            "degraded is amber: {r:02x}{g:02x}{b:02x}"
+        );
+        let (r, g, b) = rgb(IconState::Idle);
+        assert!(r == g && g == b, "idle is grey");
     }
 }

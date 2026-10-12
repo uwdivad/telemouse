@@ -31,14 +31,14 @@ OBS overlay on another PC); everything else is loopback-only.
 | Route | Body → response |
 |---|---|
 | `GET /healthz` | `ok` |
-| `GET /api/state?log_since=N` | `{ self_pid, now_unix_s, version, config, places, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `config` is `{ path, found, seeded, status: "seeded"\|"loaded"\|"defaults", mtime_unix_s? }`. `places` is the absolute locations the panel talks about: `panel_url, config, logs, bin_dir, docs, releases, version, webview_data` (`webview_data` is the window's WebView2 cache folder, `%LOCALAPPDATA%\telemouse\WebView2`; empty in a headless or `--no-webview` run). `ComponentState`: `id, label, summary, kind ("service"\|"task"), bin, bin_path, bin_found, flags: [{flag, help}], takes_session, markers, running, pid, since_unix_s, last_exit: { code, ctrl_break, at_unix_s, hint?, last_line? }, exits, unexpected_exits, args, saving, log: [lines], log_seq, stats?, recording?, foreground_seen?`. `log` is the last 120 lines the child printed (stdout + stderr, ANSI stripped); pass the previous `log_seq` as `log_since` to get only newer lines. `stats` (full build) is the child's last `capture stats` line parsed: `session, events_per_s, events, drops, idle_for_s, udp_unreachable, jsonl_dropped, kafka_dropped, game, pointer_locked`. `foreground_seen` (full build, capture only, while running) is `[{ exe, last_unix_s }]`, the last 8 distinct programs the agent saw in the foreground during this run, most recent first, telemouse's own windows excluded: the first-run guide's "is this your game?". `processes` is every telemouse process on the machine. |
+| `GET /api/state?log_since=N` | `{ self_pid, now_unix_s, version, config, places, recording: { enabled, dir }, components: [ComponentState], processes: [ProcInfo] }`. `config` is `{ path, found, seeded, status: "seeded"\|"loaded"\|"defaults", mtime_unix_s? }`. `places` is the absolute locations the panel talks about: `panel_url, config, logs, bin_dir, docs, releases, version, webview_data` (`webview_data` is the window's WebView2 cache folder, `%LOCALAPPDATA%\telemouse\WebView2`; empty in a headless or `--no-webview` run). `ComponentState`: `id, label, summary, kind ("service"\|"task"), bin, bin_path, bin_found, flags: [{flag, help}], takes_session, markers, running, pid, since_unix_s, last_exit: { code, ctrl_break, at_unix_s, hint?, last_line? }, exits, unexpected_exits, args, saving, log: [lines], log_seq, stats?, recording?, foreground_seen?`. `log` is the last 120 lines the child printed (stdout + stderr, ANSI stripped); pass the previous `log_seq` as `log_since` to get only newer lines. `log_since` is either one number applied to every component or a per-component list `capture:N,viz:M` (each component's own `log_seq`; a component not listed gets its tail); anything else is `400`. `stats` (full build) is the child's last `capture stats` line parsed: `session, events_per_s, events, drops, idle_for_s, udp_unreachable, jsonl_dropped, kafka_dropped, game, pointer_locked`. `foreground_seen` (full build, capture only, while running) is `[{ exe, last_unix_s }]`, the last 8 distinct programs the agent saw in the foreground during this run, most recent first, telemouse's own windows excluded: the first-run guide's "is this your game?". `processes` is every telemouse process on the machine. |
 | `GET /api/sessions` | `["<id>.jsonl", ...]`, newest first — the report picker's list. |
 | `POST /api/components/{id}/start` | `{ flags?: [..], session?: "<id>.jsonl", save?: bool }` → `{ ok, pid }`. Component ids: `capture`, `viz`, `doctor`, `trend`, `report`. `flags` must be from the component's allow-list (`capture`: `--print`, `--no-kafka`, `--no-udp`, `--record`, `--no-record`; `doctor`: `--json`; `report`: `--timing`); anything else is `400`. `save` is the capture card's switch and becomes `--record`/`--no-record`. `report` needs `session`. `404` unknown id, `409` already running, `500` binary missing. |
 | `POST /api/components/{id}/stop` | `{ force?: bool }` → `{ ok, outcome: "graceful"\|"terminated" }`. Ctrl-Break, then terminate after `[ctl] stop_grace_secs`; `force` terminates at once. `409` not running. |
 | `POST /api/components/{id}/marker` | `{ label }` → `{ ok, label }`. Drops a labelled marker into a running capture, timestamped on arrival (see *Markers*). `400` blank / multi-line / >120 chars / component without a pipe (only `capture` has one), `409` not running, `500` pipe write failed. |
 | `POST /api/processes/{pid}/kill` | → `{ ok, killed: ProcInfo }`. `403` for the panel itself or a process the scan would not list, `404` unknown. |
 | `GET /api/config` | `{ path, status, exists, token, settings: { mouse_cpi, marker_hotkey, recording: { enabled, dir }, ctl: { hotkey }, games: { "<exe>": { sens, yaw_coeff, pitch_coeff } }, obs: { layout, background, hud, hud_position, scale } } \| null, error, choices: { obs_layouts, obs_hud_items, obs_hud_positions }, not_editable: [..] }`. The editable subset of `telemouse.toml` as it is on disk now. `token` fingerprints the file's bytes (`"none"` when there is no file). `settings` is `null` and `error` says why when the file cannot be used. |
-| `POST /api/config` | `{ token, patch }` → `{ ok, token, created, settings, changed: ["mouse_cpi"\|"marker_hotkey"\|"recording"\|"ctl.hotkey"\|"games"\|"viz.obs"], restart_required: ["ctl hotkey"], next_start: ["capture"\|"viz"] }`. `patch` has the shape of `settings` with every field optional; in `games` a value of `null` removes that game, a new game needs `sens` (`yaw_coeff` defaults to 0.022, `pitch_coeff` to the yaw), and the exe name is trimmed, lowercased and given `.exe`. Comments, ordering and other keys in the file are kept; the result is validated exactly as the binaries validate it before anything is written, and the write is atomic. Bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` are not in the patch shape and cannot be changed here. `400 { error, field }` invalid value or unknown key (nothing written), `409 { error, token }` the file changed since `token` (re-`GET` and retry), `500` write failed. `recording` takes effect at once; `next_start` names running components that keep their old settings until restarted; `restart_required` needs the panel restarted. |
+| `POST /api/config` | `{ token, patch }` → `{ ok, token, created, settings, changed: ["mouse_cpi"\|"marker_hotkey"\|"recording"\|"ctl.hotkey"\|"games"\|"viz.obs"], restart_required: ["ctl.hotkey"], next_start: ["capture"\|"viz"] }`. `patch` has the shape of `settings` with every field optional; in `games` a value of `null` removes that game, a new game needs `sens` (`yaw_coeff` defaults to 0.022, `pitch_coeff` to the yaw), and the exe name is trimmed, lowercased and given `.exe`. Comments, ordering and other keys in the file are kept; the result is validated exactly as the binaries validate it before anything is written, and the write is atomic. Bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` are not in the patch shape and cannot be changed here. `400 { error, field }` invalid value or unknown key (nothing written), `409 { error, token }` the file changed since `token` (re-`GET` and retry), `500` write failed. `recording` takes effect at once; `next_start` names running components that keep their old settings until restarted; `restart_required` needs the panel restarted. |
 | `GET /api/reports/{id}` | The stored `ReportSummary` (see *Analyzer*, `report --summary`) for recording `<id>`, if one was made since the recording last changed *and* carries the schema this panel knows (`telemouse-report-summary/2`); `404` otherwise, which is also how a cache written for an older shape is retired — a finished recording never changes again, so mtime alone would serve it forever. `400` when `id` is not a safe recording id. |
 | `POST /api/reports/{id}` | Runs the analyzer in `--summary` mode over `<id>.jsonl` and returns the `ReportSummary`; also stored as `<recordings>/.reports/<id>.summary.json` next to the analyzer's cached `<id>.report.json`. `400` bad id, `404` no such recording, `503` no `telemouse-analyze` beside the panel (minimal zip), `500` the run failed. |
 | `POST /api/open` | `{ target: "config"\|"recordings"\|"logs"\|"docs" }` → `{ ok, target, path }`. Opens that place with the shell's default handler (the config in an editor, the recordings or logs folder in Explorer, the docs). The target is a name; the path comes from the server, never from the request. `400` unknown target, `404` when this build has no such place (logs in the minimal build), `500` if the shell refused. |
@@ -62,7 +62,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:7880/api/components/capture/stop
 | `GET /api/sessions` | `[{ id, path, bytes, modified_epoch_ms, started_utc_us, ended_utc_us, sidecar }]`, newest first. `sidecar` is the parsed `<id>.meta.json` (below) or `null`. Cached for 5 s. |
 | `GET /api/session/{id}` | The raw `.jsonl` recording, streamed. `404` for anything that is not a recording directly in the recordings directory. |
 | `GET /ws` | WebSocket. Every capture envelope (below) forwarded verbatim as a text frame — including the live-only `heartbeat` — plus a `{"type":"viz_stats", ...}` frame each second. `Origin`, when present, must be local. At most 16 clients (`503` past that). |
-| `GET /`, `GET /obs` | The dashboard and the OBS overlay (HTML). `/?session=<id>` opens the dashboard straight into replay of that recording (`<id>` must pass `is_safe_id`); `/?at=<local datetime>` picks the recording running then. `/obs` layers URL parameters over `[viz.obs]`: `layout` (or `view`), `bg`, `hud`, `hudpos`, `scale`, `trail`, `buffer`, `grid`, `legend`, `labels`, and `stale` (0–60 s without a batch before the overlay stops saying nothing; `0` = never; default `stale_secs` = 3. Past it the overlay shows *idle · 12s* while the agent's heartbeats are still arriving — a still hand — and dims to *no feed · 12s* once they stop too). The dashboard remembers its theme in `localStorage.tmTheme` (`light`/`dark`, absent = follow the system); the overlay is never themed and stores nothing. |
+| `GET /`, `GET /obs` | The dashboard and the OBS overlay (HTML). `/?session=<id>` opens the dashboard straight into replay of that recording (`<id>` must pass `is_safe_id`); `/?at=<local datetime>` picks the recording running then. `/obs` layers URL parameters over `[viz.obs]`: `layout` (`split`, `stack`, `desk`, `aim`, `pointer` — the Windows cursor path as the whole overlay — or `compare`, the raw hand path beside it; or `view`, the dashboard's spelling), `bg`, `hud` (`speed`, `aim`, `pointer` in px/s, `cpm`, `eps`, `dist`, `aimdist`, `clicks`, `game`, `latency`, `eventage`, `status`), `hudpos`, `scale`, `trail`, `buffer`, `grid`, `legend`, `labels`, and `stale` (0–60 s without a batch before the overlay stops saying nothing; `0` = never; default `stale_secs` = 3. Past it the overlay shows *idle · 12s* while the agent's heartbeats are still arriving — a still hand — and dims to *no feed · 12s* once they stop too). The dashboard remembers its theme in `localStorage.tmTheme` (`light`/`dark`, absent = follow the system); the overlay is never themed and stores nothing. |
 
 ### The UDP stream into it (`[udp] addr`, default `127.0.0.1:7878`)
 
@@ -102,7 +102,9 @@ reachability) and prints the resolved config.
 ### `doctor --json`
 
 One `telemouse-doctor/1` document on stdout and nothing else (the log goes
-to stderr, as always), rendered from the same checks as the text rows:
+to stderr, as always), rendered from the same checks as the text rows. It is
+printed as a single compact line so it fits the panel's 120-line output ring
+intact; the shape, shown pretty-printed here, is:
 
 ```json
 { "schema": "telemouse-doctor/1", "capture_version": "0.2.0",
@@ -144,8 +146,11 @@ below). Sources:
   taken when the line arrives. A console stdin is never read. The control
   panel starts capture with such a pipe and its `/marker` route writes to
   it. From a shell: `"trial 1" | telemouse run --duration-secs 30`.
-- **The agent itself** — a config reload writes a `config_changed` marker
-  and a clock-drift check that finds drift writes `anchor_drift_us=<n>`.
+- **The agent itself** — a config reload that changes a key capture reads
+  (`mouse_cpi`, `marker_hotkey`, `[batch]`, `[udp]`, `[kafka]`,
+  `[recording]`, `viz.http_addr`, `[games]`) writes a `config_changed`
+  marker, and a clock-drift check that finds drift writes
+  `anchor_drift_us=<n>`.
 
 `telemouse-analyze report --split-by-marker` gives a sub-report per interval
 between markers; every report JSON lists them under `markers[]` as
@@ -161,7 +166,7 @@ telemouse-analyze report <path.jsonl | session-id> [--dir recordings] [--summary
 telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]... [--csv FILE] [--json]
 ```
 
-- **`list --json`** → `[{ path, session_id, started_utc_us, duration_s,
+- **`list --json`** → `[{ schema: "telemouse-list/1", path, session_id, started_utc_us, duration_s,
   events, drops, games: [..], bad_lines, losses: [[sink, count], ..],
   exit }]`. Header-only scan; never loads events. `drops` are ring drops
   inside capture; `losses` are per-sink undelivered envelopes from the
@@ -178,6 +183,7 @@ telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]...
   pct_within_1ms, median_interval_ms, p99_interval_ms, gaps_over_10ms,
   poll_hz, locked_fraction, clean, threads_clean, exit, unfinished,
   capture_profile, sink_losses }, flicks: { count, per_minute,
+  (the full report's `quality.sidecar` carries the same `sink_losses`)
   amplitude_deg_median, peak_velocity_deg_s_median, duration_ms_median,
   overshoot_ratio_median, overshoot_ratio_p90, settle_ms_median,
   settle_ms_p90, time_to_click_ms_median, clicked_fraction }, micro: {
@@ -209,7 +215,7 @@ telemouse-analyze trend  [--dir recordings] [--json-dir DIR] [--metric a.b.c]...
   markers[], segments[], per_second[], per_minute[], warnings[], timings[]`.
   Distribution fields are `{ n, mean, median, p90, p99, max, stddev }`. Tens
   of MB for a long session because of `per_second`.
-- **`trend --json`** → `[{ session_id, path, started_utc_us, started_utc,
+- **`trend --json`** → `[{ schema: "telemouse-trend/1", session_id, path, started_utc_us, started_utc,
   duration_s, events, drops, game, flicks, flicks_per_min, overshoot_median,
   settle_median_ms, tremor_rms_counts_s, path_efficiency, clicks_per_min,
   distance_m, lifts, cm_per_360, from_cache, extra: [[path, value], ..] }]`,
@@ -257,11 +263,11 @@ Read-only, answered from the analyzer library and `GET`s:
 
 | Tool | Input | Result |
 |---|---|---|
-| `sessions_list` | `limit?` (1-500, default 50) | `{ dir, total, returned, sessions: [...] }`. Each entry is a `list --json` row: `path, session_id, started_utc_us, duration_s, events, drops, games, bad_lines, losses, exit`. Newest first; `total` is how many exist, so a truncated answer says so. |
-| `session_summary` | `id` (a recording id, no `.jsonl`) | The `telemouse-report-summary/2` object (*Analyzer*, `report --summary`), ~3 KB. Uses and fills the same `recordings/.reports/<id>.report.json` cache the panel does. |
-| `trend` | `metric?: [dotted paths]`, `last?` (1-500) | `{ rows, sessions: [TrendRow] }`, oldest first — the `trend --json` rows, `last` keeping the newest. |
+| `sessions_list` | `limit?` (1-500, default 50, alias `last`) | `{ dir, total, returned, sessions: [...] }`. Each entry is a `list --json` row: `path, session_id, started_utc_us, duration_s, events, drops, games, bad_lines, losses, exit`. Newest first; `total` is how many exist, so a truncated answer says so. |
+| `session_summary` | `id` (a recording id; a trailing `.jsonl` is accepted and stripped) | The `telemouse-report-summary/2` object (*Analyzer*, `report --summary`), ~3 KB. Uses and fills the same `recordings/.reports/<id>.report.json` cache the panel does. |
+| `trend` | `metric?: [dotted paths]` (alias `metrics`), `last?` (1-500, alias `limit`) | `{ rows, sessions: [TrendRow] }`, oldest first — the `trend --json` rows, `last` keeping the newest. |
 | `health` | — | `{ ctl: {...}, viz: {...} }`: a projection of ctl `GET /api/state` (per component: running, pid, since, exit counts, `last_exit`, the capture agent's `stats`; plus the process table as `pid`/`name`) and of viz `/healthz` + `/api/stats`. The 120-line log rings and the bulk fields are left out. |
-| `logs_tail` | `component` (`ctl`, `capture`, `viz`, `doctor`, `trend`, `report`), `lines?` (1-500, default 50) | `{ component, source, lines }`. The panel's live ring for a component it launched, otherwise `<log_dir>/<component>.log`; ANSI stripped. |
+| `logs_tail` | `component` (`ctl`, `capture`, `viz`, `analyze`, `mcp`, `doctor`, `trend`, `report`), `lines?` (1-500, default 50) | `{ component, source, lines }`. The panel's live ring for a component it launched, otherwise `<log_dir>/<component>.log`; ANSI stripped. |
 | `live_stats` | `seconds?` (0-60, default 5) | Two `/api/stats` readings that far apart, as rates: `{ sampled_s, datagrams_per_s, forwarded_per_s, parse_errors_per_s, lag_drops_per_s, *_delta, latest }`. `seconds: 0` is a single reading. |
 
 Control, every one of them a `POST` to ctl with `X-Telemouse-Ctl: 1` — this
@@ -270,10 +276,10 @@ allow-list and its pid rule are still what decide:
 
 | Tool | Input | Result |
 |---|---|---|
-| `capture_start` | `save?`, `flags?`, `session?` | ctl's `{ ok, pid }`. `flags` is checked against `--print`, `--no-kafka`, `--no-udp`, `--record`, `--no-record` here as well as there. `session` is carried through for symmetry with the route; the capture agent names its own session, so it changes nothing. |
+| `capture_start` | `save?`, `flags?` | ctl's `{ ok, pid }`. `flags` is checked against the one allow-list in `telemouse_core::ctl::CAPTURE_FLAGS` (`--print`, `--no-kafka`, `--no-udp`, `--no-record`, `--record`) here as well as there. The capture agent names its own session; a `session` argument is ignored. |
 | `capture_stop` | `force?` | `{ ok, outcome: "graceful" \| "terminated" }`. |
 | `marker` | `label` | `{ ok, label }`. One line, trimmed, at most 120 characters. |
-| `doctor` | — | Starts the doctor component and polls until it exits, up to 30 s: `{ finished, last_exit?, note?, lines }`. |
+| `doctor` | — | Starts the doctor component with `--json` and polls until it exits, up to 30 s: `{ finished, last_exit, report }` where `report` is the `telemouse-doctor/1` document. If the document did not arrive whole (an older capture binary, or a truncated ring) it reruns doctor in text mode and returns `{ finished, last_exit, note, lines }`; a timeout returns `{ finished: false, note, lines }`. A doctor already running (`409`) is waited for rather than started again. |
 | `kill` | `pid` | `{ ok, killed: ProcInfo }`. ctl refuses itself and any pid its own scan would not list. |
 
 `--read-only` removes those five from the router, so `tools/list` does not
@@ -301,6 +307,17 @@ default `recordings`).
   sens table, QPC anchor), then `batch` and `marker` lines in order. Grows
   ~150 MB per hour of play at 1 kHz; read it with the analyzer or a
   streaming parser, never whole.
+  - `session`: `{ session_id, started_utc_us, qpc_freq, anchor: { qpc, utc_us,
+    qpc_freq }, anchor_uncertainty_us?, mouse_cpi, devices, games,
+    monitors: [{ width, height, refresh_hz?, primary }], capture_version,
+    coalesce_ms, window_ms, max_events, os?, pointer? }`. `pointer` is the
+    desktop's pointer settings when the session started —
+    `{ enhance_pointer_precision, speed (1..20), curve_x[5], curve_y[5]
+    (the SmoothMouse{X,Y}Curve registry points, decoded from 16.16, in
+    Windows' inches/s), screen_dpi }` — which is what the viz's Pointer view
+    re-runs the raw counts through; absent from recordings made before it was
+    collected and off Windows, and the viz then assumes a fresh install
+    (precision on, 10/20, 96 dpi, the default curve) and says so.
   - `batch`: `{ session_id, seq_no, ts_anchor_us, game?, pointer_locked,
     screen_w, screen_h, cursor_x?, cursor_y?, drops_since_last,
     abs_frames_since_last, events: [{ ts_qpc, dx, dy, buttons?, wheel?,

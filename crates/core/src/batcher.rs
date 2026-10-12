@@ -1,3 +1,8 @@
+//! The shipping thread's batching policy: when a run of drained events
+//! becomes one batch on the wire. Pure, clock-free logic (every instant is a
+//! caller-supplied QPC reading), so the window/size rules are unit-tested
+//! here rather than against a live capture.
+
 use crate::event::RawEvent;
 
 /// Accumulates drained ring-buffer events into flush-ready batches.
@@ -51,8 +56,10 @@ impl Batcher {
     /// `window_ticks` is clamped to at least one tick: a zero-length window
     /// would expire the instant it opened and spin the owner's loop. The
     /// config layer already refuses `window_ms = 0`; this is the belt.
+    /// `max_events` is clamped to at least one for the same reason (the
+    /// config refuses 0 too): a batch that can hold nothing is always full.
     pub fn new(max_events: usize, window_ticks: u64) -> Self {
-        assert!(max_events > 0);
+        let max_events = max_events.max(1);
         Self {
             max_events,
             window_ticks: window_ticks.max(1),
@@ -62,12 +69,10 @@ impl Batcher {
         }
     }
 
-    /// Convenience: window given in milliseconds at a known QPC frequency.
+    /// Convenience: window given in milliseconds at a known QPC frequency
+    /// (converted with [`crate::clock::ms_to_ticks`]).
     pub fn with_window_ms(max_events: usize, window_ms: u64, qpc_freq: u64) -> Self {
-        Self::new(
-            max_events,
-            (window_ms as u128 * qpc_freq as u128 / 1000) as u64,
-        )
+        Self::new(max_events, crate::clock::ms_to_ticks(window_ms, qpc_freq))
     }
 
     /// The configured window, in QPC ticks.
@@ -345,6 +350,14 @@ mod tests {
         b.push(ev(0));
         assert!(!b.should_flush(249_999));
         assert!(b.should_flush(250_000));
+    }
+
+    #[test]
+    fn a_zero_event_cap_is_clamped_instead_of_panicking() {
+        let mut b = Batcher::new(0, 100);
+        assert!(!b.is_full());
+        b.push(ev(1));
+        assert!(b.is_full());
     }
 
     #[test]

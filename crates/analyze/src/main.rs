@@ -13,12 +13,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod explorer;
 
-use telemouse_analyze::{
-    load,
-    series::Params,
-    timefmt::{format_duration, format_utc_us},
-    trend,
-};
+use telemouse_analyze::{load, series::Params, trend};
 
 /// Install the shared subscriber, when this build has one.
 ///
@@ -166,6 +161,32 @@ struct ParamFlags {
 }
 
 impl ParamFlags {
+    /// The [`Params`] these flags describe, validated: a value that would
+    /// break the analysis is refused here, naming the flag, before any
+    /// recording is read.
+    fn params(&self) -> Result<Params> {
+        let p = self.apply();
+        p.validate().map_err(|e| {
+            anyhow::anyhow!(
+                "--{} {}: must be {}",
+                Self::flag_for(e.field),
+                e.value,
+                e.rule
+            )
+        })?;
+        Ok(p)
+    }
+
+    /// The command-line spelling of a [`Params`] field.
+    fn flag_for(field: &str) -> String {
+        match field {
+            "grid_dt_s" => "grid-dt".to_string(),
+            "flick_speed" => "flick-threshold".to_string(),
+            "still_speed" => "still-threshold".to_string(),
+            other => other.replace('_', "-"),
+        }
+    }
+
     fn apply(&self) -> Params {
         let mut p = Params::default();
         macro_rules! set {
@@ -366,7 +387,7 @@ fn run() -> Result<()> {
             quiet,
             params,
         } => {
-            let params = params.apply();
+            let params = params.params()?;
             let session = resolve_session(&session, &dir)?;
 
             let t = Instant::now();
@@ -381,10 +402,9 @@ fn run() -> Result<()> {
             }
 
             if summary {
-                let losses = load::read_sidecar(&session)
-                    .map(|m| m.losses())
-                    .unwrap_or_default();
-                println!("{}", serde_json::to_string_pretty(&report.summary(losses))?);
+                // The sink losses come from the sidecar the report was built
+                // (or, from the cache, refreshed) with — no second read.
+                println!("{}", serde_json::to_string_pretty(&report.headline())?);
             } else if !quiet {
                 let t = Instant::now();
                 let text = report.render();
@@ -425,10 +445,10 @@ fn run() -> Result<()> {
             json,
             params,
         } => {
-            let rows = trend::compute(&dir, json_dir.as_deref(), params.apply(), &metric)
+            let rows = trend::compute(&dir, json_dir.as_deref(), params.params()?, &metric)
                 .with_context(|| format!("building a trend over {}", dir.display()))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+                println!("{}", trend::to_json(&rows)?);
             } else {
                 print!("{}", trend::render(&rows));
             }
@@ -450,53 +470,9 @@ fn run() -> Result<()> {
             let entries =
                 load::scan_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
-            } else if entries.is_empty() {
-                println!("no recordings in {}", dir.display());
+                println!("{}", load::list_json(&entries)?);
             } else {
-                println!(
-                    "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:>5}  {:<16}  {:<12}  GAME",
-                    "SESSION",
-                    "STARTED (UTC)",
-                    "DURATION",
-                    "EVENTS",
-                    "DROPS",
-                    "BAD",
-                    "LOSS",
-                    "EXIT"
-                );
-                for e in &entries {
-                    println!(
-                        "{:<24}  {:<28}  {:>12}  {:>12}  {:>8}  {:>5}  {:<16}  {:<12}  {}",
-                        e.session_id,
-                        format_utc_us(e.started_utc_us),
-                        format_duration(e.duration_s),
-                        e.events,
-                        e.drops,
-                        e.bad_lines.flag(),
-                        e.losses_text(),
-                        e.exit_text(),
-                        e.games.first().map_or("—", |g| g.as_str()),
-                    );
-                }
-                let total_events: u64 = entries.iter().map(|e| e.events).sum();
-                let total_drops: u64 = entries.iter().map(|e| e.drops).sum();
-                let lossy = entries.iter().filter(|e| !e.losses.is_empty()).count();
-                let unfinished = entries
-                    .iter()
-                    .filter(|e| e.exit.as_deref() == Some("running"))
-                    .count();
-                println!(
-                    "\n{} session(s), {} events, {} drops, {} with sink losses, {} unfinished\n\
-                     BAD = unparseable JSONL lines (a bare count is a cut-off tail; ! means corruption inside the file); \
-                     LOSS = sink=envelopes not delivered and EXIT = how the run ended, both from the .meta.json sidecar \
-                     (\"running\" = it never stopped cleanly)",
-                    entries.len(),
-                    total_events,
-                    total_drops,
-                    lossy,
-                    unfinished
-                );
+                print!("{}", load::render_list(&entries, &dir));
             }
         }
     }
@@ -506,4 +482,39 @@ fn run() -> Result<()> {
         "analysis complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags(args: &[&str]) -> ParamFlags {
+        let mut argv = vec!["telemouse-analyze", "trend"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("parses").cmd {
+            Cmd::Trend { params, .. } => params,
+            other => panic!("not a trend: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_defaults_validate() {
+        assert_eq!(flags(&[]).params().unwrap(), Params::default());
+    }
+
+    /// The message names the flag the user typed, not the struct field.
+    #[test]
+    fn a_bad_flag_is_refused_by_its_own_name() {
+        for (args, flag) in [
+            (&["--sg-half", "3", "--sg-order", "7"][..], "--sg-order 7"),
+            (&["--grid-dt", "3"][..], "--grid-dt 3"),
+            (&["--grid-dt", "0"][..], "--grid-dt 0"),
+            (&["--flick-threshold", "0"][..], "--flick-threshold 0"),
+            (&["--still-threshold=-1"][..], "--still-threshold -1"),
+            (&["--max-grid-cells", "0"][..], "--max-grid-cells 0"),
+        ] {
+            let err = flags(args).params().unwrap_err().to_string();
+            assert!(err.starts_with(flag), "{args:?}: {err}");
+        }
+    }
 }

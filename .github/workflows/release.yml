@@ -19,6 +19,13 @@ name: release
 # docs/DEVELOPING.md, "Code signing". Without them the release is published
 # unsigned, exactly as before.
 #
+# The five executables are listed once, in the build job's `BINS`; signing,
+# signature verification and packaging all read that list. A new binary is
+# one word added there.
+#
+# Every `uses:` is pinned to a commit SHA (the tag in the trailing comment);
+# .github/dependabot.yml keeps the pins current.
+#
 #   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
 
 on:
@@ -42,18 +49,19 @@ jobs:
     # credential per tag. GitHub creates the environment on the first run.
     environment: release
     env:
+      # The shipped executables (target/release/<name>.exe), space-separated.
+      BINS: telemouse telemouse-viz telemouse-analyze telemouse-ctl telemouse-mcp
       # `secrets` cannot be read in a step's `if:`, so the decision is made
       # once here: 'true' only when the app registration and the signing
       # account are all configured; anything else is an unsigned release.
       SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' && vars.SIGNING_ENDPOINT != '' && vars.SIGNING_ACCOUNT_NAME != '' && vars.SIGNING_CERTIFICATE_PROFILE != '' }}
     steps:
-      - uses: actions/checkout@v6
-      # rust-toolchain.toml is the single source of truth for the version.
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # rust-toolchain.toml is the single source of truth for the version and
+      # components: with no argument rustup installs exactly what it names.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Tag matches Cargo.toml version
         shell: pwsh
@@ -68,11 +76,24 @@ jobs:
       - name: clippy (full)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy (minimal)
-        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
+        run: cargo clippy -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-analyze/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
       - name: Test (full)
         run: cargo test --workspace --locked
       - name: Test (minimal)
-        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
+      - name: viz page syntax
+        run: node --check crates/viz/src/app.js
+      - name: viz engine tests
+        run: node --test "crates/viz/js-tests/*.test.mjs"
+      - name: ctl page syntax
+        run: node --check crates/ctl/src/panel.js
+      - name: ctl page tests
+        run: node --test "crates/ctl/js-tests/*.test.mjs"
+      # Same pinned RustSec CLI as ci.yml's audit job.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        run: cargo audit
 
       - name: Build
         run: cargo build --release --workspace --locked
@@ -82,26 +103,28 @@ jobs:
       # stored anywhere; azure/login leaves an Azure CLI session behind and
       # the signing action picks it up (every other credential source is
       # switched off so a stray environment variable cannot be tried first).
+      - name: List the executables to sign
+        id: sign-list
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          $files = $env:BINS -split ' ' | ForEach-Object { Join-Path $env:GITHUB_WORKSPACE "target\release\$_.exe" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value (@('files<<EOF') + $files + @('EOF'))
       - name: Azure login (OIDC)
         if: env.SIGNING == 'true'
-        uses: azure/login@v3
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Sign the executables
         if: env.SIGNING == 'true'
-        uses: azure/artifact-signing-action@v2
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.SIGNING_CERTIFICATE_PROFILE }}
-          files: |
-            ${{ github.workspace }}\target\release\telemouse.exe
-            ${{ github.workspace }}\target\release\telemouse-viz.exe
-            ${{ github.workspace }}\target\release\telemouse-analyze.exe
-            ${{ github.workspace }}\target\release\telemouse-ctl.exe
-            ${{ github.workspace }}\target\release\telemouse-mcp.exe
+          files: ${{ steps.sign-list.outputs.files }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -120,7 +143,7 @@ jobs:
         if: env.SIGNING == 'true'
         shell: pwsh
         run: |
-          foreach ($exe in 'telemouse', 'telemouse-viz', 'telemouse-analyze', 'telemouse-ctl', 'telemouse-mcp') {
+          foreach ($exe in $env:BINS -split ' ') {
             $sig = Get-AuthenticodeSignature "target/release/$exe.exe"
             "{0,-22} {1}  {2}" -f "$exe.exe", $sig.Status, $sig.SignerCertificate.Subject
             if ($sig.Status -ne 'Valid') { throw "$exe.exe: signature is $($sig.Status): $($sig.StatusMessage)" }
@@ -144,7 +167,7 @@ jobs:
           # plan) and audit notes stay out; the GUIDE links to the plan on
           # GitHub.
           New-Item -ItemType Directory $dir, "$dir/docs", "$dir/recordings" | Out-Null
-          Copy-Item target/release/telemouse.exe, target/release/telemouse-viz.exe, target/release/telemouse-analyze.exe, target/release/telemouse-ctl.exe, target/release/telemouse-mcp.exe $dir
+          Copy-Item ($env:BINS -split ' ' | ForEach-Object { "target/release/$_.exe" }) $dir
           Copy-Item telemouse.example.toml "$dir/telemouse.toml"
           Copy-Item LICENSE, README.md, CHANGELOG.md $dir
           Copy-Item docs/HELP.md, docs/GUIDE.md, docs/FAIR-PLAY.md, docs/API.md "$dir/docs"
@@ -168,11 +191,11 @@ jobs:
       # A signed statement that this exact zip was built by this workflow from
       # this commit. It holds whether or not the executables inside carry an
       # Authenticode signature.
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: telemouse-${{ github.ref_name }}-windows-x86_64.zip
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: telemouse ${{ github.ref_name }}
           body_path: notes.md

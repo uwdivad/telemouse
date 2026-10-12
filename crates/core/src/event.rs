@@ -1,3 +1,8 @@
+//! The unit of capture: one raw mouse report ([`RawEvent`]) and the button
+//! transition bits it carries. Fixed-size and `Copy` so the capture thread
+//! can move it through the ring buffer without allocating; the wire carries
+//! it as-is, raw counts and all.
+
 use serde::{Deserialize, Serialize};
 
 /// Button-transition bitfield values for [`RawEvent::buttons`].
@@ -41,29 +46,23 @@ pub struct RawEvent {
     /// Zero-valued rare fields (buttons, wheels, device index) are omitted
     /// from JSON entirely — consumers must treat a missing field as 0. This
     /// keeps the typical motion-only event small on the wire.
-    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub buttons: u16,
     /// Wheel delta if this event carried one (signed, ±120 per detent typical).
-    #[serde(default, skip_serializing_if = "is_zero_i16")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub wheel: i16,
     /// Horizontal (tilt) wheel delta, `RI_MOUSE_HWHEEL`.
-    #[serde(default, skip_serializing_if = "is_zero_i16")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub wheel_h: i16,
     /// Index into [`crate::session::SessionConfig::devices`] identifying which
     /// HID device produced this event. 0 when unknown (and for recordings made
     /// before device tracking existed).
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub device_ix: u8,
 }
 
-fn is_zero_u16(v: &u16) -> bool {
-    *v == 0
-}
-fn is_zero_i16(v: &i16) -> bool {
-    *v == 0
-}
-fn is_zero_u8(v: &u8) -> bool {
-    *v == 0
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 impl RawEvent {

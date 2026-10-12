@@ -69,7 +69,6 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let g = &p.grid;
     let dt = g.dt;
     let n = g.len();
-    let (kx, ky) = p.aim_scale();
     let still = p.params.still_speed;
 
     let d1 = SavGol::new(p.params.sg_half, p.params.sg_order, 1);
@@ -85,9 +84,13 @@ pub fn compute(p: &Prepared) -> Kinematics {
         .map(|r| r.speed.iter().filter(|&&s| s > still).count())
         .sum();
     let mut speeds = Vec::with_capacity(moving_total);
-    let mut speeds_deg = Vec::with_capacity(moving_total);
     let mut accel = Vec::with_capacity(moving_total);
     let mut jerk = Vec::with_capacity(moving_total);
+    // Aim space: the same moving cells, minus whatever `locked_only` excludes,
+    // with yaw and pitch each scaled by their own coefficient.
+    let mut speeds_deg = Vec::with_capacity(moving_total);
+    let mut accel_deg = Vec::with_capacity(moving_total);
+    let mut jerk_deg = Vec::with_capacity(moving_total);
     let mut moving = 0usize;
 
     // Four derivative lanes per run, each into a reused scratch pair; the
@@ -114,16 +117,19 @@ pub fn compute(p: &Prepared) -> Kinematics {
             accel.push(stats::mag(ax[j], ay[j]));
             jerk.push(stats::mag(jx[j], jy[j]));
             if p.aim_cell_ok(r.start + j) {
-                speeds_deg.push(stats::mag(r.vxs[j] * kx, r.vys[j] * ky));
+                speeds_deg.push(p.aim_mag(r.vxs[j], r.vys[j]));
+                accel_deg.push(p.aim_mag(ax[j], ay[j]));
+                jerk_deg.push(p.aim_mag(jx[j], jy[j]));
             }
         }
     }
     debug_assert_eq!(moving, moving_total);
 
-    // One selection pass per count-space sample; the cm and degree variants
-    // are the same sample rescaled, so they are derived from the summary
-    // rather than re-summarized (`Summary::scaled`). `counts_to_cm` is linear
-    // in counts.
+    // One selection pass per sample. The cm variants are the count sample
+    // rescaled (`counts_to_cm` is linear and isotropic), so they come off the
+    // summary (`Summary::scaled`). The degree variants cannot: pitch has its
+    // own coefficient and `locked_only` drops cells, so they are their own
+    // samples.
     let cm_per_count = p.counts_to_cm(1.0);
     let speed_summary = Summary::of_vec(speeds);
     let accel_summary = Summary::of_vec(accel);
@@ -138,10 +144,9 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let mut net_x = 0i64;
     let mut net_y = 0i64;
     for (i, e) in p.analysed_events().iter().enumerate() {
-        let (dx, dy) = (e.dx as f64, e.dy as f64);
-        dist_counts += stats::mag(dx, dy);
-        if p.aim_event_ok(i) {
-            dist_deg += stats::mag(dx * kx, dy * ky);
+        dist_counts += stats::mag(e.dx as f64, e.dy as f64);
+        if let Some(deg) = p.event_aim_deg(i) {
+            dist_deg += deg;
             net_x += e.dx as i64;
             net_y += e.dy as i64;
         }
@@ -151,20 +156,7 @@ pub fn compute(p: &Prepared) -> Kinematics {
     let net_pitch = units::counts_to_pitch_deg(net_y as f64, &p.aim);
 
     let segs = p.segments();
-    let mut effs = Vec::with_capacity(segs.len());
-    let mut sum_net = 0.0;
-    let mut sum_path = 0.0;
-    for s in segs {
-        let (dx, dy) = g.displacement(s.start, s.end);
-        let path = g.path_length(s.start, s.end);
-        if path <= 0.0 {
-            continue;
-        }
-        let net = stats::mag(dx, dy);
-        effs.push((net / path).min(1.0));
-        sum_net += net;
-        sum_path += path;
-    }
+    let eff = efficiencies(p, segs);
 
     let minutes = p.minutes();
     let moving_time_s = moving as f64 * dt;
@@ -176,10 +168,10 @@ pub fn compute(p: &Prepared) -> Kinematics {
         speed_deg_per_s: Summary::of_vec(speeds_deg),
         accel_counts_per_s2: accel_summary,
         accel_cm_per_s2: accel_summary.scaled(cm_per_count),
-        accel_deg_per_s2: accel_summary.scaled(kx),
+        accel_deg_per_s2: Summary::of_vec(accel_deg),
         jerk_counts_per_s3: jerk_summary,
         jerk_cm_per_s3: jerk_summary.scaled(cm_per_count),
-        jerk_deg_per_s3: jerk_summary.scaled(kx),
+        jerk_deg_per_s3: Summary::of_vec(jerk_deg),
         total_distance_counts: dist_counts,
         total_distance_cm: total_cm,
         total_distance_m: total_cm / 100.0,
@@ -196,24 +188,64 @@ pub fn compute(p: &Prepared) -> Kinematics {
             0.0
         },
         segment_count: segs.len(),
-        path_efficiency: Summary::of_vec(effs),
-        path_efficiency_weighted: if sum_path > 0.0 {
-            sum_net / sum_path
-        } else {
-            0.0
-        },
+        path_efficiency_weighted: eff.weighted(),
+        path_efficiency: Summary::of_vec(eff.per_segment),
         degrees_locked_only: p.params.locked_only,
     }
 }
 
-/// Mean speed (counts/s) over the time window `[t0, t1)` seconds — used by the
-/// click metrics for pre-click stability.
-pub fn mean_speed_in_window(p: &Prepared, t0: f64, t1: f64) -> Option<f64> {
-    if p.grid.is_empty() || t1 <= t0 {
+/// Net displacement ÷ path length over a run of movement segments: one ratio
+/// per segment, and the totals the length-weighted ratio is made of.
+struct Efficiencies {
+    per_segment: Vec<f64>,
+    sum_net: f64,
+    sum_path: f64,
+}
+
+impl Efficiencies {
+    /// Σ net ÷ Σ path — each segment weighted by how far it travelled.
+    fn weighted(&self) -> f64 {
+        if self.sum_path > 0.0 {
+            self.sum_net / self.sum_path
+        } else {
+            0.0
+        }
+    }
+}
+
+/// The one path-efficiency loop, for the whole session and for any slice of
+/// it. Segments that never moved have no path and are skipped.
+fn efficiencies(p: &Prepared, segs: &[crate::series::Segment]) -> Efficiencies {
+    let mut out = Efficiencies {
+        per_segment: Vec::with_capacity(segs.len()),
+        sum_net: 0.0,
+        sum_path: 0.0,
+    };
+    for s in segs {
+        let (dx, dy) = p.grid.displacement(s.start, s.end);
+        let path = p.grid.path_length(s.start, s.end);
+        if path <= 0.0 {
+            continue;
+        }
+        let net = stats::mag(dx, dy);
+        out.per_segment.push((net / path).min(1.0));
+        out.sum_net += net;
+        out.sum_path += path;
+    }
+    out
+}
+
+/// Mean speed (counts/s) over the window `[us0, us1)` µs since session start
+/// — used by the click metrics for pre-click stability.
+///
+/// Both ends are rounded up to a cell boundary, on integers: the window is
+/// the whole cells that start inside it.
+pub fn mean_speed_in_window(p: &Prepared, us0: i64, us1: i64) -> Option<f64> {
+    if p.grid.is_empty() || us1 <= us0 {
         return None;
     }
-    let a = (t0 / p.grid.dt).ceil().max(0.0) as usize;
-    let b = ((t1 / p.grid.dt).ceil().max(0.0) as usize).min(p.grid.len());
+    let a = p.cell_ceil_us(us0);
+    let b = p.cell_ceil_us(us1);
     if a >= b {
         return None;
     }
@@ -228,8 +260,6 @@ pub fn mean_speed_in_window(p: &Prepared, t0: f64, t1: f64) -> Option<f64> {
 /// searches logarithmic. A debug assertion catches hand-mutated `Prepared`
 /// values without adding work to release report builds.
 pub fn path_efficiency_in(p: &Prepared, a: usize, b: usize) -> (f64, f64) {
-    let mut sum_net = 0.0;
-    let mut sum_path = 0.0;
     // Segments are emitted in grid order. Narrow to the requested start-cell
     // range instead of rescanning every session segment for every minute or
     // marker interval.
@@ -237,25 +267,10 @@ pub fn path_efficiency_in(p: &Prepared, a: usize, b: usize) -> (f64, f64) {
     debug_assert!(segments.windows(2).all(|w| w[0].start <= w[1].start));
     let from = segments.partition_point(|s| s.start < a);
     let to = segments[from..].partition_point(|s| s.start < b) + from;
-    let mut effs = Vec::with_capacity(to - from);
-    for s in &segments[from..to] {
-        let (dx, dy) = p.grid.displacement(s.start, s.end);
-        let path = p.grid.path_length(s.start, s.end);
-        if path <= 0.0 {
-            continue;
-        }
-        let net = stats::mag(dx, dy);
-        effs.push((net / path).min(1.0));
-        sum_net += net;
-        sum_path += path;
-    }
+    let eff = efficiencies(p, &segments[from..to]);
     (
-        if sum_path > 0.0 {
-            sum_net / sum_path
-        } else {
-            0.0
-        },
-        stats::median(&effs).unwrap_or(0.0),
+        eff.weighted(),
+        stats::median(&eff.per_segment).unwrap_or(0.0),
     )
 }
 
@@ -388,12 +403,51 @@ mod tests {
         b.move_ms(50, 10, 0).idle_ms(50).move_ms(50, 10, 0);
         let p = prep(b.into_events());
         // 0-50ms is the 10_000 counts/s pull.
-        let moving = mean_speed_in_window(&p, 0.005, 0.045).unwrap();
+        let moving = mean_speed_in_window(&p, 5_000, 45_000).unwrap();
         assert!((moving - 10_000.0).abs() < 50.0, "{moving}");
         // 55-95ms is idle.
-        let still = mean_speed_in_window(&p, 0.055, 0.095).unwrap();
+        let still = mean_speed_in_window(&p, 55_000, 95_000).unwrap();
         assert!(still < 1.0, "{still}");
-        assert!(mean_speed_in_window(&p, 0.05, 0.05).is_none());
+        assert!(mean_speed_in_window(&p, 50_000, 50_000).is_none());
+        // A window reaching back before the session starts at cell 0, and
+        // one that starts mid-cell starts at the next cell boundary.
+        assert_eq!(
+            mean_speed_in_window(&p, -20_000, 3_000),
+            Some(p.grid.speed_sum(0, 3) / 3.0)
+        );
+        assert_eq!(
+            mean_speed_in_window(&p, 1_500, 4_000),
+            Some(p.grid.speed_sum(2, 4) / 2.0)
+        );
+    }
+
+    /// A game whose pitch coefficient differs from its yaw one: every
+    /// degree-valued summary scales vertical motion by pitch, not by yaw.
+    #[test]
+    fn degree_metrics_scale_pitch_by_the_pitch_coefficient() {
+        use crate::series::{Params, prepare};
+        use crate::testutil::loaded_from;
+
+        let mut b = StreamBuilder::new();
+        b.move_ms(300, 0, 8); // straight down: all pitch
+        let mut s = loaded_from(b.into_events(), Some("cs2.exe"));
+        s.config.games.get_mut("cs2.exe").unwrap().pitch_coeff = 0.011;
+        let p = prepare(s, Params::default()).unwrap();
+        let k = compute(&p);
+        let ky = 2.0 * 0.011;
+        for (deg, counts) in [
+            (&k.speed_deg_per_s, &k.speed_counts_per_s),
+            (&k.accel_deg_per_s2, &k.accel_counts_per_s2),
+            (&k.jerk_deg_per_s3, &k.jerk_counts_per_s3),
+        ] {
+            assert_eq!(deg.n, counts.n);
+            assert!(
+                (deg.median - counts.median * ky).abs() <= 1e-9 * counts.median.max(1.0),
+                "{deg:?} vs {counts:?}"
+            );
+            assert!((deg.max - counts.max * ky).abs() <= 1e-9 * counts.max.max(1.0));
+        }
+        assert!((k.total_distance_deg - 2400.0 * ky).abs() < 1e-9);
     }
 
     /// `--locked-only` must drop desktop-mode movement from the degree-valued
@@ -414,17 +468,23 @@ mod tests {
             ]
         };
 
-        let all = compute(&prepare(
-            loaded_with_batches(evs.clone(), batches()),
-            Params::default(),
-        ));
-        let locked = compute(&prepare(
-            loaded_with_batches(evs, batches()),
-            Params {
-                locked_only: true,
-                ..Default::default()
-            },
-        ));
+        let all = compute(
+            &prepare(
+                loaded_with_batches(evs.clone(), batches()),
+                Params::default(),
+            )
+            .unwrap(),
+        );
+        let locked = compute(
+            &prepare(
+                loaded_with_batches(evs, batches()),
+                Params {
+                    locked_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
 
         // Hand travel is unchanged: the mouse really did move that far.
         assert!((all.total_distance_counts - 1000.0).abs() < 1e-9);
@@ -433,10 +493,19 @@ mod tests {
         assert!((all.total_distance_deg - 1000.0 * FIXTURE_DEG_PER_COUNT).abs() < 1e-9);
         assert!((locked.total_distance_deg - 500.0 * FIXTURE_DEG_PER_COUNT).abs() < 1e-9);
         assert!((locked.net_yaw_deg - 500.0 * FIXTURE_DEG_PER_COUNT).abs() < 1e-9);
-        // ...as does the sample count behind the deg/s summary.
-        assert_eq!(all.speed_deg_per_s.n, all.speed_counts_per_s.n);
-        assert!(locked.speed_deg_per_s.n < all.speed_deg_per_s.n);
+        // ...as does the sample count behind every degree-valued summary —
+        // acceleration and jerk included, which used to be the count-space
+        // sample rescaled and so ignored the flag.
+        for (all_deg, locked_deg) in [
+            (&all.speed_deg_per_s, &locked.speed_deg_per_s),
+            (&all.accel_deg_per_s2, &locked.accel_deg_per_s2),
+            (&all.jerk_deg_per_s3, &locked.jerk_deg_per_s3),
+        ] {
+            assert_eq!(all_deg.n, all.speed_counts_per_s.n);
+            assert!(locked_deg.n < all_deg.n);
+        }
         assert_eq!(locked.speed_counts_per_s.n, all.speed_counts_per_s.n);
+        assert_eq!(locked.accel_counts_per_s2.n, all.accel_counts_per_s2.n);
         assert!(locked.degrees_locked_only);
         assert!(!all.degrees_locked_only);
     }

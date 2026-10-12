@@ -20,7 +20,7 @@ pub fn basename_lower(path: &str) -> Option<String> {
 
 #[cfg(windows)]
 mod imp {
-    use telemouse_core::session::MonitorInfo;
+    use telemouse_core::session::{MonitorInfo, PointerSettings};
     use windows::Win32::Foundation::{CloseHandle, HMODULE, LPARAM, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
         DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW,
@@ -33,6 +33,7 @@ mod imp {
     };
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
         PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
@@ -40,13 +41,14 @@ mod imp {
         THREAD_PRIORITY_ABOVE_NORMAL,
     };
     use windows::Win32::UI::HiDpi::{
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
-        SM_CYSCREEN,
+        SM_CYSCREEN, SPI_GETMOUSE, SPI_GETMOUSESPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
     };
-    use windows::core::{s, w};
+    use windows::core::{PCWSTR, s, w};
 
     const MONITORINFOF_PRIMARY: u32 = 1;
 
@@ -118,20 +120,27 @@ mod imp {
         }
     }
 
+    /// What `qpc_freq` reports if the OS ever returned nothing usable: the
+    /// 10MHz every Windows 10+ machine actually runs QPC at.
+    const FALLBACK_QPC_FREQ: u64 = 10_000_000;
+
     pub fn qpc() -> u64 {
         let mut v = 0i64;
-        // Documented never to fail on Windows XP or later.
+        // SAFETY: writes one i64 through a valid local; documented never to
+        // fail on Windows XP or later.
         unsafe { QueryPerformanceCounter(&mut v) }.ok();
         v as u64
     }
 
     pub fn qpc_freq() -> u64 {
         let mut v = 0i64;
+        // SAFETY: writes one i64 through a valid local.
         unsafe { QueryPerformanceFrequency(&mut v) }.ok();
-        if v <= 0 { 10_000_000 } else { v as u64 }
+        if v <= 0 { FALLBACK_QPC_FREQ } else { v as u64 }
     }
 
     pub fn primary_screen() -> (u32, u32) {
+        // SAFETY: pure queries with constant indices; no pointers involved.
         unsafe {
             (
                 GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
@@ -142,21 +151,96 @@ mod imp {
 
     pub fn cursor_pos() -> Option<(i32, i32)> {
         let mut p = POINT::default();
+        // SAFETY: writes one POINT through a valid local.
         unsafe { GetCursorPos(&mut p) }.ok()?;
         Some((p.x, p.y))
     }
 
+    /// The desktop's pointer settings, read once at session start.
+    ///
+    /// Three reads, all of them of this user's own settings and none of
+    /// them touching another process: `SPI_GETMOUSE` (the "Enhance pointer
+    /// precision" flag rides in its third value), `SPI_GETMOUSESPEED` (the
+    /// slider, 1..=20) and the two `SmoothMouse*Curve` values under
+    /// `HKCU\Control Panel\Mouse`. A curve that is missing or malformed
+    /// falls back to Windows' default one, which is what the vast majority
+    /// of machines have anyway; `None` only when the two `SystemParametersInfo`
+    /// calls fail, which means there is no interactive desktop to ask.
+    pub fn pointer_settings() -> Option<PointerSettings> {
+        let defaults = PointerSettings::windows_defaults();
+        // [threshold1, threshold2, acceleration]: the first two are the
+        // pre-XP doubling thresholds, unused once the curve is in play.
+        let mut mouse = [0i32; 3];
+        let mut speed = 0i32;
+        // SAFETY: both buffers are the documented sizes for these actions
+        // and outlive the calls; nothing is written to the system (fWinIni 0
+        // and a *_GET action).
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETMOUSE,
+                0,
+                Some(mouse.as_mut_ptr() as *mut std::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()?;
+            SystemParametersInfoW(
+                SPI_GETMOUSESPEED,
+                0,
+                Some(&mut speed as *mut i32 as *mut std::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()?;
+        }
+        // GetDpiForSystem never fails; on a pre-1607 build the crate's stub
+        // would not link at all, and the manifest declares per-monitor v2.
+        // SAFETY: no arguments, no pointers.
+        let dpi = unsafe { GetDpiForSystem() };
+        Some(PointerSettings {
+            enhance_pointer_precision: mouse[2] != 0,
+            speed: speed.clamp(1, 20) as u32,
+            curve_x: smooth_mouse_curve(w!("SmoothMouseXCurve")).unwrap_or(defaults.curve_x),
+            curve_y: smooth_mouse_curve(w!("SmoothMouseYCurve")).unwrap_or(defaults.curve_y),
+            screen_dpi: if dpi == 0 { defaults.screen_dpi } else { dpi },
+        })
+    }
+
+    /// One `REG_BINARY` curve from `HKCU\Control Panel\Mouse`, decoded.
+    fn smooth_mouse_curve(value: PCWSTR) -> Option<[f64; 5]> {
+        let mut buf = [0u8; 64];
+        let mut len = buf.len() as u32;
+        // SAFETY: a fixed local buffer whose length is passed alongside it;
+        // the API truncates (and reports an error) rather than overrun.
+        let err = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!(r"Control Panel\Mouse"),
+                value,
+                RRF_RT_REG_BINARY,
+                None,
+                Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                Some(&mut len),
+            )
+        };
+        if err.is_err() {
+            return None;
+        }
+        PointerSettings::decode_curve(&buf[..(len as usize).min(buf.len())])
+    }
+
     /// PID owning the foreground window, or 0. Costs no handle at all.
     pub fn foreground_pid() -> u32 {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.0.is_null() {
-                return 0;
-            }
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            pid
+        // SAFETY: no arguments; the handle is only compared and passed back
+        // to the OS, never dereferenced.
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            return 0;
         }
+        let mut pid = 0u32;
+        // SAFETY: `hwnd` came from the OS a moment ago (a stale one just
+        // fails), and the pid is written through a valid local. Opens no
+        // handle on the process.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        pid
     }
 
     /// Executable name of `pid`, lowercased, read from a snapshot of the
@@ -207,6 +291,8 @@ mod imp {
     /// Nudge the calling thread (T1 only) above normal so a busy desktop cannot
     /// delay `WM_INPUT` delivery. Failure is a warning, never fatal.
     pub fn raise_capture_thread_priority() {
+        // SAFETY: the pseudo-handle for the calling thread and a constant;
+        // affects only this process's own thread.
         let r = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
         match r {
             Ok(()) => tracing::info!(priority = "above_normal", "capture thread priority set"),
@@ -223,6 +309,8 @@ mod imp {
             // Control the knob, and set it to "not throttled".
             StateMask: 0,
         };
+        // SAFETY: the pseudo-handle for this process, and a pointer to a
+        // live local whose exact size is passed alongside it.
         let r = unsafe {
             SetProcessInformation(
                 GetCurrentProcess(),
@@ -238,12 +326,21 @@ mod imp {
         }
     }
 
+    /// `EnumDisplayMonitors` callback: appends one monitor to the Vec.
+    ///
+    /// # Safety
+    /// Only called by `EnumDisplayMonitors` from [`monitors`], with `lparam`
+    /// pointing at its live `Vec<MonitorInfo>`.
     unsafe extern "system" fn enum_monitor(
         hmonitor: HMONITOR,
         _hdc: HDC,
         _rect: *mut RECT,
         lparam: LPARAM,
     ) -> windows::core::BOOL {
+        // SAFETY: `lparam` is the `&mut Vec<MonitorInfo>` that `monitors()`
+        // passed to `EnumDisplayMonitors`, which calls this synchronously on
+        // the same thread before returning; the Vec outlives the call and
+        // nothing else touches it meanwhile, so this is the only `&mut`.
         let out = unsafe { &mut *(lparam.0 as *mut Vec<MonitorInfo>) };
         let mut info = MONITORINFOEXW {
             monitorInfo: MONITORINFO {
@@ -252,6 +349,9 @@ mod imp {
             },
             ..Default::default()
         };
+        // SAFETY: `hmonitor` is the one the enumeration handed us; `info` is
+        // a live MONITORINFOEXW with `cbSize` set to its full size, which is
+        // how the API knows it may write the extended fields.
         let ok = unsafe {
             GetMonitorInfoW(
                 hmonitor,
@@ -275,6 +375,8 @@ mod imp {
             dmSize: size_of::<DEVMODEW>() as u16,
             ..Default::default()
         };
+        // SAFETY: `device` is a NUL-terminated name from MONITORINFOEXW that
+        // lives for the call, and `mode` has `dmSize` set.
         let ok = unsafe {
             EnumDisplaySettingsW(
                 windows::core::PCWSTR(device.as_ptr()),
@@ -291,6 +393,9 @@ mod imp {
 
     pub fn monitors() -> Vec<MonitorInfo> {
         let mut out: Vec<MonitorInfo> = Vec::new();
+        // SAFETY: `enum_monitor` matches MONITORENUMPROC and is called
+        // synchronously, before this returns, with `lparam` pointing at
+        // `out` — which stays alive and otherwise untouched across the call.
         let ok = unsafe {
             EnumDisplayMonitors(
                 None,
@@ -315,7 +420,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
     use telemouse_core::session::MonitorInfo;
 
@@ -327,8 +432,6 @@ mod imp {
 
     /// Nanosecond monotonic clock stands in for QPC off Windows.
     pub fn qpc() -> u64 {
-        let _ = UNIX_EPOCH;
-        let _ = SystemTime::now();
         origin().elapsed().as_nanos() as u64
     }
 
@@ -341,6 +444,10 @@ mod imp {
     }
 
     pub fn cursor_pos() -> Option<(i32, i32)> {
+        None
+    }
+
+    pub fn pointer_settings() -> Option<telemouse_core::session::PointerSettings> {
         None
     }
 
@@ -388,6 +495,13 @@ pub fn primary_screen() -> (u32, u32) {
 
 pub fn cursor_pos() -> Option<(i32, i32)> {
     imp::cursor_pos()
+}
+
+/// The desktop's pointer settings ("Enhance pointer precision", the speed
+/// slider, the transfer curve, the system DPI) as they go into the session
+/// record. `None` off Windows, or when there is no desktop to ask.
+pub fn pointer_settings() -> Option<telemouse_core::session::PointerSettings> {
+    imp::pointer_settings()
 }
 
 /// Lowercase foreground process name, e.g. `cs2.exe`. Uncached — `doctor` and
@@ -587,6 +701,19 @@ mod tests {
         set_dpi_awareness();
         set_dpi_awareness();
         let _ = owns_console();
+    }
+
+    /// An interactive desktop answers all three reads with something the
+    /// pointer model can use: a slider position in range, a DPI that is a
+    /// real scaling factor, and curves that start at zero.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_pointer_settings_the_model_can_use() {
+        let p = pointer_settings().expect("a desktop session answers SPI_GETMOUSE");
+        assert!((1..=20).contains(&p.speed), "speed {}", p.speed);
+        assert!(p.screen_dpi >= 96, "dpi {}", p.screen_dpi);
+        assert_eq!((p.curve_x[0], p.curve_y[0]), (0.0, 0.0));
+        assert!(p.curve_x.windows(2).all(|w| w[1] >= w[0]));
     }
 
     #[cfg(windows)]

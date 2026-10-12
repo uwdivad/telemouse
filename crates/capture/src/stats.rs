@@ -17,7 +17,11 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "observability")]
+use telemouse_core::clock::ticks_to_us_u64;
 use telemouse_core::{LatencyHist, LatencySnapshot, Percentile};
+
+use crate::sinks::SinkKind;
 
 /// Padding that fills out T1's cache line. The exact number is checked by
 /// [`tests::t1_counters_own_their_cache_line`]; `repr(align(64))` would round
@@ -104,15 +108,46 @@ pub struct Stats {
     pub ship_latency_last: LatencyHist,
 }
 
+/// The four counters a queued sink (JSONL, Kafka) keeps, borrowed from
+/// [`Stats`] so [`crate::sinks::queue::QueueAccounting`] can do the same
+/// bookkeeping for either.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueCounters<'a> {
+    pub queued: &'a AtomicU64,
+    pub dropped: &'a AtomicU64,
+    pub abandoned: &'a AtomicU64,
+    pub errors: &'a AtomicU64,
+}
+
 impl Stats {
-    pub fn count_sink_error(&self, sink: &str) {
+    pub fn count_sink_error(&self, sink: SinkKind) {
         let c = match sink {
-            "udp" => &self.udp_errors,
-            "jsonl" => &self.jsonl_errors,
-            "kafka" => &self.kafka_errors,
-            _ => return,
+            SinkKind::Udp => &self.udp_errors,
+            SinkKind::Jsonl => &self.jsonl_errors,
+            SinkKind::Kafka => &self.kafka_errors,
         };
         c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The JSONL writer's queue counters.
+    pub fn jsonl_queue(&self) -> QueueCounters<'_> {
+        QueueCounters {
+            queued: &self.jsonl_queued,
+            dropped: &self.jsonl_dropped,
+            abandoned: &self.jsonl_abandoned,
+            errors: &self.jsonl_errors,
+        }
+    }
+
+    /// The Kafka forwarder's queue counters.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+    pub fn kafka_queue(&self) -> QueueCounters<'_> {
+        QueueCounters {
+            queued: &self.kafka_queued,
+            dropped: &self.kafka_dropped,
+            abandoned: &self.kafka_abandoned,
+            errors: &self.kafka_errors,
+        }
     }
 
     pub fn events(&self) -> u64 {
@@ -134,34 +169,12 @@ impl Stats {
 
     /// Raise the ring high-water mark if `slots` beats it.
     pub fn observe_ring_slots(&self, slots: u64) {
-        let mut best = self.ring_high_water.load(Ordering::Relaxed);
-        while slots > best {
-            match self.ring_high_water.compare_exchange_weak(
-                best,
-                slots,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => best = actual,
-            }
-        }
+        self.ring_high_water.fetch_max(slots, Ordering::Relaxed);
     }
 
     /// Raise the slowest-JSONL-flush mark if `us` beats it.
     pub fn observe_jsonl_flush(&self, us: u64) {
-        let mut best = self.jsonl_flush_max_us.load(Ordering::Relaxed);
-        while us > best {
-            match self.jsonl_flush_max_us.compare_exchange_weak(
-                best,
-                us,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => best = actual,
-            }
-        }
+        self.jsonl_flush_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -242,6 +255,34 @@ impl ReportPercentile {
     }
 }
 
+/// The three latency figures every report line carries: p50 and p99 of
+/// capture→ship from a batch's first event, and p99 from its last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShipLatency {
+    pub capture_to_ship_us_p50: ReportPercentile,
+    pub capture_to_ship_us_p99: ReportPercentile,
+    pub ship_tail_us_p99: ReportPercentile,
+}
+
+impl ShipLatency {
+    /// From the first-event and last-event histograms (whole-run or one
+    /// window's delta, the arithmetic is the same).
+    pub fn of(first: &LatencySnapshot, last: &LatencySnapshot) -> Self {
+        Self {
+            capture_to_ship_us_p50: ReportPercentile::of(first, 0.50),
+            capture_to_ship_us_p99: ReportPercentile::of(first, 0.99),
+            ship_tail_us_p99: ReportPercentile::of(last, 0.99),
+        }
+    }
+}
+
+impl StatsSnapshot {
+    /// The whole run's latency figures.
+    pub fn ship_latency(&self) -> ShipLatency {
+        ShipLatency::of(&self.ship_latency_first, &self.ship_latency_last)
+    }
+}
+
 impl std::fmt::Display for ReportPercentile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
@@ -290,6 +331,39 @@ impl Throttle {
                 Some(std::mem::take(&mut self.suppressed))
             }
         }
+    }
+}
+
+/// One [`Throttle`] per key: per-sink failure warnings.
+///
+/// With no viz running, a broken sink can fail on every batch (~40/s). One
+/// warning per key per interval, carrying how many were suppressed, says the
+/// same thing without drowning the log.
+#[derive(Debug)]
+pub struct WarnLimiter {
+    interval: Duration,
+    entries: Vec<(&'static str, Throttle)>,
+}
+
+impl WarnLimiter {
+    pub fn with_interval(interval: Duration) -> Self {
+        Self {
+            interval,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Should this failure be logged now? `Some(suppressed)` says yes and
+    /// reports how many were swallowed since the last one; `None` says no.
+    pub fn allow(&mut self, key: &'static str, now: Instant) -> Option<u64> {
+        let idx = match self.entries.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.entries.push((key, Throttle::new(self.interval)));
+                self.entries.len() - 1
+            }
+        };
+        self.entries[idx].1.allow(now)
     }
 }
 
@@ -371,7 +445,7 @@ pub enum Escalation {
 /// One `warn!` per condition per [`ESCALATION_INTERVAL`] for as long as the
 /// condition holds, and a fresh one the moment it recurs after clearing.
 ///
-/// Unlike [`crate::shipping::WarnLimiter`], which only ever throttles, this
+/// Unlike [`WarnLimiter`], which only ever throttles, this
 /// tracks the condition's *state*: a Kafka outage that ends and starts again
 /// two minutes later is two incidents, and the second one is worth a line
 /// even though the first was warned about recently.
@@ -485,20 +559,30 @@ pub struct ReportFields {
 #[cfg(feature = "observability")]
 impl ReportFields {
     /// True when a sink is failing, dropping or abandoning envelopes in this
-    /// window — the escalation condition for `jsonl` / `kafka`.
-    pub fn sink_is_losing(&self, sink: &str) -> bool {
+    /// window — the escalation condition for `jsonl` / `kafka`. UDP is
+    /// best-effort by design and never escalates.
+    pub fn sink_is_losing(&self, sink: SinkKind) -> bool {
         match sink {
-            "jsonl" => {
+            SinkKind::Jsonl => {
                 self.jsonl_errors_delta > 0
                     || self.jsonl_dropped_delta > 0
                     || self.jsonl_abandoned_delta > 0
             }
-            "kafka" => {
+            SinkKind::Kafka => {
                 self.kafka_errors_delta > 0
                     || self.kafka_dropped_delta > 0
                     || self.kafka_abandoned_delta > 0
             }
-            _ => false,
+            SinkKind::Udp => false,
+        }
+    }
+
+    /// `(dropped, abandoned)` in this window for a queued sink; zeros for UDP.
+    pub fn sink_losses_delta(&self, sink: SinkKind) -> (u64, u64) {
+        match sink {
+            SinkKind::Jsonl => (self.jsonl_dropped_delta, self.jsonl_abandoned_delta),
+            SinkKind::Kafka => (self.kafka_dropped_delta, self.kafka_abandoned_delta),
+            SinkKind::Udp => (0, 0),
         }
     }
 }
@@ -519,8 +603,10 @@ pub fn compute_report(
     let events_delta = now.events.saturating_sub(prev.events);
     let batches_delta = now.batches.saturating_sub(prev.batches);
     let drains_delta = now.drains.saturating_sub(prev.drains);
-    let first = now.ship_latency_first.delta(&prev.ship_latency_first);
-    let last = now.ship_latency_last.delta(&prev.ship_latency_last);
+    let latency = ShipLatency::of(
+        &now.ship_latency_first.delta(&prev.ship_latency_first),
+        &now.ship_latency_last.delta(&prev.ship_latency_last),
+    );
     ReportFields {
         events_per_s: events_delta as f64 / secs,
         events: now.events,
@@ -558,9 +644,9 @@ pub fn compute_report(
         kafka_abandoned_delta: now.kafka_abandoned.saturating_sub(prev.kafka_abandoned),
         ring_high_water: now.ring_high_water,
         jsonl_flush_max_us: now.jsonl_flush_max_us,
-        capture_to_ship_us_p50: ReportPercentile::of(&first, 0.50),
-        capture_to_ship_us_p99: ReportPercentile::of(&first, 0.99),
-        ship_tail_us_p99: ReportPercentile::of(&last, 0.99),
+        capture_to_ship_us_p50: latency.capture_to_ship_us_p50,
+        capture_to_ship_us_p99: latency.capture_to_ship_us_p99,
+        ship_tail_us_p99: latency.ship_tail_us_p99,
         idle_for_s,
     }
 }
@@ -572,7 +658,7 @@ pub fn idle_for_secs(last_event_qpc: u64, now_qpc: u64, qpc_freq: u64) -> u64 {
     if last_event_qpc == 0 || qpc_freq == 0 {
         return 0;
     }
-    now_qpc.saturating_sub(last_event_qpc) / qpc_freq
+    ticks_to_us_u64(now_qpc.saturating_sub(last_event_qpc), qpc_freq) / 1_000_000
 }
 
 /// Idle past this many seconds is worth one warning: a desk nobody is at is
@@ -585,12 +671,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sink_errors_are_routed_by_name() {
+    fn sink_errors_are_routed_by_kind() {
         let s = Stats::default();
-        s.count_sink_error("udp");
-        s.count_sink_error("kafka");
-        s.count_sink_error("kafka");
-        s.count_sink_error("nope");
+        s.count_sink_error(SinkKind::Udp);
+        s.count_sink_error(SinkKind::Kafka);
+        s.count_sink_error(SinkKind::Kafka);
         let snap = s.snapshot();
         assert_eq!(snap.udp_errors, 1);
         assert_eq!(snap.kafka_errors, 2);
@@ -677,6 +762,50 @@ mod tests {
     }
 
     #[test]
+    fn warnings_are_rate_limited_per_key_with_a_suppressed_count() {
+        let interval = Duration::from_secs(10);
+        let mut l = WarnLimiter::with_interval(interval);
+        let t0 = Instant::now();
+        // First failure for a key always warns.
+        assert_eq!(l.allow("udp", t0), Some(0));
+        // Everything inside the window is swallowed...
+        for i in 1..=5 {
+            assert_eq!(l.allow("udp", t0 + Duration::from_millis(i * 100)), None);
+        }
+        // ...and the next one past it reports the backlog.
+        assert_eq!(l.allow("udp", t0 + interval), Some(5));
+        // The counter resets after being reported.
+        assert_eq!(l.allow("udp", t0 + interval + Duration::from_secs(1)), None);
+        assert_eq!(l.allow("udp", t0 + interval * 2), Some(1));
+    }
+
+    #[test]
+    fn each_key_gets_its_own_warn_budget() {
+        let mut l = WarnLimiter::with_interval(Duration::from_secs(10));
+        let t0 = Instant::now();
+        assert_eq!(l.allow("udp", t0), Some(0));
+        // A different key is not silenced by udp's warning.
+        assert_eq!(l.allow("kafka", t0), Some(0));
+        assert_eq!(l.allow("udp", t0), None);
+        assert_eq!(l.allow("kafka", t0), None);
+        assert_eq!(l.allow("jsonl", t0), Some(0));
+    }
+
+    #[test]
+    fn whole_run_latency_reads_off_the_snapshot() {
+        let s = Stats::default();
+        s.ship_latency_first.record(1_000);
+        s.ship_latency_last.record(300);
+        let l = s.snapshot().ship_latency();
+        assert_eq!(l.capture_to_ship_us_p50.to_string(), "1250");
+        assert_eq!(l.ship_tail_us_p99.to_string(), "500");
+        assert_eq!(
+            StatsSnapshot::default().ship_latency(),
+            ShipLatency::default()
+        );
+    }
+
+    #[test]
     fn a_loop_that_stops_counting_twice_is_stalled() {
         let mut w = StallWatch::new();
         // The first check only establishes a baseline.
@@ -747,9 +876,13 @@ mod tests {
         let r = compute_report(&prev, &now, 5.0, 0);
         assert_eq!(r.kafka_dropped_delta, 400);
         assert_eq!(r.jsonl_errors_delta, 0);
-        assert!(r.sink_is_losing("kafka"));
-        assert!(!r.sink_is_losing("jsonl"));
-        assert!(!r.sink_is_losing("udp"), "udp is best-effort by design");
+        assert!(r.sink_is_losing(SinkKind::Kafka));
+        assert!(!r.sink_is_losing(SinkKind::Jsonl));
+        assert!(
+            !r.sink_is_losing(SinkKind::Udp),
+            "udp is best-effort by design"
+        );
+        assert_eq!(r.sink_losses_delta(SinkKind::Kafka), (400, 0));
     }
 
     #[cfg(feature = "observability")]

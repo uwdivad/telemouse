@@ -19,6 +19,16 @@ pub const MOD_CONTROL: u32 = 0x0002;
 pub const MOD_SHIFT: u32 = 0x0004;
 pub const MOD_WIN: u32 = 0x0008;
 
+/// `VK_PAUSE`, `VK_SCROLL`, `VK_SNAPSHOT`, `VK_NUMLOCK`: the keys allowed
+/// without a modifier (see [`STANDALONE`]).
+const VK_PAUSE: u16 = 0x13;
+const VK_SCROLL: u16 = 0x91;
+const VK_SNAPSHOT: u16 = 0x2C;
+const VK_NUMLOCK: u16 = 0x90;
+/// `VK_F1` and `VK_F24`: the function-key range.
+const VK_F1: u16 = 0x70;
+const VK_F24: u16 = 0x87;
+
 /// Named keys and their virtual-key codes (winuser.h `VK_*`).
 pub const NAMED_KEYS: &[(&str, u16)] = &[
     ("space", 0x20),
@@ -38,10 +48,10 @@ pub const NAMED_KEYS: &[(&str, u16)] = &[
     ("down", 0x28),
     ("left", 0x25),
     ("right", 0x27),
-    ("pause", 0x13),
-    ("scrolllock", 0x91),
-    ("printscreen", 0x2C),
-    ("numlock", 0x90),
+    ("pause", VK_PAUSE),
+    ("scrolllock", VK_SCROLL),
+    ("printscreen", VK_SNAPSHOT),
+    ("numlock", VK_NUMLOCK),
     ("numpad0", 0x60),
     ("numpad1", 0x61),
     ("numpad2", 0x62),
@@ -72,7 +82,39 @@ pub const NAMED_KEYS: &[(&str, u16)] = &[
 
 /// Keys that may be a hotkey on their own, without a modifier: nothing
 /// types them, so grabbing them steals no text.
-const STANDALONE: &[u16] = &[0x13, 0x91, 0x2C, 0x90];
+const STANDALONE: &[u16] = &[VK_PAUSE, VK_SCROLL, VK_SNAPSHOT, VK_NUMLOCK];
+
+/// Why a chord in `telemouse.toml` cannot be registered. Every message
+/// starts with the text as written, quoted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HotkeyError {
+    /// Two `+` in a row, or a leading `+`.
+    #[error("{text:?}: empty part (two '+' in a row?)")]
+    EmptyPart { text: String },
+    /// A part before the last that is not a modifier.
+    #[error("{text:?}: {part:?} is not a modifier (ctrl, alt, shift, win); the key must come last")]
+    NotAModifier { text: String, part: String },
+    /// The last part names no key.
+    #[error(
+        "{text:?}: unknown key {key:?} (a letter, a digit, f1-f24, or one of: {})",
+        named_key_list()
+    )]
+    UnknownKey { text: String, key: String },
+    /// A typing key with no modifier.
+    #[error(
+        "{text:?}: a plain key would be taken away from every program; add ctrl, alt, shift or win"
+    )]
+    PlainKey { text: String },
+}
+
+/// Every name in [`NAMED_KEYS`], space-separated, for the error message.
+fn named_key_list() -> String {
+    NAMED_KEYS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
@@ -86,7 +128,7 @@ pub struct Hotkey {
 
 impl Hotkey {
     /// `Ok(None)` for "no hotkey"; `Err` names what is wrong with the text.
-    pub fn parse(text: &str) -> Result<Option<Hotkey>, String> {
+    pub fn parse(text: &str) -> Result<Option<Hotkey>, HotkeyError> {
         let t = text.trim();
         if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("off") {
             return Ok(None);
@@ -109,28 +151,27 @@ impl Hotkey {
                 "alt" => hk.alt = true,
                 "shift" => hk.shift = true,
                 "win" | "super" | "meta" => hk.win = true,
-                "" => return Err(format!("{text:?}: empty part (two '+' in a row?)")),
+                "" => {
+                    return Err(HotkeyError::EmptyPart {
+                        text: text.to_string(),
+                    });
+                }
                 other => {
-                    return Err(format!(
-                        "{text:?}: {other:?} is not a modifier (ctrl, alt, shift, win); the key must come last"
-                    ));
+                    return Err(HotkeyError::NotAModifier {
+                        text: text.to_string(),
+                        part: other.to_string(),
+                    });
                 }
             }
         }
-        hk.vk = key_code(key).ok_or_else(|| {
-            format!(
-                "{text:?}: unknown key {key:?} (a letter, a digit, f1-f24, or one of: {})",
-                NAMED_KEYS
-                    .iter()
-                    .map(|(n, _)| *n)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
+        hk.vk = key_code(key).ok_or_else(|| HotkeyError::UnknownKey {
+            text: text.to_string(),
+            key: key.clone(),
         })?;
         if hk.modifiers() == 0 && !STANDALONE.contains(&hk.vk) && !is_function_key(hk.vk) {
-            return Err(format!(
-                "{text:?}: a plain key would be taken away from every program; add ctrl, alt, shift or win"
-            ));
+            return Err(HotkeyError::PlainKey {
+                text: text.to_string(),
+            });
         }
         Ok(Some(hk))
     }
@@ -155,7 +196,7 @@ impl Hotkey {
 }
 
 fn is_function_key(vk: u16) -> bool {
-    (0x70..=0x87).contains(&vk)
+    (VK_F1..=VK_F24).contains(&vk)
 }
 
 fn key_code(key: &str) -> Option<u16> {
@@ -167,9 +208,9 @@ fn key_code(key: &str) -> Option<u16> {
     }
     if let Some(n) = key.strip_prefix('f')
         && let Ok(n) = n.parse::<u16>()
-        && (1..=24).contains(&n)
+        && (1..=VK_F24 - VK_F1 + 1).contains(&n)
     {
-        return Some(0x70 + n - 1);
+        return Some(VK_F1 + n - 1);
     }
     NAMED_KEYS
         .iter()
@@ -182,7 +223,7 @@ fn key_name(vk: u16) -> String {
         return (vk as u8 as char).to_string();
     }
     if is_function_key(vk) {
-        return format!("F{}", vk - 0x70 + 1);
+        return format!("F{}", vk - VK_F1 + 1);
     }
     NAMED_KEYS
         .iter()
@@ -259,7 +300,8 @@ mod tests {
         assert!(Hotkey::parse("scrolllock").unwrap().is_some());
         assert!(Hotkey::parse("f12").unwrap().is_some());
         let e = Hotkey::parse("r").unwrap_err();
-        assert!(e.contains("plain key"), "{e}");
+        assert!(matches!(e, HotkeyError::PlainKey { .. }));
+        assert!(e.to_string().contains("plain key"), "{e}");
         assert!(Hotkey::parse("5").is_err());
         assert!(Hotkey::parse("space").is_err());
     }
@@ -274,12 +316,23 @@ mod tests {
 
     #[test]
     fn errors_say_what_is_wrong() {
-        let e = Hotkey::parse("ctrl+bogus").unwrap_err();
-        assert!(e.contains("unknown key \"bogus\""), "{e}");
+        let e = Hotkey::parse("ctrl+bogus").unwrap_err().to_string();
+        assert!(
+            e.starts_with("\"ctrl+bogus\": unknown key \"bogus\""),
+            "{e}"
+        );
+        assert!(e.contains("numpad0") && e.contains("printscreen"), "{e}");
         let e = Hotkey::parse("r+ctrl").unwrap_err();
-        assert!(e.contains("not a modifier"), "{e}");
+        assert_eq!(
+            e,
+            HotkeyError::NotAModifier {
+                text: "r+ctrl".into(),
+                part: "r".into()
+            }
+        );
+        assert!(e.to_string().contains("not a modifier"), "{e}");
         let e = Hotkey::parse("ctrl++r").unwrap_err();
-        assert!(e.contains("empty part"), "{e}");
+        assert!(e.to_string().contains("empty part"), "{e}");
         assert!(Hotkey::parse("ctrl+").is_err());
         assert!(
             Hotkey::parse("ctrl+alt").is_err(),

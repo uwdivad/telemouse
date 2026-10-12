@@ -4,9 +4,10 @@
 //
 // and by `cargo test -p telemouse-viz` when Node is installed. They cover
 // the arithmetic a browser session only checks by eye: unit conversion,
-// unwrapped yaw, loss accounting, the live-buffer floor, the live-mode
-// memory cap, checkpointed seeking, session restarts and OBS parameter
-// clamping.
+// unwrapped yaw, loss accounting, the delivery-latency sample, the
+// live-buffer floor, the live-mode memory cap, checkpointed seeking, session
+// restarts (and what a restart must clear), OBS parameter clamping, and the
+// engine's independence from the UI (it is driven through `ctx` / `hooks`).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -23,81 +24,17 @@ import {
 
 const CM_PER_INCH = 2.54;
 
-test("arrival latency stays fixed while event age increases, then becomes idle", () => {
-  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1030, monotonicMs: 1000 };
-  const { telemouse: { engine, ui }, sandbox, elements } = loadApp({ clock });
-  const receive = (env) => ui.ws.onmessage({ data: JSON.stringify(env) });
-  receive(sessionEnvelope());
-  // Events waited 30 and 10 ms, so their mean delivery latency is 20 ms.
-  receive(batchEnvelope(0, [ev(1, 1, 0), ev(1.02, 1, 0)]));
-  const paint = () => sandbox.paintStats(clock.monotonicMs / 1000);
-  paint();
-  assert.equal(elements.get("sLat").textContent, "20.0");
-  assert.equal(elements.get("sAge").textContent, "10.0");
-  assert.equal(sandbox.hudValue("latency", engine), "20.0");
-  clock.utcMs += 2000; clock.monotonicMs += 2000;
-  receive(batchEnvelope(1, []));
-  receive({ type: "marker", ts_qpc: ev(2, 0, 0).ts_qpc, label: "idle marker" });
-  paint();
-  assert.equal(elements.get("sLat").textContent, "20.0");
-  assert.equal(elements.get("sAge").textContent, "2010.0");
-  assert.equal(elements.get("statAge").classList.contains("alert"), false);
-  clock.utcMs += 1000; clock.monotonicMs += 1000;
-  paint();
-  assert.equal(elements.get("sLat").textContent, "idle");
-  assert.equal(elements.get("sLatUnit").textContent, "");
-  assert.equal(elements.get("statLat").classList.contains("warn"), false);
-  assert.equal(sandbox.hudValue("latency", engine), "idle");
-  assert.equal(sandbox.hudValue("eventage", engine), "3010.0");
-  // The first sample after idle starts fresh instead of averaging old data.
-  receive(batchEnvelope(2, [ev(4.025, 1, 0)]));
-  paint();
-  assert.equal(elements.get("sLat").textContent, "5.0");
-  assert.equal(elements.get("sLatUnit").textContent, "ms");
-});
-
-test("timing samples need a live arrival and anchor, reset on restart, and preserve clock skew", () => {
-  const { engine, ui } = fresh();
-  const arrival = ANCHOR_UTC_US / 1000 + 1010;
-  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), arrival, 1);
-  assert.equal(engine.arrivalLatencyMs, null, "no clock anchor");
-  engine.reset();
-  engine.ingest(sessionEnvelope());
-  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]));
-  assert.equal(engine.arrivalLatencyMs, null, "no delivery timestamp");
-  ui.mode = "replay";
-  engine.ingest(batchEnvelope(1, [ev(1, 1, 0)]), arrival, 1);
-  assert.equal(engine.arrivalLatencyMs, null, "replay does not measure delivery");
-  ui.mode = "live";
-  engine.ingest(batchEnvelope(2, [ev(1.02, 1, 0)]), arrival, 1);
-  assert.equal(engine.arrivalLatencyMs, -10, "clock skew stays visible");
-  engine.ingest(batchEnvelope(3, [ev(1, 1, 0)]), arrival, 2);
-  assert.equal(engine.arrivalLatencyMs, -5, "smoothing happens on arrival");
-  engine.ingest(sessionEnvelope({ session_id: "new-session" }));
-  assert.equal(engine.arrivalLatencyMs, null);
-  assert.equal(engine.latencyReceivedAt, null);
-  assert.equal(engine.newestUtcUs(), null);
-});
-
-test("replay hides both timing tiles and OBS accepts both readouts", () => {
-  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1010, monotonicMs: 1000 };
-  const { telemouse: { engine, ui, obs }, sandbox, elements } = loadApp({
-    clock, search: "?obs=1&hud=eventage,latency",
-  });
-  assert.deepEqual([...obs.hud], ["eventage", "latency"]);
-  engine.ingest(sessionEnvelope());
-  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), clock.utcMs, 1);
-  ui.mode = "replay";
-  sandbox.paintStats(1);
-  assert.equal(elements.get("sAge").textContent, "—");
-  assert.equal(elements.get("sLat").textContent, "—");
-  assert.equal(sandbox.hudValue("latency", engine), "—");
-  assert.equal(sandbox.hudValue("eventage", engine), "—");
-});
-
+/** A freshly loaded page's devtools handle. */
 function fresh(opts) {
   const { telemouse } = loadApp(opts);
   return telemouse;
+}
+
+/** A freshly loaded page, already in replay mode. */
+function freshReplay(opts) {
+  const t = fresh(opts);
+  t.ui.setMode("replay");
+  return t;
 }
 
 /** Integrate everything up to `t` from scratch, bypassing checkpoints. */
@@ -119,8 +56,141 @@ function snapshot(engine) {
     totalDeg: engine.totalDeg,
     totalClicks: engine.totalClicks,
     held: engine.held,
+    /* The Windows-cursor integration, remainder included: a checkpoint that
+       dropped the remainder would land a seek a pixel off. */
+    ptrX: engine.ptrX,
+    ptrY: engine.ptrY,
+    ptrRem: [engine.pointer.rx, engine.pointer.ry],
+    totalPx: engine.totalPx,
   };
 }
+
+test("arrival latency stays fixed while event age increases, then becomes idle", () => {
+  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1030, monotonicMs: 1000 };
+  const { telemouse: { engine, ui, _test }, elements } = loadApp({ clock });
+  const receive = (env) => ui.ws.onmessage({ data: JSON.stringify(env) });
+  receive(sessionEnvelope());
+  // Events waited 30 and 10 ms, so their mean delivery latency is 20 ms.
+  receive(batchEnvelope(0, [ev(1, 1, 0), ev(1.02, 1, 0)]));
+  const paint = () => _test.paintStats(clock.monotonicMs / 1000);
+  paint();
+  assert.equal(elements.get("sLat").textContent, "20.0");
+  assert.equal(elements.get("sAge").textContent, "10.0");
+  assert.equal(_test.hudValue("latency", engine), "20.0");
+  clock.utcMs += 2000; clock.monotonicMs += 2000;
+  receive(batchEnvelope(1, []));
+  receive({ type: "marker", ts_qpc: ev(2, 0, 0).ts_qpc, label: "idle marker" });
+  paint();
+  assert.equal(elements.get("sLat").textContent, "20.0");
+  assert.equal(elements.get("sAge").textContent, "2010.0");
+  assert.equal(elements.get("statAge").classList.contains("alert"), false);
+  clock.utcMs += 1000; clock.monotonicMs += 1000;
+  paint();
+  assert.equal(elements.get("sLat").textContent, "idle");
+  assert.equal(elements.get("sLatUnit").textContent, "");
+  assert.equal(elements.get("statLat").classList.contains("warn"), false);
+  assert.equal(_test.hudValue("latency", engine), "idle");
+  assert.equal(_test.hudValue("eventage", engine), "3010.0");
+  // The first sample after idle starts fresh instead of averaging old data.
+  receive(batchEnvelope(2, [ev(4.025, 1, 0)]));
+  paint();
+  assert.equal(elements.get("sLat").textContent, "5.0");
+  assert.equal(elements.get("sLatUnit").textContent, "ms");
+});
+
+test("timing samples need a live arrival and anchor, reset on restart, and preserve clock skew", () => {
+  const { engine } = fresh();
+  const arrival = ANCHOR_UTC_US / 1000 + 1010;
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), arrival, 1);
+  assert.equal(engine.arrivalLatencyMs, null, "no clock anchor");
+  engine.reset();
+  engine.ingest(sessionEnvelope());
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]));
+  assert.equal(engine.arrivalLatencyMs, null, "no delivery timestamp");
+  // The mode is the caller's to say: the engine never asks the UI.
+  engine.ingest(batchEnvelope(1, [ev(1, 1, 0)]), arrival, 1, { mode: "replay" });
+  assert.equal(engine.arrivalLatencyMs, null, "replay does not measure delivery");
+  engine.ingest(batchEnvelope(2, [ev(1.02, 1, 0)]), arrival, 1, { mode: "live" });
+  assert.equal(engine.arrivalLatencyMs, -10, "clock skew stays visible");
+  engine.ingest(batchEnvelope(3, [ev(1, 1, 0)]), arrival, 2);
+  assert.equal(engine.arrivalLatencyMs, -5, "smoothing happens on arrival");
+  engine.ingest(sessionEnvelope({ session_id: "new-session" }));
+  assert.equal(engine.arrivalLatencyMs, null);
+  assert.equal(engine.latencyReceivedAt, null);
+  assert.equal(engine.newestUtcUs(), null);
+});
+
+test("replay hides both timing tiles and OBS accepts both readouts", () => {
+  const clock = { utcMs: ANCHOR_UTC_US / 1000 + 1010, monotonicMs: 1000 };
+  const { telemouse: { engine, ui, obs, _test }, elements } = loadApp({
+    clock, search: "?obs=1&hud=eventage,latency",
+  });
+  assert.deepEqual([...obs.hud], ["eventage", "latency"]);
+  ui.setMode("replay");
+  engine.ingest(sessionEnvelope());
+  engine.ingest(batchEnvelope(0, [ev(1, 1, 0)]), clock.utcMs, 1);
+  // Even with a sample and a newest event on hand, replay shows neither.
+  engine.arrivalLatencyMs = 20;
+  engine.latencyReceivedAt = 1;
+  assert.notEqual(engine.newestUtcUs(), null);
+  _test.paintStats(1);
+  assert.equal(elements.get("sAge").textContent, "—");
+  assert.equal(elements.get("sLat").textContent, "—");
+  assert.equal(_test.hudValue("latency", engine, 1), "—");
+  assert.equal(_test.hudValue("eventage", engine), "—");
+});
+
+test("a restart clears everything the last session set, the CPI and colour scale included", () => {
+  const { engine } = fresh();
+  engine.ingest(sessionEnvelope({ session_id: "s-a", mouse_cpi: 3200 }));
+  engine.ingest(batchEnvelope(0, [ev(0.1, 4000, 0), ev(0.101, 4000, 0)], { session_id: "s-a" }));
+  engine.seek(1);
+  assert.equal(engine.cpi, 3200);
+  assert.ok(engine.vrefDesk > 30, "a fast flick raised the colour scale");
+  engine.lastWall = 123;
+
+  engine.reset();
+  const clean = fresh().engine;
+  for (const key of ["cpi", "qpcFreq", "vrefDesk", "vrefAim", "vrefPtr", "lastWall", "session",
+                     "sessionId", "anchorQpc", "playT", "totalCm", "lastSeq", "drops"]) {
+    assert.deepEqual(engine[key], clean[key], key);
+  }
+  assert.equal(engine.ev.n, 0);
+  assert.equal(engine.deskTrail.n, 0);
+  assert.equal(engine.decay, clean.decay, "the user's trail setting is not session state");
+});
+
+test("the engine reports through its hooks and reads only the ctx it is given", () => {
+  const { engine } = fresh();
+  const seen = [];
+  const hooks = engine.hooks;
+  engine.hooks = {
+    ...hooks,
+    onBatch: () => seen.push("batch"),
+    onDataLoss: (d, l) => seen.push("loss " + d + "/" + l),
+    onSessionRestart: (a, b) => seen.push("restart " + a + "→" + b),
+    onReplayEnd: () => seen.push("end"),
+  };
+  engine.ingest(sessionEnvelope({ session_id: "s-a" }));
+  engine.ingest(batchEnvelope(0, [ev(0.1, 1, 0)], { session_id: "s-a" }));
+  engine.ingest(batchEnvelope(3, [ev(0.2, 1, 0)], { session_id: "s-a" }));
+  engine.ingest(sessionEnvelope({ session_id: "s-b" }));
+  assert.deepEqual(seen, ["batch", "batch", "loss 0/2", "restart s-a→s-b"]);
+
+  // Replay playback is driven by the ctx alone, and its end is a hook.
+  engine.ingest(batchEnvelope(0, [ev(0.1, 1, 0), ev(0.3, 1, 0)], { session_id: "s-b" }));
+  const ctx = { mode: "replay", liveBuffer: 0.035, replayPlaying: true, replaySpeed: 0.5 };
+  engine.playT = engine.tStart;
+  engine.tick(10, ctx);
+  engine.tick(10.1, ctx);
+  assert.ok(Math.abs(engine.playT - 0.15) < 1e-9, `half speed for 0.1 s: ${engine.playT}`);
+  assert.notEqual(seen.at(-1), "end", "not at the end yet");
+  ctx.replaySpeed = 4;
+  engine.tick(10.2, ctx);
+  assert.ok(Math.abs(engine.playT - engine.tEnd) < 1e-9, "clamped at the end");
+  assert.equal(seen.at(-1), "end");
+  engine.hooks = hooks;
+});
 
 test("a session envelope sets the calibration and anchors the timeline", () => {
   const { engine } = fresh();
@@ -139,8 +209,7 @@ test("a session envelope sets the calibration and anchors the timeline", () => {
 });
 
 test("motion integrates to centimetres and to unwrapped aim degrees", () => {
-  const { engine, ui } = fresh();
-  ui.mode = "replay";
+  const { engine } = freshReplay();
   engine.ingest(sessionEnvelope());
   // Four inches to the right, one inch per batch, at sens 2 × 0.022 °/count.
   for (let i = 0; i < 4; i++) {
@@ -158,8 +227,7 @@ test("motion integrates to centimetres and to unwrapped aim degrees", () => {
 });
 
 test("pitch is clamped and a game without a profile falls back", () => {
-  const { engine, ui } = fresh();
-  ui.mode = "replay";
+  const { engine } = freshReplay();
   engine.ingest(sessionEnvelope());
   engine.ingest(batchEnvelope(0, [ev(0.1, 0, 100_000)], { game: "unknown.exe" }));
   engine.seek(1.0);
@@ -199,8 +267,7 @@ test("the live buffer never drops below one batch span plus 10 ms", () => {
 });
 
 test("live mode caps the timeline even when nothing consumes it", () => {
-  const { engine, ui } = fresh();
-  ui.mode = "live";
+  const { engine } = fresh();   // live, the page's starting mode
   engine.ingest(sessionEnvelope());
   // ~45 s of 1 kHz input into a hidden tab: nothing ticks, so only ingest
   // can keep memory bounded.
@@ -213,8 +280,7 @@ test("live mode caps the timeline even when nothing consumes it", () => {
 });
 
 test("a backward seek restores a checkpoint and matches integrating from zero", () => {
-  const { engine, ui } = fresh();
-  ui.mode = "replay";
+  const { engine } = freshReplay();
   engine.ingest(sessionEnvelope());
   for (const b of syntheticStream(35)) engine.ingest(b);
   engine.extendCheckpoints();
@@ -239,8 +305,7 @@ test("a backward seek restores a checkpoint and matches integrating from zero", 
 });
 
 test("a marker is placed on the timeline and reported once when passed", () => {
-  const { engine, ui } = fresh();
-  ui.mode = "replay";
+  const { engine, ui } = freshReplay();
   const seen = [];
   ui.onMarker = (m) => seen.push(m.label);
   engine.ingest(sessionEnvelope());

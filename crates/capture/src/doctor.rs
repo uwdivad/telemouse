@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use telemouse_core::config::AppConfig;
-use telemouse_core::session::MonitorInfo;
+use telemouse_core::session::{MonitorInfo, PointerSettings};
 
 /// Schema tag of the `--json` document. Bump it when a field — or the meaning
 /// of one — changes; a consumer that does not know the tag should say so
@@ -177,8 +177,11 @@ impl Report {
         out
     }
 
-    pub fn to_json_pretty(&self) -> serde_json::Result<String> {
-        serde_json::to_string_pretty(self)
+    /// The document as one line of compact JSON. One line on purpose: the
+    /// control panel keeps a bounded ring of each child's output lines, and a
+    /// pretty-printed document (~145 lines) arrived there truncated.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
     }
 }
 
@@ -229,6 +232,8 @@ pub struct Facts {
     pub primary_screen: (u32, u32),
     pub monitors: Vec<MonitorInfo>,
     pub cursor: Option<(i32, i32)>,
+    /// The desktop's pointer settings, as the session record will carry them.
+    pub pointer: Option<PointerSettings>,
     pub foreground: Option<String>,
     /// Pointing devices as raw input enumerates them.
     pub devices: Vec<String>,
@@ -241,6 +246,25 @@ pub struct Facts {
     pub brokers: Vec<Broker>,
     pub config: serde_json::Value,
     pub config_toml: String,
+}
+
+/// "default curve", or the curve's own points when it is not Windows' — a
+/// display-scaling change leaves a rescaled copy behind, and a "mouse fix"
+/// flattens it, and both are worth seeing next to the pointer view.
+fn describe_curve(p: &PointerSettings) -> String {
+    use telemouse_core::session::{WINDOWS_CURVE_X, WINDOWS_CURVE_Y};
+    if p.curve_x == WINDOWS_CURVE_X && p.curve_y == WINDOWS_CURVE_Y {
+        return "default curve".to_string();
+    }
+    let pts = p
+        .curve_x
+        .iter()
+        .zip(&p.curve_y)
+        .skip(1)
+        .map(|(x, y)| format!("{x:.2}→{y:.2}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("curve {pts} in/s")
 }
 
 impl Facts {
@@ -350,6 +374,30 @@ impl Facts {
             Some((x, y)) => Check::pass("cursor", "Cursor", format!("at {x},{y}")),
             None => Check::warn("cursor", "Cursor", "unavailable")
                 .hint("the cursor position could not be read; absolute frames will be missing"),
+        });
+
+        // What the desktop does with the counts. Informational: raw input is
+        // pre-acceleration either way, so no setting here is wrong for
+        // capture — but the viz's pointer view re-runs Windows' curve over the
+        // counts and this is what it will be told.
+        checks.push(match &self.pointer {
+            Some(p) => Check::pass(
+                "pointer",
+                "Pointer settings",
+                format!(
+                    "enhance pointer precision {}, speed {}/20, {} dpi, {}",
+                    if p.enhance_pointer_precision {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    p.speed,
+                    p.screen_dpi,
+                    describe_curve(p),
+                ),
+            ),
+            None => Check::warn("pointer", "Pointer settings", "unavailable")
+                .hint("no desktop answered; the pointer view will assume Windows' defaults"),
         });
 
         checks.push(match &self.foreground {
@@ -502,7 +550,7 @@ pub fn probe(
 
     Facts {
         capture_version: capture_version.to_string(),
-        generated_utc_us: chrono::Utc::now().timestamp_micros(),
+        generated_utc_us: telemouse_core::now_utc_us(),
         profile,
         features,
         windows: cfg!(windows),
@@ -519,6 +567,7 @@ pub fn probe(
         primary_screen: platform::primary_screen(),
         monitors: platform::monitors(),
         cursor: platform::cursor_pos(),
+        pointer: platform::pointer_settings(),
         foreground: platform::foreground_process_name(),
         // device_ix 0 is reserved for "unknown", so these are the real ones.
         devices: devices::enumerate_mice()
@@ -562,6 +611,7 @@ mod tests {
                 primary: true,
             }],
             cursor: Some((100, 200)),
+            pointer: Some(PointerSettings::windows_defaults()),
             foreground: Some("explorer.exe".into()),
             devices: vec!["mouse-a".into(), "mouse-b".into()],
             udp: SinkProbe::Ready("127.0.0.1:7878".into()),
@@ -615,6 +665,7 @@ mod tests {
                 "clock",
                 "screen",
                 "cursor",
+                "pointer",
                 "foreground",
                 "devices",
                 "udp",
@@ -643,6 +694,44 @@ mod tests {
         assert_eq!(r.verdict, Status::Fail, "a fail outranks a warn");
         assert!(row(&r, "udp").detail.contains("10049"));
         assert!(row(&r, "udp").hint.is_some());
+    }
+
+    /// The row names every input the pointer model runs on, and says when
+    /// the curve is not Windows' own — that is the one thing a person
+    /// comparing two machines' pointer views needs to know.
+    #[test]
+    fn pointer_settings_are_described_and_default_when_unavailable() {
+        let r = healthy().into_report();
+        assert_eq!(
+            row(&r, "pointer").detail,
+            "enhance pointer precision on, speed 10/20, 96 dpi, default curve"
+        );
+
+        let mut f = healthy();
+        f.pointer = Some(PointerSettings {
+            enhance_pointer_precision: false,
+            speed: 6,
+            curve_y: [0.0; 5],
+            screen_dpi: 144,
+            ..PointerSettings::windows_defaults()
+        });
+        let r = f.clone().into_report();
+        assert_eq!(
+            row(&r, "pointer").detail,
+            "enhance pointer precision off, speed 6/20, 144 dpi, \
+             curve 0.43→0.00 1.25→0.00 3.86→0.00 40.00→0.00 in/s"
+        );
+
+        f.pointer = None;
+        let r = f.into_report();
+        assert_eq!(row(&r, "pointer").status, Status::Warn);
+        assert!(
+            row(&r, "pointer")
+                .hint
+                .as_ref()
+                .unwrap()
+                .contains("defaults")
+        );
     }
 
     #[test]
@@ -734,7 +823,9 @@ mod tests {
         let mut f = healthy();
         f.cursor = None;
         let r = f.into_report();
-        let v: serde_json::Value = serde_json::from_str(&r.to_json_pretty().unwrap()).unwrap();
+        let json = r.to_json().unwrap();
+        assert_eq!(json.lines().count(), 1, "one line, whatever the config");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(v["schema"], "telemouse-doctor/1");
         assert_eq!(v["capture_version"], "9.9.9");

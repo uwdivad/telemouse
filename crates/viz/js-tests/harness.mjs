@@ -2,10 +2,13 @@
 // browser stubbed out for the script to run to its last line, and hands back
 // what the page exposes on `window.telemouse` (engine, ui, panels).
 //
-// The stubs are deliberately dumb: elements remember classes, text and values,
-// canvases hand out a 2D context whose every method is a no-op, timers never
-// fire, no animation frame runs and no socket connects. The engine is pure
-// arithmetic over typed arrays, which is exactly what the tests exercise; the
+// The stubs are deliberately dumb: elements remember classes, attributes, text
+// and values (form controls start at the `value="…"` index.html gives them),
+// canvases hand out a 2D context whose every method is a no-op, no animation
+// frame runs and no socket connects. Timeouts queue until a test calls
+// `flushTimers()`; intervals never fire. `fetch` answers from a test-supplied
+// function (by default: an empty recording list). The engine is pure
+// arithmetic over typed arrays, which is most of what the tests exercise; the
 // DOM only has to not throw.
 
 import fs from "node:fs";
@@ -15,7 +18,35 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const APP_JS_PATH = path.join(HERE, "..", "src", "app.js");
+export const INDEX_HTML_PATH = path.join(HERE, "..", "src", "index.html");
 const APP_JS = fs.readFileSync(APP_JS_PATH, "utf8");
+const INDEX_HTML = fs.readFileSync(INDEX_HTML_PATH, "utf8");
+
+/**
+ * The starting value of every form control in index.html, by id: an
+ * `<input>`'s `value="…"`, a `<select>`'s selected (or first) option. What a
+ * browser would show before the script touches anything.
+ */
+export function markupValues(html = INDEX_HTML) {
+  const values = new Map();
+  const attr = (tag, name) => {
+    const m = tag.match(new RegExp("\\s" + name + "=\"([^\"]*)\""));
+    return m ? m[1] : null;
+  };
+  for (const [tag] of html.matchAll(/<input\b[^>]*>/g)) {
+    const id = attr(tag, "id");
+    if (id !== null) values.set(id, attr(tag, "value") ?? "");
+  }
+  for (const m of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+    const id = attr(m[1], "id");
+    if (id === null) continue;
+    const options = [...m[2].matchAll(/<option\b([^>]*)>/g)].map((o) => o[1]);
+    const chosen = options.find((o) => /\sselected\b/.test(o)) ?? options[0];
+    values.set(id, chosen === undefined ? "" : attr(chosen, "value") ?? "");
+  }
+  return values;
+}
+const MARKUP_VALUES = markupValues();
 
 function classList() {
   const set = new Set();
@@ -41,10 +72,11 @@ function context2d() {
 }
 
 function element(id) {
+  const attrs = new Map();
   const el = {
     id,
     textContent: "",
-    value: "",
+    value: MARKUP_VALUES.get(id) ?? "",
     innerHTML: "",
     title: "",
     className: "",
@@ -53,13 +85,23 @@ function element(id) {
     height: 0,
     dataset: {},
     children: [],
+    parentNode: null,
     firstChild: { nodeValue: "" },
     style: { setProperty() {}, },
     classList: classList(),
     addEventListener() {},
     removeEventListener() {},
-    appendChild(c) { this.children.push(c); return c; },
-    remove() {},
+    setAttribute(name, value) { attrs.set(name, String(value)); },
+    getAttribute(name) { return attrs.has(name) ? attrs.get(name) : null; },
+    removeAttribute(name) { attrs.delete(name); },
+    appendChild(c) { this.children.push(c); c.parentNode = this; return c; },
+    remove() {
+      const p = this.parentNode;
+      if (!p) return;
+      const i = p.children.indexOf(this);
+      if (i >= 0) p.children.splice(i, 1);
+      this.parentNode = null;
+    },
     focus() {},
     querySelector() { return null; },
     querySelectorAll() { return []; },
@@ -68,6 +110,72 @@ function element(id) {
   };
   el.parentElement = { id: id + "-parent", getBoundingClientRect: el.getBoundingClientRect };
   return el;
+}
+
+/**
+ * A queue standing in for `setTimeout`: nothing runs until `flush()`, which
+ * runs every queued callback in due order — including ones queued while it
+ * runs (a toast's fade schedules its removal) — up to a sanity limit.
+ */
+function timerQueue() {
+  let nextId = 1, now = 0;
+  const pending = new Map();
+  return {
+    setTimeout(fn, delay = 0, ...args) {
+      const id = nextId++;
+      pending.set(id, { fn, args, at: now + Math.max(0, +delay || 0), id });
+      return id;
+    },
+    clearTimeout(id) { pending.delete(id); },
+    get size() { return pending.size; },
+    flush(limit = 10_000) {
+      let ran = 0;
+      while (pending.size) {
+        if (ran++ >= limit) throw new Error("flushTimers: timers keep scheduling timers");
+        const t = [...pending.values()].sort((a, b) => a.at - b.at || a.id - b.id)[0];
+        pending.delete(t.id);
+        now = Math.max(now, t.at);
+        t.fn(...t.args);
+      }
+      return ran;
+    },
+  };
+}
+
+/** A `fetch` Response whose body is `obj` as JSON. */
+export function jsonResponse(obj, { status = 200 } = {}) {
+  return textResponse(JSON.stringify(obj), { status });
+}
+
+/**
+ * A `fetch` Response carrying `text`, readable both ways the page reads one:
+ * `json()` / `text()`, and `body.getReader()` handing out `chunkSize`-byte
+ * chunks (so a line can straddle two reads, as it does on a real socket).
+ * Content-Length is set, as the server sets it.
+ */
+export function textResponse(text, { status = 200, chunkSize = 64 } = {}) {
+  const bytes = new TextEncoder().encode(text);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => (name.toLowerCase() === "content-length" ? String(bytes.length) : null) },
+    json: async () => JSON.parse(text),
+    text: async () => text,
+    body: {
+      getReader() {
+        let at = 0;
+        return {
+          read: async () => {
+            if (at >= bytes.length) return { done: true, value: undefined };
+            const value = bytes.subarray(at, at + chunkSize);
+            at += chunkSize;
+            return { done: false, value };
+          },
+          cancel: async () => { at = bytes.length; },
+        };
+      },
+    },
+  };
 }
 
 class ResizeObserver {
@@ -88,12 +196,20 @@ class WebSocket {
  * `config` is what the server injects as window.TELEMOUSE_CONFIG.
  * `globals` is merged into the page's `window` before the script runs (e.g.
  * `{ obsstudio: {} }` to look like an OBS browser source).
- * Returns { telemouse, sandbox, elements, fire } — `telemouse` is the page's
- * devtools handle; `fire(type, detail)` dispatches a window event to whatever
- * the page registered for it. No animation frame ever runs by itself: tests
- * that need the frame loop call `sandbox.frame(ms)`.
+ * `fetch(url)` answers the page's requests (return a Response from
+ * `jsonResponse` / `textResponse`, or throw); by default every request gets
+ * an empty JSON list.
+ * Returns { telemouse, sandbox, elements, fire, fetched, flushTimers } —
+ * `telemouse` is the page's devtools handle; `fire(type, detail)` dispatches
+ * a window event to whatever the page registered for it; `fetched` lists the
+ * URLs requested; `flushTimers()` runs every queued timeout. No animation
+ * frame ever runs by itself: tests that need the frame loop call
+ * `telemouse.frame(ms)`.
  */
-export function loadApp({ search = "", config = {}, clock = null, globals = {} } = {}) {
+export function loadApp({ search = "", config = {}, clock = null, globals = {}, fetch = null } = {}) {
+  const timers = timerQueue();
+  const fetched = [];
+  const answer = fetch || (() => jsonResponse([]));
   const elements = new Map();
   const listeners = new Map();
   const document = {
@@ -115,6 +231,7 @@ export function loadApp({ search = "", config = {}, clock = null, globals = {} }
     URLSearchParams,
     TextDecoder,
     document,
+    fetch: async (url) => { fetched.push(String(url)); return answer(String(url)); },
     ResizeObserver,
     WebSocket,
     TELEMOUSE_CONFIG: config,
@@ -132,8 +249,8 @@ export function loadApp({ search = "", config = {}, clock = null, globals = {} }
     cancelAnimationFrame() {},
     setInterval() { return 0; },
     clearInterval() {},
-    setTimeout() { return 0; },
-    clearTimeout() {},
+    setTimeout: (fn, delay, ...args) => timers.setTimeout(fn, delay, ...args),
+    clearTimeout: (id) => timers.clearTimeout(id),
   };
   Object.assign(sandbox, globals);
   sandbox.window = sandbox;
@@ -146,7 +263,16 @@ export function loadApp({ search = "", config = {}, clock = null, globals = {} }
   vm.runInContext(APP_JS, sandbox, { filename: "app.js" });
   if (!sandbox.telemouse) throw new Error("app.js did not publish window.telemouse");
   const fire = (type, detail) => (listeners.get(type) || []).forEach((fn) => fn({ type, detail }));
-  return { telemouse: sandbox.telemouse, sandbox, elements, fire };
+  return {
+    telemouse: sandbox.telemouse, sandbox, elements, fire, fetched,
+    flushTimers: () => timers.flush(),
+    pendingTimers: () => timers.size,
+  };
+}
+
+/** Let every pending promise continuation run (fetch answers, awaited reads). */
+export async function settle(rounds = 20) {
+  for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r));
 }
 
 /* ---------- wire-format builders (mirror telemouse-core) ---------- */

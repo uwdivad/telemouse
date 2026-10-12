@@ -1,14 +1,14 @@
 //! Localhost UDP fan-out for the live viz: one JSON envelope per datagram.
 
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use telemouse_core::wire::MAX_UDP_PAYLOAD;
 
-use super::Sink;
+use super::{Sink, SinkKind};
 use crate::stats::Stats;
 
 pub struct UdpSink {
@@ -17,13 +17,32 @@ pub struct UdpSink {
     stats: Arc<Stats>,
 }
 
+/// The local address to send to `target` from: loopback for a loopback
+/// target (the default, and it never touches the firewall), otherwise the
+/// unspecified address of the target's own family, so a viz on another
+/// machine — or an IPv6 one — is reachable at all.
+pub fn local_bind_for(target: SocketAddr) -> SocketAddr {
+    let ip: std::net::IpAddr = match target {
+        SocketAddr::V4(a) if a.ip().is_loopback() => Ipv4Addr::LOCALHOST.into(),
+        SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        SocketAddr::V6(a) if a.ip().is_loopback() => Ipv6Addr::LOCALHOST.into(),
+        SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    };
+    SocketAddr::new(ip, 0)
+}
+
 impl UdpSink {
     /// Bind an ephemeral local port and connect it to `addr`. Connecting a UDP
     /// socket costs nothing but lets us `send` without re-resolving per packet.
     pub fn connect(addr: &str, stats: Arc<Stats>) -> Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0").context("bind udp socket")?;
+        let target = addr
+            .to_socket_addrs()
+            .with_context(|| format!("resolve udp address {addr}"))?
+            .next()
+            .with_context(|| format!("udp address {addr} resolves to nothing"))?;
+        let socket = UdpSocket::bind(local_bind_for(target)).context("bind udp socket")?;
         socket
-            .connect(addr)
+            .connect(target)
             .with_context(|| format!("connect udp socket to {addr}"))?;
         // Never let a full socket buffer stall the shipping thread.
         socket
@@ -67,8 +86,8 @@ pub fn classify(kind: ErrorKind) -> SendOutcome {
 }
 
 impl Sink for UdpSink {
-    fn name(&self) -> &'static str {
-        "udp"
+    fn kind(&self) -> SinkKind {
+        SinkKind::Udp
     }
 
     fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
@@ -126,12 +145,30 @@ mod tests {
         })
     }
 
+    /// A loopback port that nobody is listening on any more: bound by the OS
+    /// (so it is free right now), then released.
+    fn vacant_loopback_addr() -> String {
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr.to_string()
+    }
+
+    #[test]
+    fn the_local_side_matches_the_target_family_and_scope() {
+        let bind = |s: &str| local_bind_for(s.parse().unwrap()).to_string();
+        assert_eq!(bind("127.0.0.1:7878"), "127.0.0.1:0");
+        assert_eq!(bind("192.168.1.20:7878"), "0.0.0.0:0");
+        assert_eq!(bind("[::1]:7878"), "[::1]:0");
+        assert_eq!(bind("[2001:db8::1]:7878"), "[::]:0");
+    }
+
     #[test]
     fn connect_to_a_local_port_and_send() {
         // No listener needed: connected UDP on loopback still accepts sends.
         let stats = Arc::new(Stats::default());
-        let mut sink = UdpSink::connect("127.0.0.1:59999", Arc::clone(&stats)).unwrap();
-        assert_eq!(sink.name(), "udp");
+        let mut sink = UdpSink::connect(&vacant_loopback_addr(), Arc::clone(&stats)).unwrap();
+        assert_eq!(sink.kind(), SinkKind::Udp);
         let env = marker();
         let payload = env.to_json().unwrap();
         // With nothing listening, Windows may report the earlier datagram's
@@ -182,7 +219,7 @@ mod tests {
     #[test]
     fn oversized_payloads_are_counted_and_rejected() {
         let stats = Arc::new(Stats::default());
-        let mut sink = UdpSink::connect("127.0.0.1:59998", Arc::clone(&stats)).unwrap();
+        let mut sink = UdpSink::connect(&vacant_loopback_addr(), Arc::clone(&stats)).unwrap();
         let huge = "x".repeat(MAX_UDP_PAYLOAD + 1);
         let env = marker();
         assert!(sink.send(env.topic(), env.key(), &huge).is_err());

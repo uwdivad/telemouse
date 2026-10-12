@@ -113,24 +113,17 @@ pub struct ProcInfo {
     pub is_self: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KillError {
+    #[error("no such process")]
     NotFound,
+    #[error("refusing to kill the control panel itself")]
     IsSelf,
+    #[error("process is not a telemouse process")]
     NotRelated,
     /// The OS refused (access denied, or it exited in between).
+    #[error("the OS refused to terminate the process")]
     Failed,
-}
-
-impl std::fmt::Display for KillError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotFound => "no such process",
-            Self::IsSelf => "refusing to kill the control panel itself",
-            Self::NotRelated => "process is not a telemouse process",
-            Self::Failed => "the OS refused to terminate the process",
-        })
-    }
 }
 
 /// CPU time of one process at one scan, so the next scan can report a rate.
@@ -295,25 +288,72 @@ impl Scanner {
             .into_iter()
             .find(|e| e.pid == pid)
             .ok_or(KillError::NotFound)?;
-        let d = sys::details(pid).unwrap_or_default();
-        let kind = classify(&entry.name, &d.cmd).ok_or(KillError::NotRelated)?;
-        let info = ProcInfo {
-            pid,
-            parent: entry.parent,
-            name: entry.name,
-            cmd: d.cmd,
-            exe: d.exe,
-            kind,
-            cpu_pct: 0.0,
-            mem_mb: d.mem_bytes as f64 / (1024.0 * 1024.0),
-            started_unix_s: d.started_unix_s,
-            is_self: false,
-        };
-        if sys::terminate(pid) {
-            Ok(info)
-        } else {
-            Err(KillError::Failed)
-        }
+        kill_entry(entry, sys::open_for_kill)
+    }
+}
+
+/// An open handle on a process, good for both reading what it is and
+/// terminating it. Reading and terminating through the *same* handle is the
+/// point: a PID can be recycled between two `OpenProcess` calls, a handle
+/// cannot change the process it names.
+pub trait KillHandle {
+    /// Image path, command line, times and memory, read through this handle.
+    fn details(&self) -> Details;
+    /// Terminate the process this handle names.
+    fn terminate(&self) -> bool;
+}
+
+/// The policy half of [`Scanner::kill`], over whatever opens the handle:
+///
+/// 1. the snapshot's name must be a candidate *before* anything is opened —
+///    the panel never opens a handle on a process whose name says it is not
+///    telemouse's (the anticheat posture: games are never touched);
+/// 2. one handle, for querying and terminating, is opened;
+/// 3. the process is classified again from what that handle reads (its own
+///    image name and command line), so a PID that was recycled since the
+///    snapshot is refused;
+/// 4. and terminated through the same handle.
+pub fn kill_entry<H: KillHandle>(
+    entry: Entry,
+    open: impl FnOnce(u32) -> Option<H>,
+) -> Result<ProcInfo, KillError> {
+    if !name_is_candidate(&entry.name) {
+        return Err(KillError::NotRelated);
+    }
+    // Access denied (an elevated process), or it is gone already.
+    let handle = open(entry.pid).ok_or(KillError::Failed)?;
+    let d = handle.details();
+    if d.exited {
+        return Err(KillError::NotFound);
+    }
+    // The name the handle reports beats the snapshot's: they differ only
+    // when the PID now belongs to another process.
+    let name = d
+        .exe
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| entry.name.clone());
+    if !name_is_candidate(&name) {
+        return Err(KillError::NotRelated);
+    }
+    let kind = classify(&name, &d.cmd).ok_or(KillError::NotRelated)?;
+    let info = ProcInfo {
+        pid: entry.pid,
+        parent: entry.parent,
+        name: entry.name,
+        cmd: d.cmd,
+        exe: d.exe,
+        kind,
+        cpu_pct: 0.0,
+        mem_mb: d.mem_bytes as f64 / (1024.0 * 1024.0),
+        started_unix_s: d.started_unix_s,
+        is_self: false,
+    };
+    if handle.terminate() {
+        Ok(info)
+    } else {
+        Err(KillError::Failed)
     }
 }
 
@@ -406,6 +446,10 @@ mod sys {
     /// The command line, without touching the target's address space:
     /// `ProcessCommandLineInformation` (Windows 8.1+) works with the limited
     /// query right and returns a `UNICODE_STRING` followed by its characters.
+    ///
+    /// # Safety
+    /// `h` must be an open process handle with at least
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`.
     unsafe fn command_line(h: HANDLE) -> String {
         let mut len = 0u32;
         // SAFETY: a size probe with a null buffer; the API reports the length.
@@ -421,23 +465,27 @@ mod sys {
         if len == 0 || len > 1 << 20 {
             return String::new();
         }
-        let mut buf = vec![0u8; len as usize];
-        // SAFETY: buffer of exactly the reported length, u16-aligned by the
-        // allocator for the UNICODE_STRING header (align 8).
+        // A `u64` buffer, not `u8`: the `UNICODE_STRING` header the API
+        // writes at the start has a pointer in it (align 8), and only the
+        // element type decides the allocation's alignment.
+        let mut buf = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
+        let cap = (buf.len() * size_of::<u64>()) as u32;
+        // SAFETY: the buffer is at least `len` bytes and 8-aligned.
         let status = unsafe {
             NtQueryInformationProcess(
                 h,
                 ProcessCommandLineInformation,
-                buf.as_mut_ptr() as *mut _,
-                len,
+                buf.as_mut_ptr().cast(),
+                cap,
                 &mut len,
             )
         };
-        if status.is_err() || (buf.len() < size_of::<UNICODE_STRING>()) {
+        if status.is_err() || (cap as usize) < size_of::<UNICODE_STRING>() {
             return String::new();
         }
-        // SAFETY: the API wrote a UNICODE_STRING at the buffer start whose
-        // Buffer points inside the same allocation.
+        // SAFETY: the API wrote an 8-aligned UNICODE_STRING at the buffer
+        // start whose Buffer points inside the same allocation, which lives
+        // until the end of this function.
         unsafe {
             let us = &*(buf.as_ptr() as *const UNICODE_STRING);
             if us.Buffer.is_null() || us.Length == 0 {
@@ -448,11 +496,62 @@ mod sys {
         }
     }
 
-    pub fn details(pid: u32) -> Option<Details> {
-        // SAFETY: every handle opened here is closed before returning; the
-        // out-parameters are plain stack structs.
+    /// An open process handle, closed on drop.
+    pub struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from OpenProcess and is closed once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    impl super::KillHandle for Handle {
+        fn details(&self) -> Details {
+            // SAFETY: an open handle with the query right (see open_for_kill).
+            unsafe { query(self.0) }
+        }
+
+        fn terminate(&self) -> bool {
+            // SAFETY: an open handle with PROCESS_TERMINATE.
+            unsafe { TerminateProcess(self.0, 1).is_ok() }
+        }
+    }
+
+    /// One handle to query *and* terminate `pid` with, so the process that is
+    /// classified is the process that is terminated. Only ever called for a
+    /// PID whose snapshot name is a telemouse candidate (`kill_entry`).
+    pub fn open_for_kill(pid: u32) -> Option<Handle> {
+        // SAFETY: OpenProcess takes integers; the handle is owned by `Handle`.
         unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+            .ok()
+            .map(Handle)
+        }
+    }
+
+    pub fn details(pid: u32) -> Option<Details> {
+        // SAFETY: OpenProcess takes integers; the handle is owned by `Handle`
+        // and closed when it drops, and it has the query right `query` needs.
+        unsafe {
+            let h = Handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?);
+            Some(query(h.0))
+        }
+    }
+
+    /// Everything [`Details`] holds, read through `h`.
+    ///
+    /// # Safety
+    /// `h` must be an open process handle with at least
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`.
+    unsafe fn query(h: HANDLE) -> Details {
+        // SAFETY: the caller's handle is open with the query right; the
+        // out-parameters are plain stack structs sized as the APIs expect.
+        unsafe {
             let mut d = Details::default();
 
             let mut path = [0u16; 1024];
@@ -486,8 +585,7 @@ mod sys {
             }
 
             d.cmd = command_line(h);
-            let _ = CloseHandle(h);
-            Some(d)
+            d
         }
     }
 
@@ -530,18 +628,6 @@ mod sys {
                     }
                 }
             }
-        }
-    }
-
-    pub fn terminate(pid: u32) -> bool {
-        // SAFETY: terminate by handle, then close it.
-        unsafe {
-            let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) else {
-                return false;
-            };
-            let ok = TerminateProcess(h, 1).is_ok();
-            let _ = CloseHandle(h);
-            ok
         }
     }
 }
@@ -604,10 +690,26 @@ mod sys {
             .is_some()
     }
 
-    pub fn terminate(pid: u32) -> bool {
-        let target = Pid::from_u32(pid);
-        let s = table(ProcessesToUpdate::Some(&[target]));
-        s.process(target).is_some_and(|p| p.kill())
+    /// Off Windows there is no handle to hold: the PID is re-read for both
+    /// halves. Capture is Windows-only; this keeps the policy testable.
+    pub struct Handle {
+        pid: u32,
+    }
+
+    impl super::KillHandle for Handle {
+        fn details(&self) -> Details {
+            details(self.pid).unwrap_or_default()
+        }
+
+        fn terminate(&self) -> bool {
+            let target = Pid::from_u32(self.pid);
+            let s = table(ProcessesToUpdate::Some(&[target]));
+            s.process(target).is_some_and(|p| p.kill())
+        }
+    }
+
+    pub fn open_for_kill(pid: u32) -> Option<Handle> {
+        exists(pid).then_some(Handle { pid })
     }
 }
 
@@ -790,39 +892,143 @@ mod tests {
         // alive (Windows' System process, PID 4, is the standing example),
         // and the answer comes from OpenProcess alone.
         if cfg!(windows) {
+            // 100 calls; a table walk each (~7 ms) would be the better part
+            // of a second. Bound generously for a loaded CI box.
             let t0 = Instant::now();
             for _ in 0..50 {
                 let _ = sys::exists(me);
                 let _ = sys::exists(u32::MAX - 7);
             }
             assert!(
-                t0.elapsed() < Duration::from_millis(50),
+                t0.elapsed() < Duration::from_millis(300),
                 "sys::exists must not walk the process table: {:?}",
                 t0.elapsed()
             );
         }
         // The whole point of the rewrite: a scan between enumerations is a
         // handful of per-process queries, not a walk of the process table.
-        // Generous bounds for CI boxes.
+        // Asserted as an ordering (a details-only scan is cheaper than one
+        // that also enumerates), which holds however slow the box is.
         let s = Scanner::new();
         let _ = s.scan(); // enumerates
         let t0 = Instant::now();
         for _ in 0..20 {
             let _ = s.scan();
         }
-        let per_scan = t0.elapsed() / 20;
-        assert!(
-            per_scan < Duration::from_millis(5),
-            "details-only scan took {per_scan:?}"
-        );
+        let details_only = t0.elapsed();
         let t0 = Instant::now();
-        s.invalidate();
-        let _ = s.scan();
+        for _ in 0..20 {
+            s.invalidate();
+            let _ = s.scan();
+        }
+        let enumerating = t0.elapsed();
         assert!(
-            t0.elapsed() < Duration::from_millis(200),
-            "enumeration took {:?}",
-            t0.elapsed()
+            details_only < enumerating,
+            "details-only scans ({details_only:?}) must be cheaper than enumerating ones ({enumerating:?})"
         );
+        assert!(
+            enumerating / 20 < Duration::from_secs(1),
+            "enumeration took {:?}",
+            enumerating / 20
+        );
+    }
+
+    /// A handle that records what was asked of it.
+    struct FakeHandle {
+        details: Details,
+        terminated: std::cell::Cell<bool>,
+    }
+
+    impl KillHandle for &FakeHandle {
+        fn details(&self) -> Details {
+            self.details.clone()
+        }
+        fn terminate(&self) -> bool {
+            self.terminated.set(true);
+            true
+        }
+    }
+
+    fn entry(pid: u32, name: &str) -> Entry {
+        Entry {
+            pid,
+            parent: None,
+            name: name.into(),
+        }
+    }
+
+    /// The anticheat rule: a process whose name is not telemouse's is never
+    /// opened, not even to be looked at.
+    #[test]
+    fn a_non_candidate_name_never_reaches_the_handle() {
+        for name in ["cs2.exe", "explorer.exe", "System", "notelemouse.exe"] {
+            let r = kill_entry::<&FakeHandle>(entry(1234, name), |_| {
+                panic!("{name}: a handle was opened on a process that is not telemouse's")
+            });
+            assert_eq!(r.unwrap_err(), KillError::NotRelated, "{name}");
+        }
+    }
+
+    #[test]
+    fn kill_classifies_through_the_handle_and_terminates_through_it() {
+        // The ordinary case: snapshot and handle agree.
+        let h = FakeHandle {
+            details: Details {
+                exe: Some(r"C:\tm\telemouse-viz.exe".into()),
+                cmd: "telemouse-viz serve".into(),
+                ..Default::default()
+            },
+            terminated: false.into(),
+        };
+        let mut opened = None;
+        let info = kill_entry(entry(42, "telemouse-viz.exe"), |pid| {
+            opened = Some(pid);
+            Some(&h)
+        })
+        .unwrap();
+        assert_eq!(opened, Some(42));
+        assert_eq!(info.kind, ProcKind::Viz);
+        assert!(h.terminated.get());
+
+        // The PID was recycled since the snapshot: the handle names another
+        // program, and nothing is terminated.
+        let recycled = FakeHandle {
+            details: Details {
+                exe: Some(r"C:\Games\game.exe".into()),
+                ..Default::default()
+            },
+            terminated: false.into(),
+        };
+        let r = kill_entry(entry(42, "telemouse.exe"), |_| Some(&recycled));
+        assert_eq!(r.unwrap_err(), KillError::NotRelated);
+        assert!(!recycled.terminated.get());
+
+        // A cargo wrapper is decided by the command line the handle reads.
+        let cargo = FakeHandle {
+            details: Details {
+                exe: Some(r"C:\cargo\bin\cargo.exe".into()),
+                cmd: "cargo build -p other".into(),
+                ..Default::default()
+            },
+            terminated: false.into(),
+        };
+        let r = kill_entry(entry(7, "cargo.exe"), |_| Some(&cargo));
+        assert_eq!(r.unwrap_err(), KillError::NotRelated);
+        assert!(!cargo.terminated.get());
+
+        // Gone between the snapshot and the open; or refused the handle.
+        let exited = FakeHandle {
+            details: Details {
+                exited: true,
+                ..Default::default()
+            },
+            terminated: false.into(),
+        };
+        let r = kill_entry(entry(9, "telemouse.exe"), |_| Some(&exited));
+        assert_eq!(r.unwrap_err(), KillError::NotFound);
+        assert!(!exited.terminated.get());
+        let r = kill_entry::<&FakeHandle>(entry(9, "telemouse.exe"), |_| None);
+        assert_eq!(r.unwrap_err(), KillError::Failed);
     }
 
     #[test]

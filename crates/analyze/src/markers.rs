@@ -62,17 +62,21 @@ pub struct MarkerInterval {
 
 /// Cut the session at every marker. Always returns at least one interval, so
 /// callers never need an "unmarked session" special case.
+///
+/// The cuts are placed on the integer µs timeline (each marker's UTC minus
+/// the session zero) and floored to a cell there; the `f64` seconds in the
+/// result are for reading, not for deciding anything.
 pub fn intervals(p: &Prepared, markers: &[MarkerRow]) -> Vec<MarkerInterval> {
     let n = p.grid.len();
-    let dt = p.grid.dt;
-    let end_s = n as f64 * dt;
-    let cell = |t: f64| -> usize { ((t.max(0.0) / dt).floor() as usize).min(n) };
+    let end_us = p.cell_start_us(n);
+    let cell = |us: i64| -> usize { ((us.max(0) / p.grid_dt_us) as usize).min(n) };
 
-    let mut cuts: Vec<(f64, String)> = vec![(0.0, String::new())];
+    let mut cuts: Vec<(i64, String)> = vec![(0, String::new())];
     for m in markers {
-        if m.t_s > 0.0 && m.t_s < end_s {
-            cuts.push((m.t_s, m.label.clone()));
-        } else if m.t_s <= 0.0 {
+        let us = m.t_utc_us - p.t0_utc_us;
+        if us > 0 && us < end_us {
+            cuts.push((us, m.label.clone()));
+        } else if us <= 0 {
             // A marker at the very start relabels the opening interval.
             cuts[0].1 = m.label.clone();
         }
@@ -80,16 +84,52 @@ pub fn intervals(p: &Prepared, markers: &[MarkerRow]) -> Vec<MarkerInterval> {
 
     let mut out = Vec::with_capacity(cuts.len());
     for i in 0..cuts.len() {
-        let t_start = cuts[i].0;
-        let t_end = cuts.get(i + 1).map_or(end_s, |c| c.0);
+        let start_us = cuts[i].0;
+        let end = cuts.get(i + 1).map_or(end_us, |c| c.0);
         out.push(MarkerInterval {
             index: i,
             label: cuts[i].1.clone(),
-            t_start_s: t_start,
-            t_end_s: t_end,
-            start_cell: cell(t_start),
-            end_cell: cell(t_end),
+            t_start_s: start_us as f64 / 1e6,
+            t_end_s: end as f64 / 1e6,
+            start_cell: cell(start_us),
+            end_cell: cell(end),
         });
+    }
+    out
+}
+
+/// Hand and aim travel per interval, summed per event exactly as the session
+/// totals in [`crate::kinematics`] are — `locked_only` included — so the
+/// intervals add up to the totals. Each analysed event is attributed to the
+/// interval holding its cell; `intervals` must be [`intervals`]' output
+/// (ascending, tiling the grid).
+fn travel_per_interval(p: &Prepared, intervals: &[MarkerInterval]) -> Vec<(f64, f64)> {
+    let mut out = vec![(0.0, 0.0); intervals.len()];
+    let mut k = 0usize;
+    for (i, (e, &us)) in p
+        .analysed_events()
+        .iter()
+        .zip(p.analysed_event_us())
+        .enumerate()
+    {
+        if us < 0 {
+            continue;
+        }
+        let cell = (us / p.grid_dt_us) as usize;
+        // Events are near-monotonic, so the interval the last one landed in
+        // almost always holds this one too; search only when it does not.
+        let holds = |iv: &MarkerInterval| iv.start_cell <= cell && cell < iv.end_cell;
+        if !intervals.get(k).is_some_and(holds) {
+            match intervals.partition_point(|iv| iv.start_cell <= cell) {
+                0 => continue,
+                j if holds(&intervals[j - 1]) => k = j - 1,
+                _ => continue,
+            }
+        }
+        out[k].0 += stats::mag(e.dx as f64, e.dy as f64);
+        if let Some(deg) = p.event_aim_deg(i) {
+            out[k].1 += deg;
+        }
     }
     out
 }
@@ -126,8 +166,8 @@ pub fn segment_reports(
     tremor: &TremorSeries,
     intervals: &[MarkerInterval],
 ) -> Vec<SegmentReport> {
-    let (kx, ky) = p.aim_scale();
     let flicks = crate::flicks::ordered_by_start(flicks);
+    let travel = travel_per_interval(p, intervals);
     // ClickReport intentionally preserves source-event order so hold and
     // double-click pairing remain faithful even when a recording contains a
     // timestamp inversion. Sort only the sparse timestamps used for interval
@@ -141,7 +181,8 @@ pub fn segment_reports(
     click_times.sort_by(f64::total_cmp);
     intervals
         .iter()
-        .map(|iv| {
+        .zip(travel)
+        .map(|(iv, (path_counts, deg))| {
             let dur = (iv.t_end_s - iv.t_start_s).max(0.0);
             let minutes = (dur / 60.0).max(f64::MIN_POSITIVE);
             // Restrict each ordered timeline with two logarithmic searches.
@@ -154,22 +195,6 @@ pub fn segment_reports(
             let os: Vec<f64> = interval_flicks.iter().map(|f| f.overshoot_ratio).collect();
             let settle: Vec<f64> = interval_flicks.iter().map(|f| f.settle_ms).collect();
             let (eff, _) = kinematics::path_efficiency_in(p, iv.start_cell, iv.end_cell);
-
-            // Distances come off the grid so an interval boundary lands on a
-            // cell rather than needing an event-index search.
-            let path = p.grid.path_length(iv.start_cell, iv.end_cell);
-            let (dx, dy) = p.grid.displacement(iv.start_cell, iv.end_cell);
-            let _ = (dx, dy);
-            let deg = {
-                let mut acc = 0.0;
-                for r in p.grid.runs_in(iv.start_cell, iv.end_cell) {
-                    let (lo, hi) = r.clip(iv.start_cell, iv.end_cell);
-                    for j in lo..hi {
-                        acc += stats::mag(r.vx[j] * kx, r.vy[j] * ky) * p.grid.dt;
-                    }
-                }
-                acc
-            };
 
             let sec_a = (iv.t_start_s.max(0.0)) as usize;
             let sec_b = (iv.t_end_s.max(0.0).ceil()) as usize;
@@ -190,7 +215,7 @@ pub fn segment_reports(
                 tremor_rms_cm_s: p.counts_to_cm(rms),
                 clicks: n_clicks,
                 clicks_per_min: n_clicks as f64 / minutes,
-                distance_cm: p.counts_to_cm(path),
+                distance_cm: p.counts_to_cm(path_counts),
                 distance_deg: deg,
             }
         })
@@ -207,18 +232,64 @@ mod tests {
     fn session_with_markers(labels: &[(u64, &str)]) -> Prepared {
         let mut b = StreamBuilder::new();
         for _ in 0..6 {
-            b.move_ms(25, 60, 0)
-                .idle_ms(10)
-                .move_ms(10, -10, 0)
-                .idle_ms(5)
-                .button(buttons::LEFT_DOWN)
-                .idle_ms(39)
-                .button(buttons::LEFT_UP)
-                .idle_ms(400);
+            b.flick_cycle(1, 0, 400);
         }
         let mut s = loaded_from(b.into_events(), Some("cs2.exe"));
         s.markers = labels.iter().map(|(ms, l)| marker_at(*ms, l)).collect();
-        crate::series::prepare(s, crate::series::Params::default())
+        crate::series::prepare(s, crate::series::Params::default()).unwrap()
+    }
+
+    /// Interval travel is summed per event, like the session totals, so the
+    /// intervals add up to them — with `locked_only` honoured in both.
+    #[test]
+    fn interval_distances_add_up_to_the_session_totals() {
+        use crate::series::{Params, prepare};
+        use crate::testutil::{batch_meta, loaded_with_batches};
+
+        let mut b = StreamBuilder::new();
+        for _ in 0..6 {
+            b.flick_cycle(1, 3, 400);
+        }
+        let events = b.into_events();
+        let half = events.len() / 2;
+        let batches = vec![
+            batch_meta(0, Some("cs2.exe"), true, half),
+            batch_meta(1, Some("cs2.exe"), false, events.len() - half),
+        ];
+        for locked_only in [false, true] {
+            let mut s = loaded_with_batches(events.clone(), batches.clone());
+            s.markers = vec![marker_at(700, "a"), marker_at(1_900, "b")];
+            let p = prepare(
+                s,
+                Params {
+                    locked_only,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let k = crate::kinematics::compute(&p);
+            let iv = intervals(&p, &rows(&p));
+            let reps =
+                segment_reports(&p, &[], &clicks::compute(&p), &TremorSeries::default(), &iv);
+            assert_eq!(reps.len(), 3);
+            let cm: f64 = reps.iter().map(|r| r.distance_cm).sum();
+            let deg: f64 = reps.iter().map(|r| r.distance_deg).sum();
+            assert!(
+                (cm - k.total_distance_cm).abs() < 1e-9,
+                "{cm} vs {}",
+                k.total_distance_cm
+            );
+            assert!(
+                (deg - k.total_distance_deg).abs() < 1e-9,
+                "locked_only={locked_only}: {deg} vs {}",
+                k.total_distance_deg
+            );
+            assert!(reps.iter().all(|r| r.distance_cm > 0.0));
+            if locked_only {
+                // The last stretch is all unlocked: no aim travel in it.
+                assert_eq!(reps[2].distance_deg, 0.0);
+            }
+        }
     }
 
     #[test]
@@ -288,7 +359,7 @@ mod tests {
             .push_at_us(2_500_000, 0, 0, buttons::X2_DOWN);
         let mut s = loaded_from(b.into_events(), Some("cs2.exe"));
         s.markers = vec![marker_at(1000, "one"), marker_at(2000, "two")];
-        let p = crate::series::prepare(s, crate::series::Params::default());
+        let p = crate::series::prepare(s, crate::series::Params::default()).unwrap();
         let cl = clicks::compute(&p);
         let iv = intervals(&p, &rows(&p));
         let reps = segment_reports(&p, &[], &cl, &TremorSeries::default(), &iv);

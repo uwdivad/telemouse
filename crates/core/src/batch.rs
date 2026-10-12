@@ -1,3 +1,8 @@
+//! A batch: the events of one window plus the context they were captured in
+//! (session, game, cursor, loss counters). [`Batch`] is the owned form every
+//! reader parses; [`BatchView`] is the borrowing form the shipping thread
+//! serializes without copying its event buffer.
+
 use serde::{Deserialize, Serialize};
 
 use crate::event::RawEvent;
@@ -5,6 +10,10 @@ use crate::event::RawEvent;
 /// The batch envelope shipped to Kafka (`mouse.events`) and fanned out over
 /// localhost UDP for the live viz. Assembled by the shipping thread every
 /// ~25ms; the capture hot path never builds these.
+///
+/// Deliberately *not* `deny_unknown_fields`: [`crate::wire::Envelope::from_json`]'s
+/// fast path parses this struct straight from a document that still carries
+/// the envelope's `"type"` key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
     pub session_id: String,
@@ -148,8 +157,7 @@ mod tests {
 
     #[test]
     fn pre_abs_frames_json_still_parses() {
-        let mut b = sample();
-        b.abs_frames_since_last = 0;
+        let b = sample();
         let mut v: serde_json::Value = serde_json::to_value(&b).unwrap();
         v.as_object_mut().unwrap().remove("abs_frames_since_last");
         let back: Batch = serde_json::from_value(v).unwrap();

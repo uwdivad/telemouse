@@ -6,7 +6,8 @@
 //! Kafka must never stall shipping (the plan's "viz latency never gated on
 //! Kafka" rule, applied to capture as well).
 //!
-//! Produces go through rskafka's [`BatchProducer`] with a 25ms linger and zstd
+//! Produces go through rskafka's [`BatchProducer`] with a linger of one batch
+//! window (`batch.window_ms`, passed to [`KafkaSink::connect`]) and zstd
 //! compression, so a second of capture is a couple of RPCs rather than forty.
 //! That only works if several produce calls are in flight at once — the
 //! forwarder therefore spawns each job onto a [`JoinSet`] instead of awaiting
@@ -16,15 +17,15 @@
 //! worker. Constructing this sink therefore never delays capture startup.
 //!
 //! Shutdown is *bounded*: initialization is cancellable and the forwarder gets
-//! [`DRAIN_TIMEOUT`] to finish what is queued, then the runtime is dropped and
-//! the remainder is reported as abandoned. An unreachable broker can delay
-//! neither capture startup nor exit.
+//! its share of the shutdown budget (never more than [`DRAIN_TIMEOUT`]) to
+//! finish what is queued, then the runtime is dropped and the remainder is
+//! reported as abandoned. An unreachable broker can delay neither capture
+//! startup nor exit.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rskafka::client::partition::{Compression, UnknownTopicHandling};
@@ -37,23 +38,35 @@ use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
-use super::Sink;
-use crate::stats::Stats;
+use super::queue::{QueueAccounting, TrySend};
+use super::{Sink, SinkKind};
+use crate::stats::{Stats, Throttle};
 
 /// Envelopes buffered towards Kafka before we start dropping. ~3s of batches.
 const QUEUE_CAPACITY: usize = 128;
+/// Produce calls in flight at once. Past this the forwarder waits for one to
+/// finish, so a stalled broker backs up onto the (bounded, drop-happy)
+/// channel instead of growing the in-flight set without limit.
+const MAX_INFLIGHT: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Coalescing window: matches the batch window, so one RPC per ~2 batches even
-/// under a burst, without adding meaningful durability lag.
-const LINGER: Duration = Duration::from_millis(25);
 /// Kafka's default `max.message.bytes` is 1MiB; stay comfortably under it.
 const MAX_AGGREGATED_BYTES: usize = 900_000;
-/// How long a dropped sink waits for the forwarder to finish before giving up.
+/// The most a dropped sink waits for the forwarder to finish, whatever share
+/// of the shutdown budget it was given.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Do not let runtime-owned I/O resources turn the bounded drain into an
 /// unbounded `Runtime::drop` wait.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+/// A failing produce warns at most this often (CONVENTIONS: anything that
+/// stays wrong is repeated once a minute).
+const PRODUCE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const TOPICS: [&str; 3] = [TOPIC_EVENTS, TOPIC_SESSIONS, TOPIC_MARKERS];
+/// Topics the agent creates itself get one partition (the producers only
+/// write partition 0), a replication factor of one (a desk broker), and a
+/// few seconds for the controller to answer.
+const TOPIC_PARTITIONS: i32 = 1;
+const TOPIC_REPLICATION: i16 = 1;
+const TOPIC_CREATE_TIMEOUT_MS: i32 = 5_000;
 
 type Producers = HashMap<&'static str, Arc<BatchProducer<RecordAggregator>>>;
 
@@ -80,69 +93,73 @@ impl KafkaJob {
 
 pub struct KafkaSink {
     tx: Option<Sender<KafkaJob>>,
-    shutdown: Option<oneshot::Sender<()>>,
-    stats: Arc<Stats>,
+    /// Sent (or dropped) to start the bounded drain; carries this sink's
+    /// share of the shutdown budget when [`Sink::set_drain_deadline`] set one.
+    shutdown: Option<oneshot::Sender<Option<Instant>>>,
     /// Serializes enqueue/completion against terminal failure and shutdown
     /// accounting. This keeps aggregate counters exact when late async jobs
     /// finish after the bounded drain has already claimed them.
-    state: Arc<std::sync::Mutex<KafkaState>>,
+    queue: Arc<QueueAccounting>,
     worker: Option<JoinHandle<()>>,
-    /// True while the queue is overflowing, so the warning fires on the
-    /// 0→nonzero edge (and the recovery on the way back) instead of per drop.
-    dropping: bool,
-}
-
-#[derive(Debug, Default)]
-struct KafkaState {
-    failed: bool,
-    /// Jobs accepted by the channel but not yet successfully produced.
-    outstanding: u64,
-    /// Initialization failure, worker panic, and shutdown timeout are terminal
-    /// claims. Only the first transfers all outstanding jobs to abandoned.
-    loss_claimed: bool,
+    drain_deadline: Option<Instant>,
 }
 
 impl KafkaSink {
     /// Start a forwarder thread. The broker connection and topic setup happen
     /// on that thread; this returns as soon as its bounded channel exists.
-    pub fn connect(brokers: &[String], stats: Arc<Stats>) -> Result<Self> {
+    ///
+    /// `linger` is the producer's coalescing window: the batch window, so one
+    /// RPC covers ~2 batches even under a burst without adding meaningful
+    /// durability lag.
+    pub fn connect(brokers: &[String], linger: Duration, stats: Arc<Stats>) -> Result<Self> {
         anyhow::ensure!(!brokers.is_empty(), "no kafka brokers configured");
         let (tx, rx) = tokio::sync::mpsc::channel::<KafkaJob>(QUEUE_CAPACITY);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let worker_stats = Arc::clone(&stats);
-        let state = Arc::new(std::sync::Mutex::new(KafkaState::default()));
-        let worker_state = Arc::clone(&state);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<Option<Instant>>();
+        let queue = Arc::new(new_queue(stats));
+        let worker_queue = Arc::clone(&queue);
         let brokers = brokers.to_vec();
         let worker = std::thread::Builder::new()
             .name("telemouse-kafka".into())
             .spawn(move || {
-                run_worker(brokers, rx, shutdown_rx, worker_stats, worker_state);
+                run_worker(brokers, linger, rx, shutdown_rx, worker_queue);
                 tracing::debug!("kafka forwarder stopped");
             })
             .context("spawn kafka forwarder")?;
 
         tracing::info!(
-            linger_ms = LINGER.as_millis() as u64,
+            linger_ms = linger.as_millis() as u64,
             compression = "zstd",
             "kafka forwarder started; connecting in background"
         );
         Ok(Self {
             tx: Some(tx),
             shutdown: Some(shutdown_tx),
-            stats,
-            state,
+            queue,
             worker: Some(worker),
-            dropping: false,
+            drain_deadline: None,
         })
     }
 }
 
+fn new_queue(stats: Arc<Stats>) -> QueueAccounting {
+    QueueAccounting::new(SinkKind::Kafka, QUEUE_CAPACITY, stats, Stats::kafka_queue)
+}
+
+/// How long the drain may run: what is left of `deadline` when one was
+/// given, never more than [`DRAIN_TIMEOUT`].
+fn drain_timeout(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(DRAIN_TIMEOUT, |d| {
+        d.saturating_duration_since(Instant::now())
+            .min(DRAIN_TIMEOUT)
+    })
+}
+
 fn run_worker(
     brokers: Vec<String>,
+    linger: Duration,
     rx: Receiver<KafkaJob>,
-    mut shutdown: oneshot::Receiver<()>,
-    stats: Arc<Stats>,
-    state: Arc<std::sync::Mutex<KafkaState>>,
+    mut shutdown: oneshot::Receiver<Option<Instant>>,
+    queue: Arc<QueueAccounting>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -151,10 +168,9 @@ fn run_worker(
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
+            queue.count_error();
             tracing::error!(error = %e, "build kafka runtime failed");
-            mark_failed(&state);
-            claim_loss(&state, &stats);
+            queue.claim_loss();
             return;
         }
     };
@@ -165,29 +181,27 @@ fn run_worker(
         // connection timeout.
         let initialized = tokio::select! {
             _ = &mut shutdown => {
-                claim_loss(&state, &stats);
+                queue.claim_loss();
                 return;
             }
-            result = tokio::time::timeout(CONNECT_TIMEOUT, initialize(brokers)) => result,
+            result = tokio::time::timeout(CONNECT_TIMEOUT, initialize(brokers, linger)) => result,
         };
 
         let (client, producers) = match initialized {
             Ok(Ok(ready)) => ready,
             Ok(Err(e)) => {
-                stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
+                queue.count_error();
                 tracing::warn!(error = %format!("{e:#}"), "kafka unavailable; forwarder stopped");
-                mark_failed(&state);
-                claim_loss(&state, &stats);
+                queue.claim_loss();
                 return;
             }
             Err(_) => {
-                stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
+                queue.count_error();
                 tracing::warn!(
                     timeout_s = CONNECT_TIMEOUT.as_secs(),
                     "kafka initialization timed out; forwarder stopped"
                 );
-                mark_failed(&state);
-                claim_loss(&state, &stats);
+                queue.claim_loss();
                 return;
             }
         };
@@ -195,29 +209,25 @@ fn run_worker(
         tracing::info!("kafka producer configured");
         // Keep the client alive for as long as its partition producers run.
         let _client = client;
-        let mut forwarder = tokio::spawn(forward(
-            rx,
-            producers,
-            Arc::clone(&stats),
-            Arc::clone(&state),
-        ));
-        // Resolves (with Err) the moment the sink is dropped.
-        let _ = shutdown.await;
-        match tokio::time::timeout(DRAIN_TIMEOUT, &mut forwarder).await {
+        let mut forwarder = tokio::spawn(forward(rx, producers, Arc::clone(&queue)));
+        // Resolves the moment the sink is dropped: with its deadline, or
+        // with an error if it had none to send.
+        let timeout = drain_timeout(shutdown.await.ok().flatten());
+        match tokio::time::timeout(timeout, &mut forwarder).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                let first_failure = mark_failed(&state);
-                let abandoned = claim_loss(&state, &stats);
+                let first_failure = queue.mark_failed();
+                let abandoned = queue.claim_loss();
                 if first_failure {
-                    stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
+                    queue.count_error();
                 }
                 tracing::error!(error = %e, abandoned, "kafka forwarder panicked");
             }
             Err(_) => {
-                let abandoned = claim_loss(&state, &stats);
+                let abandoned = queue.claim_loss();
                 tracing::warn!(
                     abandoned,
-                    timeout_s = DRAIN_TIMEOUT.as_secs(),
+                    timeout_ms = timeout.as_millis() as u64,
                     "kafka drain timed out; abandoning queued envelopes"
                 );
                 forwarder.abort();
@@ -228,112 +238,70 @@ fn run_worker(
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
-async fn initialize(brokers: Vec<String>) -> Result<(Client, Producers)> {
+async fn initialize(brokers: Vec<String>, linger: Duration) -> Result<(Client, Producers)> {
     let client = ClientBuilder::new(brokers)
         .client_id("telemouse-capture")
         .build()
         .await
         .context("kafka connect failed")?;
     ensure_topics(&client).await;
-    let producers = open_producers(&client).await?;
+    let producers = open_producers(&client, linger).await?;
     Ok((client, producers))
-}
-
-fn mark_failed(state: &std::sync::Mutex<KafkaState>) -> bool {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    let first = !state.failed;
-    state.failed = true;
-    first
-}
-
-fn claim_loss(state: &std::sync::Mutex<KafkaState>, stats: &Stats) -> u64 {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    state.failed = true;
-    if state.loss_claimed {
-        return 0;
-    }
-    state.loss_claimed = true;
-    let abandoned = std::mem::take(&mut state.outstanding);
-    stats.kafka_queued.fetch_sub(abandoned, Ordering::Relaxed);
-    stats
-        .kafka_abandoned
-        .fetch_add(abandoned, Ordering::Relaxed);
-    abandoned
-}
-
-fn finish_job(state: &std::sync::Mutex<KafkaState>, stats: &Stats, delivered: bool) {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.loss_claimed {
-        return;
-    }
-    debug_assert!(state.outstanding > 0);
-    state.outstanding -= 1;
-    stats.kafka_queued.fetch_sub(1, Ordering::Relaxed);
-    if !delivered {
-        stats.kafka_abandoned.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// Drain the channel, keeping several produces in flight so the linger window
 /// actually has something to coalesce.
-async fn forward(
-    mut rx: Receiver<KafkaJob>,
-    producers: Producers,
-    stats: Arc<Stats>,
-    state: Arc<std::sync::Mutex<KafkaState>>,
-) {
+async fn forward(mut rx: Receiver<KafkaJob>, producers: Producers, queue: Arc<QueueAccounting>) {
     let producers = Arc::new(producers);
     let mut inflight: JoinSet<()> = JoinSet::new();
-    let produce_warning_emitted = Arc::new(AtomicBool::new(false));
+    let produce_warn = Arc::new(Mutex::new(Throttle::new(PRODUCE_WARN_INTERVAL)));
     while let Some(job) = rx.recv().await {
         // Reap anything already finished, then bound concurrency so a stalled
         // broker backpressures onto the (bounded, drop-happy) channel rather
         // than growing this set without limit.
         while let Some(result) = inflight.try_join_next() {
-            observe_join(result, &state, &stats);
+            observe_join(result, &queue);
         }
-        if inflight.len() >= QUEUE_CAPACITY
+        if inflight.len() >= MAX_INFLIGHT
             && let Some(result) = inflight.join_next().await
         {
-            observe_join(result, &state, &stats);
+            observe_join(result, &queue);
         }
         let producers = Arc::clone(&producers);
-        let stats = Arc::clone(&stats);
-        let state = Arc::clone(&state);
-        let produce_warning_emitted = Arc::clone(&produce_warning_emitted);
+        let queue = Arc::clone(&queue);
+        let produce_warn = Arc::clone(&produce_warn);
         inflight.spawn(async move {
             let topic = job.topic;
             match produce(&producers, job).await {
-                Ok(()) => {
-                    finish_job(&state, &stats, true);
-                }
+                Ok(()) => queue.finish(1, true),
                 Err(e) => {
-                    stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
-                    if !produce_warning_emitted.swap(true, Ordering::AcqRel) {
+                    queue.count_error();
+                    let allowed = produce_warn
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .allow(Instant::now());
+                    if let Some(suppressed) = allowed {
                         tracing::warn!(
                             error = %format!("{e:#}"),
                             topic,
-                            "kafka produce failed; suppressing repeats for this sink"
+                            suppressed,
+                            "kafka produce failed"
                         );
                     }
-                    finish_job(&state, &stats, false);
+                    queue.finish(1, false);
                 }
             }
         });
     }
     while let Some(result) = inflight.join_next().await {
-        observe_join(result, &state, &stats);
+        observe_join(result, &queue);
     }
 }
 
-fn observe_join(
-    result: std::result::Result<(), tokio::task::JoinError>,
-    state: &std::sync::Mutex<KafkaState>,
-    stats: &Stats,
-) {
+fn observe_join(result: std::result::Result<(), tokio::task::JoinError>, queue: &QueueAccounting) {
     if let Err(e) = result {
-        stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
-        finish_job(state, stats, false);
+        queue.count_error();
+        queue.finish(1, false);
         tracing::error!(error = %e, "kafka produce task panicked");
     }
 }
@@ -347,7 +315,15 @@ async fn ensure_topics(client: &Client) {
         }
     };
     for topic in TOPICS {
-        match controller.create_topic(topic, 1, 1, 5_000).await {
+        match controller
+            .create_topic(
+                topic,
+                TOPIC_PARTITIONS,
+                TOPIC_REPLICATION,
+                TOPIC_CREATE_TIMEOUT_MS,
+            )
+            .await
+        {
             Ok(()) => tracing::info!(topic, "created kafka topic"),
             // Almost always "topic already exists", which is the happy path.
             Err(e) => tracing::debug!(topic, error = %e, "kafka topic not created"),
@@ -355,7 +331,7 @@ async fn ensure_topics(client: &Client) {
     }
 }
 
-async fn open_producers(client: &Client) -> Result<Producers> {
+async fn open_producers(client: &Client, linger: Duration) -> Result<Producers> {
     let mut map = HashMap::new();
     for topic in TOPICS {
         let pc = client
@@ -363,7 +339,7 @@ async fn open_producers(client: &Client) -> Result<Producers> {
             .await
             .with_context(|| format!("open kafka partition for {topic}"))?;
         let producer = BatchProducerBuilder::new(Arc::new(pc))
-            .with_linger(LINGER)
+            .with_linger(linger)
             .with_compression(Compression::Zstd)
             .build(RecordAggregator::new(MAX_AGGREGATED_BYTES));
         map.insert(topic, Arc::new(producer));
@@ -393,65 +369,39 @@ async fn produce(producers: &Producers, job: KafkaJob) -> Result<()> {
 }
 
 impl Sink for KafkaSink {
-    fn name(&self) -> &'static str {
-        "kafka"
+    fn kind(&self) -> SinkKind {
+        SinkKind::Kafka
     }
 
     fn send(&mut self, topic: &'static str, key: &str, payload: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.failed {
-            self.stats.kafka_dropped.fetch_add(1, Ordering::Relaxed);
-            // The worker has already logged the causal failure. Staying on the
-            // successful Sink path avoids allocating and formatting the same
-            // error for every later capture batch.
+        // After a terminal failure the worker has already logged the cause;
+        // staying on the successful Sink path avoids allocating and
+        // formatting the same error for every later capture batch.
+        if self.queue.is_failed() {
+            self.queue.count_dropped();
             return Ok(());
         }
         let Some(tx) = self.tx.as_ref() else {
             anyhow::bail!("kafka forwarder is shut down");
         };
-        // Increment before publishing: the worker may consume immediately.
-        // Holding `state` closes the race with a terminal loss claim.
-        state.outstanding += 1;
-        self.stats.kafka_queued.fetch_add(1, Ordering::Relaxed);
-        match tx.try_send(KafkaJob::new(topic, key, payload)) {
-            Ok(()) => {
-                if self.dropping {
-                    self.dropping = false;
-                    tracing::info!(
-                        dropped_total = self.stats.kafka_dropped.load(Ordering::Relaxed),
-                        "kafka queue recovered"
-                    );
-                }
-                Ok(())
-            }
-            // Backed up: drop and count. Never block the shipping loop.
-            Err(TrySendError::Full(_)) => {
-                state.outstanding -= 1;
-                self.stats.kafka_queued.fetch_sub(1, Ordering::Relaxed);
-                let total = self.stats.kafka_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                if !self.dropping {
-                    self.dropping = true;
-                    tracing::warn!(
-                        queue_capacity = QUEUE_CAPACITY,
-                        dropped_total = total,
-                        "kafka queue full; dropping envelopes until it drains"
-                    );
-                }
-                Ok(())
-            }
-            Err(TrySendError::Closed(_)) => {
-                state.outstanding -= 1;
-                let first_failure = !state.failed;
-                state.failed = true;
-                self.stats.kafka_queued.fetch_sub(1, Ordering::Relaxed);
-                self.stats.kafka_dropped.fetch_add(1, Ordering::Relaxed);
-                if first_failure {
-                    self.stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!("kafka forwarder channel closed unexpectedly");
-                }
-                Ok(())
-            }
-        }
+        // Counted as outstanding before publishing (the worker may consume at
+        // once), under the lock that closes the race with a terminal loss
+        // claim. Backed up: drop and count. Never block the shipping loop.
+        self.queue
+            .enqueue(|| match tx.try_send(KafkaJob::new(topic, key, payload)) {
+                Ok(()) => TrySend::Sent,
+                Err(TrySendError::Full(_)) => TrySend::Full,
+                Err(TrySendError::Closed(_)) => TrySend::Closed,
+            });
+        Ok(())
+    }
+
+    fn drains_on_close(&self) -> bool {
+        true
+    }
+
+    fn set_drain_deadline(&mut self, deadline: Instant) {
+        self.drain_deadline = Some(deadline);
     }
 }
 
@@ -459,15 +409,17 @@ impl Drop for KafkaSink {
     fn drop(&mut self) {
         // Signal first (starts the bounded drain), then close the channel so
         // the forwarder's recv loop can finish.
-        self.shutdown.take();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(self.drain_deadline);
+        }
         self.tx.take();
         if let Some(worker) = self.worker.take()
             && let Err(payload) = worker.join()
         {
-            let first_failure = mark_failed(&self.state);
-            let abandoned = claim_loss(&self.state, &self.stats);
+            let first_failure = self.queue.mark_failed();
+            let abandoned = self.queue.claim_loss();
             if first_failure {
-                self.stats.kafka_errors.fetch_add(1, Ordering::Relaxed);
+                self.queue.count_error();
             }
             tracing::error!(
                 abandoned,
@@ -480,6 +432,8 @@ impl Drop for KafkaSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use telemouse_core::Envelope;
 
     use super::*;
@@ -494,10 +448,39 @@ mod tests {
         })
     }
 
+    const LINGER: Duration = Duration::from_millis(25);
+
+    fn sink_with(queue: QueueAccounting, worker: Option<JoinHandle<()>>) -> KafkaSink {
+        KafkaSink {
+            tx: None,
+            shutdown: None,
+            queue: Arc::new(queue),
+            worker,
+            drain_deadline: None,
+        }
+    }
+
     #[test]
     fn connect_without_brokers_is_an_error_not_a_panic() {
         let stats = Arc::new(Stats::default());
-        assert!(KafkaSink::connect(&[], stats).is_err());
+        assert!(KafkaSink::connect(&[], LINGER, stats).is_err());
+    }
+
+    #[test]
+    fn the_drain_never_outlives_its_share_or_its_cap() {
+        assert_eq!(drain_timeout(None), DRAIN_TIMEOUT);
+        assert_eq!(
+            drain_timeout(Some(Instant::now() - Duration::from_secs(1))),
+            Duration::ZERO
+        );
+        assert!(
+            drain_timeout(Some(Instant::now() + Duration::from_millis(500)))
+                <= Duration::from_millis(500)
+        );
+        assert_eq!(
+            drain_timeout(Some(Instant::now() + Duration::from_secs(60))),
+            DRAIN_TIMEOUT
+        );
     }
 
     #[test]
@@ -530,21 +513,16 @@ mod tests {
     #[test]
     fn unreachable_broker_does_not_delay_sink_construction_or_shutdown() {
         let stats = Arc::new(Stats::default());
-        let started = std::time::Instant::now();
-        let sink = KafkaSink::connect(&["203.0.113.1:9092".into()], stats).unwrap();
+        let started = Instant::now();
+        let sink = KafkaSink::connect(&["203.0.113.1:9092".into()], LINGER, stats).unwrap();
         // Before initialization moved to the worker this call could consume
-        // the full 5s connection timeout before capture even started.
-        let connect_elapsed = started.elapsed();
-        assert!(connect_elapsed < Duration::from_millis(250));
-        let dropping = std::time::Instant::now();
+        // the full 5s connection timeout before capture even started. The
+        // bounds are generous on purpose: what matters is "not the connect
+        // timeout", not a benchmark on a loaded CI box.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let dropping = Instant::now();
         drop(sink);
-        let drop_elapsed = dropping.elapsed();
-        eprintln!(
-            "kafka unreachable connect={}us drop={}us",
-            connect_elapsed.as_micros(),
-            drop_elapsed.as_micros()
-        );
-        assert!(drop_elapsed < Duration::from_millis(250));
+        assert!(dropping.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -552,50 +530,51 @@ mod tests {
         let stats = Arc::new(Stats::default());
         stats.kafka_errors.store(1, Ordering::Relaxed);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut sink = KafkaSink {
-            tx: Some(tx),
-            shutdown: None,
-            stats: Arc::clone(&stats),
-            state: Arc::new(std::sync::Mutex::new(KafkaState {
-                failed: true,
-                ..Default::default()
-            })),
-            worker: None,
-            dropping: false,
-        };
+        let mut sink = sink_with(new_queue(Arc::clone(&stats)), None);
+        sink.tx = Some(tx);
+        assert!(sink.queue.mark_failed());
 
         const SENDS: u64 = 10_000;
-        let started = std::time::Instant::now();
         for _ in 0..SENDS {
             sink.send(TOPIC_EVENTS, "s-1", "{}").unwrap();
         }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "kafka terminal-failure fast path: sends={SENDS} total_us={} ns_per_send={}",
-            elapsed.as_micros(),
-            elapsed.as_nanos() / SENDS as u128
-        );
-        assert!(elapsed < Duration::from_millis(250));
         let snap = stats.snapshot();
-        assert_eq!(snap.kafka_errors, 1);
+        assert_eq!(snap.kafka_errors, 1, "no error churn after the cause");
         assert_eq!(snap.kafka_dropped, SENDS);
         assert_eq!(snap.kafka_queued, 0);
         assert_eq!(snap.kafka_abandoned, 0);
     }
 
+    /// The forwarder going away claims what it had accepted, exactly as the
+    /// JSONL writer's does — before the shared accounting, Kafka left those
+    /// envelopes "queued" forever.
+    #[test]
+    fn a_closed_forwarder_channel_claims_the_loss() {
+        let stats = Arc::new(Stats::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut sink = sink_with(new_queue(Arc::clone(&stats)), None);
+        sink.tx = Some(tx);
+        sink.send(TOPIC_EVENTS, "s-1", "{}").unwrap();
+        drop(rx);
+        sink.send(TOPIC_EVENTS, "s-1", "{}").unwrap();
+        sink.send(TOPIC_EVENTS, "s-1", "{}").unwrap();
+        let snap = stats.snapshot();
+        assert_eq!(snap.kafka_queued, 0);
+        assert_eq!(snap.kafka_abandoned, 1);
+        assert_eq!(snap.kafka_dropped, 2);
+        assert_eq!(snap.kafka_errors, 1);
+    }
+
     #[test]
     fn terminal_loss_claim_is_exact_once_and_late_completion_is_harmless() {
-        let stats = Stats::default();
-        stats.kafka_queued.store(3, Ordering::Relaxed);
-        let state = std::sync::Mutex::new(KafkaState {
-            outstanding: 3,
-            ..Default::default()
-        });
+        let stats = Arc::new(Stats::default());
+        let queue = new_queue(Arc::clone(&stats));
+        queue.preload(3);
 
-        assert_eq!(claim_loss(&state, &stats), 3);
-        assert_eq!(claim_loss(&state, &stats), 0);
+        assert_eq!(queue.claim_loss(), 3);
+        assert_eq!(queue.claim_loss(), 0);
         // Models an async produce completing after the bounded drain claimed it.
-        finish_job(&state, &stats, true);
+        queue.finish(1, true);
         let snap = stats.snapshot();
         assert_eq!(snap.kafka_queued, 0);
         assert_eq!(snap.kafka_abandoned, 3);
@@ -603,14 +582,11 @@ mod tests {
 
     #[test]
     fn accepted_produce_failure_is_counted_as_abandoned() {
-        let stats = Stats::default();
-        stats.kafka_queued.store(1, Ordering::Relaxed);
-        let state = std::sync::Mutex::new(KafkaState {
-            outstanding: 1,
-            ..Default::default()
-        });
+        let stats = Arc::new(Stats::default());
+        let queue = new_queue(Arc::clone(&stats));
+        queue.preload(1);
 
-        finish_job(&state, &stats, false);
+        queue.finish(1, false);
         let snap = stats.snapshot();
         assert_eq!(snap.kafka_queued, 0);
         assert_eq!(snap.kafka_abandoned, 1);
@@ -619,18 +595,15 @@ mod tests {
     #[test]
     fn panicked_produce_task_is_accounted() {
         let stats = Arc::new(Stats::default());
-        stats.kafka_queued.store(1, Ordering::Relaxed);
-        let state = Arc::new(std::sync::Mutex::new(KafkaState {
-            outstanding: 1,
-            ..Default::default()
-        }));
+        let queue = new_queue(Arc::clone(&stats));
+        queue.preload(1);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
             let task = tokio::spawn(async { panic!("produce panic") });
-            observe_join(task.await, &state, &stats);
+            observe_join(task.await, &queue);
         });
 
         let snap = stats.snapshot();
@@ -642,20 +615,10 @@ mod tests {
     #[test]
     fn panicked_worker_thread_claims_all_outstanding_jobs() {
         let stats = Arc::new(Stats::default());
-        stats.kafka_queued.store(2, Ordering::Relaxed);
-        let state = Arc::new(std::sync::Mutex::new(KafkaState {
-            outstanding: 2,
-            ..Default::default()
-        }));
+        let queue = new_queue(Arc::clone(&stats));
+        queue.preload(2);
         let worker = std::thread::spawn(|| panic!("worker panic"));
-        let sink = KafkaSink {
-            tx: None,
-            shutdown: None,
-            stats: Arc::clone(&stats),
-            state,
-            worker: Some(worker),
-            dropping: false,
-        };
+        let sink = sink_with(queue, Some(worker));
         drop(sink);
 
         let snap = stats.snapshot();

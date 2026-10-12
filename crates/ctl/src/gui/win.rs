@@ -79,6 +79,7 @@ use windows::core::{PCWSTR, w};
 use super::feed::{self, GuiLink, HOTKEY_FAILED, HOTKEY_OK};
 use super::model::{self, IconState, MenuEntry};
 use super::webview::{self, WebHost};
+use crate::manager::{CAPTURE, VIZ};
 
 const CLASS_NAME: PCWSTR = w!("TelemouseCtlWindow");
 /// Tray icon callback (legacy semantics: the mouse message in `lParam`).
@@ -290,56 +291,14 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         )
         .context("create the window")?;
 
-        let edit = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("EDIT"),
-            PCWSTR::null(),
-            WS_CHILD
-                | WS_VISIBLE
-                | WS_VSCROLL
-                | WS_HSCROLL
-                | WS_BORDER
-                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
-            0,
-            0,
-            WINDOW_W,
-            WINDOW_H,
-            Some(hwnd),
-            Some(HMENU(EDIT_ID as *mut c_void)),
-            Some(hinstance),
-            None,
-        );
-        let edit = match edit {
+        let edit = match create_edit(hwnd, hinstance) {
             Ok(e) => e,
             Err(e) => {
                 let _ = DestroyWindow(hwnd);
-                return Err(e).context("create the EDIT control");
+                return Err(e);
             }
         };
-
-        let font = {
-            let f = CreateFontW(
-                -15,
-                0,
-                0,
-                0,
-                FW_NORMAL.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                (FIXED_PITCH.0 | FF_MODERN.0) as u32,
-                w!("Consolas"),
-            );
-            if f.is_invalid() {
-                HFONT(GetStockObject(ANSI_FIXED_FONT).0)
-            } else {
-                f
-            }
-        };
+        let font = monospace_font();
         SendMessageW(
             edit,
             WM_SETFONT,
@@ -408,19 +367,7 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             );
         }
 
-        let mut msg = MSG::default();
-        loop {
-            let r = GetMessageW(&mut msg, None, 0, 0);
-            if r.0 == 0 {
-                break; // WM_QUIT
-            }
-            if r.0 == -1 {
-                warn!(error = %windows::core::Error::from_thread(), "GetMessageW failed; leaving the gui loop");
-                break;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        message_loop();
 
         hwnd_slot.store(0, Ordering::Release);
         teardown(ptr);
@@ -435,6 +382,88 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
         info!("gui stopped");
     }
     Ok(())
+}
+
+/// The read-only EDIT control that is the text view (and the fallback when
+/// the page cannot be hosted).
+///
+/// # Safety
+/// `hwnd` is a live window of this thread created from `hinstance`.
+unsafe fn create_edit(hwnd: HWND, hinstance: HINSTANCE) -> Result<HWND> {
+    // SAFETY: plain window creation with a valid parent; the control is
+    // destroyed with its parent.
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            PCWSTR::null(),
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_VSCROLL
+                | WS_HSCROLL
+                | WS_BORDER
+                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+            0,
+            0,
+            WINDOW_W,
+            WINDOW_H,
+            Some(hwnd),
+            Some(HMENU(EDIT_ID as *mut c_void)),
+            Some(hinstance),
+            None,
+        )
+        .context("create the EDIT control")
+    }
+}
+
+/// Consolas for the text view, or the stock fixed font when GDI says no.
+/// The caller deletes it in `teardown` (a stock object ignores that).
+fn monospace_font() -> HFONT {
+    // SAFETY: CreateFontW takes plain values and a static string; the
+    // stock object needs no release.
+    unsafe {
+        let f = CreateFontW(
+            -15,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            (FIXED_PITCH.0 | FF_MODERN.0) as u32,
+            w!("Consolas"),
+        );
+        if f.is_invalid() {
+            HFONT(GetStockObject(ANSI_FIXED_FONT).0)
+        } else {
+            f
+        }
+    }
+}
+
+/// Pump this thread's messages until `WM_QUIT` (or an error).
+fn message_loop() {
+    let mut msg = MSG::default();
+    loop {
+        // SAFETY: `msg` is a stack struct the calls fill and read.
+        unsafe {
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            if r.0 == 0 {
+                break; // WM_QUIT
+            }
+            if r.0 == -1 {
+                warn!(error = %windows::core::Error::from_thread(), "GetMessageW failed; leaving the gui loop");
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
 unsafe fn teardown(s: *mut UiState) {
@@ -576,10 +605,7 @@ unsafe fn hotkey_pressed(s: *mut UiState) {
         info!(hotkey = %hk, "new-session hotkey pressed");
         let (running, dir) = {
             let snap = (*s).link.state.borrow();
-            let running = snap
-                .components
-                .iter()
-                .any(|c| c.id == "capture" && c.running);
+            let running = snap.components.iter().any(|c| c.id == CAPTURE && c.running);
             (running, snap.recording_dir.clone())
         };
         feed::new_session(&(*s).link);
@@ -897,12 +923,12 @@ unsafe fn command(s: *mut UiState, id: u16) {
         match id {
             model::MENU_TOGGLE_WINDOW => set_visible(s, !(*s).visible),
             model::MENU_START_CAPTURE | model::MENU_START_CAPTURE_NOSAVE => {
-                feed::start(&(*s).link, "capture", Some(id == model::MENU_START_CAPTURE))
+                feed::start(&(*s).link, CAPTURE, Some(id == model::MENU_START_CAPTURE))
             }
-            model::MENU_STOP_CAPTURE => feed::stop(&(*s).link, "capture"),
+            model::MENU_STOP_CAPTURE => feed::stop(&(*s).link, CAPTURE),
             model::MENU_NEW_SESSION => feed::new_session(&(*s).link),
-            model::MENU_START_VIZ => feed::start(&(*s).link, "viz", None),
-            model::MENU_STOP_VIZ => feed::stop(&(*s).link, "viz"),
+            model::MENU_START_VIZ => feed::start(&(*s).link, VIZ, None),
+            model::MENU_STOP_VIZ => feed::stop(&(*s).link, VIZ),
             model::MENU_OPEN_PANEL
             | model::MENU_OPEN_LOGS
             | model::MENU_OPEN_RECORDINGS
@@ -914,6 +940,128 @@ unsafe fn command(s: *mut UiState, id: u16) {
     }
 }
 
+/// `WM_SIZE`: the text view and the page follow the client area.
+///
+/// # Safety
+/// `s` is this thread's live `UiState`.
+unsafe fn on_size(s: *mut UiState, wparam: WPARAM, lparam: LPARAM) {
+    if wparam.0 as u32 == SIZE_MINIMIZED {
+        return;
+    }
+    let (w, h) = (
+        loword(lparam.0 as usize) as i32,
+        hiword(lparam.0 as usize) as i32,
+    );
+    // SAFETY: the caller's state is live; `edit` is its child window.
+    unsafe {
+        let _ = MoveWindow((*s).edit, 0, 0, w, h, true);
+        webview::resize(s, w, h);
+    }
+}
+
+/// `WM_DPICHANGED`: the window crossed onto a display with another scale.
+/// Take the size Windows suggests; the WM_SIZE that follows re-bounds the
+/// page, which rescales itself for a PerMonitorV2 parent.
+///
+/// # Safety
+/// `lparam` is the message's, which points at a `RECT` (or is null).
+unsafe fn on_dpi_changed(hwnd: HWND, lparam: LPARAM) {
+    let suggested = lparam.0 as *const RECT;
+    if suggested.is_null() {
+        return;
+    }
+    // SAFETY: for WM_DPICHANGED lParam is a valid RECT owned by the system
+    // for the duration of the message.
+    unsafe {
+        let r = *suggested;
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// `WM_GETMINMAXINFO`: the smallest size the window may be dragged to.
+///
+/// # Safety
+/// `lparam` is the message's, which points at a `MINMAXINFO` (or is null).
+unsafe fn on_min_max(lparam: LPARAM) {
+    let info = lparam.0 as *mut MINMAXINFO;
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: for WM_GETMINMAXINFO lParam is a writable MINMAXINFO owned by
+    // the system for the duration of the message.
+    unsafe {
+        (*info).ptMinTrackSize.x = scaled(MIN_W);
+        (*info).ptMinTrackSize.y = scaled(MIN_H);
+    }
+}
+
+/// `WM_CLOSE`: to the tray, unless Shift is held or there is no tray icon.
+///
+/// # Safety
+/// `s` is this thread's live `UiState`.
+unsafe fn on_close(s: *mut UiState) {
+    // SAFETY: the caller's state is live; GetKeyState takes an integer.
+    unsafe {
+        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        if shift || !(*s).tray_added {
+            request_exit(s);
+        } else {
+            set_visible(s, false);
+        }
+    }
+}
+
+/// The tray icon's callback. A double-click arrives as UP, DBLCLK, UP: a
+/// single click toggles, a double-click shows and swallows its second UP.
+///
+/// # Safety
+/// `s` is this thread's live `UiState`.
+unsafe fn on_tray(s: *mut UiState, lparam: LPARAM) {
+    // SAFETY: the caller's state is live and only touched on this thread.
+    unsafe {
+        match loword(lparam.0 as usize) {
+            WM_LBUTTONUP => {
+                if (*s).swallow_up {
+                    (*s).swallow_up = false;
+                } else {
+                    set_visible(s, !(*s).visible);
+                }
+            }
+            WM_LBUTTONDBLCLK => {
+                (*s).swallow_up = true;
+                set_visible(s, true);
+            }
+            WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(s),
+            _ => {}
+        }
+    }
+}
+
+/// `WM_APP_QUIT` / `WM_DESTROY`: take the icon out of the tray and end the
+/// message loop.
+///
+/// # Safety
+/// `s` is this thread's live `UiState`.
+unsafe fn on_quit(s: *mut UiState) {
+    // SAFETY: the caller's state is live; the tray data is built from it.
+    unsafe {
+        if (*s).tray_added {
+            let data = tray_data(s);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            (*s).tray_added = false;
+        }
+        PostQuitMessage(0);
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: GWLP_USERDATA is either 0 or the live `UiState` of this
     // thread, set before any message that needs it and cleared before the
@@ -922,131 +1070,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if s.is_null() {
         return match msg {
             WM_DESTROY | WM_APP_QUIT => {
+                // SAFETY: no arguments; ends this thread's message loop.
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
+            // SAFETY: the arguments are this message's, passed through.
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         };
     }
+    // SAFETY: `s` is non-null, so it is this thread's live `UiState` (see
+    // above), and a window procedure only ever runs on that thread, so no
+    // other reference to it is active while a handler below uses it. The
+    // `wparam`/`lparam` handed on are this message's, which is what each
+    // handler's own contract asks for.
     unsafe {
         match msg {
-            WM_SIZE => {
-                if wparam.0 as u32 != SIZE_MINIMIZED {
-                    let (w, h) = (
-                        loword(lparam.0 as usize) as i32,
-                        hiword(lparam.0 as usize) as i32,
-                    );
-                    let _ = MoveWindow((*s).edit, 0, 0, w, h, true);
-                    webview::resize(s, w, h);
-                }
-                LRESULT(0)
-            }
-            WM_MOVE => {
-                webview::position_changed(s);
-                LRESULT(0)
-            }
-            // The window crossed onto a display with another scale: take
-            // the size Windows suggests; the WM_SIZE that follows re-bounds
-            // the page, which rescales itself for a PerMonitorV2 parent.
-            WM_DPICHANGED => {
-                let suggested = lparam.0 as *const RECT;
-                if !suggested.is_null() {
-                    let r = *suggested;
-                    let _ = SetWindowPos(
-                        hwnd,
-                        None,
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-                LRESULT(0)
-            }
-            WM_GETMINMAXINFO => {
-                let info = lparam.0 as *mut MINMAXINFO;
-                if !info.is_null() {
-                    (*info).ptMinTrackSize.x = scaled(MIN_W);
-                    (*info).ptMinTrackSize.y = scaled(MIN_H);
-                }
-                LRESULT(0)
-            }
-            WM_TIMER => {
-                webview::timer(s, wparam.0);
-                LRESULT(0)
-            }
+            WM_SIZE => on_size(s, wparam, lparam),
+            WM_MOVE => webview::position_changed(s),
+            WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
+            WM_GETMINMAXINFO => on_min_max(lparam),
+            WM_TIMER => webview::timer(s, wparam.0),
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE && (*s).tray_added => {
-                set_visible(s, false);
-                LRESULT(0)
+                set_visible(s, false)
             }
-            WM_CLOSE => {
-                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                if shift || !(*s).tray_added {
-                    request_exit(s);
-                } else {
-                    set_visible(s, false);
-                }
-                LRESULT(0)
-            }
-            WM_APP_REFRESH => {
-                refresh(s);
-                LRESULT(0)
-            }
+            WM_CLOSE => on_close(s),
+            WM_APP_REFRESH => refresh(s),
             // Logoff / shutdown: TRUE means "go ahead", and by then the
             // children are stopped. WM_ENDSESSION with wParam = TRUE follows
             // (or arrives alone on a forced shutdown); `end_session` runs once.
             WM_QUERYENDSESSION => {
                 end_session(s);
-                LRESULT(1)
+                return LRESULT(1);
             }
-            WM_ENDSESSION if wparam.0 != 0 => {
-                end_session(s);
-                LRESULT(0)
-            }
-            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID && !(*s).exiting => {
-                hotkey_pressed(s);
-                LRESULT(0)
-            }
-            WM_APP_TRAY => {
-                // A double-click arrives as UP, DBLCLK, UP: a single click
-                // toggles, a double-click shows and swallows its second UP.
-                match loword(lparam.0 as usize) {
-                    WM_LBUTTONUP => {
-                        if (*s).swallow_up {
-                            (*s).swallow_up = false;
-                        } else {
-                            set_visible(s, !(*s).visible);
-                        }
-                    }
-                    WM_LBUTTONDBLCLK => {
-                        (*s).swallow_up = true;
-                        set_visible(s, true);
-                    }
-                    WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(s),
-                    _ => {}
-                }
-                LRESULT(0)
-            }
+            WM_ENDSESSION if wparam.0 != 0 => end_session(s),
+            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID && !(*s).exiting => hotkey_pressed(s),
+            WM_APP_TRAY => on_tray(s, lparam),
             // No WM_COMMAND arm on purpose: menu choices arrive as the
             // return value of TrackPopupMenu (see `show_menu`), so a
             // WM_COMMAND posted from outside falls through to DefWindowProc.
-            WM_APP_QUIT | WM_DESTROY => {
-                if (*s).tray_added {
-                    let data = tray_data(s);
-                    let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-                    (*s).tray_added = false;
-                }
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
+            WM_APP_QUIT | WM_DESTROY => on_quit(s),
             m if m == (*s).taskbar_created && m != 0 => {
                 info!("taskbar recreated; re-adding the tray icon");
                 (*s).tray_added = false;
                 tray_add(s);
-                LRESULT(0)
             }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+    LRESULT(0)
 }

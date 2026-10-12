@@ -26,7 +26,7 @@ function boot(opts) {
     while (clock.monotonicMs < until) {
       clock.monotonicMs += 20;
       clock.utcMs += 20;
-      app.sandbox.frame(clock.monotonicMs);
+      app.telemouse.frame(clock.monotonicMs);
     }
   };
   let seq = 0;
@@ -35,8 +35,12 @@ function boot(opts) {
   });
   const beat = () => app.telemouse.ui.ws.onmessage({ data: JSON.stringify(heartbeatEnvelope()) });
   const body = app.sandbox.document.body;
+  const el = (id) => app.elements.get(id);
   return {
     ...app, clock, run, batch, beat,
+    /** The dashboard's connection pill: its class and its text. */
+    pill: () => el("connPill").className + " | " + el("connText").textContent,
+    hud: (key) => app.telemouse._test.hudValue(key, app.telemouse.engine),
     stale: () => body.classList.contains("stale"),
     idle: () => body.classList.contains("idle"),
   };
@@ -59,14 +63,14 @@ test("the overlay says no feed after stale_secs of silence and recovers on the n
   t.run(1);
   assert.equal(t.stale(), true, "2 s without a batch");
   assert.match(t.elements.get("feedBadge").textContent, /^no feed · 2s$/);
-  assert.equal(t.sandbox.hudValue("status", engine), "no feed (2s)");
+  assert.equal(t.hud("status"), "no feed (2s)");
   t.run(3);
   assert.match(t.elements.get("feedBadge").textContent, /^no feed · 5s$/, "the badge counts");
 
   // Data returns: cleared by the batch itself, not by the next repaint.
   t.batch();
   assert.equal(t.stale(), false, "instant recovery");
-  assert.equal(t.sandbox.hudValue("status", engine), "live");
+  assert.equal(t.hud("status"), "live");
 
   // A feed that was live and stops goes stale again, measured from its last batch.
   for (let i = 0; i < 10; i++) { t.run(0.5); t.batch(); }
@@ -102,7 +106,7 @@ test("a still hand under a live agent reads idle, not no feed", () => {
   assert.equal(t.idle(), true, "the agent is there; the hand is not");
   assert.equal(t.stale(), false, "idle never dims the panels");
   assert.match(t.elements.get("feedBadge").textContent, /^idle · \ds$/);
-  assert.match(t.sandbox.hudValue("status", engine), /^idle \(\ds\)$/);
+  assert.match(t.hud("status"), /^idle \(\ds\)$/);
 
   // Now the agent dies. Three missed heartbeats later it is no feed after all.
   t.run(3.1);
@@ -114,12 +118,12 @@ test("a still hand under a live agent reads idle, not no feed", () => {
   t.beat();
   assert.equal(t.stale(), false, "instant recovery, exactly like a batch");
   assert.equal(t.idle(), true);
-  assert.match(t.sandbox.hudValue("status", engine), /^idle \(\d+s\)$/);
+  assert.match(t.hud("status"), /^idle \(\d+s\)$/);
 
   // Only data is live.
   t.batch();
   assert.equal(t.idle(), false);
-  assert.equal(t.sandbox.hudValue("status", engine), "live");
+  assert.equal(t.hud("status"), "live");
 });
 
 test("a heartbeat is liveness only: it never touches the timeline or the numbers", () => {
@@ -153,7 +157,7 @@ test("a heartbeat is liveness only: it never touches the timeline or the numbers
 
 test("the dashboard pill says idle when the agent is up and the hand is still", () => {
   const t = boot({ config: { udp_addr: "127.0.0.1:7878" } });
-  const pill = () => t.elements.get("connPill").className + " | " + t.elements.get("connText").textContent;
+  const { pill } = t;
   t.telemouse.ui.ws.onopen();
   assert.equal(pill(), "pill warn | waiting for capture on udp 127.0.0.1:7878");
 
@@ -214,7 +218,7 @@ test("the dashboard never gets the overlay's stale class", () => {
 
 test("the dashboard pill follows the feed: waiting, live, no data, live again", () => {
   const t = boot({ config: { udp_addr: "127.0.0.1:7878" } });
-  const pill = () => t.elements.get("connPill").className + " | " + t.elements.get("connText").textContent;
+  const { pill } = t;
   assert.equal(pill(), "pill warn | connecting");
   t.telemouse.ui.ws.onopen();
   assert.equal(pill(), "pill warn | waiting for capture on udp 127.0.0.1:7878");

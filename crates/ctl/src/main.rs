@@ -290,34 +290,18 @@ async fn serve(
         None
     };
 
-    // Every place the panel talks about, decided once so the header, the
-    // tray menu and the page cannot disagree.
-    let exe_dir = telemouse_core::paths::exe_dir();
-    let places = Places {
-        version: places::VERSION.into(),
-        panel_url: gui::model::panel_url(http_addr),
-        config: config.display().to_string(),
-        logs: log_dir
-            .as_ref()
-            .map(|d| d.display().to_string())
-            .unwrap_or_default(),
-        bin_dir: bin_dir
-            .as_ref()
-            .or(exe_dir.as_ref())
-            .map(|d| d.display().to_string())
-            .unwrap_or_default(),
-        docs: Places::docs_target(exe_dir.as_deref()),
-        releases: places::RELEASES_URL.into(),
-        webview_data: webview_data_dir
-            .as_ref()
-            .map(|d| d.display().to_string())
-            .unwrap_or_default(),
-    };
+    let places = build_places(
+        http_addr,
+        &config,
+        log_dir.as_deref(),
+        bin_dir.as_deref(),
+        webview_data_dir.as_deref(),
+    );
 
     let state = AppState {
         manager: manager.clone(),
         scanner: Arc::new(Scanner::new()),
-        page: Arc::new(server::render_page(&PageConfig {
+        page: server::render_page(&PageConfig {
             // The page links to the viz; a wildcard bind is not a URL a
             // browser will open, so link to the loopback of the same family.
             viz_http: telemouse_core::localhost::browse_addr_str(&cfg.viz.http_addr),
@@ -326,60 +310,18 @@ async fn serve(
             places: places.clone(),
             marker_hotkey: cfg.marker_hotkey.clone(),
             hotkey: cfg.ctl.hotkey.clone(),
-        })),
+            limits: server::PageLimits::default(),
+        })
+        .into(),
         places: Arc::new(places.clone()),
         settings_lock: Arc::default(),
     };
 
-    // Reap exited children while anything runs; when nothing does, sleep
-    // until the manager reports a start instead of ticking at an idle panel.
-    {
-        let m = manager.clone();
-        tokio::spawn(async move {
-            loop {
-                if !m.any_running().await {
-                    m.work().notified().await;
-                }
-                tokio::time::sleep(REAP_INTERVAL).await;
-                m.reap().await;
-            }
-        });
-    }
+    spawn_reaper(manager.clone());
 
-    let listener = match tokio::net::TcpListener::bind(http_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            // The most likely first-run failure: a panel is already running.
-            // Explorer closes the console with the process, so say it where
-            // it can be seen, and take the user to the panel that answers.
-            error!(error = %e, %http_addr, "failed to bind the control panel port");
-            if gui_mode && e.kind() == std::io::ErrorKind::AddrInUse {
-                let url = &places.panel_url;
-                let opened = gui::open_url(url);
-                gui::alert(
-                    "telemouse-ctl is already running",
-                    &format!(
-                        "Port {} is in use, most likely by another telemouse-ctl.\n\n{}\n\nTo run a second panel start it with --http 127.0.0.1:<other port>.",
-                        http_addr.port(),
-                        if opened {
-                            format!("Opened {url} in your browser.")
-                        } else {
-                            format!("Open {url} in your browser.")
-                        }
-                    ),
-                );
-                return Ok(());
-            }
-            if gui_mode {
-                gui::alert(
-                    "telemouse-ctl could not start",
-                    &format!(
-                        "Could not listen on {http_addr}:\n{e}\n\nChange [ctl] http_addr in telemouse.toml or start with --http."
-                    ),
-                );
-            }
-            return Err(e).with_context(|| format!("failed to bind http {http_addr}"));
-        }
+    let Some(listener) = bind_or_explain(http_addr, &places.panel_url, gui_mode).await? else {
+        // Another panel answers on that port; the user was sent to it.
+        return Ok(());
     };
 
     for c in manager::COMPONENTS {
@@ -424,34 +366,7 @@ async fn serve(
         None
     };
 
-    // Console signals. Ctrl-C and Ctrl-Break are the ordinary stop; a closed
-    // console, a logoff or a shutdown are "terminal": Windows kills the
-    // process the moment the handler returns, so the handler blocks until
-    // the children have been stopped (`finished`) or `SIGNAL_MAX_WAIT`.
-    let signalled = Arc::new(tokio::sync::Notify::new());
-    let terminal = Arc::new(AtomicBool::new(false));
-    let signal_name = Arc::new(std::sync::Mutex::new(""));
-    let guard = {
-        let (n, t, name) = (signalled.clone(), terminal.clone(), signal_name.clone());
-        match telemouse_core::shutdown::install(
-            move |sig| {
-                if sig.is_terminal() {
-                    t.store(true, Ordering::Release);
-                }
-                if let Ok(mut g) = name.lock() {
-                    *g = sig.as_str();
-                }
-                n.notify_one();
-            },
-            SIGNAL_MAX_WAIT,
-        ) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                warn!(error = %e, "console signal handler unavailable; use the tray's Exit to stop");
-                None
-            }
-        }
-    };
+    let signals = install_signals();
 
     // Children live in their own process groups, so a console signal here
     // does not reach them: stop them ourselves before leaving. Every exit
@@ -459,16 +374,15 @@ async fn serve(
     // one looked.
     let shutdown = {
         let m = manager.clone();
-        let guard = guard.clone();
         async move {
             tokio::select! {
-                _ = signalled.notified() => {
-                    let name = signal_name.lock().map(|g| *g).unwrap_or("signal");
+                _ = signals.signalled.notified() => {
+                    let name = signals.name.lock().map(|g| *g).unwrap_or("signal");
                     info!(signal = name, "shutting down on a console signal");
                 }
                 _ = quit.notified() => info!("shutting down: exit requested from the tray"),
             }
-            if terminal.load(Ordering::Acquire) {
+            if signals.terminal.load(Ordering::Acquire) {
                 // The session is ending: stop fast, inside the OS's window.
                 info!(
                     "stopping managed components (fast: the console is closing or the session is ending)"
@@ -478,7 +392,7 @@ async fn serve(
                 info!("stopping managed components");
                 m.stop_all().await;
             }
-            if let Some(g) = guard {
+            if let Some(g) = signals.guard {
                 g.finished();
             }
         }
@@ -494,6 +408,140 @@ async fn serve(
     }
     info!("telemouse-ctl stopped");
     served
+}
+
+/// Every place the panel talks about, decided once so the header, the tray
+/// menu and the page cannot disagree.
+fn build_places(
+    http_addr: SocketAddr,
+    config: &Path,
+    log_dir: Option<&Path>,
+    bin_dir: Option<&Path>,
+    webview_data_dir: Option<&Path>,
+) -> Places {
+    let exe_dir = telemouse_core::paths::exe_dir();
+    let shown = |p: Option<&Path>| p.map(|d| d.display().to_string()).unwrap_or_default();
+    Places {
+        version: places::VERSION.into(),
+        panel_url: gui::model::panel_url(http_addr),
+        config: config.display().to_string(),
+        logs: shown(log_dir),
+        bin_dir: shown(bin_dir.or(exe_dir.as_deref())),
+        docs: Places::docs_target(exe_dir.as_deref()),
+        releases: places::RELEASES_URL.into(),
+        webview_data: shown(webview_data_dir),
+    }
+}
+
+/// Reap exited children while anything runs; when nothing does, sleep until
+/// the manager reports a start instead of ticking at an idle panel.
+fn spawn_reaper(m: Arc<Manager>) {
+    tokio::spawn(async move {
+        loop {
+            // Register for the wake-up *before* asking whether anything
+            // runs: `notify_waiters` keeps no permit, so a start landing
+            // between the question and the wait would otherwise be missed
+            // and its exit not reaped until something else polled.
+            let started = m.work().notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            if !m.any_running().await {
+                started.await;
+            }
+            tokio::time::sleep(REAP_INTERVAL).await;
+            m.reap().await;
+        }
+    });
+}
+
+/// Bind the panel's port. `Ok(None)` when another panel already holds it and
+/// the user has been sent there instead; an error for anything else. Either
+/// way a tray-launched panel says so in a message box, because Explorer
+/// closes the console along with the process.
+async fn bind_or_explain(
+    http_addr: SocketAddr,
+    panel_url: &str,
+    gui_mode: bool,
+) -> Result<Option<tokio::net::TcpListener>> {
+    let e = match tokio::net::TcpListener::bind(http_addr).await {
+        Ok(l) => return Ok(Some(l)),
+        Err(e) => e,
+    };
+    // The most likely first-run failure: a panel is already running.
+    error!(error = %e, %http_addr, "failed to bind the control panel port");
+    if gui_mode && e.kind() == std::io::ErrorKind::AddrInUse {
+        let opened = gui::open_url(panel_url);
+        gui::alert(
+            "telemouse-ctl is already running",
+            &format!(
+                "Port {} is in use, most likely by another telemouse-ctl.\n\n{}\n\nTo run a second panel start it with --http 127.0.0.1:<other port>.",
+                http_addr.port(),
+                if opened {
+                    format!("Opened {panel_url} in your browser.")
+                } else {
+                    format!("Open {panel_url} in your browser.")
+                }
+            ),
+        );
+        return Ok(None);
+    }
+    if gui_mode {
+        gui::alert(
+            "telemouse-ctl could not start",
+            &format!(
+                "Could not listen on {http_addr}:\n{e}\n\nChange [ctl] http_addr in telemouse.toml or start with --http."
+            ),
+        );
+    }
+    Err(e).with_context(|| format!("failed to bind http {http_addr}"))
+}
+
+/// What the console signal handler reports to the shutdown future.
+struct Signals {
+    /// Fired once on Ctrl-C, Ctrl-Break, console close, logoff or shutdown.
+    signalled: Arc<tokio::sync::Notify>,
+    /// The signal is one Windows kills the process after (close, logoff,
+    /// shutdown): stop fast.
+    terminal: Arc<AtomicBool>,
+    /// Which signal, for the log line.
+    name: Arc<std::sync::Mutex<&'static str>>,
+    /// Holds a terminal signal's handler until the children are stopped.
+    guard: Option<telemouse_core::shutdown::ShutdownGuard>,
+}
+
+/// Console signals. Ctrl-C and Ctrl-Break are the ordinary stop; a closed
+/// console, a logoff or a shutdown are "terminal": Windows kills the process
+/// the moment the handler returns, so the handler blocks until the children
+/// have been stopped (`finished`) or `SIGNAL_MAX_WAIT`.
+fn install_signals() -> Signals {
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let terminal = Arc::new(AtomicBool::new(false));
+    let name = Arc::new(std::sync::Mutex::new(""));
+    let (n, t, nm) = (signalled.clone(), terminal.clone(), name.clone());
+    let guard = match telemouse_core::shutdown::install(
+        move |sig| {
+            if sig.is_terminal() {
+                t.store(true, Ordering::Release);
+            }
+            if let Ok(mut g) = nm.lock() {
+                *g = sig.as_str();
+            }
+            n.notify_one();
+        },
+        SIGNAL_MAX_WAIT,
+    ) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            warn!(error = %e, "console signal handler unavailable; use the tray's Exit to stop");
+            None
+        }
+    };
+    Signals {
+        signalled,
+        terminal,
+        name,
+        guard,
+    }
 }
 
 #[cfg(test)]

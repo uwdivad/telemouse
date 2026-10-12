@@ -20,14 +20,16 @@ path = "src/main.rs"
 #   the polling-rate counters and the `<session>.meta.json` sidecar.
 # * `kafka` is the Kafka sink and, with it, `rskafka` + `tokio`. Without it
 #   `[kafka] enabled = true` warns once and the run continues.
-# * `quiet` compiles every `debug!`/`info!` out of a release build.
 [features]
 default = ["logging", "observability", "kafka"]
 logging = ["telemouse-core/logging"]
 observability = []
 kafka = ["dep:rskafka", "dep:tokio"]
+# `quiet` compiles every `tracing` event out of a release build: all levels,
+# `error!` and `warn!` included (debug builds keep them). Cargo unifies
+# `tracing`'s features, so it applies to every binary built in the same cargo
+# invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
-
 [dependencies]
 telemouse-core = { workspace = true }
 anyhow = { workspace = true }
@@ -35,7 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true }
 rtrb = "0.4.0"
 # Lock-free context snapshot swap: T2 reads the snapshot per flush and must
 # never contend with T3's 4/s publisher.
@@ -44,7 +46,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 # zstd on the wire: at 1KHz these batches compress hard, and the BatchProducer
 # needs `rt` on tokio for its linger tasks. Both are the Kafka sink's alone.
 rskafka = { version = "0.6.0", features = ["compression-zstd"], optional = true }
-tokio = { version = "1.53.1", features = [
+tokio = { workspace = true, features = [
     "rt",
     "time",
     "net",
@@ -53,7 +55,7 @@ tokio = { version = "1.53.1", features = [
 ], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
@@ -66,6 +68,9 @@ windows = { version = "0.62.2", features = [
     # The foreground process's name comes from a Toolhelp snapshot, so the
     # agent never opens a handle on a game process (docs/ANTICHEAT-2026-09-14.md).
     "Win32_System_Diagnostics_ToolHelp",
+    # The SmoothMouse{X,Y}Curve values under HKCU\Control Panel\Mouse: the
+    # desktop's pointer curve goes into the session record (read-only).
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
@@ -75,4 +80,7 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
-winresource = "0.1.31"
+winresource.workspace = true
+
+[lints]
+workspace = true

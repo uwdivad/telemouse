@@ -23,6 +23,19 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+/// The header every mutating `POST` to `telemouse-ctl` must carry, with the
+/// value [`CTL_GUARD_VALUE`]. A cross-site form or simple request cannot
+/// carry a custom header, so this is the CSRF guard; the panel's own page
+/// and local tools (the MCP server) send it. Header names are case-insensitive; this is the spelling clients
+/// send, and [`CTL_GUARD_HEADER_LOWER`] the one a server's header map is
+/// keyed by.
+pub const CTL_GUARD_HEADER: &str = "X-Telemouse-Ctl";
+/// [`CTL_GUARD_HEADER`] in lowercase, as `http::HeaderName::from_static`
+/// requires.
+pub const CTL_GUARD_HEADER_LOWER: &str = "x-telemouse-ctl";
+/// The value [`CTL_GUARD_HEADER`] must have.
+pub const CTL_GUARD_VALUE: &str = "1";
+
 /// Response headers both local servers add to every response (lowercase
 /// names, as the HTTP crate wants them). `X-Frame-Options: DENY` stops an
 /// `http://` page from framing the control panel and clickjacking a one-click
@@ -182,6 +195,15 @@ mod tests {
                 .iter()
                 .any(|(n, v)| *n == "x-content-type-options" && *v == "nosniff")
         );
+    }
+
+    #[test]
+    fn the_ctl_guard_header_spellings_agree() {
+        assert_eq!(
+            CTL_GUARD_HEADER.to_ascii_lowercase(),
+            CTL_GUARD_HEADER_LOWER
+        );
+        assert_eq!(CTL_GUARD_VALUE, "1");
     }
 
     #[test]

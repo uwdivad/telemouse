@@ -79,13 +79,35 @@ canvases repainting on the game's GPU. Add `?fps=60` to its URL while
 playing, or close it and open it afterwards for replay. The recording is
 complete either way.
 
+### Raw input vs the Windows pointer
+
+Everything telemouse records is raw input: the counts the mouse sent,
+before Windows' *Enhance pointer precision* and pointer speed slider touch
+them. That is what a game reading raw input sees, so the desk and aim
+panels are the truth for aiming. The desktop cursor sees something else.
+The **Pointer** view (the View toggle, `?view=pointer`, or `V` to cycle)
+re-runs the same counts through Windows' pointer acceleration and draws
+where the cursor went, in screen pixels; **Raw vs Pointer** puts it beside
+the hand path so a slow, precise movement and a flick show how differently
+the two behave. It uses the pointer settings recorded with the session
+(shown in the panel's subtitle: precision on or off, the slider, the screen
+DPI, read from Windows when capture started), so an old recording, or one
+made with those settings changed since, is played back with the settings
+it had — and a recording that predates them is played with a fresh
+install's and says so in the panel corner. It is a reconstruction from
+Microsoft's published curve, not a recording of the cursor: a mouse polling
+faster than 125 Hz lands lower on the curve than a slower one, exactly as
+the real cursor does, since the counts are the real reports.
+
 ## OBS overlay
 
 Add a **Browser** source in OBS with `http://127.0.0.1:7879/obs` and size
 it however you like; the panels fill the source. Tick *Refresh browser when
 scene becomes active* if you toggle the scene a lot. The overlay's look is
 under **Settings** in the panel; every option is also a URL parameter, see
-[GUIDE.md](GUIDE.md).
+[GUIDE.md](GUIDE.md). `layout=pointer` makes the Windows cursor path the
+whole overlay and `layout=compare` puts it beside the raw hand path; the HUD
+readout `pointer` is its speed in px/s.
 
 After a few seconds without mouse movement the overlay puts a small badge
 top centre. *idle* means capture is running and your hand is simply still —

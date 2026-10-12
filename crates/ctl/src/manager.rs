@@ -21,14 +21,16 @@
 //! stats` line parsed into numbers the card and the tray can show
 //! (`observability`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use telemouse_core::config::AppConfig;
+use telemouse_core::ctl::CAPTURE_FLAGS;
 use telemouse_core::recordings::id_from_file_name;
+pub use telemouse_core::session::MAX_MARKER_LABEL_CHARS;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -54,8 +56,26 @@ const BIN_TTL: Duration = Duration::from_secs(5);
 pub const FAST_STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// Below this, a recording is one long session away from filling the disk.
-#[cfg(feature = "observability")]
-const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Also handed to the page (`PageConfig::low_disk_bytes`), which says the
+/// same thing on the capture card.
+pub const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How long a marker may take to reach the capture agent's stdin. A pipe
+/// write only blocks when the child has stopped reading; past this the
+/// marker is reported as not delivered rather than holding the request.
+const MARKER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The capture agent's component id.
+pub const CAPTURE: &str = "capture";
+/// The viz server's component id.
+pub const VIZ: &str = "viz";
+/// The analyzer's per-recording report task, whose binary also makes the
+/// summaries the report card is drawn from.
+pub const REPORT: &str = "report";
+
+/// The id of the sample recording a release ships (`recordings/demo-session.jsonl`):
+/// the first-run guide offers it when it is there.
+pub const DEMO_SESSION: &str = "demo-session";
 
 /// How long a disk-free / recording-size reading is reused.
 #[cfg(feature = "observability")]
@@ -73,7 +93,21 @@ pub enum Kind {
 #[derive(Debug, Clone, Serialize)]
 pub struct Flag {
     pub flag: &'static str,
+    /// What the page's checkbox says. Reaches the page through its config
+    /// (`PageLimits::flag_labels`), not `/api/state`; empty = the flag itself.
+    #[serde(skip)]
+    pub label: &'static str,
     pub help: &'static str,
+}
+
+/// Every flag's page label, by flag, for the page config.
+pub fn flag_labels() -> std::collections::BTreeMap<&'static str, &'static str> {
+    COMPONENTS
+        .iter()
+        .flat_map(|c| c.flags)
+        .filter(|f| !f.label.is_empty())
+        .map(|f| (f.flag, f.label))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +143,8 @@ pub const REPORTS_DIR: &str = ".reports";
 /// `SUMMARY_SCHEMA` (`crates/analyze/src/report.rs`). The panel does not
 /// depend on the analyzer crate (it only ever spawns the exe), so the tag is
 /// repeated here; a cached summary carrying anything else is thrown away and
-/// computed again. Keep the two in step when the shape changes.
+/// computed again. A test reads the analyzer's source and fails when the two
+/// drift apart.
 pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/2";
 
 /// How long one summary run of the analyzer may take before it is given up
@@ -117,32 +152,62 @@ pub const SUMMARY_SCHEMA: &str = "telemouse-report-summary/2";
 /// recording analysed from cold takes tens of seconds.
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// What each of [`CAPTURE_FLAGS`] is called on the page and what it does,
+/// in the same order. The flags themselves come from `telemouse_core::ctl`,
+/// the one list ctl and the MCP server both check against; this table only
+/// adds the words. A flag added there fails to compile here until it is
+/// described. The two recording switches are the page's "Save to disk"
+/// switch ([`SAVE_FLAGS`]), not checkboxes, so they need no label.
+const CAPTURE_FLAG_TEXT: [(&str, &str); 5] = [
+    (
+        "Print every batch to the log",
+        "log a one-line summary for every batch",
+    ),
+    ("Don't send to Kafka", "disable the Kafka sink"),
+    (
+        "Don't stream to the live view",
+        "disable the localhost UDP sink (live viz)",
+    ),
+    (
+        "",
+        "do not save the JSONL recording, whatever telemouse.toml says",
+    ),
+    ("", "save the JSONL recording, whatever telemouse.toml says"),
+];
+const _: () = assert!(
+    CAPTURE_FLAGS.len() == CAPTURE_FLAG_TEXT.len(),
+    "every capture flag in telemouse_core::ctl::CAPTURE_FLAGS needs its words here"
+);
+
+/// [`CAPTURE_FLAGS`] paired with [`CAPTURE_FLAG_TEXT`].
+const fn capture_flag(i: usize) -> Flag {
+    Flag {
+        flag: CAPTURE_FLAGS[i],
+        label: CAPTURE_FLAG_TEXT[i].0,
+        help: CAPTURE_FLAG_TEXT[i].1,
+    }
+}
+
 /// The panel's catalogue. Order is display order.
 // rustfmt would spread every `Flag` over four lines; one row per flag reads
 // as the table it is.
 #[rustfmt::skip]
 pub const COMPONENTS: &[Component] = &[
     Component {
-        id: "capture",
+        id: CAPTURE,
         label: "Capture agent",
         summary: "telemouse run — raw mouse input → UDP / recording / Kafka",
         bin: "telemouse",
         base_args: &["run"],
         kind: Kind::Service,
-        flags: &[
-            Flag { flag: "--print",     help: "log a one-line summary for every batch" },
-            Flag { flag: "--no-kafka",  help: "disable the Kafka sink" },
-            Flag { flag: "--no-udp",    help: "disable the localhost UDP sink (live viz)" },
-            Flag { flag: "--no-record", help: "do not save the JSONL recording, whatever telemouse.toml says" },
-            Flag { flag: "--record",    help: "save the JSONL recording, whatever telemouse.toml says" },
-        ],
+        flags: &[capture_flag(0), capture_flag(1), capture_flag(2), capture_flag(3), capture_flag(4)],
         takes_session: false,
         passes_config: true,
         markers: true,
         report_cache: false,
     },
     Component {
-        id: "viz",
+        id: VIZ,
         label: "Viz server",
         summary: "telemouse-viz serve — live dashboard, replay, OBS overlay",
         bin: "telemouse-viz",
@@ -162,7 +227,7 @@ pub const COMPONENTS: &[Component] = &[
         base_args: &["doctor"],
         kind: Kind::Task,
         flags: &[
-            Flag { flag: "--json",       help: "print one telemouse-doctor/1 JSON document instead of the text rows" },
+            Flag { flag: "--json", label: "", help: "print one telemouse-doctor/1 JSON document instead of the text rows" },
         ],
         takes_session: false,
         passes_config: true,
@@ -183,7 +248,7 @@ pub const COMPONENTS: &[Component] = &[
         report_cache: true,
     },
     Component {
-        id: "report",
+        id: REPORT,
         label: "Analyze: report",
         summary: "telemouse-analyze report <session> — metrics for one recording",
         bin: "telemouse-analyze",
@@ -191,6 +256,7 @@ pub const COMPONENTS: &[Component] = &[
         kind: Kind::Task,
         flags: &[Flag {
             flag: "--timing",
+            label: "Print the time each analysis phase took",
             help: "print the per-phase timing table",
         }],
         takes_session: true,
@@ -414,12 +480,20 @@ pub struct ConfigInfo {
     pub mtime_unix_s: Option<u64>,
 }
 
+/// The capture flag that turns recording off for one run.
+const NO_RECORD: &str = "--no-record";
+/// The capture flag that turns recording on for one run.
+const RECORD: &str = "--record";
+/// The two capture flags behind the "Save to disk" switch: the page shows
+/// them as the switch, not as options.
+pub const SAVE_FLAGS: &[&str] = &[NO_RECORD, RECORD];
+
 /// Does a capture run with these arguments save a recording? The CLI
 /// switches beat the config; they are mutually exclusive on the agent.
 pub fn recording_saves(config_enabled: bool, args: &[String]) -> bool {
-    if args.iter().any(|a| a == "--no-record") {
+    if args.iter().any(|a| a == NO_RECORD) {
         false
-    } else if args.iter().any(|a| a == "--record") {
+    } else if args.iter().any(|a| a == RECORD) {
         true
     } else {
         config_enabled
@@ -430,9 +504,57 @@ pub fn recording_saves(config_enabled: bool, args: &[String]) -> bool {
 /// default: nothing when the default already agrees.
 pub fn recording_flags(config_enabled: bool, save: bool) -> Vec<String> {
     match (config_enabled, save) {
-        (true, false) => vec!["--no-record".into()],
-        (false, true) => vec!["--record".into()],
+        (true, false) => vec![NO_RECORD.into()],
+        (false, true) => vec![RECORD.into()],
         _ => Vec::new(),
+    }
+}
+
+/// Where a client of `/api/state` is in each component's log:
+/// `?log_since=<n>` (one cursor for every component, the original form) or
+/// `?log_since=<id>:<n>,<id>:<n>` (each component's own `log_seq` from the
+/// previous answer). A component without a cursor gets the plain tail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogCursors {
+    all: Option<u64>,
+    per: Vec<(String, u64)>,
+}
+
+impl LogCursors {
+    /// Parse the query value. Empty is "no cursor".
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(Self::default());
+        }
+        if let Ok(n) = s.parse::<u64>() {
+            return Ok(Self {
+                all: Some(n),
+                per: Vec::new(),
+            });
+        }
+        let per = s
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (id, n) = p
+                    .split_once(':')
+                    .ok_or_else(|| format!("log_since: {p:?} is not <component>:<n>"))?;
+                let n = n
+                    .parse::<u64>()
+                    .map_err(|_| format!("log_since: {n:?} is not a line count"))?;
+                Ok((id.to_string(), n))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self { all: None, per })
+    }
+
+    fn get(&self, id: &str) -> Option<u64> {
+        self.per
+            .iter()
+            .find(|(c, _)| c == id)
+            .map(|(_, n)| *n)
+            .or(self.all)
     }
 }
 
@@ -446,100 +568,65 @@ pub fn stop_grace(configured: Duration, fast: bool) -> Duration {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StartError {
+    #[error("no such component")]
     UnknownComponent,
+    #[error("already running")]
     AlreadyRunning,
+    #[error("flag not allowed for this component: {0}")]
     FlagNotAllowed(String),
+    #[error("this component needs a session")]
     SessionRequired,
+    #[error("bad session: {0}")]
     BadSession(String),
+    #[error("could not start: {0}")]
     Spawn(String),
 }
 
-impl std::fmt::Display for StartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownComponent => f.write_str("no such component"),
-            Self::AlreadyRunning => f.write_str("already running"),
-            Self::FlagNotAllowed(x) => write!(f, "flag not allowed for this component: {x}"),
-            Self::SessionRequired => f.write_str("this component needs a session"),
-            Self::BadSession(x) => write!(f, "bad session: {x}"),
-            Self::Spawn(x) => write!(f, "could not start: {x}"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StopError {
+    #[error("no such component")]
     UnknownComponent,
+    #[error("not running")]
     NotRunning,
 }
 
-impl std::fmt::Display for StopError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::UnknownComponent => "no such component",
-            Self::NotRunning => "not running",
-        })
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MarkerError {
+    #[error("no such component")]
     UnknownComponent,
     /// The component is not started with a stdin (`Component::markers`).
+    #[error("this component does not take markers")]
     Unsupported,
+    #[error("not running")]
     NotRunning,
+    #[error("bad label: {0}")]
     BadLabel(String),
     /// The pipe write failed — the child is on its way out.
+    #[error("could not deliver the marker: {0}")]
     Write(String),
 }
 
-impl std::fmt::Display for MarkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownComponent => f.write_str("no such component"),
-            Self::Unsupported => f.write_str("this component does not take markers"),
-            Self::NotRunning => f.write_str("not running"),
-            Self::BadLabel(x) => write!(f, "bad label: {x}"),
-            Self::Write(x) => write!(f, "could not deliver the marker: {x}"),
-        }
-    }
-}
-
 /// Why a recording's summary could not be had.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SummaryError {
     /// Not a recording id (`telemouse_core::recordings::is_safe_id`).
+    #[error("not a recording id")]
     BadId,
+    #[error("no such recording")]
     NoRecording,
     /// `telemouse-analyze` is not next to the panel.
+    #[error("telemouse-analyze was not found next to telemouse-ctl, so there is no report card")]
     NoAnalyzer,
+    #[error("the report could not be summarised: {0}")]
     Failed(String),
-}
-
-impl std::fmt::Display for SummaryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BadId => write!(f, "not a recording id"),
-            Self::NoRecording => write!(f, "no such recording"),
-            Self::NoAnalyzer => write!(
-                f,
-                "telemouse-analyze was not found next to telemouse-ctl, so there is no report card"
-            ),
-            Self::Failed(why) => write!(f, "the report could not be summarised: {why}"),
-        }
-    }
 }
 
 /// `path`'s modification time, to the filesystem's own resolution.
 fn mtime_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
-
-/// Longest marker label accepted, in characters. Mirrors the capture agent's
-/// own cap, so what the panel accepts is what the recording keeps.
-pub const MAX_MARKER_LABEL_CHARS: usize = 120;
 
 /// The label as it will be written, or why it cannot be. One line, no
 /// control characters, not blank, not longer than [`MAX_MARKER_LABEL_CHARS`]:
@@ -770,15 +857,23 @@ impl LogSink {
     }
 }
 
+/// A child's stdin, shared so a marker can be written to it without holding
+/// the slots lock (see [`Manager::marker`]).
+type SharedStdin = Arc<tokio::sync::Mutex<ChildStdin>>;
+
 struct Slot {
     child: Option<Child>,
     /// The child's stdin when it was started with one (`Component::markers`).
-    stdin: Option<ChildStdin>,
+    stdin: Option<SharedStdin>,
     pid: Option<u32>,
     since: Option<u64>,
     last_exit: Option<ExitInfo>,
     /// Set by `stop`: the next exit was asked for.
     stopping: bool,
+    /// The child has been taken out of the slot by a stop that is waiting
+    /// for it to exit (see [`Manager::detach`]). It still counts as
+    /// running: nothing may start in its place until the stop is done.
+    in_stop: bool,
     exits: u32,
     unexpected_exits: u32,
     args: Vec<String>,
@@ -794,11 +889,17 @@ impl Slot {
             since: None,
             last_exit: None,
             stopping: false,
+            in_stop: false,
             exits: 0,
             unexpected_exits: 0,
             args: Vec::new(),
             log: Arc::new(LogSink::default()),
         }
+    }
+
+    /// Running, or being stopped right now.
+    fn running(&self) -> bool {
+        self.child.is_some() || self.in_stop
     }
 
     /// Record an exit if the child has one; returns whether it is gone.
@@ -808,6 +909,10 @@ impl Slot {
     /// is a `warn!` with everything needed to go and look: which component,
     /// what it was running, how long it lasted, and how it ended.
     fn reap(&mut self, c: &Component) -> bool {
+        if self.in_stop {
+            // The stop that holds the child records its exit.
+            return false;
+        }
         let Some(child) = self.child.as_mut() else {
             return true;
         };
@@ -862,7 +967,35 @@ impl Slot {
         self.pid = None;
         self.since = None;
         self.stopping = false;
+        self.in_stop = false;
     }
+}
+
+/// A child taken out of its slot by a stop, so the stop can wait on its exit
+/// without holding the slots lock.
+struct Detached {
+    idx: usize,
+    child: Child,
+    pid: Option<u32>,
+}
+
+/// The common part of every child the panel launches: output piped (it is
+/// read by a page and appended to a file), colour off (escapes are noise in
+/// both; children that honour `NO_COLOR` never emit them, and
+/// `LogSink::push` strips whatever slips past), killed if the panel drops
+/// it, and — on Windows — its own process group, so a Ctrl-Break addressed
+/// to it reaches exactly that child and a Ctrl-C at the panel's console
+/// reaches none of them.
+fn child_command(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    cmd
 }
 
 pub(crate) fn describe_exit(e: &ExitInfo) -> String {
@@ -950,7 +1083,8 @@ pub struct Manager {
     components: Vec<Component>,
     cfg: ManagerConfig,
     live: Mutex<Live>,
-    slots: tokio::sync::Mutex<HashMap<&'static str, Slot>>,
+    /// One per component, in the same order as `components`.
+    slots: tokio::sync::Mutex<Vec<Slot>>,
     /// Binary lookups, good for [`BIN_TTL`]; dropped on every start and stop.
     bins: Mutex<BinCache>,
     /// Held while a summary run of the analyzer is in flight.
@@ -967,7 +1101,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(components: &[Component], cfg: ManagerConfig) -> Self {
-        let slots = components.iter().map(|c| (c.id, Slot::new())).collect();
+        let slots = components.iter().map(|_| Slot::new()).collect();
         let live = Live {
             recording_enabled: cfg.recording_enabled,
             recordings_dir: cfg.recordings_dir.clone(),
@@ -1043,11 +1177,12 @@ impl Manager {
     }
 
     pub async fn is_running(&self, id: &str) -> bool {
-        let Some(c) = self.component(id) else {
+        let Some(idx) = self.index(id) else {
             return false;
         };
+        let c = &self.components[idx];
         let mut slots = self.slots.lock().await;
-        slots.get_mut(c.id).is_some_and(|s| !s.reap(c))
+        slots.get_mut(idx).is_some_and(|s| !s.reap(c))
     }
 
     /// The stored summary of a recording, if one was made after the
@@ -1097,7 +1232,13 @@ impl Manager {
     pub async fn report_summary(&self, id: &str) -> Result<serde_json::Value, SummaryError> {
         self.refresh_config();
         let recording = self.recording_by_id(id)?;
-        let (bin, found) = self.resolve_bin("telemouse-analyze");
+        // The analyzer is whatever binary the catalogue's report task runs.
+        let analyzer = COMPONENTS
+            .iter()
+            .find(|c| c.id == REPORT)
+            .map(|c| c.bin)
+            .ok_or(SummaryError::NoAnalyzer)?;
+        let (bin, found) = self.resolve_bin(analyzer);
         if !found {
             return Err(SummaryError::NoAnalyzer);
         }
@@ -1105,17 +1246,12 @@ impl Manager {
         // over the same cores the game is using.
         let _one = self.summary_lock.lock().await;
         let dir = self.reports_dir();
-        let mut cmd = Command::new(&bin);
+        let mut cmd = child_command(&bin);
         cmd.arg("report")
             .arg(&recording)
             .arg("--summary")
             .arg("--json-dir")
-            .arg(&dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("NO_COLOR", "1")
-            .kill_on_drop(true);
+            .arg(&dir);
         let run = tokio::time::timeout(SUMMARY_TIMEOUT, cmd.output());
         let out = match run.await {
             Ok(Ok(out)) => out,
@@ -1199,8 +1335,10 @@ impl Manager {
         live.recordings_dir = c.recording.dir;
     }
 
-    fn component(&self, id: &str) -> Option<&Component> {
-        self.components.iter().find(|c| c.id == id)
+    /// The position of component `id` in the catalogue, which is also its
+    /// slot's position.
+    fn index(&self, id: &str) -> Option<usize> {
+        self.components.iter().position(|c| c.id == id)
     }
 
     /// Where a component's binary is expected: `bin_dir` if configured, else
@@ -1293,8 +1431,8 @@ impl Manager {
     /// so an unwatched panel still records exits.
     pub async fn reap(&self) {
         let mut slots = self.slots.lock().await;
-        for c in &self.components {
-            slots.get_mut(c.id).expect("slot per component").reap(c);
+        for (c, slot) in self.components.iter().zip(slots.iter_mut()) {
+            slot.reap(c);
         }
     }
 
@@ -1302,21 +1440,21 @@ impl Manager {
     /// nothing is, instead of waking twice a second forever.
     pub async fn any_running(&self) -> bool {
         let slots = self.slots.lock().await;
-        slots.values().any(|s| s.child.is_some())
+        slots.iter().any(Slot::running)
     }
 
     pub async fn snapshot(&self, log_lines: usize) -> Vec<ComponentState> {
-        self.snapshot_since(log_lines, None).await
+        self.snapshot_since(log_lines, &LogCursors::default()).await
     }
 
-    /// The state of every component. With `since`, each component's `log`
-    /// holds only the lines that arrived after that cursor (`log_seq` from a
-    /// previous read), so a page polling twice a second sends back a few
-    /// hundred bytes instead of 120 lines per component.
+    /// The state of every component. With a cursor, a component's `log`
+    /// holds only the lines that arrived after it (`log_seq` from a previous
+    /// read), so a page polling every two seconds sends back a few hundred
+    /// bytes instead of 120 lines per component.
     pub async fn snapshot_since(
         &self,
         log_lines: usize,
-        since: Option<u64>,
+        since: &LogCursors,
     ) -> Vec<ComponentState> {
         // Filesystem work (config mtime, binary lookups, and a PATH walk for
         // a missing binary) happens before the lock, not under it.
@@ -1324,16 +1462,18 @@ impl Manager {
         let bins = self.bins_cached();
         let recording_enabled = self.recording_enabled();
         let mut slots = self.slots.lock().await;
-        self.components
+        #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
+        let mut states: Vec<ComponentState> = self
+            .components
             .iter()
+            .zip(slots.iter_mut())
             .zip(bins)
-            .map(|(c, (bin_path, bin_found))| {
-                let s = slots.get_mut(c.id).expect("slot per component");
+            .map(|((c, s), (bin_path, bin_found))| {
                 s.reap(c);
-                let running = s.child.is_some();
+                let running = s.running();
                 let saving =
-                    running && c.id == "capture" && recording_saves(recording_enabled, &s.args);
-                let (log, log_seq) = s.log.read(log_lines, since);
+                    running && c.id == CAPTURE && recording_saves(recording_enabled, &s.args);
+                let (log, log_seq) = s.log.read(log_lines, since.get(c.id));
                 #[cfg(feature = "observability")]
                 let stats = s.log.stats();
                 ComponentState {
@@ -1357,22 +1497,30 @@ impl Manager {
                     saving,
                     log,
                     log_seq,
+                    // Filled in below, once the lock is released.
                     #[cfg(feature = "observability")]
-                    recording: (running && saving)
-                        .then(|| {
-                            stats
-                                .as_ref()
-                                .and_then(|st| st.session.as_deref())
-                                .map(|session| self.recording_live(session))
-                        })
-                        .flatten(),
+                    recording: None,
                     #[cfg(feature = "observability")]
                     foreground_seen: if running { s.log.seen() } else { Vec::new() },
                     #[cfg(feature = "observability")]
                     stats,
                 }
             })
-            .collect()
+            .collect();
+        drop(slots);
+        // The recording's size and the disk's free space are filesystem
+        // calls: made after the lock, so a slow disk never holds up a start,
+        // a stop or another snapshot.
+        #[cfg(feature = "observability")]
+        for st in &mut states {
+            if st.running
+                && st.saving
+                && let Some(session) = st.stats.as_ref().and_then(|s| s.session.as_deref())
+            {
+                st.recording = Some(self.recording_live(session));
+            }
+        }
+        states
     }
 
     /// The size of the recording being written and what the disk has left,
@@ -1459,12 +1607,15 @@ impl Manager {
         // the recording lands, so it is re-read before the arguments are
         // built rather than after.
         self.refresh_config();
-        let c = self.component(id).ok_or(StartError::UnknownComponent)?;
+        let idx = self.index(id).ok_or(StartError::UnknownComponent)?;
+        let c = &self.components[idx];
         let args = self.arguments(c, req)?;
         let (bin, _) = self.resolve_bin(c.bin);
 
         let mut slots = self.slots.lock().await;
-        let slot = slots.get_mut(c.id).expect("slot per component");
+        let Some(slot) = slots.get_mut(idx) else {
+            return Err(StartError::UnknownComponent);
+        };
         if !slot.reap(c) {
             return Err(StartError::AlreadyRunning);
         }
@@ -1475,29 +1626,22 @@ impl Manager {
         #[cfg(feature = "observability")]
         slot.log.forget_seen();
 
-        let mut cmd = Command::new(&bin);
-        cmd.args(&args)
-            .stdin(if c.markers {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // What a child prints is read by a page and appended to a file:
-            // colour escapes are noise in both. Children that honour this
-            // never emit them; `LogSink::push` strips whatever slips past.
-            .env("NO_COLOR", "1")
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        let mut cmd = child_command(&bin);
+        cmd.args(&args);
+        if c.markers {
+            cmd.stdin(Stdio::piped());
+        }
 
         let mut child = cmd
             .spawn()
             .map_err(|e| StartError::Spawn(format!("{} {}: {e}", bin.display(), args.join(" "))))?;
-        let pid = child.id().unwrap_or(0);
+        // `None` only when the child has already been reaped, which cannot
+        // have happened yet; kept as an `Option` all the same, because a
+        // made-up 0 would address the panel's own console group on stop.
+        let pid = child.id();
+        let shown_pid = pid.map_or_else(|| "?".to_string(), |p| p.to_string());
         slot.log.push(format!(
-            "--- started pid {pid}: {} {} ---",
+            "--- started pid {shown_pid}: {} {} ---",
             bin.display(),
             args.join(" ")
         ));
@@ -1507,16 +1651,19 @@ impl Manager {
         if let Some(err) = child.stderr.take() {
             tokio::spawn(pump(err, slot.log.clone()));
         }
-        slot.stdin = child.stdin.take();
+        slot.stdin = child
+            .stdin
+            .take()
+            .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
         slot.child = Some(child);
-        slot.pid = Some(pid);
+        slot.pid = pid;
         slot.since = Some(now_unix());
         slot.args = args;
         info!(component = c.id, pid, bin = %bin.display(), "started");
         drop(slots);
         self.invalidate_bins();
         self.work.notify_waiters();
-        Ok(pid)
+        Ok(pid.unwrap_or(0))
     }
 
     /// Hand a marker label to a running component's stdin. The label is
@@ -1524,34 +1671,52 @@ impl Manager {
     /// business (the capture agent stamps it and records it, see
     /// `stdin_markers.rs` there).
     pub async fn marker(&self, id: &str, label: &str) -> Result<String, MarkerError> {
-        let c = self.component(id).ok_or(MarkerError::UnknownComponent)?;
+        let idx = self.index(id).ok_or(MarkerError::UnknownComponent)?;
+        let c = &self.components[idx];
         if !c.markers {
             return Err(MarkerError::Unsupported);
         }
         let label = marker_label(label)?;
-        let mut slots = self.slots.lock().await;
-        let slot = slots.get_mut(c.id).expect("slot per component");
-        if slot.reap(c) {
-            return Err(MarkerError::NotRunning);
-        }
-        let Some(stdin) = slot.stdin.as_mut() else {
-            return Err(MarkerError::NotRunning);
+        // Only the handles are taken under the slots lock; the pipe write
+        // happens after it is released. A child that has stopped reading
+        // its stdin then stalls this one request (up to the timeout), not
+        // every state read, start and stop in the panel.
+        let (stdin, pid, log) = {
+            let mut slots = self.slots.lock().await;
+            let Some(slot) = slots.get_mut(idx) else {
+                return Err(MarkerError::UnknownComponent);
+            };
+            if slot.reap(c) || slot.in_stop {
+                return Err(MarkerError::NotRunning);
+            }
+            let Some(stdin) = slot.stdin.clone() else {
+                return Err(MarkerError::NotRunning);
+            };
+            (stdin, slot.pid, slot.log.clone())
         };
         let line = format!("{label}\n");
-        let written = async {
+        let write = async {
+            let mut stdin = stdin.lock().await;
             stdin.write_all(line.as_bytes()).await?;
             stdin.flush().await
-        }
-        .await;
+        };
+        let written = match tokio::time::timeout(MARKER_WRITE_TIMEOUT, write).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err(format!(
+                "{} did not read its input within {} s",
+                c.label,
+                MARKER_WRITE_TIMEOUT.as_secs()
+            )),
+        };
         match written {
             Ok(()) => {
-                info!(component = c.id, pid = slot.pid, label = %label, "marker sent");
-                slot.log.push(format!("--- marker: {label} ---"));
+                info!(component = c.id, pid, label = %label, "marker sent");
+                log.push(format!("--- marker: {label} ---"));
                 Ok(label)
             }
             Err(e) => {
-                warn!(component = c.id, pid = slot.pid, error = %e, "marker not delivered");
-                Err(MarkerError::Write(e.to_string()))
+                warn!(component = c.id, pid, error = %e, "marker not delivered");
+                Err(MarkerError::Write(e))
             }
         }
     }
@@ -1568,53 +1733,94 @@ impl Manager {
         force: bool,
         grace: Duration,
     ) -> Result<StopOutcome, StopError> {
-        let c = self.component(id).ok_or(StopError::UnknownComponent)?;
-        let pid = {
-            let mut slots = self.slots.lock().await;
-            let slot = slots.get_mut(c.id).expect("slot per component");
-            if slot.reap(c) {
-                return Err(StopError::NotRunning);
-            }
-            slot.stopping = true;
-            slot.pid
-        };
-        // Whatever happens below, the process table and the binary cache are
-        // stale from here on.
-        self.invalidate_bins();
+        let idx = self.index(id).ok_or(StopError::UnknownComponent)?;
+        let d = self.detach(idx).await?;
+        let outcome = self.finish_stops(vec![d], force, grace).await;
+        Ok(outcome
+            .into_iter()
+            .next()
+            .unwrap_or(StopOutcome::Terminated))
+    }
 
-        // A pid of 0 would address the whole console group — this panel
-        // included — so a child whose pid was never known is only terminated.
-        if !force && pid.is_some_and(send_ctrl_break) {
-            let deadline = tokio::time::Instant::now() + grace;
-            while tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let mut slots = self.slots.lock().await;
-                if slots.get_mut(c.id).expect("slot per component").reap(c) {
-                    info!(component = c.id, pid, "stopped gracefully");
-                    self.work.notify_waiters();
-                    return Ok(StopOutcome::Graceful);
-                }
-            }
-            warn!(
-                component = c.id,
-                pid,
-                grace_s = grace.as_secs(),
-                "did not stop in time; terminating"
-            );
-        }
-
+    /// Take a running child out of its slot for a stop to wait on, marking
+    /// the slot as stopping. `NotRunning` when there is nothing to stop, or
+    /// another stop already holds it.
+    async fn detach(&self, idx: usize) -> Result<Detached, StopError> {
+        let c = &self.components[idx];
         let mut slots = self.slots.lock().await;
-        let slot = slots.get_mut(c.id).expect("slot per component");
-        if let Some(child) = slot.child.as_mut()
-            && let Err(e) = child.kill().await
-        {
-            warn!(component = c.id, pid, error = %e, "kill failed");
+        let slot = slots.get_mut(idx).ok_or(StopError::UnknownComponent)?;
+        if slot.in_stop || slot.reap(c) {
+            return Err(StopError::NotRunning);
         }
-        slot.reap(c);
-        info!(component = c.id, pid, "terminated");
-        drop(slots);
+        let child = slot.child.take().ok_or(StopError::NotRunning)?;
+        slot.stopping = true;
+        slot.in_stop = true;
+        // Whatever happens next, the binary cache is stale.
+        self.invalidate_bins();
+        Ok(Detached {
+            idx,
+            child,
+            pid: slot.pid,
+        })
+    }
+
+    /// Stop detached children: Ctrl-Break to every one of them first, then
+    /// wait on all of them against one shared deadline, then terminate what
+    /// is left. Two services stopped together take one grace period, not
+    /// two — which matters when Windows is the one waiting.
+    async fn finish_stops(
+        &self,
+        list: Vec<Detached>,
+        force: bool,
+        grace: Duration,
+    ) -> Vec<StopOutcome> {
+        // A child without a known pid is only terminated: a pid of 0 would
+        // address the whole console group, this panel included.
+        let asked: Vec<bool> = list
+            .iter()
+            .map(|d| !force && d.pid.is_some_and(send_ctrl_break))
+            .collect();
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut outcomes = Vec::with_capacity(list.len());
+        for (mut d, asked) in list.into_iter().zip(asked) {
+            let c = &self.components[d.idx];
+            let graceful = asked
+                && matches!(
+                    tokio::time::timeout_at(deadline, d.child.wait()).await,
+                    Ok(Ok(_))
+                );
+            let outcome = if graceful {
+                info!(component = c.id, pid = d.pid, "stopped gracefully");
+                StopOutcome::Graceful
+            } else {
+                if asked {
+                    warn!(
+                        component = c.id,
+                        pid = d.pid,
+                        grace_s = grace.as_secs(),
+                        "did not stop in time; terminating"
+                    );
+                }
+                if let Err(e) = d.child.kill().await {
+                    warn!(component = c.id, pid = d.pid, error = %e, "kill failed");
+                }
+                info!(component = c.id, pid = d.pid, "terminated");
+                StopOutcome::Terminated
+            };
+            // Back into the slot, where the ordinary reap records the exit
+            // the wait above already collected.
+            let mut slots = self.slots.lock().await;
+            if let Some(slot) = slots.get_mut(d.idx) {
+                slot.in_stop = false;
+                slot.child = Some(d.child);
+                slot.reap(c);
+            }
+            drop(slots);
+            outcomes.push(outcome);
+        }
+        self.invalidate_bins();
         self.work.notify_waiters();
-        Ok(StopOutcome::Terminated)
+        outcomes
     }
 
     /// Shutdown: stop every running component, gracefully where possible.
@@ -1630,9 +1836,14 @@ impl Manager {
     }
 
     async fn stop_all_within(&self, grace: Duration) {
-        let ids: Vec<&'static str> = self.components.iter().map(|c| c.id).collect();
-        for id in ids {
-            let _ = self.stop_within(id, false, grace).await;
+        let mut list = Vec::new();
+        for idx in 0..self.components.len() {
+            if let Ok(d) = self.detach(idx).await {
+                list.push(d);
+            }
+        }
+        if !list.is_empty() {
+            self.finish_stops(list, false, grace).await;
         }
     }
 }
@@ -1708,6 +1919,7 @@ mod tests {
         kind: Kind::Service,
         flags: &[Flag {
             flag: "--ok",
+            label: "",
             help: "allowed",
         }],
         takes_session: false,
@@ -1749,6 +1961,33 @@ mod tests {
         passes_config: false,
         markers: false,
         report_cache: false,
+    };
+
+    /// A task that succeeds: prints, exits 0.
+    const SUCCEEDER: Component = Component {
+        id: "succeeder",
+        label: "Succeeder",
+        summary: "test task that exits 0",
+        #[cfg(windows)]
+        bin: "cmd",
+        #[cfg(not(windows))]
+        bin: "sh",
+        #[cfg(windows)]
+        base_args: &["/C", "echo all good && exit 0"],
+        #[cfg(not(windows))]
+        base_args: &["-c", "echo all good; exit 0"],
+        kind: Kind::Task,
+        flags: &[],
+        takes_session: false,
+        passes_config: false,
+        markers: false,
+        report_cache: false,
+    };
+
+    /// A second service, for stopping two at once.
+    const SLEEPER2: Component = Component {
+        id: "sleeper2",
+        ..SLEEPER
     };
 
     fn config(dir: &Path) -> ManagerConfig {
@@ -1804,28 +2043,41 @@ mod tests {
     /// can say what it printed without the log being open.
     #[tokio::test]
     async fn a_failed_exit_carries_the_last_line() {
-        let m = manager(Path::new("."));
+        let m = Manager::new(&[FAILER, SUCCEEDER], config(Path::new(".")));
         m.start("failer", &StartRequest::default()).await.unwrap();
-        // The pumps may land the line after try_wait sees the exit; the next
-        // reap does not re-run, so read the ring directly.
+        // The pumps may land the line after try_wait sees the exit, and an
+        // exit is recorded once. Wait for the line in the ring *without*
+        // reaping, so the exit that is then recorded has it for certain.
+        let idx = m.index("failer").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let printed = m.slots.lock().await[idx]
+                .log
+                .tail(10)
+                .iter()
+                .any(|l| l.trim_end() == "about to fail");
+            if printed {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no output captured");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let s = wait_exit(&m, "failer").await;
         let exit = s.last_exit.unwrap();
         assert_eq!(exit.code, Some(3));
         assert!(exit.failed());
-        assert!(
-            exit.last_line.is_none() || exit.last_line.as_deref() == Some("about to fail"),
-            "{:?}",
-            exit.last_line
-        );
-        // A clean stop carries neither hint nor line.
-        m.start("sleeper", &StartRequest::default()).await.unwrap();
-        m.stop("sleeper", true).await.unwrap();
-        let s = wait_exit(&m, "sleeper").await;
+        assert_eq!(exit.last_line.as_deref(), Some("about to fail"));
+
+        // A clean exit carries neither hint nor line.
+        m.start("succeeder", &StartRequest::default())
+            .await
+            .unwrap();
+        let s = wait_exit(&m, "succeeder").await;
         let exit = s.last_exit.unwrap();
-        if !exit.failed() {
-            assert!(exit.last_line.is_none());
-            assert!(exit.hint.is_none());
-        }
+        assert_eq!(exit.code, Some(0));
+        assert!(!exit.failed());
+        assert!(exit.last_line.is_none());
+        assert!(exit.hint.is_none());
     }
 
     #[cfg(feature = "logging")]
@@ -1960,7 +2212,9 @@ mod tests {
             outcome,
             StopOutcome::Graceful | StopOutcome::Terminated
         ));
-        assert!(t0.elapsed() < Duration::from_secs(4));
+        // The grace period plus a generous allowance for a loaded CI box.
+        let bound = config(Path::new(".")).grace + Duration::from_secs(5);
+        assert!(t0.elapsed() < bound, "took {:?}", t0.elapsed());
         let st = m.snapshot(5).await;
         assert!(!st.iter().find(|s| s.id == "sleeper").unwrap().running);
     }
@@ -1984,8 +2238,11 @@ mod tests {
             Duration::from_secs(60)
         );
 
+        // Two services: they are asked together and waited on against one
+        // deadline, so the whole stop still fits in one fast grace period
+        // (one after the other, it would be two).
         let m = Manager::new(
-            &[SLEEPER],
+            &[SLEEPER, SLEEPER2],
             ManagerConfig {
                 // Far longer than Windows would ever grant us.
                 grace: Duration::from_secs(60),
@@ -1993,6 +2250,7 @@ mod tests {
             },
         );
         m.start("sleeper", &StartRequest::default()).await.unwrap();
+        m.start("sleeper2", &StartRequest::default()).await.unwrap();
         let t0 = tokio::time::Instant::now();
         m.stop_all_fast().await;
         assert!(
@@ -2001,6 +2259,39 @@ mod tests {
             t0.elapsed()
         );
         assert!(!m.any_running().await);
+        let st = m.snapshot(1).await;
+        assert!(st.iter().all(|s| !s.running && s.exits == 1), "both reaped");
+        assert!(
+            st.iter().all(|s| s.unexpected_exits == 0),
+            "a stop is an expected exit"
+        );
+    }
+
+    /// While a stop waits for its child the slot still reads as running, a
+    /// second stop is refused, and nothing can start in its place.
+    #[tokio::test]
+    async fn a_child_being_stopped_still_counts_as_running() {
+        let m = Manager::new(&[SLEEPER], config(Path::new(".")));
+        m.start("sleeper", &StartRequest::default()).await.unwrap();
+        let d = m.detach(0).await.unwrap();
+        assert!(m.any_running().await);
+        assert!(m.is_running("sleeper").await);
+        assert!(m.snapshot(1).await[0].running);
+        assert_eq!(
+            m.stop("sleeper", true).await.unwrap_err(),
+            StopError::NotRunning
+        );
+        assert_eq!(
+            m.start("sleeper", &StartRequest::default())
+                .await
+                .unwrap_err(),
+            StartError::AlreadyRunning
+        );
+        assert_eq!(m.marker("sleeper", "x").await, Err(MarkerError::NotRunning));
+        let out = m.finish_stops(vec![d], true, Duration::ZERO).await;
+        assert_eq!(out, vec![StopOutcome::Terminated]);
+        assert!(!m.any_running().await);
+        assert_eq!(m.snapshot(1).await[0].exits, 1);
     }
 
     #[tokio::test]
@@ -2261,14 +2552,31 @@ mod tests {
     #[test]
     fn sessions_are_listed_newest_first_and_only_jsonl() {
         let dir = tmpdir("list");
-        std::fs::write(dir.join("old.jsonl"), "{}\n").unwrap();
+        // Named so that the name order is the opposite of the age order: a
+        // tie on mtime would fall back to the names and fail.
+        let write_at = |name: &str, secs: u64| {
+            let p = dir.join(name);
+            std::fs::write(&p, "{}\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        write_at("a-old.jsonl", 1_700_000_000);
+        write_at("b-new.jsonl", 1_700_000_100);
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
-        std::thread::sleep(Duration::from_millis(30));
-        std::fs::write(dir.join("new.jsonl"), "{}\n").unwrap();
         let m = manager(&dir);
         assert_eq!(
             m.list_sessions(),
-            vec!["new.jsonl".to_string(), "old.jsonl".to_string()]
+            vec!["b-new.jsonl".to_string(), "a-old.jsonl".to_string()]
+        );
+        // Equal mtimes sort by name.
+        write_at("b-new.jsonl", 1_700_000_000);
+        assert_eq!(
+            m.list_sessions(),
+            vec!["a-old.jsonl".to_string(), "b-new.jsonl".to_string()]
         );
         assert!(manager(&dir.join("absent")).list_sessions().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2293,11 +2601,17 @@ mod tests {
         std::fs::write(&p, "").unwrap();
         assert!(m.resolve_bin("telemouse-viz").1);
         // The cache is a cache: it answers from the same lookup until it is
-        // dropped, which every start and stop does.
+        // dropped, which every start and stop does. The sleeper's binary
+        // appearing in between is how that shows.
         let before = m.bins_cached();
-        assert_eq!(m.bins_cached(), before);
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].1, "no sleeper binary in the bin dir yet");
+        std::fs::write(&before[0].0, "").unwrap();
+        assert_eq!(m.bins_cached(), before, "served from the cache");
         m.invalidate_bins();
-        assert_eq!(m.bins_cached(), before, "same answer, freshly read");
+        let after = m.bins_cached();
+        assert_eq!(after[0].0, before[0].0);
+        assert!(after[0].1, "a fresh lookup sees the new binary");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2433,7 +2747,8 @@ mod tests {
         m.start("failer", &StartRequest::default()).await.unwrap();
         let s = wait_exit(&m, "failer").await;
         assert!(s.log_seq >= 2, "{} lines", s.log_seq);
-        let st = m.snapshot_since(50, Some(s.log_seq)).await;
+        let cursor = LogCursors::parse(&format!("failer:{}", s.log_seq)).unwrap();
+        let st = m.snapshot_since(50, &cursor).await;
         let again = st.iter().find(|x| x.id == "failer").unwrap();
         assert!(
             again.log.is_empty(),
@@ -2441,6 +2756,28 @@ mod tests {
             again.log
         );
         assert_eq!(again.log_seq, s.log_seq);
+        // The other components had no cursor: they get their tail.
+        let sleeper = st.iter().find(|x| x.id == "sleeper").unwrap();
+        assert_eq!(sleeper.log_seq, 0);
+        // The one-number form still applies to everything.
+        let st = m
+            .snapshot_since(50, &LogCursors::parse(&s.log_seq.to_string()).unwrap())
+            .await;
+        assert!(st.iter().find(|x| x.id == "failer").unwrap().log.is_empty());
+    }
+
+    #[test]
+    fn log_cursors_parse_both_forms() {
+        assert_eq!(LogCursors::parse("").unwrap(), LogCursors::default());
+        let all = LogCursors::parse("12").unwrap();
+        assert_eq!((all.get("capture"), all.get("viz")), (Some(12), Some(12)));
+        let per = LogCursors::parse("capture:3,viz:40").unwrap();
+        assert_eq!(per.get("capture"), Some(3));
+        assert_eq!(per.get("viz"), Some(40));
+        assert_eq!(per.get("doctor"), None, "no cursor: the plain tail");
+        for bad in ["capture", "capture:", "capture:-1", "capture:x,viz:1", "-3"] {
+            assert!(LogCursors::parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     /// A `telemouse.toml` edited while the panel runs changes what a start
@@ -2567,6 +2904,180 @@ mod tests {
             )
             .unwrap_err(),
             StartError::FlagNotAllowed("--json-dir".into())
+        );
+    }
+
+    /// The error messages are part of the HTTP API (`{ "error": ... }`).
+    #[test]
+    fn error_messages_are_unchanged() {
+        use crate::procs::KillError;
+        let cases: [(String, &str); 10] = [
+            (
+                StartError::FlagNotAllowed("--x".into()).to_string(),
+                "flag not allowed for this component: --x",
+            ),
+            (
+                StartError::Spawn("e".into()).to_string(),
+                "could not start: e",
+            ),
+            (
+                StartError::SessionRequired.to_string(),
+                "this component needs a session",
+            ),
+            (StopError::NotRunning.to_string(), "not running"),
+            (
+                MarkerError::Unsupported.to_string(),
+                "this component does not take markers",
+            ),
+            (
+                MarkerError::Write("w".into()).to_string(),
+                "could not deliver the marker: w",
+            ),
+            (
+                SummaryError::NoAnalyzer.to_string(),
+                "telemouse-analyze was not found next to telemouse-ctl, so there is no report card",
+            ),
+            (
+                SummaryError::Failed("f".into()).to_string(),
+                "the report could not be summarised: f",
+            ),
+            (
+                KillError::IsSelf.to_string(),
+                "refusing to kill the control panel itself",
+            ),
+            (
+                KillError::Failed.to_string(),
+                "the OS refused to terminate the process",
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+    }
+
+    /// The capture allow-list is core's, flag for flag and in order, so ctl
+    /// and the MCP server can never disagree about it.
+    #[test]
+    fn the_capture_allow_list_is_cores() {
+        let capture = COMPONENTS.iter().find(|c| c.id == CAPTURE).unwrap();
+        assert_eq!(
+            capture.flags.iter().map(|f| f.flag).collect::<Vec<_>>(),
+            CAPTURE_FLAGS
+        );
+        assert!(capture.flags.iter().all(|f| !f.help.is_empty()));
+        for id in [CAPTURE, VIZ, REPORT] {
+            assert!(COMPONENTS.iter().any(|c| c.id == id), "{id}");
+        }
+    }
+
+    /// The `pub` field names of `pub struct <name>` anywhere under `dir`.
+    fn struct_fields(dir: &Path, name: &str) -> Vec<String> {
+        fn walk(dir: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && let Ok(t) = std::fs::read_to_string(&p)
+                {
+                    out.push(t);
+                }
+            }
+        }
+        let mut texts = Vec::new();
+        walk(dir, &mut texts);
+        let head = format!("pub struct {name} {{");
+        for t in texts {
+            if let Some(i) = t.find(&head) {
+                let body = &t[i + head.len()..];
+                let body = &body[..body.find("\n}").unwrap_or(body.len())];
+                return body
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("pub "))
+                    .filter_map(|l| l.split(':').next())
+                    .map(|f| f.trim().to_string())
+                    .collect();
+            }
+        }
+        panic!("no `pub struct {name}` under {}", dir.display());
+    }
+
+    /// The page's report-card test (`js-tests/report.test.mjs`) feeds
+    /// `renderReport` a fixture and fails on any field it reads that the
+    /// fixture lacks; this keeps the fixture's keys the analyzer's, so a
+    /// renamed or removed `ReportSummary` field fails here.
+    #[test]
+    fn the_js_summary_fixture_has_the_analyzers_shape() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../analyze/src");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("js-tests/fixtures/report-summary.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fixture["schema"], SUMMARY_SCHEMA);
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let fields = |name: &str| {
+            let mut f = struct_fields(&src, name);
+            f.sort();
+            f
+        };
+        assert_eq!(keys(&fixture), fields("ReportSummary"), "ReportSummary");
+        for (key, name) in [
+            ("session", "SessionSummary"),
+            ("quality", "QualityHeadline"),
+            ("flicks", "FlickHeadline"),
+            ("micro", "MicroHeadline"),
+            ("clicks", "ClickHeadline"),
+            ("kinematics", "KinematicsHeadline"),
+            ("lifts", "LiftHeadline"),
+        ] {
+            assert_eq!(keys(&fixture[key]), fields(name), "{key} ↔ {name}");
+        }
+        assert_eq!(keys(&fixture["markers"][0]), fields("SummaryMarker"));
+        assert_eq!(keys(&fixture["segments"][0]), fields("SummarySegment"));
+    }
+
+    /// `SUMMARY_SCHEMA` is repeated here by hand (the panel only spawns the
+    /// analyzer, it does not link it); this reads the analyzer's source and
+    /// fails the moment the two tags differ.
+    #[test]
+    fn the_summary_schema_matches_the_analyzers() {
+        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rust_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../analyze/src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let needle = "pub const SUMMARY_SCHEMA: &str = \"";
+        let found: Vec<String> = files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter_map(|l| l.trim().strip_prefix(needle))
+                    .filter_map(|rest| rest.split('"').next())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![SUMMARY_SCHEMA.to_string()],
+            "the analyzer's SUMMARY_SCHEMA (under {}) and ctl's must be the same tag",
+            src.display()
         );
     }
 }

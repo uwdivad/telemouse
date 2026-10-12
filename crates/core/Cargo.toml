@@ -26,14 +26,14 @@ tracing-subscriber = { workspace = true, optional = true }
 # Console control handler (core::shutdown): the one Win32 API core needs, so
 # every binary can block Windows' teardown until its sinks are closed.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Console",
 ] }
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
-tempfile = "3.27.0"
+criterion.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "wire"
@@ -42,3 +42,6 @@ harness = false
 [[bench]]
 name = "clock"
 harness = false
+
+[lints]
+workspace = true

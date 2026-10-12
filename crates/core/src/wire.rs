@@ -40,6 +40,10 @@ pub const MAX_EVENTS_PER_BATCH: usize = 448;
 /// `ts_anchor_us`: the viz bridge reads those two off every datagram for its
 /// seq-gap and latency estimators, and a heartbeat is neither telemetry nor
 /// part of the batch sequence. Absent fields keep it out of both.
+///
+/// Deliberately *not* `deny_unknown_fields`, like every envelope payload:
+/// [`Envelope::from_json`]'s fast path parses it from a document that still
+/// carries the `"type"` key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub session_id: String,
@@ -70,7 +74,8 @@ impl Envelope {
     /// 448-event batch, 6.8µs vs 2.5µs for a 25-event one). Every envelope
     /// telemouse itself writes starts with `{"type":"<tag>",` verbatim, so
     /// that prefix is matched first and the variant's struct is parsed
-    /// directly (the `type` key is then just an ignored unknown field).
+    /// directly (the `type` key is then just an ignored unknown field, which
+    /// is why no payload struct may be `deny_unknown_fields`).
     /// Anything else — reordered keys, whitespace, hand-written JSON — takes
     /// the general tagged path, so the accepted language is unchanged.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
@@ -219,7 +224,7 @@ mod tests {
                 ts_qpc: u64::MAX - i as u64,
                 dx: i32::MIN,
                 dy: i32::MIN,
-                buttons: 0x03FF,
+                buttons: buttons::MASK,
                 wheel: i16::MIN,
                 wheel_h: i16::MIN,
                 device_ix: u8::MAX,

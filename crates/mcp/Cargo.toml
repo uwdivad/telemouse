@@ -18,15 +18,18 @@ path = "src/main.rs"
 # "periodic stats", since it has no loop of its own.
 [features]
 default = ["logging", "observability"]
-logging = ["telemouse-core/logging", "telemouse-analyze/logging"]
+logging = ["telemouse-core/logging"]
 observability = []
+# `quiet` compiles every `tracing` event out of a release build: all levels,
+# `error!` and `warn!` included (debug builds keep them). Cargo unifies
+# `tracing`'s features, so it applies to every binary built in the same cargo
+# invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
-
 [dependencies]
 telemouse-core = { workspace = true }
 # The analyzer as a library: `list`, `report --summary` and `trend` are the
 # same code paths the CLI runs, not a reimplementation of them.
-telemouse-analyze = { path = "../analyze", default-features = false }
+telemouse-analyze = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -34,7 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 # The official MCP SDK. Only the server half and the stdio transport: no
-# HTTP transport, no client, no auth, no reqwest (see `local.rs` for why the
+# HTTP transport, no client, no auth, no reqwest (see `http.rs` for why the
 # two loopback servers are spoken to without an HTTP crate).
 rmcp = { version = "3.4.0", default-features = false, features = [
     "server",
@@ -43,7 +46,7 @@ rmcp = { version = "3.4.0", default-features = false, features = [
 ] }
 # Explicit features, not "full": one stdin/stdout pair and two short-lived
 # loopback TCP connections per tool call.
-tokio = { version = "1.53.1", features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -54,4 +57,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
-winresource = "0.1.31"
+winresource.workspace = true
+
+[lints]
+workspace = true

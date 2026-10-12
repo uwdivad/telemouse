@@ -166,7 +166,7 @@ pub const NOT_EDITABLE: &[&str] = &[
 /// A change request. Every field is optional; a field that is absent is
 /// left as the file has it. Anything outside this shape is refused by serde
 /// (`deny_unknown_fields`), which is the allow-list.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Patch {
     #[serde(default)]
@@ -184,7 +184,7 @@ pub struct Patch {
     pub obs: Option<ObsPatch>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordingPatch {
     #[serde(default)]
@@ -193,7 +193,7 @@ pub struct RecordingPatch {
     pub dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CtlPatch {
     #[serde(default)]
@@ -202,7 +202,7 @@ pub struct CtlPatch {
 
 /// A new game needs `sens`; `yaw_coeff` defaults to [`DEFAULT_COEFF`] and
 /// `pitch_coeff` to whatever the yaw ends up as.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GamePatch {
     #[serde(default)]
@@ -213,7 +213,7 @@ pub struct GamePatch {
     pub pitch_coeff: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObsPatch {
     #[serde(default)]
@@ -690,29 +690,96 @@ pub fn save(path: &Path, expected_token: &str, patch: &Patch) -> Result<Saved, S
     })
 }
 
-/// Which editable groups differ between two configs, by the name the page
-/// and the log use.
-pub fn changed(old: &AppConfig, new: &AppConfig) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if old.mouse_cpi != new.mouse_cpi {
-        out.push("mouse_cpi");
+/// One editable group of settings: one top-level key of [`Patch`], one card
+/// section on the page. Serialised as its dotted config name — the name
+/// core's validation errors use as `field` prefix and the page's error slots
+/// (`data-err`) are keyed by — so `changed`, `restart_required`, an error's
+/// `field` and the page all spell a group the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeGroup {
+    MouseCpi,
+    MarkerHotkey,
+    Recording,
+    CtlHotkey,
+    Games,
+    VizObs,
+}
+
+impl Serialize for ChangeGroup {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.config_name())
     }
-    if old.marker_hotkey != new.marker_hotkey {
-        out.push("marker_hotkey");
+}
+
+impl ChangeGroup {
+    pub const ALL: [ChangeGroup; 6] = [
+        Self::MouseCpi,
+        Self::MarkerHotkey,
+        Self::Recording,
+        Self::CtlHotkey,
+        Self::Games,
+        Self::VizObs,
+    ];
+
+    /// The dotted name in `telemouse.toml`, which is also how it serialises.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::MouseCpi => "mouse_cpi",
+            Self::MarkerHotkey => "marker_hotkey",
+            Self::Recording => "recording",
+            Self::CtlHotkey => "ctl.hotkey",
+            Self::Games => "games",
+            Self::VizObs => "viz.obs",
+        }
     }
-    if old.recording != new.recording {
-        out.push("recording");
+
+    /// The top-level key of [`Patch`] (and of [`Settings`]) that holds this
+    /// group. The same as the config name except for the overlay, which the
+    /// patch flattens to `obs` (it is the only `viz` setting the page edits),
+    /// and the new-session chord, which sits in `ctl`. The drift test walks
+    /// `Patch` through this.
+    #[cfg(test)]
+    pub fn patch_key(self) -> &'static str {
+        match self {
+            Self::VizObs => "obs",
+            Self::CtlHotkey => "ctl",
+            other => other.config_name(),
+        }
     }
-    if old.ctl.hotkey != new.ctl.hotkey {
-        out.push("ctl.hotkey");
+
+    /// Did this group change between two configs?
+    fn differs(self, old: &AppConfig, new: &AppConfig) -> bool {
+        match self {
+            Self::MouseCpi => old.mouse_cpi != new.mouse_cpi,
+            Self::MarkerHotkey => old.marker_hotkey != new.marker_hotkey,
+            Self::Recording => old.recording != new.recording,
+            Self::CtlHotkey => old.ctl.hotkey != new.ctl.hotkey,
+            Self::Games => old.games != new.games,
+            Self::VizObs => old.viz.obs != new.viz.obs,
+        }
     }
-    if old.games != new.games {
-        out.push("games");
+
+    /// Read by a running capture agent at its start, so a change waits for
+    /// the next run.
+    fn read_by_capture(self) -> bool {
+        matches!(
+            self,
+            Self::MouseCpi | Self::MarkerHotkey | Self::Games | Self::Recording
+        )
     }
-    if old.viz.obs != new.viz.obs {
-        out.push("viz.obs");
+
+    /// Read by a running viz server at its start.
+    fn read_by_viz(self) -> bool {
+        matches!(self, Self::VizObs | Self::Recording)
     }
-    out
+}
+
+/// Which editable groups differ between two configs.
+pub fn changed(old: &AppConfig, new: &AppConfig) -> Vec<ChangeGroup> {
+    ChangeGroup::ALL
+        .into_iter()
+        .filter(|g| g.differs(old, new))
+        .collect()
 }
 
 /// Who will not see a change until later. `restart_required` is about the
@@ -722,23 +789,21 @@ pub fn changed(old: &AppConfig, new: &AppConfig) -> Vec<&'static str> {
 /// the panel at once and needs neither.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Effects {
-    pub restart_required: Vec<&'static str>,
+    pub restart_required: Vec<ChangeGroup>,
+    /// Component ids (`capture`, `viz`).
     pub next_start: Vec<&'static str>,
 }
 
-pub fn effects(changed: &[&str], capture_running: bool, viz_running: bool) -> Effects {
-    let has = |k: &str| changed.contains(&k);
+pub fn effects(changed: &[ChangeGroup], capture_running: bool, viz_running: bool) -> Effects {
     let mut e = Effects::default();
-    if has("ctl.hotkey") {
-        e.restart_required.push("ctl hotkey");
+    if changed.contains(&ChangeGroup::CtlHotkey) {
+        e.restart_required.push(ChangeGroup::CtlHotkey);
     }
-    if capture_running
-        && (has("mouse_cpi") || has("marker_hotkey") || has("games") || has("recording"))
-    {
-        e.next_start.push("capture");
+    if capture_running && changed.iter().any(|g| g.read_by_capture()) {
+        e.next_start.push(crate::manager::CAPTURE);
     }
-    if viz_running && (has("viz.obs") || has("recording")) {
-        e.next_start.push("viz");
+    if viz_running && changed.iter().any(|g| g.read_by_viz()) {
+        e.next_start.push(crate::manager::VIZ);
     }
     e
 }
@@ -923,6 +988,17 @@ pitch_coeff = 0.022
                 "{refused} must not be a patch"
             );
         }
+        // What the page says it cannot change, it cannot express either.
+        for key in NOT_EDITABLE {
+            let mut v = serde_json::json!(1);
+            for part in key.rsplit('.') {
+                v = serde_json::json!({ part: v });
+            }
+            assert!(
+                serde_json::from_value::<Patch>(v.clone()).is_err(),
+                "{key} is listed as not editable but {v} is a patch"
+            );
+        }
     }
 
     #[test]
@@ -1036,7 +1112,7 @@ pitch_coeff = 0.022
         assert_eq!(ok.new.mouse_cpi, 800.0);
         assert_eq!(
             changed(ok.old.as_ref().unwrap(), &ok.new),
-            vec!["mouse_cpi"]
+            vec![ChangeGroup::MouseCpi]
         );
         let after = std::fs::read(&p).unwrap();
         assert_eq!(ok.token, token(Some(&after)));
@@ -1084,15 +1160,144 @@ pitch_coeff = 0.022
 
     #[test]
     fn effects_say_who_has_to_wait() {
-        assert_eq!(effects(&["recording"], false, false), Effects::default());
+        use ChangeGroup as G;
+        assert_eq!(effects(&[G::Recording], false, false), Effects::default());
         assert_eq!(
-            effects(&["ctl.hotkey", "games"], true, true),
+            effects(&[G::CtlHotkey, G::Games], true, true),
             Effects {
-                restart_required: vec!["ctl hotkey"],
+                restart_required: vec![G::CtlHotkey],
                 next_start: vec!["capture"],
             }
         );
-        assert_eq!(effects(&["viz.obs"], true, true).next_start, vec!["viz"]);
-        assert!(effects(&["mouse_cpi"], false, true).next_start.is_empty());
+        assert_eq!(effects(&[G::VizObs], true, true).next_start, vec!["viz"]);
+        assert!(effects(&[G::MouseCpi], false, true).next_start.is_empty());
+        // One spelling on the wire: the config's dotted name.
+        assert_eq!(
+            serde_json::to_value(effects(&[G::CtlHotkey], false, false)).unwrap(),
+            serde_json::json!({ "restart_required": ["ctl.hotkey"], "next_start": [] })
+        );
+        for g in G::ALL {
+            assert_eq!(serde_json::to_value(g).unwrap(), g.config_name());
+        }
+    }
+
+    /// A patch with every field set: its JSON is the allow-list's shape.
+    fn full_patch() -> Patch {
+        Patch {
+            mouse_cpi: Some(800.0),
+            marker_hotkey: Some("f9".into()),
+            recording: Some(RecordingPatch {
+                enabled: Some(true),
+                dir: Some("r".into()),
+            }),
+            ctl: Some(CtlPatch {
+                hotkey: Some("ctrl+alt+r".into()),
+            }),
+            games: Some(BTreeMap::from([(
+                "g.exe".to_string(),
+                Some(GamePatch {
+                    sens: Some(1.0),
+                    yaw_coeff: Some(0.022),
+                    pitch_coeff: Some(0.022),
+                }),
+            )])),
+            obs: Some(ObsPatch {
+                layout: Some("split".into()),
+                background: Some("transparent".into()),
+                hud: Some(vec![]),
+                hud_position: Some("top-left".into()),
+                scale: Some(1.0),
+            }),
+        }
+    }
+
+    /// The `"key": "inputId"` lines of the page's `FIELD_INPUTS` table.
+    fn field_inputs(js: &str) -> BTreeMap<String, String> {
+        let start = js
+            .find("const FIELD_INPUTS = {")
+            .expect("panel.js defines FIELD_INPUTS");
+        let body = &js[start..];
+        let body = &body[..body.find("};").expect("FIELD_INPUTS is closed")];
+        body.lines()
+            .skip(1)
+            .filter_map(|l| {
+                let mut parts = l.trim().trim_end_matches(',').split(": ");
+                let k = parts.next()?.trim_matches('"');
+                let v = parts.next()?.trim_matches('"');
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
+    /// The allow-list is `Patch`; everything else that names a setting is
+    /// checked against it here, so adding a key to one and not the others
+    /// fails a test rather than leaving an error with nowhere to show:
+    /// every group has a `ChangeGroup`, an error slot on the page and a
+    /// part of the `Settings` view, and every free-text or number field of
+    /// the patch has an input the page highlights.
+    #[test]
+    fn the_patch_shape_drives_the_groups_the_view_and_the_page() {
+        let html = crate::server::INDEX_HTML;
+        let js = crate::server::PANEL_JS;
+        let patch = serde_json::to_value(full_patch()).unwrap();
+        let patch = patch.as_object().unwrap();
+        let groups: Vec<&str> = ChangeGroup::ALL.iter().map(|g| g.patch_key()).collect();
+        let mut keys: Vec<&str> = patch.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut sorted = groups.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "every Patch key is one ChangeGroup and back");
+
+        let view = serde_json::to_value(Settings::from(&AppConfig::default())).unwrap();
+        for g in ChangeGroup::ALL {
+            assert!(
+                view.get(g.patch_key()).is_some(),
+                "Settings shows {}",
+                g.patch_key()
+            );
+            assert!(
+                html.contains(&format!("data-err=\"{}\"", g.config_name())),
+                "index.html has an error slot for {}",
+                g.config_name()
+            );
+        }
+
+        // Leaf fields, by the dotted config name an error would carry.
+        let inputs = field_inputs(js);
+        let mut leaves = Vec::new();
+        for g in ChangeGroup::ALL {
+            match &patch[g.patch_key()] {
+                serde_json::Value::Object(o) if g != ChangeGroup::Games => {
+                    let prefix = match g {
+                        ChangeGroup::CtlHotkey => "ctl",
+                        other => other.config_name(),
+                    };
+                    for (k, v) in o {
+                        leaves.push((format!("{prefix}.{k}"), v.clone()));
+                    }
+                }
+                v => leaves.push((g.config_name().to_string(), v.clone())),
+            }
+        }
+        for (field, value) in &leaves {
+            // Checkboxes (booleans, the HUD list) and the games table mark
+            // their whole group instead of one input.
+            if value.is_boolean() || value.is_array() || field == "games" {
+                continue;
+            }
+            let id = inputs
+                .get(field)
+                .unwrap_or_else(|| panic!("FIELD_INPUTS in panel.js lacks {field}"));
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "index.html has no #{id} for {field}"
+            );
+        }
+        for field in inputs.keys() {
+            assert!(
+                leaves.iter().any(|(l, _)| l == field),
+                "FIELD_INPUTS names {field}, which is not a patch field"
+            );
+        }
     }
 }

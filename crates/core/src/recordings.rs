@@ -24,8 +24,18 @@ use serde::{Deserialize, Serialize};
 
 /// File extension of a recording, without the dot.
 pub const RECORDING_EXT: &str = "jsonl";
+/// [`RECORDING_EXT`] with its dot: what follows the id in a file name.
+pub const RECORDING_SUFFIX: &str = ".jsonl";
 /// Suffix of the metadata sidecar written next to a recording at shutdown.
 pub const META_SUFFIX: &str = ".meta.json";
+
+/// Sink names, as they key [`SessionMeta::sinks`] and appear in logs and the
+/// capture agent's stats line. The single spelling every crate uses.
+pub const SINK_UDP: &str = "udp";
+/// The JSONL recording sink; see [`SINK_UDP`].
+pub const SINK_JSONL: &str = "jsonl";
+/// The Kafka sink; see [`SINK_UDP`].
+pub const SINK_KAFKA: &str = "kafka";
 /// Longest session id accepted. The agent's ids are 22 characters.
 pub const MAX_ID_LEN: usize = 128;
 
@@ -43,7 +53,7 @@ pub fn is_safe_id(id: &str) -> bool {
 
 /// `<id>.jsonl` for a valid id, `None` otherwise.
 pub fn recording_file_name(id: &str) -> Option<String> {
-    is_safe_id(id).then(|| format!("{id}.{RECORDING_EXT}"))
+    is_safe_id(id).then(|| format!("{id}{RECORDING_SUFFIX}"))
 }
 
 /// `<id>.meta.json` for a valid id, `None` otherwise.
@@ -55,7 +65,7 @@ pub fn meta_file_name(id: &str) -> Option<String> {
 /// if the name is not `<safe id>.jsonl` exactly — so a name that came from a
 /// request is validated and normalised in one step.
 pub fn id_from_file_name(name: &str) -> Option<&str> {
-    let id = name.strip_suffix(&format!(".{RECORDING_EXT}"))?;
+    let id = name.strip_suffix(RECORDING_SUFFIX)?;
     is_safe_id(id).then_some(id)
 }
 
@@ -209,8 +219,8 @@ pub struct SessionMeta {
     /// A 1000Hz mouse that actually reported at 125Hz explains a suspiciously
     /// smooth recording.
     pub poll_hz: Option<f64>,
-    /// Keyed by sink name (`udp`, `jsonl`, `kafka`); only the sinks that
-    /// were enabled for the run appear.
+    /// Keyed by sink name ([`SINK_UDP`], [`SINK_JSONL`], [`SINK_KAFKA`]);
+    /// only the sinks that were enabled for the run appear.
     pub sinks: BTreeMap<String, SinkMeta>,
 }
 
@@ -237,9 +247,10 @@ impl SessionMeta {
             .collect()
     }
 
-    /// Whether the JSONL recording itself is known to be incomplete.
+    /// Envelopes the JSONL recording itself lost (dropped or abandoned);
+    /// non-zero means the recording is known to be incomplete.
     pub fn recording_lost(&self) -> u64 {
-        self.sinks.get("jsonl").map(SinkMeta::lost).unwrap_or(0)
+        self.sinks.get(SINK_JSONL).map(SinkMeta::lost).unwrap_or(0)
     }
 
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
@@ -389,6 +400,52 @@ mod tests {
         // An unknown spelling is data, not a panic.
         let err = "ctrl-c".parse::<ExitReason>().unwrap_err();
         assert_eq!(err.to_string(), "unknown exit reason \"ctrl-c\"");
+    }
+
+    /// `ALL` is maintained by hand next to `as_str`. The `match` below has no
+    /// wildcard arm, so a new variant does not compile until it is listed
+    /// here, and then this fails until it is in `ALL` too.
+    #[test]
+    fn exit_reason_all_lists_every_variant() {
+        fn listed(r: ExitReason) -> bool {
+            match r {
+                ExitReason::Running
+                | ExitReason::Interrupt
+                | ExitReason::Duration
+                | ExitReason::CaptureThreadExited
+                | ExitReason::ShippingThreadExited
+                | ExitReason::ContextThreadExited
+                | ExitReason::CaptureThreadStalled
+                | ExitReason::ShippingThreadStalled
+                | ExitReason::ContextThreadStalled
+                | ExitReason::Error => ExitReason::ALL.contains(&r),
+            }
+        }
+        let every = [
+            ExitReason::Running,
+            ExitReason::Interrupt,
+            ExitReason::Duration,
+            ExitReason::CaptureThreadExited,
+            ExitReason::ShippingThreadExited,
+            ExitReason::ContextThreadExited,
+            ExitReason::CaptureThreadStalled,
+            ExitReason::ShippingThreadStalled,
+            ExitReason::ContextThreadStalled,
+            ExitReason::Error,
+        ];
+        for r in every {
+            assert!(listed(r), "{r:?} is missing from ExitReason::ALL");
+        }
+        assert_eq!(ExitReason::ALL.len(), every.len(), "ALL has a duplicate");
+    }
+
+    #[test]
+    fn sink_names_and_suffix_are_the_on_disk_spellings() {
+        assert_eq!(RECORDING_SUFFIX, format!(".{RECORDING_EXT}"));
+        assert_eq!(
+            (SINK_UDP, SINK_JSONL, SINK_KAFKA),
+            ("udp", "jsonl", "kafka")
+        );
     }
 
     #[test]

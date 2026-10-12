@@ -120,6 +120,134 @@ pub struct Params {
     pub lift_opposite_cos: f64,
 }
 
+/// Why a [`Params`] cannot be analysed with: the field, the value it had, and
+/// the rule it broke. Every value [`Params::validate`] accepts runs the whole
+/// pipeline without a panic, a NaN or an infinity.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("analysis parameter `{field}` is {value}, but it must be {rule}")]
+pub struct ParamsError {
+    /// The [`Params`] field at fault.
+    pub field: &'static str,
+    /// The value it had, as text.
+    pub value: String,
+    /// What it must be instead.
+    pub rule: &'static str,
+}
+
+/// Finest grid [`Params::validate`] accepts, seconds (10 kHz).
+pub const MIN_GRID_DT_S: f64 = 1e-4;
+/// Coarsest grid [`Params::validate`] accepts, seconds: one cell a second.
+pub const MAX_GRID_DT_S: f64 = 1.0;
+/// Widest Savitzky–Golay half-window accepted.
+pub const MAX_SG_HALF: usize = 100;
+/// Highest Savitzky–Golay polynomial order accepted; past this the normal
+/// equations are too ill-conditioned for the coefficients to mean anything.
+pub const MAX_SG_ORDER: usize = 6;
+/// Widest tremor baseline accepted, ms. The baseline sets the run padding, so
+/// this bounds memory as much as it bounds meaning.
+pub const MAX_TREMOR_BASELINE_MS: usize = 10_000;
+/// Longest settle hold accepted, ms.
+pub const MAX_STILL_HOLD_MS: u64 = 600_000;
+
+impl Params {
+    /// Reject parameters that would panic, divide by zero or produce NaN
+    /// somewhere in the pipeline. [`prepare`] calls this, so a library caller
+    /// gets an error rather than an assertion; the CLI calls it first so the
+    /// message names the flag.
+    pub fn validate(&self) -> Result<(), ParamsError> {
+        fn bad(
+            field: &'static str,
+            value: impl std::fmt::Display,
+            rule: &'static str,
+        ) -> ParamsError {
+            ParamsError {
+                field,
+                value: value.to_string(),
+                rule,
+            }
+        }
+        let finite_non_negative = |field: &'static str, v: f64| {
+            (v.is_finite() && v >= 0.0)
+                .then_some(())
+                .ok_or_else(|| bad(field, v, "a finite number, 0 or more"))
+        };
+
+        let dt = self.grid_dt_s;
+        if !(dt.is_finite() && (MIN_GRID_DT_S..=MAX_GRID_DT_S).contains(&dt)) {
+            return Err(bad("grid_dt_s", dt, "between 0.0001 and 1 second"));
+        }
+        // The per-second table is built from whole cells, so a second has to
+        // be a whole number of them.
+        let per_sec = (1.0 / dt).round();
+        if (per_sec * dt - 1.0).abs() > 1e-9 {
+            return Err(bad(
+                "grid_dt_s",
+                dt,
+                "a whole fraction of a second (0.001, 0.002, 0.005, ...)",
+            ));
+        }
+        if !(1..=MAX_SG_HALF).contains(&self.sg_half) {
+            return Err(bad("sg_half", self.sg_half, "between 1 and 100"));
+        }
+        if self.sg_order > MAX_SG_ORDER || self.sg_order > 2 * self.sg_half {
+            return Err(bad(
+                "sg_order",
+                self.sg_order,
+                "at most 6 and at most twice sg_half (a 2*half+1 window cannot fit a higher polynomial)",
+            ));
+        }
+        finite_non_negative("still_speed", self.still_speed)?;
+        if self.still_hold_ms > MAX_STILL_HOLD_MS {
+            return Err(bad("still_hold_ms", self.still_hold_ms, "at most 600000"));
+        }
+        if !(self.flick_speed.is_finite() && self.flick_speed > 0.0) {
+            return Err(bad(
+                "flick_speed",
+                self.flick_speed,
+                "a finite number above 0",
+            ));
+        }
+        finite_non_negative("click_window_ms", self.click_window_ms)?;
+        finite_non_negative("pre_click_lo_ms", self.pre_click_lo_ms)?;
+        finite_non_negative("pre_click_hi_ms", self.pre_click_hi_ms)?;
+        if self.pre_click_lo_ms <= self.pre_click_hi_ms {
+            return Err(bad(
+                "pre_click_lo_ms",
+                self.pre_click_lo_ms,
+                "larger than pre_click_hi_ms (the window runs from lo to hi ms before the press)",
+            ));
+        }
+        finite_non_negative("double_click_max_ms", self.double_click_max_ms)?;
+        if !(1..=MAX_TREMOR_BASELINE_MS).contains(&self.tremor_baseline_ms) {
+            return Err(bad(
+                "tremor_baseline_ms",
+                self.tremor_baseline_ms,
+                "between 1 and 10000",
+            ));
+        }
+        // `Run::last_move` stores `1 + local index` as a `u32`, and a run is
+        // never longer than the cell cap.
+        if !(1..=u32::MAX as usize - 1).contains(&self.max_grid_cells) {
+            return Err(bad(
+                "max_grid_cells",
+                self.max_grid_cells,
+                "between 1 and 4294967294",
+            ));
+        }
+        finite_non_negative("lift_drift_max_speed", self.lift_drift_max_speed)?;
+        finite_non_negative("lift_drift_min_counts", self.lift_drift_min_counts)?;
+        finite_non_negative("lift_return_min_speed", self.lift_return_min_speed)?;
+        if !(self.lift_opposite_cos.is_finite() && (-1.0..=1.0).contains(&self.lift_opposite_cos)) {
+            return Err(bad(
+                "lift_opposite_cos",
+                self.lift_opposite_cos,
+                "a cosine between -1 and 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Params {
     fn default() -> Self {
         Self {
@@ -214,6 +342,18 @@ impl Run {
     }
 }
 
+/// Every lane of a dense grid, for [`Grid::from_dense`].
+#[cfg(test)]
+pub(crate) struct DenseLanes {
+    pub vx: Vec<f64>,
+    pub vy: Vec<f64>,
+    pub vxs: Vec<f64>,
+    pub vys: Vec<f64>,
+    pub speed_raw: Vec<f64>,
+    pub speed: Vec<f64>,
+    pub clicks: Vec<u32>,
+}
+
 /// The uniform 1 ms series, stored as [`Run`]s. All velocities are counts/s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grid {
@@ -238,22 +378,21 @@ impl Grid {
 
     /// Wrap already-computed dense lanes as a single run covering `[0, n)`.
     /// Used by the tests to compare the sparse grid against a dense one.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_dense(
-        dt: f64,
-        vx: Vec<f64>,
-        vy: Vec<f64>,
-        vxs: Vec<f64>,
-        vys: Vec<f64>,
-        speed_raw: Vec<f64>,
-        speed: Vec<f64>,
-        clicks: Vec<u32>,
-        still_speed: f64,
-    ) -> Self {
-        let n = speed.len();
+    #[cfg(test)]
+    pub(crate) fn from_dense(dt: f64, lanes: DenseLanes, still_speed: f64) -> Self {
+        let n = lanes.speed.len();
         if n == 0 {
             return Self::empty(dt, 0, 0);
         }
+        let DenseLanes {
+            vx,
+            vy,
+            vxs,
+            vys,
+            speed_raw,
+            speed,
+            clicks,
+        } = lanes;
         let mut run = Run {
             start: 0,
             vx,
@@ -273,6 +412,13 @@ impl Grid {
             pad: 0,
             runs: vec![run],
         }
+    }
+
+    /// Cells in one second of the grid, at least one. [`Params::validate`]
+    /// guarantees a second is a whole number of cells, so this is exact for
+    /// every grid `prepare` builds.
+    pub fn cells_per_second(&self) -> usize {
+        ((1.0 / self.dt).round() as usize).max(1)
     }
 
     pub fn len(&self) -> usize {
@@ -514,12 +660,16 @@ impl Grid {
 }
 
 /// `1 + index of the last cell at or before i above `threshold``, else 0.
+///
+/// A run is never longer than `Params::max_grid_cells`, which
+/// [`Params::validate`] holds below `u32::MAX`, so the index always fits; the
+/// saturating conversion is there so a hand-built grid cannot wrap.
 fn last_move_table(speed: &[f64], threshold: f64) -> Vec<u32> {
     let mut out = vec![0u32; speed.len()];
     let mut last = 0u32;
     for (i, &s) in speed.iter().enumerate() {
         if s > threshold {
-            last = i as u32 + 1;
+            last = u32::try_from(i).map_or(u32::MAX, |i| i.saturating_add(1));
         }
         out[i] = last;
     }
@@ -685,25 +835,70 @@ impl Prepared {
         (self.analysis_duration_s / 60.0).max(f64::MIN_POSITIVE)
     }
 
-    /// Smoothed aim-space speed at cell `i`, deg/s.
-    pub fn aim_speed(&self, i: usize) -> f64 {
+    /// Aim-space length of a count-space vector, degrees: yaw and pitch each
+    /// scaled by their own coefficient. The one conversion every degree-valued
+    /// magnitude in the crate goes through, so a game with a pitch coefficient
+    /// different from its yaw one is honoured everywhere or nowhere.
+    #[inline]
+    pub fn aim_mag(&self, x: f64, y: f64) -> f64 {
         let (kx, ky) = self.aim_scale();
-        stats::mag(self.grid.vxs(i) * kx, self.grid.vys(i) * ky)
+        stats::mag(x * kx, y * ky)
     }
 
-    /// Highest aim-space speed in `[a, b)`, deg/s.
+    /// Aim-space length of event `i`'s motion, degrees — or `None` when
+    /// `Params::locked_only` excludes the event. Every per-event degree
+    /// distance (kinematics, per-second rows, marker intervals) sums this.
+    #[inline]
+    pub fn event_aim_deg(&self, i: usize) -> Option<f64> {
+        let e = self.session.events.get(i)?;
+        self.aim_event_ok(i)
+            .then(|| self.aim_mag(e.dx as f64, e.dy as f64))
+    }
+
+    /// Smoothed aim-space speed at cell `i`, deg/s — or `None` when
+    /// `Params::locked_only` excludes the cell.
+    pub fn aim_speed(&self, i: usize) -> Option<f64> {
+        self.aim_cell_ok(i)
+            .then(|| self.aim_mag(self.grid.vxs(i), self.grid.vys(i)))
+    }
+
+    /// Highest aim-space speed in `[a, b)`, deg/s, over the cells
+    /// `Params::locked_only` admits (every cell when it is off).
     pub fn peak_aim_speed(&self, a: usize, b: usize) -> f64 {
-        let (kx, ky) = self.aim_scale();
+        self.peak_aim_speed_where(a, b, |i| self.aim_cell_ok(i))
+    }
+
+    /// [`Self::peak_aim_speed`] over every cell, whatever `locked_only` says:
+    /// a property of one movement (a flick's own peak), not a session
+    /// aggregate.
+    pub(crate) fn peak_aim_speed_all(&self, a: usize, b: usize) -> f64 {
+        self.peak_aim_speed_where(a, b, |_| true)
+    }
+
+    fn peak_aim_speed_where(&self, a: usize, b: usize, ok: impl Fn(usize) -> bool) -> f64 {
         let n = self.grid.len();
         let (a, b) = (a.min(n), b.min(n));
         let mut m = 0.0f64;
         for r in self.grid.runs_in(a, b) {
             let (lo, hi) = r.clip(a, b);
             for j in lo..hi {
-                m = m.max(stats::mag(r.vxs[j] * kx, r.vys[j] * ky));
+                if ok(r.start + j) {
+                    m = m.max(self.aim_mag(r.vxs[j], r.vys[j]));
+                }
             }
         }
         m
+    }
+
+    /// The cell holding `us` µs since session start, *rounded up* to the next
+    /// cell boundary and clamped to `[0, grid.len()]` — the start of a window
+    /// that should only see whole cells at or after `us`.
+    pub fn cell_ceil_us(&self, us: i64) -> usize {
+        if us <= 0 {
+            return 0;
+        }
+        let i = (us + self.grid_dt_us - 1) / self.grid_dt_us;
+        (i as usize).min(self.grid.len())
     }
 
     /// Grid cell containing `us` microseconds since session start, clamped.
@@ -888,7 +1083,11 @@ pub(crate) fn sg_run_into<'s>(
 /// Takes the session by value: at 8 M events the event vector is ~200 MB, and
 /// cloning it to hand the metrics a copy is the single largest avoidable
 /// allocation in the pipeline.
-pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
+///
+/// Fails only on parameters [`Params::validate`] refuses; any recording the
+/// loader accepted prepares.
+pub fn prepare(session: LoadedSession, params: Params) -> Result<Prepared, ParamsError> {
+    params.validate()?;
     // One tally of events-per-process for the whole pipeline: the dominant
     // game, its share, and the aim profile all fall out of it, and the quality
     // report reads it off `Prepared` instead of walking the batches again.
@@ -1041,7 +1240,7 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
     let segments = movement_segments(&grid, params.still_speed, params.min_segment_ms);
     let (locked_events, locked_cells) = locked_spans(&session, &event_us, grid_dt_us, n);
 
-    Prepared {
+    Ok(Prepared {
         params,
         session_id: session.config.session_id.clone(),
         t0_utc_us,
@@ -1062,7 +1261,7 @@ pub fn prepare(session: LoadedSession, params: Params) -> Prepared {
         locked_events,
         locked_cells,
         session,
-    }
+    })
 }
 
 /// Event-index and cell-index spans the capture agent flagged `pointer_locked`.
@@ -1121,13 +1320,15 @@ mod tests {
     fn grid_of(speeds: &[f64]) -> Grid {
         Grid::from_dense(
             0.001,
-            speeds.to_vec(),
-            vec![0.0; speeds.len()],
-            speeds.to_vec(),
-            vec![0.0; speeds.len()],
-            speeds.to_vec(),
-            speeds.to_vec(),
-            vec![0; speeds.len()],
+            DenseLanes {
+                vx: speeds.to_vec(),
+                vy: vec![0.0; speeds.len()],
+                vxs: speeds.to_vec(),
+                vys: vec![0.0; speeds.len()],
+                speed_raw: speeds.to_vec(),
+                speed: speeds.to_vec(),
+                clicks: vec![0; speeds.len()],
+            },
             50.0,
         )
     }
@@ -1165,15 +1366,257 @@ mod tests {
         let speed: Vec<f64> = (0..n).map(|i| stats::mag(vxs[i], vys[i])).collect();
         Grid::from_dense(
             dt,
-            vx,
-            vy,
-            vxs,
-            vys,
-            speed_raw,
-            speed,
-            clicks,
+            DenseLanes {
+                vx,
+                vy,
+                vxs,
+                vys,
+                speed_raw,
+                speed,
+                clicks,
+            },
             p.params.still_speed,
         )
+    }
+
+    #[test]
+    fn the_default_params_validate() {
+        assert_eq!(Params::default().validate(), Ok(()));
+        // The coarse end of the range, where a second is a single cell.
+        let coarse = Params {
+            grid_dt_s: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(coarse.validate(), Ok(()));
+        assert_eq!(Grid::empty(coarse.grid_dt_s, 0, 0).cells_per_second(), 1);
+    }
+
+    /// Every value that used to panic, divide by zero or go NaN somewhere in
+    /// the pipeline is refused up front, naming the field.
+    #[test]
+    fn params_that_would_break_the_pipeline_are_refused() {
+        let d = Params::default;
+        let cases: Vec<(&str, Params)> = vec![
+            // `assert!(2*half >= order)` in the SG constructor.
+            (
+                "sg_order",
+                Params {
+                    sg_half: 3,
+                    sg_order: 7,
+                    ..d()
+                },
+            ),
+            (
+                "sg_order",
+                Params {
+                    sg_half: 50,
+                    sg_order: 9,
+                    ..d()
+                },
+            ),
+            (
+                "sg_half",
+                Params {
+                    sg_half: 0,
+                    sg_order: 0,
+                    ..d()
+                },
+            ),
+            (
+                "sg_half",
+                Params {
+                    sg_half: 1_000,
+                    ..d()
+                },
+            ),
+            // `per_sec = round(1/dt)` was 0 and divided everything after it.
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: 3.0,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: 0.0,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: -0.001,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: f64::NAN,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: f64::INFINITY,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: 0.0015,
+                    ..d()
+                },
+            ),
+            (
+                "grid_dt_s",
+                Params {
+                    grid_dt_s: 1e-6,
+                    ..d()
+                },
+            ),
+            (
+                "still_speed",
+                Params {
+                    still_speed: -1.0,
+                    ..d()
+                },
+            ),
+            (
+                "still_speed",
+                Params {
+                    still_speed: f64::NAN,
+                    ..d()
+                },
+            ),
+            (
+                "still_hold_ms",
+                Params {
+                    still_hold_ms: u64::MAX,
+                    ..d()
+                },
+            ),
+            (
+                "flick_speed",
+                Params {
+                    flick_speed: 0.0,
+                    ..d()
+                },
+            ),
+            (
+                "flick_speed",
+                Params {
+                    flick_speed: f64::INFINITY,
+                    ..d()
+                },
+            ),
+            (
+                "click_window_ms",
+                Params {
+                    click_window_ms: -5.0,
+                    ..d()
+                },
+            ),
+            (
+                "pre_click_lo_ms",
+                Params {
+                    pre_click_lo_ms: 50.0,
+                    pre_click_hi_ms: 100.0,
+                    ..d()
+                },
+            ),
+            (
+                "pre_click_hi_ms",
+                Params {
+                    pre_click_hi_ms: f64::NAN,
+                    ..d()
+                },
+            ),
+            (
+                "double_click_max_ms",
+                Params {
+                    double_click_max_ms: f64::NEG_INFINITY,
+                    ..d()
+                },
+            ),
+            (
+                "tremor_baseline_ms",
+                Params {
+                    tremor_baseline_ms: 0,
+                    ..d()
+                },
+            ),
+            (
+                "tremor_baseline_ms",
+                Params {
+                    tremor_baseline_ms: 1_000_000,
+                    ..d()
+                },
+            ),
+            (
+                "max_grid_cells",
+                Params {
+                    max_grid_cells: 0,
+                    ..d()
+                },
+            ),
+            (
+                "max_grid_cells",
+                Params {
+                    max_grid_cells: usize::MAX,
+                    ..d()
+                },
+            ),
+            (
+                "lift_drift_max_speed",
+                Params {
+                    lift_drift_max_speed: f64::NAN,
+                    ..d()
+                },
+            ),
+            (
+                "lift_drift_min_counts",
+                Params {
+                    lift_drift_min_counts: -1.0,
+                    ..d()
+                },
+            ),
+            (
+                "lift_return_min_speed",
+                Params {
+                    lift_return_min_speed: f64::INFINITY,
+                    ..d()
+                },
+            ),
+            (
+                "lift_opposite_cos",
+                Params {
+                    lift_opposite_cos: -1.5,
+                    ..d()
+                },
+            ),
+            (
+                "lift_opposite_cos",
+                Params {
+                    lift_opposite_cos: f64::NAN,
+                    ..d()
+                },
+            ),
+        ];
+        for (field, params) in cases {
+            let err = params.validate().expect_err(field);
+            assert_eq!(err.field, field, "{err}");
+            assert!(err.to_string().contains(field), "{err}");
+            // And `prepare` refuses the same thing rather than panicking.
+            let mut b = StreamBuilder::new();
+            b.move_ms(50, 5, 0);
+            let session = crate::testutil::loaded_from(b.into_events(), Some("cs2.exe"));
+            assert_eq!(prepare(session, params).unwrap_err(), err);
+        }
     }
 
     #[test]

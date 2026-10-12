@@ -28,7 +28,8 @@ fn bench_prepare(c: &mut Criterion) {
         g.throughput(Throughput::Elements(cells as u64));
         g.bench_with_input(BenchmarkId::from_parameter(cells), &cells, |b, _| {
             b.iter(|| {
-                let p = prepare(black_box(session.clone()), Params::default());
+                let p =
+                    prepare(black_box(session.clone()), Params::default()).expect("valid params");
                 black_box(p.grid.stored_cells())
             })
         });
@@ -42,7 +43,7 @@ fn bench_savgol(c: &mut Criterion) {
     for cells in SIZES {
         // The smoother is applied lane by lane over the stored cells, so the
         // input is one dense buffer of that size.
-        let p = prepare(testutil::bench_session(cells), Params::default());
+        let p = prepare(testutil::bench_session(cells), Params::default()).expect("valid params");
         let x = p.grid.dense(|r, j| r.vx[j]);
         let sg = SavGol::smoother(3, 2);
         g.throughput(Throughput::Elements(x.len() as u64));
@@ -57,7 +58,7 @@ fn bench_welch(c: &mut Criterion) {
     let mut g = c.benchmark_group("welch");
     g.sample_size(10);
     for cells in SIZES {
-        let p = prepare(testutil::bench_session(cells), Params::default());
+        let p = prepare(testutil::bench_session(cells), Params::default()).expect("valid params");
         g.throughput(Throughput::Elements(cells as u64));
         g.bench_with_input(BenchmarkId::from_parameter(cells), &cells, |b, _| {
             b.iter(|| black_box(micro::compute(black_box(&p)).analyzed_blocks))
@@ -70,7 +71,7 @@ fn bench_flick_detect(c: &mut Criterion) {
     let mut g = c.benchmark_group("flick_detect");
     g.sample_size(10);
     for cells in SIZES {
-        let p = prepare(testutil::bench_session(cells), Params::default());
+        let p = prepare(testutil::bench_session(cells), Params::default()).expect("valid params");
         g.throughput(Throughput::Elements(cells as u64));
         g.bench_with_input(BenchmarkId::from_parameter(cells), &cells, |b, _| {
             b.iter(|| black_box(flicks::detect(black_box(&p)).len()))

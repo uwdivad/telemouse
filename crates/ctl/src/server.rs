@@ -16,31 +16,43 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
-use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted};
+use telemouse_core::localhost::{
+    CTL_GUARD_HEADER, CTL_GUARD_HEADER_LOWER, CTL_GUARD_VALUE, SECURITY_HEADERS, host_is_trusted,
+};
 use tracing::{info, warn};
 
-use crate::manager::{Manager, MarkerError, StartError, StartRequest, StopError, SummaryError};
+use crate::manager::{
+    CAPTURE, LogCursors, Manager, MarkerError, StartError, StartRequest, StopError, SummaryError,
+    VIZ,
+};
 use crate::places::Places;
 use crate::procs::{KillError, Scanner};
 use crate::settings::{self, SaveError};
 
-/// The single-file browser app. No external assets, no CDN.
+/// The page shell: markup and CSS, plus one `<script src="panel.js">` tag
+/// where the app goes. Served, the script is inlined by [`render_page`], so
+/// the page is one self-contained response with no external assets and no
+/// CDN.
 pub const INDEX_HTML: &str = include_str!("index.html");
+/// The page's script. Its own file so it can be syntax-checked and
+/// unit-tested with Node (`crates/ctl/js-tests`) without a browser.
+pub const PANEL_JS: &str = include_str!("panel.js");
+/// The tag [`render_page`] replaces with the inlined [`PANEL_JS`].
+const PANEL_SCRIPT_TAG: &str = "<script src=\"panel.js\"></script>";
 
 const CONFIG_PLACEHOLDER: &str = "/*__TELEMOUSE_CTL_CONFIG__*/";
 
-/// Header every mutating request must carry.
-pub const GUARD_HEADER: &str = "x-telemouse-ctl";
-
-/// Log lines returned per component in `/api/state`.
-const LOG_LINES: usize = 120;
+/// Log lines returned per component in `/api/state`, and how many the page
+/// keeps per component when it appends what `?log_since=` sends.
+pub const LOG_LINES: usize = 120;
 /// How old a process scan may be and still be served. The page polls every
 /// 2s; a scan is now ~100µs (see `procs.rs`), but the list does not change
 /// at poll rate, so one scan per two polls is still plenty.
@@ -50,7 +62,9 @@ const SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 pub struct AppState {
     pub manager: Arc<Manager>,
     pub scanner: Arc<Scanner>,
-    pub page: Arc<String>,
+    /// The rendered page. `Bytes`, so every `GET /` hands out a reference
+    /// to the one copy instead of copying 80 KB.
+    pub page: Bytes,
     /// Version, config, logs and docs, as absolute strings the page shows.
     pub places: Arc<Places>,
     /// One settings save at a time: read, check the token, write.
@@ -71,12 +85,51 @@ pub struct PageConfig {
     pub marker_hotkey: String,
     /// `[ctl] hotkey`: the new-session chord, for the same hint.
     pub hotkey: String,
+    /// Values the page must agree with the panel on, sent rather than
+    /// repeated in the script.
+    #[serde(flatten)]
+    pub limits: PageLimits,
 }
 
+/// The constants [`PageConfig`] carries from the Rust side to the page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PageLimits {
+    /// Below this many free bytes the capture card warns about the disk
+    /// ([`crate::manager::LOW_DISK_BYTES`]).
+    pub low_disk_bytes: u64,
+    /// The sample recording the first-run guide offers.
+    pub demo_session: &'static str,
+    /// Lines of log the page keeps per component ([`LOG_LINES`]).
+    pub log_lines: usize,
+    /// The capture flags that are the "Save to disk" switch, not options.
+    pub save_flags: &'static [&'static str],
+    /// Flag → the words its checkbox shows ([`crate::manager::Flag::label`]).
+    pub flag_labels: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+impl Default for PageLimits {
+    fn default() -> Self {
+        Self {
+            low_disk_bytes: crate::manager::LOW_DISK_BYTES,
+            demo_session: crate::manager::DEMO_SESSION,
+            log_lines: LOG_LINES,
+            save_flags: crate::manager::SAVE_FLAGS,
+            flag_labels: crate::manager::flag_labels(),
+        }
+    }
+}
+
+/// The page with its script inlined and `cfg` in place.
 pub fn render_page(cfg: &PageConfig) -> String {
     let mut json = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".into());
     json = json[1..json.len() - 1].replace('<', "\\u003c");
-    INDEX_HTML.replace(CONFIG_PLACEHOLDER, &json)
+    INDEX_HTML
+        .replacen(
+            PANEL_SCRIPT_TAG,
+            &format!("<script>\n{PANEL_JS}</script>"),
+            1,
+        )
+        .replacen(CONFIG_PLACEHOLDER, &json, 1)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -93,6 +146,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/open", post(api_open))
         .route("/api/config", get(api_config).post(api_config_save))
         .route("/api/reports/{id}", get(api_report).post(api_report_run))
+        // Layers run outside-in from the bottom: security headers on every
+        // response, then the Host check, then the guard — so a request from
+        // a rebound name is refused whatever it carries, and an unguarded
+        // mutation is refused before its body is even looked at.
+        .layer(middleware::from_fn(require_guard_header))
         .layer(middleware::from_fn(require_local_host))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -127,13 +185,35 @@ async fn require_local_host(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// Refuse any request that can change something — anything but `GET` and
+/// `HEAD` — unless it carries `X-Telemouse-Ctl: 1`. One check for every
+/// route, run before the handler, so a route added later cannot forget it
+/// and a bad body is never what an unguarded request learns about.
+async fn require_guard_header(req: Request, next: Next) -> Response {
+    let safe = req.method() == Method::GET || req.method() == Method::HEAD;
+    let guarded = req
+        .headers()
+        .get(CTL_GUARD_HEADER_LOWER)
+        .is_some_and(|v| v == CTL_GUARD_VALUE);
+    if !safe && !guarded {
+        warn!(method = %req.method(), path = %req.uri().path(), "refusing a mutating request without the guard header");
+        return error(
+            StatusCode::FORBIDDEN,
+            format!(
+                "mutating requests must carry the {CTL_GUARD_HEADER}: {CTL_GUARD_VALUE} header"
+            ),
+        );
+    }
+    next.run(req).await
+}
+
 async fn index(State(st): State<AppState>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        st.page.as_str().to_owned(),
+        st.page.clone(),
     )
         .into_response()
 }
@@ -146,28 +226,24 @@ fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, axum::Json(json!({ "error": msg.to_string() }))).into_response()
 }
 
-/// The refusal to send back, if the request lacks the guard header.
-fn guard(headers: &HeaderMap) -> Option<Response> {
-    match headers.get(GUARD_HEADER) {
-        Some(v) if v == "1" => None,
-        _ => Some(error(
-            StatusCode::FORBIDDEN,
-            format!("mutating requests must carry the {GUARD_HEADER}: 1 header"),
-        )),
-    }
-}
-
-/// `?log_since=<n>`: only log lines newer than that cursor per component.
+/// `?log_since=`: only log lines newer than a cursor. Either one number for
+/// every component, or `id:n,id:n` with each component's own `log_seq`
+/// (see [`LogCursors`]).
 #[derive(Debug, Default, Deserialize)]
 struct StateQuery {
-    log_since: Option<u64>,
+    log_since: Option<String>,
 }
 
 async fn api_state(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<StateQuery>,
 ) -> Response {
-    let components = st.manager.snapshot_since(LOG_LINES, q.log_since).await;
+    let cursors = match q.log_since.as_deref().map(LogCursors::parse) {
+        None => LogCursors::default(),
+        Some(Ok(c)) => c,
+        Some(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let components = st.manager.snapshot_since(LOG_LINES, &cursors).await;
     // The process table is blocking I/O (and on Windows, a fair amount of it).
     let scanner = st.scanner.clone();
     let processes = tokio::task::spawn_blocking(move || scanner.scan_cached(SCAN_TTL))
@@ -197,12 +273,8 @@ async fn api_sessions(State(st): State<AppState>) -> Response {
 async fn api_start(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
     body: Option<axum::Json<StartRequest>>,
 ) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
     let req = body.map(|b| b.0).unwrap_or_default();
     match st.manager.start(&id, &req).await {
         Ok(pid) => {
@@ -234,12 +306,8 @@ struct StopBody {
 async fn api_stop(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
     body: Option<axum::Json<StopBody>>,
 ) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
     let force = body.map(|b| b.0.force).unwrap_or(false);
     match st.manager.stop(&id, force).await {
         Ok(outcome) => {
@@ -265,12 +333,8 @@ struct MarkerBody {
 async fn api_marker(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
     body: Option<axum::Json<MarkerBody>>,
 ) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
     let label = body.map(|b| b.0.label).unwrap_or_default();
     match st.manager.marker(&id, &label).await {
         Ok(label) => axum::Json(json!({ "ok": true, "label": label })).into_response(),
@@ -287,14 +351,7 @@ async fn api_marker(
     }
 }
 
-async fn api_kill(
-    State(st): State<AppState>,
-    Path(pid): Path<u32>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
+async fn api_kill(State(st): State<AppState>, Path(pid): Path<u32>) -> Response {
     let scanner = st.scanner.clone();
     let result = tokio::task::spawn_blocking(move || scanner.kill(pid)).await;
     match result {
@@ -325,14 +382,7 @@ struct OpenBody {
 /// about with the shell's default handler — the config in an editor, the
 /// recordings or logs folder in Explorer, the docs. The target is a name;
 /// the path comes from this server, never from the request.
-async fn api_open(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    body: Option<axum::Json<OpenBody>>,
-) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
+async fn api_open(State(st): State<AppState>, body: Option<axum::Json<OpenBody>>) -> Response {
     let target = body.map(|b| b.0.target).unwrap_or_default();
     let path = match target.as_str() {
         "config" => st.places.config.clone(),
@@ -405,12 +455,8 @@ struct ConfigSaveBody {
 /// `409` when the file changed since `token` was handed out.
 async fn api_config_save(
     State(st): State<AppState>,
-    headers: HeaderMap,
     body: Result<axum::Json<ConfigSaveBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
     let body = match body {
         Ok(b) => b.0,
         // Unknown fields land here: the patch shape is the allow-list.
@@ -458,8 +504,8 @@ async fn api_config_save(
     };
     let effects = settings::effects(
         &changed,
-        st.manager.is_running("capture").await,
-        st.manager.is_running("viz").await,
+        st.manager.is_running(CAPTURE).await,
+        st.manager.is_running(VIZ).await,
     );
     info!(changed = ?changed, created = saved.created, "settings saved from the page");
     axum::Json(json!({
@@ -499,14 +545,7 @@ async fn api_report(State(st): State<AppState>, Path(id): Path<String>) -> Respo
 
 /// `POST /api/reports/{id}`: run the analyzer in summary mode over that
 /// recording and return the `ReportSummary` JSON it prints.
-async fn api_report_run(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(r) = guard(&headers) {
-        return r;
-    }
+async fn api_report_run(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     match st.manager.report_summary(&id).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => summary_error(e),
@@ -539,7 +578,7 @@ mod tests {
                 },
             )),
             scanner: Arc::new(Scanner::new()),
-            page: Arc::new(render_page(&PageConfig {
+            page: Bytes::from(render_page(&PageConfig {
                 viz_http: "127.0.0.1:7879".into(),
                 stop_grace_secs: 5,
                 features: "test".into(),
@@ -550,6 +589,7 @@ mod tests {
                 },
                 marker_hotkey: "f9".into(),
                 hotkey: "ctrl+alt+r".into(),
+                limits: PageLimits::default(),
             })),
             places: Arc::new(Places::default()),
             settings_lock: Arc::default(),
@@ -587,7 +627,7 @@ mod tests {
             .uri(uri)
             .header(header::HOST, "127.0.0.1:7880");
         if guarded {
-            req = req.header(GUARD_HEADER, "1");
+            req = req.header(CTL_GUARD_HEADER, CTL_GUARD_VALUE);
         }
         let req = match body {
             Some(b) => req
@@ -611,21 +651,19 @@ mod tests {
         assert!(html.contains("<html"));
         assert!(!html.contains(CONFIG_PLACEHOLDER));
         assert!(html.contains("\"viz_http\":\"127.0.0.1:7879\""));
-        for forbidden in [
-            "src=\"http",
-            "href=\"http",
-            "//cdn.",
-            "unpkg.com",
-            "jsdelivr",
-        ] {
-            assert!(
-                !INDEX_HTML.contains(forbidden),
-                "external asset: {forbidden}"
-            );
+        // The constants the script must agree with Rust on arrive as data.
+        assert!(html.contains(&format!(
+            "\"low_disk_bytes\":{}",
+            crate::manager::LOW_DISK_BYTES
+        )));
+        assert!(html.contains("\"demo_session\":\"demo-session\""));
+        assert!(html.contains(&format!("\"log_lines\":{LOG_LINES}")));
+        for forbidden in ["src=\"", "href=\"http", "//cdn.", "unpkg.com", "jsdelivr"] {
+            assert!(!html.contains(forbidden), "external asset: {forbidden}");
         }
         assert_eq!(INDEX_HTML.matches(CONFIG_PLACEHOLDER).count(), 1);
         // The page must send the guard header, or nothing it does will work.
-        assert!(INDEX_HTML.contains("X-Telemouse-Ctl"));
+        assert!(PANEL_JS.contains(&format!("\"{CTL_GUARD_HEADER}\": \"{CTL_GUARD_VALUE}\"")));
         // Light and dark, a first-run banner, and the shell-open route.
         for needed in [
             "data-theme",
@@ -641,7 +679,7 @@ mod tests {
             "id=\"wizStep2\"",
             "foreground_seen",
         ] {
-            assert!(INDEX_HTML.contains(needed), "page lacks {needed}");
+            assert!(html.contains(needed), "page lacks {needed}");
         }
         // Nobody is sent to a TOML editor on first run any more, and nobody
         // is ever told to elevate.
@@ -652,7 +690,84 @@ mod tests {
             .expect("the first-run section");
         assert!(!first_run.contains("restart the panel"));
         assert!(!first_run.contains("[games]"));
-        assert!(!INDEX_HTML.to_lowercase().contains("as administrator"));
+        assert!(!html.to_lowercase().contains("as administrator"));
+    }
+
+    /// The served page is the shell with the script inlined once, and
+    /// nothing in the script can close its tag early.
+    #[test]
+    fn the_served_page_inlines_the_script() {
+        assert_eq!(INDEX_HTML.matches(PANEL_SCRIPT_TAG).count(), 1);
+        assert!(PANEL_JS.starts_with("\"use strict\";"));
+        assert!(
+            !PANEL_JS.contains("</script"),
+            "would end the inline script"
+        );
+        assert!(!PANEL_JS.contains(CONFIG_PLACEHOLDER));
+        let html = render_page(&PageConfig {
+            viz_http: String::new(),
+            stop_grace_secs: 1,
+            features: String::new(),
+            places: Places::default(),
+            marker_hotkey: String::new(),
+            hotkey: String::new(),
+            limits: PageLimits::default(),
+        });
+        assert!(!html.contains(PANEL_SCRIPT_TAG));
+        // Around the script, the page is the shell byte for byte.
+        let (before, after) = html.split_once(PANEL_JS).expect("the script, verbatim");
+        let (shell_before, shell_after) = INDEX_HTML.split_once(PANEL_SCRIPT_TAG).unwrap();
+        assert!(before.ends_with("<script>\n"));
+        assert_eq!(after.strip_prefix("</script>"), Some(shell_after));
+        let config_end = shell_before.find(CONFIG_PLACEHOLDER).unwrap() + CONFIG_PLACEHOLDER.len();
+        assert!(before.ends_with(&format!("{}<script>\n", &shell_before[config_end..])));
+        let script_end = html.rfind("</script>").unwrap();
+        assert!(script_end < html.rfind("</body>").unwrap());
+    }
+
+    /// Run `node` with `args` from the crate root when Node is installed (CI
+    /// has it); `Ok(None)` when it is not.
+    fn node(args: &[&str]) -> std::io::Result<Option<std::process::Output>> {
+        match std::process::Command::new("node")
+            .args(args)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            Ok(out) => Ok(Some(out)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not installed; skipping {}", args.join(" "));
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `node --check` over the page's script: the syntax gate a script
+    /// embedded in a Rust binary would otherwise not have.
+    #[test]
+    fn panel_js_parses_under_node_when_available() {
+        if let Some(out) = node(&["--check", "src/panel.js"]).unwrap() {
+            assert!(
+                out.status.success(),
+                "node --check failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Every `js-tests/*.test.mjs`: the poll loop, escaping, the log cursor
+    /// and the report card against a summary fixture.
+    #[test]
+    fn panel_js_tests_pass_under_node_when_available() {
+        // Node expands the glob itself, so this works from any shell.
+        if let Some(out) = node(&["--test", "js-tests/*.test.mjs"]).unwrap() {
+            assert!(
+                out.status.success(),
+                "node --test failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]
@@ -667,6 +782,7 @@ mod tests {
             },
             marker_hotkey: "</script><script>alert(3)</script>".into(),
             hotkey: String::new(),
+            limits: PageLimits::default(),
         });
         assert!(!html.contains("</script><script>alert"));
     }
@@ -728,7 +844,7 @@ mod tests {
                 .method(method)
                 .uri(uri)
                 .header(header::HOST, "evil.com")
-                .header(GUARD_HEADER, "1")
+                .header(CTL_GUARD_HEADER, CTL_GUARD_VALUE)
                 .body(Body::empty())
                 .unwrap();
             let res = router(state()).oneshot(req).await.unwrap();
@@ -757,15 +873,127 @@ mod tests {
             let (status, v, _) = call(state(), Method::POST, uri, false, None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
             assert!(
-                v["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("X-Telemouse-Ctl".to_lowercase().as_str())
+                v["error"].as_str().unwrap().contains(CTL_GUARD_HEADER),
+                "{v}"
             );
         }
         // GETs are open: the page has to load before it can send anything.
         let (status, _, _) = call(state(), Method::GET, "/api/sessions", false, None).await;
         assert_eq!(status, StatusCode::OK);
+        // A guard value other than "1" is no guard.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/components/capture/stop")
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(CTL_GUARD_HEADER, "yes")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state()).oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The guard runs before the handler, so an unguarded request with a
+    /// body the route could not even parse learns nothing but "forbidden".
+    #[tokio::test]
+    async fn an_unguarded_malformed_body_is_forbidden_not_bad_request() {
+        for (method, uri) in [
+            (Method::POST, "/api/config"),
+            (Method::POST, "/api/components/capture/start"),
+            (Method::POST, "/api/components/capture/marker"),
+            (Method::POST, "/api/open"),
+            (Method::PUT, "/api/config"),
+            (Method::DELETE, "/api/config"),
+        ] {
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:7880")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{ this is not json"))
+                .unwrap();
+            let res = router(state()).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        // With the guard, the same body is the handler's to refuse.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/config")
+            .header(header::HOST, "127.0.0.1:7880")
+            .header(CTL_GUARD_HEADER, CTL_GUARD_VALUE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{ this is not json"))
+            .unwrap();
+        let res = router(state()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn state_takes_a_log_cursor_per_component_or_for_all() {
+        for q in [
+            "",
+            "?log_since=3",
+            "?log_since=capture:3,viz:0",
+            "?log_since=",
+        ] {
+            let (s, v, _) =
+                call(state(), Method::GET, &format!("/api/state{q}"), false, None).await;
+            assert_eq!(s, StatusCode::OK, "{q}: {v}");
+        }
+        let (s, v, _) = call(
+            state(),
+            Method::GET,
+            "/api/state?log_since=capture:x",
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    /// Strings the script spells and Rust owns: the tools it titles are
+    /// task components, and the sinks it words are core's sink names.
+    #[test]
+    fn the_scripts_vocabulary_is_the_panels() {
+        let line = |start: &str| {
+            PANEL_JS
+                .lines()
+                .find(|l| l.starts_with(start))
+                .unwrap_or_else(|| panic!("panel.js has no `{start}` line"))
+        };
+        let keys = |l: &str| -> Vec<String> {
+            let body = &l[l.find('{').unwrap() + 1..l.rfind('}').unwrap()];
+            body.split(", ")
+                .filter_map(|kv| kv.split(':').next())
+                .map(|k| k.trim().trim_matches('"').to_string())
+                .collect()
+        };
+        let tasks: Vec<&str> = crate::manager::COMPONENTS
+            .iter()
+            .filter(|c| c.kind == crate::manager::Kind::Task)
+            .map(|c| c.id)
+            .collect();
+        let mut titled = keys(line("const TOOL_TITLES = {"));
+        titled.sort();
+        let mut want: Vec<String> = tasks.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(titled, want, "TOOL_TITLES names every task, and only tasks");
+        for run in INDEX_HTML.split("data-run=\"").skip(1) {
+            let id = &run[..run.find('"').unwrap()];
+            assert!(tasks.contains(&id), "data-run={id} is not a task component");
+        }
+        use telemouse_core::recordings::{SINK_JSONL, SINK_KAFKA, SINK_UDP};
+        let mut worded = keys(line("const WORDS = {"));
+        worded.sort();
+        let mut sinks = vec![SINK_JSONL, SINK_KAFKA, SINK_UDP];
+        sinks.sort();
+        assert_eq!(worded, sinks, "WORDS names core's sinks");
+        assert!(PANEL_JS.contains(&format!("sink === \"{SINK_JSONL}\"")));
+        // Component ids the script addresses directly.
+        for id in [CAPTURE, VIZ, crate::manager::REPORT] {
+            assert!(PANEL_JS.contains(&format!("comp(\"{id}\")")), "{id}");
+        }
     }
 
     /// `save` is accepted for capture (and fails only at spawn, since the

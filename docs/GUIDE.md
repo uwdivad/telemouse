@@ -181,8 +181,9 @@ telemouse/
     │              src/sinks/{udp,jsonl,kafka}.rs
     ├── viz/       src/{main,udp,hub,server,recordings,shutdown,stats}.rs
     │              + src/index.html
-    ├── ctl/       src/{main,procs,manager,server}.rs + src/gui/{mod,feed,model,win}.rs
-    │              + src/index.html
+    ├── ctl/       src/{main,procs,manager,server,settings,stats,places}.rs
+    │              + src/gui/{mod,feed,model,win,webview}.rs
+    │              + src/index.html (shell) + src/panel.js, js-tests/
     └── analyze/   src/{lib,main,load,series,savgol,kinematics,flicks,micro,clicks,
                         quality,lifts,markers,per_second,per_minute,stats,timefmt,
                         trend,report,testutil}.rs
@@ -446,14 +447,22 @@ wrap_yaw_deg(deg)                → (-180, 180]
 
 That is the entire physics. See §12.
 
-### 5.7 `session.rs` — `SessionConfig`, `GameSens`, `MonitorInfo`, `Marker`
+### 5.7 `session.rs` — `SessionConfig`, `GameSens`, `MonitorInfo`, `PointerSettings`, `Marker`
 
 `SessionConfig` is the first line of every recording and the `mouse.sessions`
 record: `session_id, started_utc_us, qpc_freq, anchor, anchor_uncertainty_us,
 mouse_cpi, devices: Vec<String>, games: BTreeMap<String, GameSens>, monitors,
-capture_version, coalesce_ms`. `sens_for(process)` is a case-insensitive
-lookup. `GameSens { sens, yaw_coeff, pitch_coeff }` defaults both coefficients
-to 0.022 (Source engine) when absent.
+capture_version, coalesce_ms, window_ms, max_events, os, pointer`.
+`sens_for(process)` is a case-insensitive lookup. `GameSens { sens, yaw_coeff,
+pitch_coeff }` defaults both coefficients to 0.022 (Source engine) when absent.
+`pointer: Option<PointerSettings>` is the desktop's pointer settings at
+session start — `enhance_pointer_precision`, `speed` (1..=20), the two
+`SmoothMouse{X,Y}Curve` registry curves as `[f64; 5]` (decoded by
+`PointerSettings::decode_curve` from 16.16; `WINDOWS_CURVE_X/Y` are the exact
+defaults, and a machine whose display scaling ever changed carries a uniformly
+rescaled Y curve) and `screen_dpi`. Nothing in a batch depends on it (raw
+input is pre-acceleration); the viz's pointer view is what reads it, and
+`windows_defaults()` is what a consumer assumes when it is absent.
 
 Several fields are `#[serde(default)]` specifically so **old recordings keep
 loading** (`pre_coalescing_session_json_still_parses`,
@@ -766,8 +775,12 @@ what `--locked-only` in the analyzer filters on.
 Also on its schedule: every 60 s re-measure the anchor and log drift in ppm,
 emitting an `anchor_drift_us=N` marker past ±200 µs (a second `session` record
 is deliberately never emitted); every 2 s stat `telemouse.toml` and on mtime
-change reload + validate + log a diff (`describe_config_change`) + emit a
-`config_changed` marker (a broken edit keeps the previous config); every 5 s
+change reload + validate + log a diff (`describe_config_change`, built from
+the two configs' serialized leaves, restricted to the sections capture reads:
+`mouse_cpi`, `marker_hotkey`, `batch`, `udp`, `kafka`, `recording`,
+`viz.http_addr` and the games table) + emit a `config_changed` marker when
+that diff is non-empty (a broken edit keeps the previous config; an edit to
+the overlay or panel sections is not a capture change); every 5 s
 compute and log the stats line (§13); on `WM_DISPLAYCHANGE` re-read monitors.
 
 `context.rs`: `SharedContext` is an `ArcSwap<ContextSnapshot>` — readers take
@@ -954,6 +967,29 @@ the origin axis repeated every 360°) instead of teleporting to the far edge. `s
 table or a flagged fallback (`sens 1.0, 0.022`; the CPI/sens tile shows `*`).
 Velocity colouring uses a decaying peak reference (8 s half-life).
 
+**The third integration: Windows' pointer** (`PointerModel`, top of
+`app.js`). The wire is raw input, so the desk and aim panels are what a game
+sees; the desktop cursor sees the counts after "Enhance pointer precision"
+and the speed slider. `applyIdx` runs every report through a model of that
+transfer function too and keeps `ptrX/ptrY` in whole screen pixels (the
+remainder carried, as Windows does, so a crawl moves the cursor in steps),
+a `ptrTrail`, `totalPx` and `speedPx`. Per report: `v = |Δ| / 3.5`
+("inches/s"), `y = curve(v)` piecewise-linear through the five
+`SmoothMouse{X,Y}Curve` points and extrapolated past the last,
+`pixels = y × dpi / 150 × slider` along the report's direction; with
+precision off, `pixels = counts × slider` from the classic 1/32…3.5 table.
+The inputs come from the session envelope's `pointer` field (read by the
+capture agent at start: `SPI_GETMOUSE`, `SPI_GETMOUSESPEED`, the two
+registry curves decoded from 16.16, `GetDpiForSystem`); `pointerSettingsFrom`
+defaults each missing or malformed field on its own and a session with none
+gets a fresh install's settings plus a hint in the panel corner. Checkpoints
+carry the pixel position *and* the model's remainder, so a seek lands where a
+straight play-through would. Not modelled, and documented as such in the
+header comment: any cross-report smoothing, and the report-rate dependence
+(3.5 assumes the 125 Hz era — but the counts are the real reports, so a
+1 kHz mouse lands lower on the curve here exactly as it does for the real
+cursor). `crates/viz/js-tests/pointer.test.mjs` pins the numbers.
+
 **Scrub without O(n) re-integration.** During a replay load,
 `extendCheckpoints` snapshots the full integrator state every 10 timeline
 seconds (`CHECKPOINT_SEC`). `seek` restores the nearest checkpoint on backward
@@ -976,7 +1012,8 @@ false, desynchronized: true}` unless the OBS background is translucent.
 repaint at 10 Hz. The desk panel also draws a cursor "ghost" minimap in
 desktop mode (a live correctness check on integration).
 
-**Stat tiles**: speed cm/s, aim °/s, hand distance m, aim distance °,
+**Stat tiles**: speed cm/s, aim °/s, pointer px/s (the Windows-cursor model;
+`pointer` on the OBS HUD), hand distance m, aim distance °,
 clicks/min, events/s, event age (time since the newest received mouse event
 was captured; increases normally while idle), latency (browser arrival time
 minus mean event capture time, smoothed across batches; warn >10 ms, alert
@@ -988,9 +1025,15 @@ FPS, ring drops, lost batches, abs frames, bridge (datagrams/s + p50 from
 **Controls**: play/pause, prev/next marker, session select, speed 0.25×–8×,
 scrub with amber marker notches; keys `R` recenter, `Space` pause,
 `←/→` ±1 s (`Shift` ±10 s) in replay, `V` cycles the view. **View switch**:
-the Both / Desk / Aim segment in the top bar (`setView`) shows one panel or
-both and mirrors the choice into `?view=` so a bookmark keeps it; `/obs`
-accepts `view=` as an alias of `layout=`. **Draw-rate cap** (`MAX_FPS`,
+the Both / Desk / Aim / Pointer / Raw vs Pointer segment in the top bar
+(`setView`) shows the desk+aim pair, one panel, the pointer panel alone or
+desk beside pointer (`compare`), as a `view-*` class on `<body>` that the
+stylesheet keys on (the pointer panel is `display: none` unless a view asks
+for it, and a hidden panel measures 0×0 and skips its `render`); the choice
+is mirrored into `?view=` so a bookmark keeps it. `/obs` accepts `view=` as
+an alias of `layout=`, and its layouts are `split`, `stack`, `desk`,
+`aim`, `pointer` and `compare` (`OBS_LAYOUTS` in core validates the
+config side). **Draw-rate cap** (`MAX_FPS`,
 `?fps=`, 5–400): the dashboard repaints at most 120×/s, 60 in OBS mode, and
 `FPS_BACKGROUND` (30) while the window is not focused; `engine.tick` still
 runs every rAF so the data stays exact. **Go to time**: a `datetime-local`
@@ -1370,8 +1413,9 @@ analyze reads nothing from it (it uses the session record inside the file —
 that is the point of recording the config per session).
 
 Mid-session edits are detected by T3 (2 s mtime poll), validated, diffed into
-the log, and recorded as a `config_changed` marker — but not re-applied to the
-running session (the session record is immutable).
+the log, and recorded as a `config_changed` marker when a key capture reads
+changed (the `[viz.obs]` and `[ctl]` sections do not count) — but not
+re-applied to the running session (the session record is immutable).
 
 ---
 
@@ -1783,7 +1827,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases, and the WebView2 data folder (`webview_data_dir`: `%LOCALAPPDATA%\telemouse\WebView2`, else `%TEMP%\telemouse\WebView2`, never next to the config) — decided once at startup so the text view's header, the tray's *Open …* items, `/api/open` and the page cannot disagree. |
 | `settings.rs` | The settings editor's pure half. `Settings` is the editable subset of `AppConfig` (`mouse_cpi`, `marker_hotkey`, `[recording] enabled`/`dir`, `[ctl] hotkey`, `[games]`, the `[viz.obs]` basics); `Patch` is the change request, and its `deny_unknown_fields` shape *is* the allow-list: bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` cannot be expressed in it. `apply_patch` edits the file's text with `toml_edit` (values are replaced through the existing item so the comment lines above a key, its trailing comment, the ordering and unknown keys survive; a value that already means the same is left as written), `checked` parses the result back through `AppConfig::from_toml` + `validate` and turns the error into `{ field, reason }` without the file path, `token` is an FNV-1a fingerprint of the bytes, `write_atomic` is temp-file-plus-rename in the same directory, and `save` strings them together (token check → patch → validate → seed from the embedded sample when there is no file → write). `game_key` is a shape check on a user-typed exe name (trim, lowercase, `.exe` appended, no separators / control / reserved characters, ≤ 64 chars) — deliberately not a list of names. `changed` + `effects` say which groups moved and who only sees them later (`restart_required`: the tray's hotkey; `next_start`: a running capture or viz). Also owns `SAMPLE_CONFIG` and `seed_config`, which `main.rs` uses on first start. |
 | `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `parse_foreground_line` + `note_seen` keep the last 8 distinct programs the agent saw in front during the current run (`foreground_seen` on the capture component; never `-` or a `telemouse*` name), which is what the first-run guide offers as *Use <exe>*; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
-| `index.html` | Self-contained page (inline CSS and JS, system fonts, no external URLs — the server test rejects any): dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, the marker labels and their offsets when the session has any, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s, patches values in place, two-click kill (no modal dialogs). A page nobody is looking at — a hidden tab, or the window in the tray, which says so through the `window.telemouseSleep` / `window.telemouseWake` hooks the host calls with `ExecuteScript` (§19.5) — stops polling and stops its clock altogether, and refreshes the moment it is back. Works in the window and in a normal browser. |
+| `index.html` + `panel.js` | Self-contained page: `index.html` is the shell (inline CSS, system fonts, no external URLs — the server test rejects any) and `panel.js` is the script, inlined at `<script src="panel.js">` when the page is rendered, the way viz does `app.js`; it has Node tests in `crates/ctl/js-tests` and strings it must share with Rust (low-disk threshold, demo session id, flag labels, log ring size) arrive through the page config JSON rather than being spelled twice. The page is: dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, the marker labels and their offsets when the session has any, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s, patches values in place, two-click kill (no modal dialogs). A page nobody is looking at — a hidden tab, or the window in the tray, which says so through the `window.telemouseSleep` / `window.telemouseWake` hooks the host calls with `ExecuteScript` (§19.5) — stops polling and stops its clock altogether, and refreshes the moment it is back. Works in the window and in a normal browser. |
 
 ### 19.2 The API
 

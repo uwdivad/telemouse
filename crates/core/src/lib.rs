@@ -1,7 +1,10 @@
 //! Shared types and pure logic for the telemouse pipeline.
 //!
-//! Everything here is platform-independent and allocation-conscious. The
-//! capture agent, viz bridge, and analysis tools all speak these types; the
+//! Everything here is platform-independent and allocation-conscious, with
+//! one deliberate exception: [`shutdown::install`] registers the Win32
+//! console control handler under `cfg(windows)` (elsewhere it installs
+//! nothing). The capture agent, viz bridge, and analysis tools all speak
+//! these types; the
 //! wire format is JSON (see [`wire::Envelope`]) for now, per the plan's
 //! "start with JSON for debuggability" decision.
 //!
@@ -13,6 +16,7 @@ pub mod batch;
 pub mod batcher;
 pub mod clock;
 pub mod config;
+pub mod ctl;
 pub mod event;
 pub mod histogram;
 pub mod hotkey;
@@ -31,5 +35,5 @@ pub use batcher::Batcher;
 pub use clock::{QpcAnchor, now_utc_us};
 pub use event::{RawEvent, buttons};
 pub use histogram::{LatencyHist, LatencySnapshot, Percentile};
-pub use session::{GameSens, Marker, MonitorInfo, SessionConfig};
+pub use session::{GameSens, Marker, MonitorInfo, SessionConfig, SessionError};
 pub use wire::{Envelope, EnvelopeView, Heartbeat};

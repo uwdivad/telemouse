@@ -5,51 +5,65 @@ on:
     branches: [main, master]
   pull_request:
 
+# Read-only token: CI only checks out and builds.
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  # ctl's child-process tests spawn cmd.exe; capture is Windows-only.
+  # A failing test prints where it panicked.
   RUST_BACKTRACE: 1
 
+# Every `uses:` is pinned to a commit SHA (the tag in the trailing comment);
+# .github/dependabot.yml keeps the pins current.
 jobs:
   check:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      # rust-toolchain.toml is the single source of truth for the version;
-      # the explicit input keeps the action from ever picking a newer stable
-      # whose lints would turn the gate red on their own.
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # rust-toolchain.toml is the single source of truth for the version and
+      # components: with no argument rustup installs exactly what it names, so
+      # a newer stable can never turn the lint gate red on its own.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy (full, default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The minimal flavour (no logging, no Kafka, no observability) is no
       # longer published, only documented as a build-it-yourself option
-      # (docs/DEVELOPING.md). These two steps keep its feature flags working.
+      # (docs/DEVELOPING.md). These two steps keep its feature flags working
+      # for every crate.
       - name: clippy (minimal)
-        run: cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
+        run: cargo clippy -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-analyze/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
       - name: test (full)
         run: cargo test --workspace --locked
       - name: test (minimal)
-        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
-      # The viz page's script is embedded in the binary; the Rust tests run
-      # these when node is present, and this makes the requirement explicit.
+        run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
+      # The viz and ctl page scripts are embedded in the binaries; the Rust
+      # tests run these when node is present, and this makes the requirement
+      # explicit.
       - name: viz page syntax
         run: node --check crates/viz/src/app.js
       - name: viz engine tests
         run: node --test "crates/viz/js-tests/*.test.mjs"
+      - name: ctl page syntax
+        run: node --check crates/ctl/src/panel.js
+      - name: ctl page tests
+        run: node --test "crates/ctl/js-tests/*.test.mjs"
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       # audit-check@v2 still targets Node 20; run RustSec's CLI directly.
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked

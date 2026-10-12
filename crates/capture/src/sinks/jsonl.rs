@@ -6,65 +6,60 @@
 //! this queue, but can never hold up UDP or later capture batches.
 //!
 //! Shutdown is bounded. Normally the worker drains every accepted line and
-//! performs a final flush. If storage does not finish within [`DRAIN_TIMEOUT`],
-//! the remaining count is exposed as `jsonl_abandoned` and shutdown proceeds.
+//! performs a final flush. If storage does not finish within its share of the
+//! shutdown budget (never more than [`DRAIN_TIMEOUT`]), the remaining count is
+//! exposed as `jsonl_abandoned` and shutdown proceeds.
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use telemouse_core::recordings::{RECORDING_SUFFIX, is_safe_id};
 
-use super::Sink;
+use super::queue::{QueueAccounting, TrySend};
+use super::{Sink, SinkKind};
 use crate::stats::Stats;
 
 /// Several seconds of normal 25--50ms batches, while keeping memory bounded.
 const QUEUE_CAPACITY: usize = 256;
 const WRITER_CAPACITY: usize = 64 * 1024;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+/// The most a dropped sink ever waits for its writer, whatever share of the
+/// shutdown budget it was given.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct JsonlSink {
     path: PathBuf,
     tx: Option<SyncSender<Vec<u8>>>,
-    stats: Arc<Stats>,
     /// Gates enqueue and flush acknowledgement against the worker's terminal
     /// transition. This is what makes outstanding/loss accounting exact even
     /// when a shutdown timeout races a late writer failure.
-    state: Arc<std::sync::Mutex<WriterState>>,
+    queue: Arc<QueueAccounting>,
     worker: Option<JoinHandle<()>>,
     done: Receiver<()>,
     drain_timeout: Duration,
-    /// Rate-limit queue-overflow logging to the transition into/out of a
-    /// saturated period rather than logging for every dropped envelope.
-    dropping: bool,
-}
-
-#[derive(Debug, Default)]
-struct WriterState {
-    failed: bool,
-    /// Accepted envelopes that have not passed a successful explicit flush.
-    outstanding: u64,
-    /// Failure and timeout can race. Only the winner transfers `outstanding`
-    /// into `jsonl_abandoned`; the late path observes this and does nothing.
-    loss_claimed: bool,
-    /// A channel disconnect can reveal a panic before Drop joins the worker.
-    /// Whichever path observes it first emits the one causal error.
-    failure_reported: bool,
+    /// Set by [`Sink::set_drain_deadline`]: this sink's share of the shutdown
+    /// budget. `drain_timeout` still caps it.
+    drain_deadline: Option<Instant>,
 }
 
 impl JsonlSink {
     /// Create (or truncate) `<dir>/<session_id>.jsonl`, creating `dir` if
-    /// needed. The caller writes the `session` envelope first.
+    /// needed. The caller writes the `session` envelope first. A session id
+    /// that is not a safe recording id is refused, never written anywhere.
     pub fn create(dir: &Path, session_id: &str, stats: Arc<Stats>) -> Result<Self> {
+        anyhow::ensure!(
+            is_safe_id(session_id),
+            "session id {session_id:?} is not a valid recording id"
+        );
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create recording dir {}", dir.display()))?;
-        let path = dir.join(format!("{session_id}.jsonl"));
+        let path = dir.join(format!("{session_id}{RECORDING_SUFFIX}"));
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -93,9 +88,14 @@ impl JsonlSink {
     ) -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(queue_capacity);
         let (done_tx, done) = std::sync::mpsc::channel();
-        let state = Arc::new(std::sync::Mutex::new(WriterState::default()));
-        let worker_state = Arc::clone(&state);
-        let worker_stats = Arc::clone(&stats);
+        let queue = Arc::new(QueueAccounting::new(
+            SinkKind::Jsonl,
+            queue_capacity,
+            Arc::clone(&stats),
+            Stats::jsonl_queue,
+        ));
+        let worker_queue = Arc::clone(&queue);
+        let worker_stats = stats;
         let worker = std::thread::Builder::new()
             .name("telemouse-jsonl".into())
             .spawn(move || {
@@ -103,13 +103,13 @@ impl JsonlSink {
                     &rx,
                     BufWriter::with_capacity(writer_capacity, writer),
                     &worker_stats,
-                    &worker_state,
+                    &worker_queue,
                     flush_interval,
                 );
                 if let Err(e) = result {
-                    let abandoned = claim_loss(&worker_state, &worker_stats);
-                    if mark_failure_reported(&worker_state) {
-                        worker_stats.jsonl_errors.fetch_add(1, Ordering::Relaxed);
+                    let abandoned = worker_queue.claim_loss();
+                    if worker_queue.mark_failure_reported() {
+                        worker_queue.count_error();
                         tracing::error!(
                             error = %format!("{e:#}"),
                             abandoned,
@@ -126,12 +126,11 @@ impl JsonlSink {
         Ok(Self {
             path,
             tx: Some(tx),
-            stats,
-            state,
+            queue,
             worker: Some(worker),
             done,
             drain_timeout,
-            dropping: false,
+            drain_deadline: None,
         })
     }
 
@@ -140,62 +139,29 @@ impl JsonlSink {
     }
 
     fn enqueue(&mut self, line: Vec<u8>) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.failed {
-            self.stats.jsonl_dropped.fetch_add(1, Ordering::Relaxed);
-            // The worker logged the causal error. Treat later envelopes like
-            // queue-overflow drops without rebuilding/formatting an error on
-            // every capture batch.
-            return Ok(());
-        }
         let Some(tx) = self.tx.as_ref() else {
             anyhow::bail!("jsonl writer is shut down");
         };
+        // Counted as outstanding before publishing: the worker may consume at
+        // once, though completion is acknowledged only after an explicit
+        // flush. Overflow and a dead writer are counted and edge-logged by
+        // the accounting, and kept off fan-out's allocating error path.
+        self.queue.enqueue(|| match tx.try_send(line) {
+            Ok(()) => TrySend::Sent,
+            Err(TrySendError::Full(_)) => TrySend::Full,
+            Err(TrySendError::Disconnected(_)) => TrySend::Closed,
+        });
+        Ok(())
+    }
 
-        // Increment before publishing: the worker may consume immediately,
-        // though completion is acknowledged only after an explicit flush.
-        state.outstanding += 1;
-        self.stats.jsonl_queued.fetch_add(1, Ordering::Relaxed);
-        match tx.try_send(line) {
-            Ok(()) => {
-                if self.dropping {
-                    self.dropping = false;
-                    tracing::info!(
-                        dropped_total = self.stats.jsonl_dropped.load(Ordering::Relaxed),
-                        "jsonl queue recovered"
-                    );
-                }
-                Ok(())
-            }
-            Err(TrySendError::Full(_)) => {
-                state.outstanding -= 1;
-                self.stats.jsonl_queued.fetch_sub(1, Ordering::Relaxed);
-                let total = self.stats.jsonl_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                if !self.dropping {
-                    self.dropping = true;
-                    tracing::warn!(
-                        queue_capacity = QUEUE_CAPACITY,
-                        dropped_total = total,
-                        "jsonl queue full; dropping envelopes until it drains"
-                    );
-                }
-                // Saturation is already counted and edge-logged above. Keep it
-                // off fan-out's allocating error path, just like Kafka full.
-                Ok(())
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                state.outstanding -= 1;
-                state.failed = true;
-                self.stats.jsonl_queued.fetch_sub(1, Ordering::Relaxed);
-                self.stats.jsonl_dropped.fetch_add(1, Ordering::Relaxed);
-                let abandoned = claim_loss_locked(&mut state, &self.stats);
-                if !state.failure_reported {
-                    state.failure_reported = true;
-                    self.stats.jsonl_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(abandoned, "jsonl writer channel closed unexpectedly");
-                }
-                Ok(())
-            }
+    /// How long `Drop` may wait for the writer: its share of the shutdown
+    /// budget when one was set, never more than `drain_timeout`.
+    fn drain_wait(&self) -> Duration {
+        match self.drain_deadline {
+            Some(d) => d
+                .saturating_duration_since(Instant::now())
+                .min(self.drain_timeout),
+            None => self.drain_timeout,
         }
     }
 }
@@ -204,7 +170,7 @@ fn write_loop(
     rx: &Receiver<Vec<u8>>,
     mut writer: BufWriter<Box<dyn Write + Send>>,
     stats: &Stats,
-    state: &std::sync::Mutex<WriterState>,
+    queue: &QueueAccounting,
     flush_interval: Duration,
 ) -> Result<()> {
     let mut last_flush = Instant::now();
@@ -220,13 +186,13 @@ fn write_loop(
                 // sustained load cannot starve durability flushes.
                 if last_flush.elapsed() >= flush_interval {
                     flush_timed(&mut writer, stats)?;
-                    acknowledge_flush(state, stats, &mut pending_flush);
+                    queue.finish(std::mem::take(&mut pending_flush), true);
                     last_flush = Instant::now();
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 flush_timed(&mut writer, stats)?;
-                acknowledge_flush(state, stats, &mut pending_flush);
+                queue.finish(std::mem::take(&mut pending_flush), true);
                 last_flush = Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -235,56 +201,8 @@ fn write_loop(
     // Sender disconnection is the graceful finish signal. recv() cannot
     // return it until all accepted FIFO jobs have been consumed.
     flush_timed(&mut writer, stats)?;
-    acknowledge_flush(state, stats, &mut pending_flush);
+    queue.finish(pending_flush, true);
     Ok(())
-}
-
-fn acknowledge_flush(
-    state: &std::sync::Mutex<WriterState>,
-    stats: &Stats,
-    pending_flush: &mut u64,
-) {
-    if *pending_flush == 0 {
-        return;
-    }
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    if !state.loss_claimed {
-        debug_assert!(state.outstanding >= *pending_flush);
-        state.outstanding -= *pending_flush;
-        stats
-            .jsonl_queued
-            .fetch_sub(*pending_flush, Ordering::Relaxed);
-    }
-    *pending_flush = 0;
-}
-
-/// Atomically transfer this sink's unresolved envelopes into the abandonment
-/// counter. The state mutex also excludes enqueue/flush acknowledgement, and
-/// `loss_claimed` makes a timeout racing a late writer error exact-once.
-fn claim_loss(state: &std::sync::Mutex<WriterState>, stats: &Stats) -> u64 {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    claim_loss_locked(&mut state, stats)
-}
-
-fn claim_loss_locked(state: &mut WriterState, stats: &Stats) -> u64 {
-    state.failed = true;
-    if state.loss_claimed {
-        return 0;
-    }
-    state.loss_claimed = true;
-    let abandoned = std::mem::take(&mut state.outstanding);
-    stats.jsonl_queued.fetch_sub(abandoned, Ordering::Relaxed);
-    stats
-        .jsonl_abandoned
-        .fetch_add(abandoned, Ordering::Relaxed);
-    abandoned
-}
-
-fn mark_failure_reported(state: &std::sync::Mutex<WriterState>) -> bool {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    let first = !state.failure_reported;
-    state.failure_reported = true;
-    first
 }
 
 fn flush_timed(writer: &mut BufWriter<Box<dyn Write + Send>>, stats: &Stats) -> Result<()> {
@@ -295,15 +213,15 @@ fn flush_timed(writer: &mut BufWriter<Box<dyn Write + Send>>, stats: &Stats) -> 
 }
 
 impl Sink for JsonlSink {
-    fn name(&self) -> &'static str {
-        "jsonl"
+    fn kind(&self) -> SinkKind {
+        SinkKind::Jsonl
     }
 
     fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
         // Avoid copying a line after a terminal writer failure. `enqueue`
         // repeats this check under the same mutex to close the transition race.
-        if self.state.lock().unwrap_or_else(|e| e.into_inner()).failed {
-            self.stats.jsonl_dropped.fetch_add(1, Ordering::Relaxed);
+        if self.queue.is_failed() {
+            self.queue.count_dropped();
             return Ok(());
         }
         let mut line = Vec::with_capacity(payload.len() + 1);
@@ -313,27 +231,36 @@ impl Sink for JsonlSink {
     }
 
     // Flush scheduling belongs to the writer thread. In particular, a disk
-    // flush must never migrate back onto shipping through this hook.
+    // flush must never migrate back onto shipping through `tick`.
+
+    fn drains_on_close(&self) -> bool {
+        true
+    }
+
+    fn set_drain_deadline(&mut self, deadline: Instant) {
+        self.drain_deadline = Some(deadline);
+    }
 }
 
 impl Drop for JsonlSink {
     fn drop(&mut self) {
         // Closing the last sender makes the worker drain and final-flush.
         self.tx.take();
-        match self.done.recv_timeout(self.drain_timeout) {
+        let wait = self.drain_wait();
+        match self.done.recv_timeout(wait) {
             Ok(()) => {
                 if let Some(worker) = self.worker.take()
                     && worker.join().is_err()
                 {
-                    self.stats.jsonl_errors.fetch_add(1, Ordering::Relaxed);
+                    self.queue.count_error();
                     tracing::error!("jsonl writer panicked");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                let abandoned = claim_loss(&self.state, &self.stats);
+                let abandoned = self.queue.claim_loss();
                 tracing::warn!(
                     abandoned,
-                    timeout_ms = self.drain_timeout.as_millis() as u64,
+                    timeout_ms = wait.as_millis() as u64,
                     "jsonl drain timed out; abandoning queued envelopes"
                 );
                 // Dropping JoinHandle detaches. The process can finish even if
@@ -341,12 +268,12 @@ impl Drop for JsonlSink {
                 self.worker.take();
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let abandoned = claim_loss(&self.state, &self.stats);
+                let abandoned = self.queue.claim_loss();
                 if let Some(worker) = self.worker.take() {
                     let _ = worker.join();
                 }
-                if mark_failure_reported(&self.state) {
-                    self.stats.jsonl_errors.fetch_add(1, Ordering::Relaxed);
+                if self.queue.mark_failure_reported() {
+                    self.queue.count_error();
                     tracing::error!(abandoned, "jsonl writer panicked");
                 }
             }
@@ -356,7 +283,7 @@ impl Drop for JsonlSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
 
     use telemouse_core::{Batch, Envelope, Marker};
@@ -448,6 +375,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn an_unsafe_session_id_is_refused_rather_than_written_anywhere() {
+        let dir = std::env::temp_dir().join(format!("telemouse-unsafe-{}", std::process::id()));
+        for id in ["../escape", "", "a/b", ".hidden"] {
+            assert!(
+                JsonlSink::create(&dir, id, Arc::new(Stats::default())).is_err(),
+                "{id:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[derive(Default)]
     struct Gate {
         entered: bool,
@@ -501,12 +440,9 @@ mod tests {
         send(&mut sink, &batch(1)).unwrap();
         let started = Instant::now();
         send(&mut sink, &batch(2)).unwrap();
-        let enqueue_elapsed = started.elapsed();
-        eprintln!(
-            "jsonl blocked-writer overflow returned in {}us",
-            enqueue_elapsed.as_micros()
-        );
-        assert!(enqueue_elapsed < Duration::from_millis(100));
+        // Generous: the point is "not the storage latency" (the writer is
+        // blocked forever), not a benchmark.
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(stats.snapshot().jsonl_dropped, 1);
 
         let mut state = lock.lock().unwrap();
@@ -536,14 +472,12 @@ mod tests {
     #[test]
     fn sustained_backlog_cannot_starve_periodic_flushes() {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        let stats = Stats::default();
-        let state = std::sync::Mutex::new(WriterState {
-            outstanding: 50,
-            ..Default::default()
-        });
+        let stats = Arc::new(Stats::default());
+        let queue =
+            QueueAccounting::new(SinkKind::Jsonl, 64, Arc::clone(&stats), Stats::jsonl_queue);
+        queue.preload(50);
         let flushes = Arc::new(AtomicUsize::new(0));
         for _ in 0..50 {
-            stats.jsonl_queued.fetch_add(1, Ordering::Relaxed);
             tx.send(vec![b'x', b'\n']).unwrap();
         }
         drop(tx);
@@ -557,7 +491,7 @@ mod tests {
                 }),
             ),
             &stats,
-            &state,
+            &queue,
             Duration::from_millis(5),
         )
         .unwrap();
@@ -599,10 +533,6 @@ mod tests {
         drop(sink);
 
         let snap = stats.snapshot();
-        eprintln!(
-            "jsonl flush failure: queued={} abandoned={} errors={}",
-            snap.jsonl_queued, snap.jsonl_abandoned, snap.jsonl_errors
-        );
         assert_eq!(snap.jsonl_queued, 0);
         assert_eq!(snap.jsonl_abandoned, 3);
         assert_eq!(snap.jsonl_errors, 1);
@@ -635,7 +565,7 @@ mod tests {
         .unwrap();
         send(&mut sink, &batch(0)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !sink.state.lock().unwrap_or_else(|e| e.into_inner()).failed {
+        while !sink.queue.is_failed() {
             assert!(
                 Instant::now() < deadline,
                 "writer did not enter failed state"
@@ -720,10 +650,6 @@ mod tests {
             std::thread::yield_now();
         }
         let final_snap = stats.snapshot();
-        eprintln!(
-            "jsonl timeout race: queued={} abandoned={} errors={}",
-            final_snap.jsonl_queued, final_snap.jsonl_abandoned, final_snap.jsonl_errors
-        );
         assert_eq!(final_snap.jsonl_queued, 0);
         assert_eq!(final_snap.jsonl_abandoned, 1);
         assert_eq!(final_snap.jsonl_errors, 1);

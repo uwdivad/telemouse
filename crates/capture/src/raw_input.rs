@@ -50,6 +50,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::thread::Thread;
+use std::time::Duration;
 
 use telemouse_core::RawEvent;
 use telemouse_core::event::buttons;
@@ -286,6 +287,40 @@ pub fn align_up(addr: usize, align: usize) -> usize {
 #[cfg(windows)]
 pub use win::{CaptureDeps, Hotkey, post_quit, post_thread_quit, run};
 
+/// Added to the coalescing window to make the cadence period of a live
+/// stream: one report interval of the usual 1kHz mouse, so the first report
+/// of the next drain has arrived by the time the timer fires and drains stay
+/// the same size as with wake-then-window. Shared with the shipping tests'
+/// model of T1.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const CADENCE_SLACK: Duration = Duration::from_millis(1);
+
+/// The label a hotkey marker carries in the stream.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const HOTKEY_MARKER_LABEL: &str = "hotkey";
+
+/// The Win32 half of T1.
+///
+/// ## The one aliasing argument in here
+///
+/// [`CaptureState`] lives on the capture thread's stack in [`run`] and is
+/// reached two ways: by `run` itself (the buffered drain and the stray
+/// `WM_INPUT`), and by [`wndproc`] through the pointer stored in the
+/// window's `GWLP_USERDATA`. Both form a `&mut CaptureState` from the same
+/// raw pointer, so they must never overlap. They cannot:
+///
+/// * Everything runs on this one thread; the pointer is never published to
+///   another (the HWND is, but only for `PostMessageW`, which queues).
+/// * `run`'s references live only for one `drain_buffer` or `handle_input`
+///   call. Those only call `GetRawInputBuffer`/`GetRawInputData`, which never
+///   dispatch messages, so `wndproc` cannot run inside them.
+/// * `wndproc` runs only inside `PeekMessageW` (for messages *sent* to this
+///   thread) and `DispatchMessageW`, which `run` calls while holding no
+///   reference to the state; its own reference ends before it returns.
+/// * `GWLP_USERDATA` is set after the state exists and cleared before it is
+///   dropped (and before `DestroyWindow`, whose `WM_DESTROY` therefore never
+///   sees it), so `wndproc` only ever finds a live state or null.
+/// * After taking the pointer, `run` never touches `state` by name again.
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;
@@ -296,6 +331,9 @@ mod win {
 
     use anyhow::{Context, Result};
     use telemouse_core::RawEvent;
+    use telemouse_core::clock::ms_to_ticks;
+    #[cfg(feature = "observability")]
+    use telemouse_core::clock::ticks_to_us_u64;
     use windows::Win32::Foundation::{
         CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
     };
@@ -320,7 +358,10 @@ mod win {
     };
     use windows::core::{PCWSTR, w};
 
-    use super::{CaptureHandles, Decoded, DrainStamper, RingWaker, decode_mouse};
+    use super::{
+        CADENCE_SLACK, CaptureHandles, Decoded, DrainStamper, HOTKEY_MARKER_LABEL, RingWaker,
+        decode_mouse,
+    };
     use crate::context::SharedContext;
     use crate::devices::{self, DeviceTable, Resolved};
     use crate::platform;
@@ -340,11 +381,6 @@ mod win {
     /// A wake more than this after the previous drain means the mouse was
     /// still; the interval estimator ignores it.
     const STAMPER_MAX_GAP: Duration = Duration::from_millis(20);
-    /// Added to the coalescing window to make the cadence period of a live
-    /// stream: one report interval of the usual 1kHz mouse, so the first
-    /// report of the next drain has arrived by the time the timer fires and
-    /// drains stay the same size as with wake-then-window.
-    const CADENCE_SLACK: Duration = Duration::from_millis(1);
     /// Slack on every waitable-timer wait. The waits are finite rather than
     /// `INFINITE`: a timer handle the OS has quietly stopped honouring would
     /// otherwise park T1 forever while the ring fills behind it, which reads
@@ -361,7 +397,6 @@ mod win {
         /// `MOD_*` bits, without `MOD_NOREPEAT` (added at registration).
         pub modifiers: u32,
         pub vk: u32,
-        pub label: &'static str,
     }
 
     impl Hotkey {
@@ -370,7 +405,6 @@ mod win {
             hk.map(|h| Self {
                 modifiers: h.modifiers(),
                 vk: u32::from(h.vk),
-                label: "hotkey",
             })
         }
     }
@@ -396,12 +430,12 @@ mod win {
 
     /// Everything the window procedure touches. Lives on the capture thread's
     /// stack for the lifetime of the message loop and is reachable from the
-    /// window procedure through `GWLP_USERDATA`.
+    /// window procedure through `GWLP_USERDATA` (see the module docs for why
+    /// that is sound).
     struct CaptureState {
         producer: rtrb::Producer<RawEvent>,
         stats: Arc<Stats>,
         marker_tx: Sender<MarkerSignal>,
-        hotkey_label: &'static str,
         waker: Arc<RingWaker>,
         ctx: Arc<SharedContext>,
         devices: DeviceTable,
@@ -420,9 +454,9 @@ mod win {
             return;
         }
         let hwnd = HWND(hwnd as *mut c_void);
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_TELEMOUSE_QUIT, WPARAM(0), LPARAM(0));
-        }
+        // SAFETY: posting only queues a message; a window that is already
+        // gone makes the call fail, it never dereferences anything of ours.
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_TELEMOUSE_QUIT, WPARAM(0), LPARAM(0)) };
     }
 
     /// Fallback stop path: post `WM_QUIT` straight to the thread's message
@@ -432,11 +466,25 @@ mod win {
         if thread_id == 0 {
             return;
         }
-        unsafe {
-            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+        // SAFETY: integers only; a thread without a queue makes it fail.
+        let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
     }
 
+    /// The `CaptureState` attached to `hwnd`, or null.
+    ///
+    /// # Safety
+    /// `hwnd` must be the capture window; see the module docs for when the
+    /// pointer may be turned into a reference.
+    unsafe fn state_of(hwnd: HWND) -> *mut CaptureState {
+        // SAFETY: reading a window long is an integer read on our own window.
+        (unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) }) as *mut CaptureState
+    }
+
+    /// The capture window's procedure.
+    ///
+    /// # Safety
+    /// Called by the system, on the capture thread, for the window `run`
+    /// created — never directly. See the module docs for the aliasing rule.
     unsafe extern "system" fn wndproc(
         hwnd: HWND,
         msg: u32,
@@ -449,21 +497,28 @@ mod win {
                 // and only dispatches the rest. Kept so a WM_INPUT that does
                 // get dispatched is still captured rather than lost.
                 let ts_qpc = platform::qpc();
-                let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CaptureState;
+                // SAFETY: this is the capture window.
+                let state = unsafe { state_of(hwnd) };
                 if !state.is_null() {
+                    // SAFETY: a live state (it is detached before it drops),
+                    // and no other reference to it exists while the system
+                    // is running this procedure (module docs). `lparam` is
+                    // this WM_INPUT's HRAWINPUT.
                     unsafe { handle_input(&mut *state, lparam, ts_qpc) };
                 }
                 // WM_INPUT must reach DefWindowProc so the system can clean up.
+                // SAFETY: forwarding the message we were handed, unchanged.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
             WM_HOTKEY => {
                 let ts_qpc = platform::qpc();
-                let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CaptureState;
-                if !state.is_null() {
-                    let state = unsafe { &mut *state };
+                // SAFETY: this is the capture window.
+                let state = unsafe { state_of(hwnd) };
+                // SAFETY: as for WM_INPUT; the only reference for this call.
+                if let Some(state) = unsafe { state.as_mut() } {
                     let _ = state.marker_tx.send(MarkerSignal {
                         ts_qpc,
-                        label: state.hotkey_label.to_string(),
+                        label: HOTKEY_MARKER_LABEL.to_string(),
                     });
                     // T2 may be parked indefinitely on an idle desk.
                     state.waker.wake();
@@ -473,25 +528,37 @@ mod win {
             WM_DISPLAYCHANGE => {
                 // The desktop geometry changed; T3 owns the context snapshot,
                 // so just flag it and let the next tick re-read the metrics.
-                let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CaptureState;
-                if !state.is_null() {
-                    unsafe { (*state).ctx.mark_display_changed() };
+                // SAFETY: this is the capture window.
+                let state = unsafe { state_of(hwnd) };
+                // SAFETY: as for WM_INPUT; a shared reference suffices here.
+                if let Some(state) = unsafe { state.as_ref() } {
+                    state.ctx.mark_display_changed();
                 }
+                // SAFETY: forwarding the message we were handed, unchanged.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
             WM_TELEMOUSE_QUIT | WM_DESTROY => {
+                // SAFETY: posts WM_QUIT to this thread's own queue.
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
+            // SAFETY: forwarding the message we were handed, unchanged.
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         }
     }
 
     /// Single-report read for a `WM_INPUT` that reached the message loop
     /// (a report that arrived between the buffered drain and the peek).
+    ///
+    /// # Safety
+    /// `lparam` must be the `HRAWINPUT` of a `WM_INPUT` delivered to this
+    /// thread and not yet handed to `DefWindowProcW`.
     unsafe fn handle_input(state: &mut CaptureState, lparam: LPARAM, ts_qpc: u64) {
         let mut raw = RAWINPUT::default();
         let mut size = size_of::<RAWINPUT>() as u32;
+        // SAFETY: `raw` is a live RAWINPUT and `size` says exactly how big;
+        // the API refuses (u32::MAX) rather than overrun. The handle is
+        // valid per this function's contract.
         let read = unsafe {
             GetRawInputData(
                 HRAWINPUT(lparam.0 as *mut c_void),
@@ -504,6 +571,8 @@ mod win {
         if read == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
             return;
         }
+        // SAFETY: the header says this is a mouse report, so `data.mouse` is
+        // the union member that was written.
         unsafe { process_mouse(state, &raw, ts_qpc) };
     }
 
@@ -521,6 +590,11 @@ mod win {
     /// Read every report waiting in the queue with as few calls as possible.
     /// Returns how many were read. Stamps come from `stamper` per `stamping`,
     /// with `now` the read time.
+    ///
+    /// # Safety
+    /// Must run on the thread that registered for raw input. Never dispatches
+    /// messages, which is what lets the caller hold `&mut CaptureState`
+    /// across it (see the module docs).
     unsafe fn drain_buffer(
         state: &mut CaptureState,
         buf: &mut [RAWINPUT],
@@ -529,14 +603,19 @@ mod win {
         now: u64,
     ) -> usize {
         let mut total = 0usize;
-        // For a spread drain that needs more than one call (only above ~28kHz
-        // at the default window), each call spreads over what is left.
+        // A spread drain spreads the *first* call's reports over
+        // `(prev, now]`. A second call is only needed when the queue held
+        // more than one buffer (above ~28kHz at the default window); its
+        // reports are stamped at `now` — still monotonic, but without the
+        // spacing. Rare enough not to be worth a second clock read per call.
         let mut spread_from = match stamping {
             Stamping::Spread { prev } => prev,
             Stamping::Anchored { .. } => 0,
         };
         loop {
             let mut size = size_of_val(buf) as u32;
+            // SAFETY: `buf` is a live, writable slice of `size` bytes, and the
+            // header size is the real one; the API fills at most `size`.
             let n = unsafe {
                 GetRawInputBuffer(
                     Some(buf.as_mut_ptr()),
@@ -571,9 +650,14 @@ mod win {
             let end = start + size_of_val(buf);
             let mut p = start;
             for i in 0..n as usize {
+                // SAFETY: `p` is inside `buf` (it starts there and only ever
+                // advances to a bound `next_block_bounds` checked).
                 let Some(block) = (unsafe { next_block_bounds(p, end) }) else {
                     break;
                 };
+                // SAFETY: `next_block_bounds` proved the whole block at `p`
+                // lies inside `buf`, which the API just filled, and blocks
+                // start pointer-aligned, which satisfies RAWINPUT's alignment.
                 let raw = unsafe { &*(p as *const RAWINPUT) };
                 if raw.header.dwType == RIM_TYPEMOUSE.0 {
                     let ts = match stamping {
@@ -582,6 +666,7 @@ mod win {
                             DrainStamper::spread(spread_from, now, n as usize, i)
                         }
                     };
+                    // SAFETY: a mouse block, so `data.mouse` is what was written.
                     unsafe { process_mouse(state, raw, ts) };
                 }
                 total += 1;
@@ -606,6 +691,8 @@ mod win {
         if p.checked_add(header)? > end {
             return None;
         }
+        // SAFETY: the header fits before `end` (checked just above), which
+        // is readable per this function's contract.
         let size = unsafe { (*(p as *const RAWINPUTHEADER)).dwSize } as usize;
         let block_end = p.checked_add(size.max(header))?;
         if block_end > end {
@@ -617,9 +704,14 @@ mod win {
     /// The decode+push half of the hot path. No allocation on the per-report
     /// path, no locking (a never-before-seen device is queried and added to
     /// the table once — the rare exception).
+    ///
+    /// # Safety
+    /// `raw.header.dwType` must be `RIM_TYPEMOUSE`: the `data.mouse` union
+    /// member is read unchecked.
     unsafe fn process_mouse(state: &mut CaptureState, raw: &RAWINPUT, ts_qpc: u64) {
-        let mouse = unsafe { raw.data.mouse };
-        let buttons = unsafe { mouse.Anonymous.Anonymous };
+        // SAFETY: per this function's contract the mouse member is the one
+        // written, and both reads are plain copies of POD fields.
+        let (mouse, buttons) = unsafe { (raw.data.mouse, raw.data.mouse.Anonymous.Anonymous) };
         // Linear scan over a handful of handles; only a device we have never
         // seen costs an OS query, and only once.
         let resolved = devices::resolve_index(&mut state.devices, raw.header.hDevice.0 as isize);
@@ -686,37 +778,70 @@ mod win {
     /// still better than the sleep. `None` means no waitable timer at all —
     /// the caller falls back to `thread::sleep`.
     fn create_coalesce_timer() -> Option<HANDLE> {
-        unsafe {
-            match CreateWaitableTimerExW(
+        // SAFETY: no security attributes, an unnamed timer, constant flags.
+        let high_res = unsafe {
+            CreateWaitableTimerExW(
                 None,
                 PCWSTR::null(),
                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                 TIMER_ALL_ACCESS.0,
-            ) {
-                Ok(t) => {
-                    tracing::info!(resolution = "high", "coalesce timer ready");
-                    Some(t)
-                }
-                Err(high_res_err) => {
-                    match CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0) {
-                        Ok(t) => {
-                            tracing::info!(
-                                resolution = "standard",
-                                high_res_error = %high_res_err,
-                                "high-resolution timer unavailable; coalesce timer ready"
-                            );
-                            Some(t)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "no waitable timer; coalescing falls back to thread::sleep"
-                            );
-                            None
-                        }
-                    }
-                }
+            )
+        };
+        let high_res_err = match high_res {
+            Ok(t) => {
+                tracing::info!(resolution = "high", "coalesce timer ready");
+                return Some(t);
             }
+            Err(e) => e,
+        };
+        // SAFETY: as above, without the high-resolution flag.
+        match unsafe { CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0) } {
+            Ok(t) => {
+                tracing::info!(
+                    resolution = "standard",
+                    high_res_error = %high_res_err,
+                    "high-resolution timer unavailable; coalesce timer ready"
+                );
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "no waitable timer; coalescing falls back to thread::sleep"
+                );
+                None
+            }
+        }
+    }
+
+    /// Wait for the coalesce/cadence timer, at most `wait_ms`. False when the
+    /// wait failed or ran out — the caller sleeps the period instead — and
+    /// that is warned about at most once per [`TIMER_WARN_INTERVAL`].
+    fn wait_timer(timer: HANDLE, wait_ms: u32, warn: &mut Throttle, what: &'static str) -> bool {
+        // SAFETY: `timer` is the live handle `run` created; it is closed only
+        // after the loop that waits on it.
+        let waited = unsafe { WaitForSingleObject(timer, wait_ms) } == WAIT_OBJECT_0;
+        if !waited && let Some(suppressed) = warn.allow(Instant::now()) {
+            let e = windows::core::Error::from_thread();
+            tracing::warn!(
+                error = %e,
+                suppressed,
+                what,
+                "timer wait failed; sleeping the period instead"
+            );
+        }
+        waited
+    }
+
+    /// Detach the state from the window, then destroy the window. After this
+    /// no message can reach the `CaptureState` about to be dropped.
+    fn detach_and_destroy(hwnd: HWND) {
+        // SAFETY: `hwnd` is the window this thread created. Clearing
+        // GWLP_USERDATA first means the WM_DESTROY that DestroyWindow sends
+        // (and anything after it) finds null.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(hwnd);
         }
     }
 
@@ -739,30 +864,39 @@ mod win {
             coalesce,
             qpc_freq,
         } = deps;
+        // SAFETY: no arguments.
         handles.set_thread_id(unsafe { GetCurrentThreadId() });
         platform::raise_capture_thread_priority();
 
-        let ticks = |d: Duration| (d.as_nanos() * qpc_freq as u128 / 1_000_000_000) as u64;
+        let ticks =
+            |d: Duration| ms_to_ticks(u64::try_from(d.as_millis()).unwrap_or(u64::MAX), qpc_freq);
         // Reports drained together never span more than the window plus the
         // sleep's overshoot; 1ms is the right prior for a 1kHz mouse.
+        let one_ms = ticks(Duration::from_millis(1));
         let mut stamper = DrainStamper::new(
-            ticks(Duration::from_millis(1)),
-            ticks(coalesce + Duration::from_millis(1)).max(ticks(Duration::from_millis(1))),
+            one_ms,
+            ticks(coalesce + Duration::from_millis(1)).max(one_ms),
             ticks(STAMPER_MAX_GAP),
         );
 
-        unsafe {
-            let hinstance = GetModuleHandleW(None).context("GetModuleHandleW")?;
-            let class = WNDCLASSW {
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance.into(),
-                lpszClassName: CLASS_NAME,
-                ..Default::default()
-            };
-            // A zero return usually means "already registered", which is fine.
-            let _ = RegisterClassW(&class);
+        // SAFETY: `None` asks for this executable's own module handle.
+        let hinstance = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW")?;
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        // A zero return usually means "already registered", which is fine.
+        // SAFETY: `class` is fully initialized, its name is a static wide
+        // string, and `wndproc` has the WNDPROC signature.
+        let _ = unsafe { RegisterClassW(&class) };
 
-            let hwnd = CreateWindowExW(
+        // SAFETY: the class exists (registered above, or already was); every
+        // string is static; HWND_MESSAGE makes it a message-only window.
+        // Messages sent during creation find GWLP_USERDATA still 0.
+        let hwnd = unsafe {
+            CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
                 w!("telemouse"),
@@ -776,250 +910,257 @@ mod win {
                 Some(hinstance.into()),
                 None,
             )
-            .context("create message-only window")?;
-            handles.set_hwnd(hwnd.0 as isize);
+        }
+        .context("create message-only window")?;
+        handles.set_hwnd(hwnd.0 as isize);
 
-            // A handle on the counters that does not go through the state the
-            // window procedure owns, so the per-drain publishing below never
-            // aliases the pointer `drain_buffer` is handed.
-            #[cfg(feature = "observability")]
-            let t1_stats = Arc::clone(&stats);
-            let mut state = CaptureState {
-                producer,
-                stats,
-                marker_tx,
-                hotkey_label: hotkey.map_or("hotkey", |h| h.label),
-                waker,
-                ctx,
-                devices,
-                events: 0,
-                ring_drops: 0,
-                abs_frames: 0,
-                raw_read_errors: 0,
-            };
-            let state_ptr: *mut CaptureState = &mut state;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        // A handle on the counters that does not go through the state the
+        // window procedure owns, so the per-drain publishing below never
+        // aliases the pointer `drain_buffer` is handed.
+        #[cfg(feature = "observability")]
+        let t1_stats = Arc::clone(&stats);
+        let mut state = CaptureState {
+            producer,
+            stats,
+            marker_tx,
+            waker,
+            ctx,
+            devices,
+            events: 0,
+            ring_drops: 0,
+            abs_frames: 0,
+            raw_read_errors: 0,
+        };
+        // From here on the state is only reached through this pointer (see
+        // the module docs); `state` itself is not named again until it drops.
+        let state_ptr: *mut CaptureState = &mut state;
+        // SAFETY: an integer write on our own window; the pointer stays valid
+        // until `detach_and_destroy` clears it, before `state` drops.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
 
-            let rid = [RAWINPUTDEVICE {
-                usUsagePage: HID_USAGE_PAGE_GENERIC,
-                usUsage: HID_USAGE_GENERIC_MOUSE,
-                // INPUTSINK: deliver input even when we are not foreground.
-                dwFlags: RIDEV_INPUTSINK,
-                hwndTarget: hwnd,
-            }];
-            let registered = RegisterRawInputDevices(&rid, size_of::<RAWINPUTDEVICE>() as u32);
-            if let Err(e) = registered {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                let _ = DestroyWindow(hwnd);
-                return Err(e).context("RegisterRawInputDevices for the mouse usage page");
-            }
+        let rid = [RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_MOUSE,
+            // INPUTSINK: deliver input even when we are not foreground.
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        }];
+        // SAFETY: an initialized one-element array with its exact element
+        // size, targeting our live window.
+        let registered =
+            unsafe { RegisterRawInputDevices(&rid, size_of::<RAWINPUTDEVICE>() as u32) };
+        if let Err(e) = registered {
+            detach_and_destroy(hwnd);
+            return Err(e).context("RegisterRawInputDevices for the mouse usage page");
+        }
 
-            let mut hotkey_registered = false;
-            match hotkey {
-                Some(hk) => {
-                    let mods = HOT_KEY_MODIFIERS(hk.modifiers) | MOD_NOREPEAT;
-                    match RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, hk.vk) {
-                        Ok(()) => {
-                            hotkey_registered = true;
-                            tracing::info!(
-                                vk = hk.vk,
-                                modifiers = hk.modifiers,
-                                "marker hotkey registered"
-                            );
-                        }
-                        // Another app owns the chord: markers are a nice-to-have.
-                        Err(e) => tracing::warn!(
-                            error = %e,
+        let mut hotkey_registered = false;
+        match hotkey {
+            Some(hk) => {
+                let mods = HOT_KEY_MODIFIERS(hk.modifiers) | MOD_NOREPEAT;
+                // SAFETY: our live window, a constant id and plain integers.
+                match unsafe { RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, hk.vk) } {
+                    Ok(()) => {
+                        hotkey_registered = true;
+                        tracing::info!(
                             vk = hk.vk,
                             modifiers = hk.modifiers,
-                            "marker hotkey unavailable (another program holds it?); change marker_hotkey in telemouse.toml"
-                        ),
+                            "marker hotkey registered"
+                        );
                     }
+                    // Another app owns the chord: markers are a nice-to-have.
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        vk = hk.vk,
+                        modifiers = hk.modifiers,
+                        "marker hotkey unavailable (another program holds it?); change marker_hotkey in telemouse.toml"
+                    ),
                 }
-                None => tracing::info!("no marker hotkey (marker_hotkey is empty)"),
             }
+            None => tracing::info!("no marker hotkey (marker_hotkey is empty)"),
+        }
 
-            tracing::info!(
-                coalesce_ms = coalesce.as_millis() as u64,
-                "raw input capture running"
-            );
-            // One process-lifetime timer for the coalescing window; the whole
-            // drain path stays allocation-free.
-            let coalesce_timer = if coalesce.is_zero() {
-                None
+        tracing::info!(
+            coalesce_ms = coalesce.as_millis() as u64,
+            "raw input capture running"
+        );
+        // One process-lifetime timer for the coalescing window; the whole
+        // drain path stays allocation-free.
+        let coalesce_timer = if coalesce.is_zero() {
+            None
+        } else {
+            create_coalesce_timer()
+        };
+        // While a stream is live the loop runs on the timer alone, one
+        // drain per cadence period: the window plus one report interval,
+        // so a 1kHz mouse yields the same drains per second (three
+        // reports each at 2ms) as wake-then-window did.
+        let cadence = coalesce + CADENCE_SLACK;
+        let cadence_ms = cadence.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // Every wait on the timer is bounded by one cadence period plus
+        // slack, so a timer that stops firing costs one late drain rather
+        // than the rest of the session.
+        let timer_wait_ms = (cadence + TIMER_WAIT_SLACK)
+            .as_millis()
+            .clamp(1, u32::MAX as u128 - 1) as u32;
+        let mut timer_warn = Throttle::new(TIMER_WARN_INTERVAL);
+        // `SetWaitableTimer` failing is a one-off fact about this machine,
+        // not a per-drain event: say it once and fall back for good.
+        let mut arm_failure_logged = false;
+        let mut raw_buf: Vec<RAWINPUT> = vec![RAWINPUT::default(); RAW_BUFFER_REPORTS];
+        let mut msg = MSG::default();
+        #[cfg(feature = "observability")]
+        let mut drains: u64 = 0;
+        // True after a drain that returned reports: the stream is live
+        // and the next drain is taken on the cadence timer rather than
+        // on the queue wait (see the module docs for why that matters).
+        let mut live = false;
+        let mut prev_now: u64 = 0;
+        'pump: loop {
+            let stamping: Stamping;
+            if live {
+                // Armed periodic on the first drain of this stream; every
+                // wait here is one cadence period.
+                let waited = coalesce_timer
+                    .is_some_and(|t| wait_timer(t, timer_wait_ms, &mut timer_warn, "cadence"));
+                if !waited {
+                    std::thread::sleep(cadence);
+                }
+                // Nothing observed any arrival this period: the reports
+                // are spread over it (see `DrainStamper::spread`).
+                stamping = Stamping::Spread { prev: prev_now };
             } else {
-                create_coalesce_timer()
-            };
-            // While a stream is live the loop runs on the timer alone, one
-            // drain per cadence period: the window plus one report interval,
-            // so a 1kHz mouse yields the same drains per second (three
-            // reports each at 2ms) as wake-then-window did.
-            let cadence = coalesce + CADENCE_SLACK;
-            let cadence_ms = cadence.as_millis().clamp(1, i32::MAX as u128) as i32;
-            // Every wait on the timer is bounded by one cadence period plus
-            // slack, so a timer that stops firing costs one late drain rather
-            // than the rest of the session.
-            let timer_wait_ms = (cadence + TIMER_WAIT_SLACK)
-                .as_millis()
-                .clamp(1, u32::MAX as u128 - 1) as u32;
-            let mut timer_warn = Throttle::new(TIMER_WARN_INTERVAL);
-            // `SetWaitableTimer` failing is a one-off fact about this machine,
-            // not a per-drain event: say it once and fall back for good.
-            let mut arm_failure_logged = false;
-            let mut raw_buf: Vec<RAWINPUT> = vec![RAWINPUT::default(); RAW_BUFFER_REPORTS];
-            let mut msg = MSG::default();
-            #[cfg(feature = "observability")]
-            let mut drains: u64 = 0;
-            // True after a drain that returned reports: the stream is live
-            // and the next drain is taken on the cadence timer rather than
-            // on the queue wait (see the module docs for why that matters).
-            let mut live = false;
-            let mut prev_now: u64 = 0;
-            'pump: loop {
-                let stamping: Stamping;
-                if live {
+                // Block until anything is queued. MWMO_INPUTAVAILABLE
+                // makes this return for messages that were already
+                // waiting, not only ones posted after the previous peek.
+                // SAFETY: no handles, constant flags; it only blocks this
+                // thread and dispatches nothing.
+                let r = unsafe {
+                    MsgWaitForMultipleObjectsEx(None, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+                };
+                if r == WAIT_FAILED {
+                    let e = windows::core::Error::from_thread();
+                    tracing::error!(error = %e, "MsgWaitForMultipleObjectsEx failed; stopping capture");
+                    break;
+                }
+                // The first report's arrival is now; let the next few
+                // land before paying for the read.
+                let wake = platform::qpc();
+                stamping = Stamping::Anchored { wake };
+                if !coalesce.is_zero() {
                     let mut waited = false;
                     if let Some(timer) = coalesce_timer {
-                        // Armed periodic on the first drain of this stream;
-                        // every wait here is one cadence period.
-                        waited = WaitForSingleObject(timer, timer_wait_ms) == WAIT_OBJECT_0;
-                        if !waited && let Some(suppressed) = timer_warn.allow(Instant::now()) {
-                            let e = windows::core::Error::from_thread();
-                            tracing::warn!(
-                                error = %e,
-                                suppressed,
-                                "cadence wait failed; sleeping the period"
-                            );
-                        }
-                    }
-                    if !waited {
-                        std::thread::sleep(cadence);
-                    }
-                    // Nothing observed any arrival this period: the reports
-                    // are spread over it (see `DrainStamper::spread`).
-                    stamping = Stamping::Spread { prev: prev_now };
-                } else {
-                    // Block until anything is queued. MWMO_INPUTAVAILABLE
-                    // makes this return for messages that were already
-                    // waiting, not only ones posted after the previous peek.
-                    let r = MsgWaitForMultipleObjectsEx(
-                        None,
-                        INFINITE,
-                        QS_ALLINPUT,
-                        MWMO_INPUTAVAILABLE,
-                    );
-                    if r == WAIT_FAILED {
-                        let e = windows::core::Error::from_thread();
-                        tracing::error!(error = %e, "MsgWaitForMultipleObjectsEx failed; stopping capture");
-                        break;
-                    }
-                    // The first report's arrival is now; let the next few
-                    // land before paying for the read.
-                    let wake = platform::qpc();
-                    stamping = Stamping::Anchored { wake };
-                    if !coalesce.is_zero() {
-                        let mut waited = false;
-                        if let Some(timer) = coalesce_timer {
-                            // Negative due time = relative, in 100ns units:
-                            // first due after one window, then periodic at
-                            // the cadence for as long as the stream is live.
-                            // A message posted meanwhile (quit, hotkey,
-                            // display change) is handled after the drain, at
-                            // most one window late.
-                            let due = -((coalesce.as_nanos() / 100) as i64);
-                            match SetWaitableTimer(timer, &due, cadence_ms, None, None, false) {
-                                Ok(()) => {
-                                    waited =
-                                        WaitForSingleObject(timer, timer_wait_ms) == WAIT_OBJECT_0;
-                                    if !waited
-                                        && let Some(suppressed) = timer_warn.allow(Instant::now())
-                                    {
-                                        let e = windows::core::Error::from_thread();
-                                        tracing::warn!(
-                                            error = %e,
-                                            suppressed,
-                                            "coalesce wait failed; sleeping the window"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    if !arm_failure_logged {
-                                        arm_failure_logged = true;
-                                        tracing::warn!(
-                                            error = %e,
-                                            "SetWaitableTimer failed; coalescing falls back to thread::sleep"
-                                        );
-                                    }
+                        // Negative due time = relative, in 100ns units:
+                        // first due after one window, then periodic at
+                        // the cadence for as long as the stream is live.
+                        // A message posted meanwhile (quit, hotkey,
+                        // display change) is handled after the drain, at
+                        // most one window late.
+                        let due = -((coalesce.as_nanos() / 100) as i64);
+                        // SAFETY: our live timer, a due time that outlives
+                        // the call, and no completion routine.
+                        match unsafe {
+                            SetWaitableTimer(timer, &due, cadence_ms, None, None, false)
+                        } {
+                            Ok(()) => {
+                                waited =
+                                    wait_timer(timer, timer_wait_ms, &mut timer_warn, "coalesce");
+                            }
+                            Err(e) => {
+                                if !arm_failure_logged {
+                                    arm_failure_logged = true;
+                                    tracing::warn!(
+                                        error = %e,
+                                        "SetWaitableTimer failed; coalescing falls back to thread::sleep"
+                                    );
                                 }
                             }
                         }
-                        if !waited {
-                            std::thread::sleep(coalesce);
-                        }
                     }
-                }
-                let now = platform::qpc();
-                let n = drain_buffer(&mut *state_ptr, &mut raw_buf, &stamper, stamping, now);
-                // The interval estimate only learns from observed wakes; a
-                // spread drain has none (its spacing is the period over its
-                // count, which needs no estimate).
-                if let Stamping::Anchored { wake } = stamping {
-                    stamper.finish(wake.min(now), n);
-                }
-                // Two relaxed stores on T1's own cache line: the estimate the
-                // reported polling rate is derived from, and how many drains
-                // produced it.
-                #[cfg(feature = "observability")]
-                {
-                    let step_us =
-                        (stamper.step() as u128 * 1_000_000 / qpc_freq.max(1) as u128) as u32;
-                    t1_stats
-                        .t1
-                        .report_interval_us
-                        .store(step_us, Ordering::Relaxed);
-                    drains = drains.wrapping_add(1);
-                    t1_stats.t1.drains.store(drains, Ordering::Relaxed);
-                }
-                prev_now = now;
-                let was_live = live;
-                live = n > 0 && !coalesce.is_zero();
-                if was_live
-                    && !live
-                    && let Some(timer) = coalesce_timer
-                {
-                    // The stream paused: stop the periodic timer so an idle
-                    // desk costs nothing, and go back to waiting on the queue.
-                    let _ = CancelWaitableTimer(timer);
-                }
-
-                // Everything that is not raw input — hotkey, display change,
-                // quit — plus any WM_INPUT that slipped in after the drain.
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    match msg.message {
-                        WM_QUIT => break 'pump,
-                        WM_INPUT => {
-                            handle_input(&mut *state_ptr, msg.lParam, platform::qpc());
-                            let _ = DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
-                        }
-                        _ => {
-                            let _ = DispatchMessageW(&msg);
-                        }
+                    if !waited {
+                        std::thread::sleep(coalesce);
                     }
                 }
             }
+            let now = platform::qpc();
+            // SAFETY: on the registering thread; no other reference to the
+            // state is live, and the drain dispatches nothing, so `wndproc`
+            // cannot run while this one exists (module docs).
+            let n = unsafe { drain_buffer(&mut *state_ptr, &mut raw_buf, &stamper, stamping, now) };
+            // The interval estimate only learns from observed wakes; a
+            // spread drain has none (its spacing is the period over its
+            // count, which needs no estimate).
+            if let Stamping::Anchored { wake } = stamping {
+                stamper.finish(wake.min(now), n);
+            }
+            // Two relaxed stores on T1's own cache line: the estimate the
+            // reported polling rate is derived from, and how many drains
+            // produced it.
+            #[cfg(feature = "observability")]
+            {
+                let step_us =
+                    u32::try_from(ticks_to_us_u64(stamper.step(), qpc_freq)).unwrap_or(u32::MAX);
+                t1_stats
+                    .t1
+                    .report_interval_us
+                    .store(step_us, Ordering::Relaxed);
+                drains = drains.wrapping_add(1);
+                t1_stats.t1.drains.store(drains, Ordering::Relaxed);
+            }
+            prev_now = now;
+            let was_live = live;
+            live = n > 0 && !coalesce.is_zero();
+            if was_live
+                && !live
+                && let Some(timer) = coalesce_timer
+            {
+                // The stream paused: stop the periodic timer so an idle
+                // desk costs nothing, and go back to waiting on the queue.
+                // SAFETY: our live timer handle.
+                let _ = unsafe { CancelWaitableTimer(timer) };
+            }
 
-            if hotkey_registered {
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            // Everything that is not raw input — hotkey, display change,
+            // quit — plus any WM_INPUT that slipped in after the drain.
+            // SAFETY: `msg` is a live local. PeekMessageW may run `wndproc`
+            // for messages *sent* to this thread; no reference to the state
+            // is live across the call, so that is sound (module docs).
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                match msg.message {
+                    WM_QUIT => break 'pump,
+                    WM_INPUT => {
+                        // SAFETY: a WM_INPUT just peeked on this thread and
+                        // not yet passed on; the only live reference to the
+                        // state, and the read dispatches nothing.
+                        unsafe { handle_input(&mut *state_ptr, msg.lParam, platform::qpc()) };
+                        // SAFETY: handing the peeked WM_INPUT back for the
+                        // system's cleanup, as the API requires.
+                        let _ = unsafe {
+                            DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam)
+                        };
+                    }
+                    _ => {
+                        // SAFETY: a message just peeked. Dispatching runs
+                        // `wndproc`, which forms its own reference to the
+                        // state — sound because none is live here.
+                        let _ = unsafe { DispatchMessageW(&msg) };
+                    }
+                }
             }
-            if let Some(timer) = coalesce_timer {
-                let _ = CloseHandle(timer);
-            }
-            // Detach the state before it goes out of scope.
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            let _ = DestroyWindow(hwnd);
-            tracing::debug!("capture thread finished");
-            Ok(())
         }
+
+        if hotkey_registered {
+            // SAFETY: the id we registered on our own window.
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
+        }
+        if let Some(timer) = coalesce_timer {
+            // SAFETY: our timer handle, closed once, after its last use.
+            let _ = unsafe { CloseHandle(timer) };
+        }
+        // Detach the state before it goes out of scope.
+        detach_and_destroy(hwnd);
+        tracing::debug!("capture thread finished");
+        Ok(())
     }
 }
 

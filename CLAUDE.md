@@ -33,6 +33,8 @@ cargo test --workspace --locked
 cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
 node --check crates/viz/src/app.js
 node --test "crates/viz/js-tests/*.test.mjs"
+node --check crates/ctl/src/panel.js
+node --test "crates/ctl/js-tests/*.test.mjs"
 ```
 
 Tests need no mouse, admin rights, Kafka or browser. Run the full list before
@@ -47,8 +49,9 @@ saying a change is done; a formatting or clippy miss fails CI.
   or talks to Kafka goes behind the matching feature. Every crate must build
   and test with `--no-default-features` too.
 - **Embedded pages need a rebuild.** `crates/viz` (`index.html`, `app.js`) and
-  the ctl page are compiled into the binaries with `include_str!`. Editing
-  them does nothing until the crate is rebuilt. `app.js` has Node tests.
+  the ctl page (`index.html` shell + `panel.js`) are compiled into the
+  binaries with `include_str!`. Editing them does nothing until the crate is
+  rebuilt. Both scripts have Node tests (`crates/{viz,ctl}/js-tests`).
 - **ctl stays a console app.** The tray/status window lives in
   `crates/ctl/src/gui` but the exe keeps the console subsystem; Ctrl-Break
   delivery to children depends on it. `--no-gui` exists for headless runs.
@@ -70,7 +73,8 @@ saying a change is done; a formatting or clippy miss fails CI.
   `Patch` struct's allow-list; bind addresses, Kafka, `bin_dir` and
   `log_dir` stay hand-edit only (LAN exposure). A new user-facing key
   belongs in `Patch`, the Settings card and `docs/API.md`.
-- **`telemouse.toml` is this machine's live config** (LAN bind, Kafka on).
+- **`telemouse.toml` is this machine's live config** (LAN bind, Kafka on) and
+  is git-ignored since 2026-10-11; ctl seeds a fresh one from the example.
   Do not copy its values into `telemouse.example.toml`; the example keeps
   loopback defaults.
 - **Recording ids** go through `telemouse_core::recordings::is_safe_id`
@@ -111,11 +115,14 @@ Bump `version` in the root `Cargo.toml`, add a `## [X.Y.Z]` section to
 does not match the Cargo version and uses the changelog section as the notes.
 It publishes one zip (five default-feature binaries) and signs the exes with
 Azure Artifact Signing when the secrets exist (`docs/DEVELOPING.md`, "Code
-signing"); without them the release is unsigned. A new binary has to be added
-in three places in `release.yml` (the `Copy-Item` in *Package*, the signing
-file list, and the verification loop) or it ships unsigned or not at all. The
-exe icon is
-`assets/telemouse.ico` (regenerate with `assets/make-icon.ps1`).
+signing"); without them the release is unsigned. A new binary is added once,
+to the job-level `BINS` list in `release.yml`; packaging, signing and
+verification all loop over it. The toolchain version lives only in
+`rust-toolchain.toml` (CI installs it with a plain `rustup toolchain
+install`), and every third-party action is pinned to a commit SHA that
+Dependabot bumps. The exe icon is `assets/telemouse.ico` (regenerate with
+`assets/make-icon.ps1`); the version resource comes from the shared
+`build-support/resource.rs` that every `build.rs` includes.
 
 ## Where things land at runtime
 
@@ -135,4 +142,6 @@ fixes are under v0.1.2), `docs/AGENTIC-2026-09-13.md` (the agentic-workflow
 menu, build order and what has landed; steps 1-3 are done, the post-session
 triage note and the log-health loop are next),
 `docs/ANTICHEAT-2026-09-14.md` (RICOCHET exposure audit, the public record
-in `-sources.md`, what landed from it).
+in `-sources.md`, what landed from it),
+`docs/SENSOR-SKIPS-2026-09-29.md` (proposal, not built: detecting the
+mouse's own missed reports and spikes, which today nothing flags).

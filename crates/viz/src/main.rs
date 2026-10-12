@@ -35,6 +35,9 @@ use crate::shutdown::Shutdown;
 #[cfg(feature = "observability")]
 use std::time::Instant;
 
+#[cfg(feature = "observability")]
+use crate::stats::{Delta, FeedState, Snapshot};
+
 /// How often the `viz_stats` frame is pushed to connected pages.
 #[cfg(feature = "observability")]
 const PUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -277,6 +280,7 @@ async fn serve(args: ServeArgs, log_file: Option<PathBuf>, stop: Shutdown) -> Re
         // Every connected page holds a task of its own; each one watches this
         // and sends a `Close` frame rather than being cut off mid-stop.
         shutdown: stop.clone(),
+        refusals: Arc::default(),
     };
     // With the peer address attached, so the network gate can tell a
     // second PC from a browser on this one.
@@ -426,13 +430,15 @@ impl axum::serve::Listener for NoDelayListener {
 async fn stats_reporter(hub: Arc<Hub>) {
     let mut prev = hub.stats.snapshot();
     let mut last = Instant::now();
-    let mut log_prev = prev;
-    let mut log_last = last;
-    let mut prev_bytes = hub.stats.bytes_forwarded();
-    let mut prev_gaps = hub.stats.seq_gaps();
+    let mut window = LogWindow::new(
+        prev,
+        last,
+        hub.stats.bytes_forwarded(),
+        hub.stats.seq_gaps(),
+    );
     let mut pushes: u32 = 0;
     let mut quiet_intervals: u32 = 0;
-    let mut feed = "never";
+    let mut feed = FeedState::Never;
 
     let mut ticker = tokio::time::interval(PUSH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -440,11 +446,9 @@ async fn stats_reporter(hub: Arc<Hub>) {
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        let secs = now.duration_since(last).as_secs_f64();
-        last = now;
         let cur = hub.stats.snapshot();
-        let d = cur.delta(&prev, secs);
-        prev = cur;
+        let d = cur.delta(&prev, now.duration_since(last).as_secs_f64());
+        (prev, last) = (cur, now);
         hub.stats.set_datagrams_per_s(d.datagrams_per_s);
 
         // Push first: the page's readout should be live even while the log
@@ -461,64 +465,38 @@ async fn stats_reporter(hub: Arc<Hub>) {
         }
         pushes = 0;
 
-        let log_secs = now.duration_since(log_last).as_secs_f64();
-        log_last = now;
-        let ld = cur.delta(&log_prev, log_secs);
-        log_prev = cur;
+        let w = window.advance(cur, now, hub.stats.bytes_forwarded(), hub.stats.seq_gaps());
+        hub.stats.set_kb_per_s(w.kb_per_s);
         let lat = hub.stats.roll_latency();
         let gaps = hub.stats.roll_gaps();
-
-        let bytes = hub.stats.bytes_forwarded();
-        let window_bytes = bytes.saturating_sub(prev_bytes);
-        prev_bytes = bytes;
-        let kb_per_s = if log_secs > 0.0 {
-            window_bytes as f64 / 1024.0 / log_secs
-        } else {
-            0.0
-        };
-        hub.stats.set_kb_per_s(kb_per_s);
-        let seq_gaps_total = hub.stats.seq_gaps();
-        let seq_gaps = seq_gaps_total.saturating_sub(prev_gaps);
-        prev_gaps = seq_gaps_total;
         let queue_depth = hub.queued();
         let queue_depth_max = hub.stats.take_queue_depth_max();
 
-        // A feed that stops (or comes back) is the single most useful thing
-        // in this log, and it is invisible in the counters: they simply stop
-        // moving. Say it once per transition.
-        let now_feed = crate::stats::feed_state(
-            hub.stats.udp_bound(),
-            hub.stats.last_datagram_age_s(crate::stats::now_utc_us()),
+        feed = feed_transition(
+            feed,
+            crate::stats::feed_state(
+                hub.stats.udp_bound(),
+                hub.stats.last_datagram_age_s(crate::stats::now_utc_us()),
+            ),
         );
-        if now_feed != feed {
-            match now_feed {
-                "stalled" => warn!(
-                    previous = feed,
-                    after_s = crate::stats::FEED_STALL_AFTER_S,
-                    "no datagrams from the capture agent; live mode is idle"
-                ),
-                _ => info!(previous = feed, feed = now_feed, "feed state changed"),
-            }
-            feed = now_feed;
-        }
 
-        let idle = ld.datagrams == 0 && ld.parse_errors == 0 && cur.clients == 0;
-        if idle && quiet_intervals + 1 < HEARTBEAT_EVERY {
+        if w.is_idle() && quiet_intervals + 1 < HEARTBEAT_EVERY {
             // Idle and unobserved: stay quiet rather than spamming the log —
             // but not forever (see `HEARTBEAT_EVERY`).
             quiet_intervals += 1;
             continue;
         }
         quiet_intervals = 0;
+        let ld = w.delta;
         info!(
             datagrams_per_s = format_args!("{:.1}", ld.datagrams_per_s),
-            kb_per_s = format_args!("{kb_per_s:.1}"),
+            kb_per_s = format_args!("{:.1}", w.kb_per_s),
             forwarded = ld.forwarded,
-            bytes_forwarded = bytes,
+            bytes_forwarded = w.bytes_total,
             parse_errors = ld.parse_errors,
             parse_errors_total = cur.parse_errors,
-            seq_gaps,
-            seq_gaps_total,
+            seq_gaps = w.seq_gaps,
+            seq_gaps_total = w.seq_gaps_total,
             ws_clients = cur.clients,
             session_cached = hub.cached_session().is_some(),
             queue_depth,
@@ -532,9 +510,91 @@ async fn stats_reporter(hub: Arc<Hub>) {
             lat_negative = lat.negative,
             gap_p99_ms = format_args!("{:.1}", gaps.p99_ms()),
             gap_max_ms = format_args!("{:.1}", gaps.max_ms()),
-            feed,
+            feed = %feed,
             "viz stats"
         );
+    }
+}
+
+/// A feed that stops (or comes back) is the single most useful thing in this
+/// log, and it is invisible in the counters: they simply stop moving. Say it
+/// once per transition; returns the state to remember.
+#[cfg(feature = "observability")]
+fn feed_transition(previous: FeedState, now: FeedState) -> FeedState {
+    if now != previous {
+        match now {
+            FeedState::Stalled => warn!(
+                %previous,
+                after_s = crate::stats::FEED_STALL_AFTER_S,
+                "no datagrams from the capture agent; live mode is idle"
+            ),
+            _ => info!(%previous, feed = %now, "feed state changed"),
+        }
+    }
+    now
+}
+
+/// The counters as they stood at the previous 5 s log line, so each line
+/// reports what happened since. Pure, so the delta maths is tested without a
+/// runtime.
+#[cfg(feature = "observability")]
+#[derive(Debug, Clone, Copy)]
+struct LogWindow {
+    snap: Snapshot,
+    at: Instant,
+    bytes: u64,
+    seq_gaps: u64,
+}
+
+/// One closed [`LogWindow`].
+#[cfg(feature = "observability")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LogDelta {
+    delta: Delta,
+    clients: i64,
+    bytes_total: u64,
+    kb_per_s: f64,
+    seq_gaps: u64,
+    seq_gaps_total: u64,
+}
+
+#[cfg(feature = "observability")]
+impl LogWindow {
+    fn new(snap: Snapshot, at: Instant, bytes: u64, seq_gaps: u64) -> Self {
+        Self {
+            snap,
+            at,
+            bytes,
+            seq_gaps,
+        }
+    }
+
+    /// Close the window at `now` with the current totals and open the next.
+    fn advance(&mut self, cur: Snapshot, now: Instant, bytes: u64, seq_gaps: u64) -> LogDelta {
+        let secs = now.duration_since(self.at).as_secs_f64();
+        let window_bytes = bytes.saturating_sub(self.bytes);
+        let out = LogDelta {
+            delta: cur.delta(&self.snap, secs),
+            clients: cur.clients,
+            bytes_total: bytes,
+            kb_per_s: if secs > 0.0 {
+                window_bytes as f64 / 1024.0 / secs
+            } else {
+                0.0
+            },
+            seq_gaps: seq_gaps.saturating_sub(self.seq_gaps),
+            seq_gaps_total: seq_gaps,
+        };
+        *self = Self::new(cur, now, bytes, seq_gaps);
+        out
+    }
+}
+
+#[cfg(feature = "observability")]
+impl LogDelta {
+    /// Nothing arrived, nothing was rejected, and nobody is watching.
+    fn is_idle(&self) -> bool {
+        self.delta.datagrams == 0 && self.delta.parse_errors == 0 && self.clients == 0
     }
 }
 
@@ -651,6 +711,7 @@ mod tests {
             sessions: Arc::new(server::SessionsCache::default()),
             addrs: Arc::new(server::Addrs::default()),
             shutdown: stop.clone(),
+            refusals: Arc::default(),
         };
         let app = server::router(state).into_make_service_with_connect_info::<server::Peer>();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -812,6 +873,48 @@ mod tests {
             .expect("an idle server must stop on the signal")
             .unwrap()
             .unwrap();
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn the_log_window_reports_deltas_and_reopens() {
+        let t0 = Instant::now();
+        let mut w = LogWindow::new(Snapshot::default(), t0, 1_000, 2);
+        let cur = Snapshot {
+            datagrams: 200,
+            parse_errors: 1,
+            forwarded: 199,
+            ..Default::default()
+        };
+        let d = w.advance(cur, t0 + Duration::from_secs(5), 1_000 + 5 * 2048, 5);
+        assert!((d.delta.datagrams_per_s - 40.0).abs() < 1e-9);
+        assert!((d.kb_per_s - 2.0).abs() < 1e-9);
+        assert_eq!((d.seq_gaps, d.seq_gaps_total), (3, 5));
+        assert!(!d.is_idle());
+
+        // Nothing since: the next window is idle and its rates are zero.
+        let d = w.advance(cur, t0 + Duration::from_secs(10), 1_000 + 5 * 2048, 5);
+        assert_eq!(d.delta.datagrams, 0);
+        assert_eq!(d.kb_per_s, 0.0);
+        assert_eq!(d.seq_gaps, 0);
+        assert!(d.is_idle());
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn feed_transition_remembers_the_new_state() {
+        assert_eq!(
+            feed_transition(FeedState::Never, FeedState::Live),
+            FeedState::Live
+        );
+        assert_eq!(
+            feed_transition(FeedState::Live, FeedState::Live),
+            FeedState::Live
+        );
+        assert_eq!(
+            feed_transition(FeedState::Live, FeedState::Stalled),
+            FeedState::Stalled
+        );
     }
 
     #[test]

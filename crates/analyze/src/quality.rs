@@ -32,7 +32,7 @@ const POLL_MAX_MS: f64 = 20.0;
 /// while staying coarse enough that USB jitter does not smear the mode.
 const POLL_BUCKET_MS: f64 = 0.125;
 /// `POLL_MAX_MS / POLL_BUCKET_MS`, plus the bucket that holds exactly 20 ms.
-const POLL_BUCKETS: usize = 161;
+const POLL_BUCKETS: usize = (POLL_MAX_MS / POLL_BUCKET_MS) as usize + 1;
 /// An interval counts as "at the polling rate" within this much of the mode.
 const POLL_TOLERANCE: f64 = 0.10;
 /// Minutes with fewer qualifying intervals than this do not get their own
@@ -56,6 +56,11 @@ pub struct SidecarSummary {
     pub poll_hz: Option<f64>,
     /// Events the agent counted. Compared against what the file holds.
     pub events: u64,
+    /// Envelopes each sink failed to deliver, `[["kafka", 400], ...]` —
+    /// `SessionMeta::losses`. Absent from reports cached before it was
+    /// carried; those are refreshed from the sidecar on every cache hit.
+    #[serde(default)]
+    pub sink_losses: Vec<(String, u64)>,
 }
 
 impl SidecarSummary {
@@ -67,6 +72,7 @@ impl SidecarSummary {
             capture_profile: meta.capture_profile.clone(),
             poll_hz: meta.poll_hz,
             events: meta.events,
+            sink_losses: meta.losses(),
         }
     }
 }
@@ -414,42 +420,59 @@ impl QualityReport {
     }
 }
 
+impl QualityReport {
+    /// Replace the sidecar-derived fields with what `meta` says now, and
+    /// recompute `clean`; returns the refreshed warnings.
+    ///
+    /// The capture agent writes its final sidecar *after* the recording's
+    /// last flush, so a report computed (and cached) while the run was going
+    /// would otherwise say "unfinished" forever: the recording never changes
+    /// again, so the cache is never invalidated. A cache hit calls this.
+    pub fn set_sidecar(&mut self, meta: Option<&SessionMeta>) -> Vec<String> {
+        self.sidecar = meta.map(SidecarSummary::of);
+        let warnings = self.warnings();
+        self.clean = warnings.is_empty();
+        warnings
+    }
+}
+
+/// The interval histogram. Buckets are `(lo, hi]`, so a clean 1 kHz stream
+/// lands in `≤1ms` rather than straddling it.
 fn histogram(intervals: &[f64]) -> Vec<IntervalBucket> {
     let total = intervals.len().max(1) as f64;
+    let counts = stats::bucket_counts(&INTERVAL_EDGES, intervals, stats::Edge::Inclusive);
     let mut out: Vec<IntervalBucket> = Vec::with_capacity(INTERVAL_EDGES.len() + 1);
     let mut lo = 0.0;
-    for &hi in &INTERVAL_EDGES {
+    for (&hi, &count) in INTERVAL_EDGES.iter().zip(&counts) {
         out.push(IntervalBucket {
             label: format!("≤{hi}ms"),
             lo_ms: lo,
             hi_ms: Some(hi),
-            count: 0,
-            fraction: 0.0,
+            count,
+            fraction: count as f64 / total,
         });
         lo = hi;
     }
+    let count = counts[INTERVAL_EDGES.len()];
     out.push(IntervalBucket {
         label: format!(">{lo}ms"),
         lo_ms: lo,
         hi_ms: None,
-        count: 0,
-        fraction: 0.0,
+        count,
+        fraction: count as f64 / total,
     });
-
-    for &v in intervals {
-        let idx = INTERVAL_EDGES
-            .iter()
-            .position(|&e| v <= e)
-            .unwrap_or(INTERVAL_EDGES.len());
-        out[idx].count += 1;
-    }
-    for b in &mut out {
-        b.fraction = b.count as f64 / total;
-    }
     out
 }
 
+/// The quality report alone. [`compute_with_warnings`] when the warnings are
+/// needed too: it formats them once instead of twice.
 pub fn compute(p: &Prepared) -> QualityReport {
+    compute_with_warnings(p).0
+}
+
+/// The quality report, and its [`QualityReport::warnings`] — computed once,
+/// used both for `clean` and for the report's own warning list.
+pub fn compute_with_warnings(p: &Prepared) -> (QualityReport, Vec<String>) {
     let session = &p.session;
 
     // Intervals come off the integer µs timeline: at 1 kHz the whole histogram
@@ -562,15 +585,18 @@ pub fn compute(p: &Prepared) -> QualityReport {
         anchor_uncertainty_us: session.config.anchor_uncertainty_us,
         aim_profile_missing: p.aim_fallback,
         grid_truncated: p.grid_truncated,
-        sidecar: crate::load::read_sidecar(&session.path)
-            .as_ref()
-            .map(SidecarSummary::of),
+        // Read once at load time; see `LoadedSession::sidecar`.
+        sidecar: session.sidecar.as_ref().map(SidecarSummary::of),
         clean: false,
     };
-    QualityReport {
-        clean: report.warnings().is_empty(),
-        ..report
-    }
+    let warnings = report.warnings();
+    (
+        QualityReport {
+            clean: warnings.is_empty(),
+            ..report
+        },
+        warnings,
+    )
 }
 
 #[cfg(test)]
@@ -581,7 +607,45 @@ mod tests {
     use crate::testutil::{StreamBuilder, batch_meta, loaded_from, loaded_with_batches};
 
     fn analyze(session: LoadedSession) -> QualityReport {
-        compute(&prepare(session, Params::default()))
+        compute(&prepare(session, Params::default()).unwrap())
+    }
+
+    #[test]
+    fn the_polling_histogram_covers_exactly_up_to_the_cap() {
+        assert_eq!(POLL_BUCKETS, 161);
+    }
+
+    /// A report that was computed while the run was going is brought up to
+    /// date when the agent's final sidecar appears.
+    #[test]
+    fn a_late_sidecar_refreshes_the_verdict() {
+        use telemouse_core::recordings::ExitReason;
+
+        let mut b = StreamBuilder::new();
+        b.move_ms(200, 3, 0);
+        let mut session = loaded_from(b.into_events(), Some("cs2.exe"));
+        session.sidecar = Some(SessionMeta {
+            exit: ExitReason::Running.as_str().into(),
+            events: 200,
+            ..Default::default()
+        });
+        let mut q = analyze(session);
+        assert!(q.sidecar.as_ref().unwrap().unfinished);
+        assert!(!q.clean);
+
+        let done = SessionMeta {
+            exit: ExitReason::Interrupt.as_str().into(),
+            events: 200,
+            ..Default::default()
+        };
+        let warnings = q.set_sidecar(Some(&done));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(q.clean);
+        assert_eq!(q.sidecar.as_ref().unwrap().exit, "interrupt");
+
+        // And a sidecar that disappears takes its fields with it.
+        assert!(q.set_sidecar(None).is_empty());
+        assert_eq!(q.sidecar, None);
     }
 
     #[test]

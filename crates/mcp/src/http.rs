@@ -196,12 +196,13 @@ pub fn parse(addr: SocketAddr, raw: &[u8]) -> Result<Response, HttpError> {
     })
 }
 
-/// First index of `needle` in `haystack`.
+/// First index of `needle` in `haystack`; `None` for an empty needle
+/// (`windows(0)` would panic).
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .filter(|_| !needle.is_empty())
+    if needle.is_empty() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Reassemble a `Transfer-Encoding: chunked` body, or `None` if it is
@@ -229,6 +230,7 @@ fn dechunk(mut rest: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use telemouse_core::localhost::{CTL_GUARD_HEADER, CTL_GUARD_VALUE};
 
     fn addr() -> SocketAddr {
         "127.0.0.1:7880".parse().unwrap()
@@ -242,7 +244,7 @@ mod tests {
                 method: "POST",
                 path: "/api/components/capture/start",
                 body: Some("{\"save\":true}"),
-                headers: &[("X-Telemouse-Ctl", "1")],
+                headers: &[(CTL_GUARD_HEADER, CTL_GUARD_VALUE)],
             },
         );
         let text = String::from_utf8(raw).unwrap();
@@ -255,6 +257,13 @@ mod tests {
         assert!(text.contains("\r\nX-Telemouse-Ctl: 1\r\n"));
         assert!(text.contains("\r\nContent-Length: 13\r\n"));
         assert!(text.ends_with("\r\n\r\n{\"save\":true}"));
+    }
+
+    #[test]
+    fn find_handles_an_empty_needle_without_panicking() {
+        assert_eq!(find(b"abc", b""), None);
+        assert_eq!(find(b"", b"\r\n"), None);
+        assert_eq!(find(b"a\r\nb", b"\r\n"), Some(1));
     }
 
     #[test]
@@ -363,7 +372,7 @@ mod tests {
                 method: "POST",
                 path: "/api/components/capture/start",
                 body: Some("{}"),
-                headers: &[("X-Telemouse-Ctl", "1")],
+                headers: &[(CTL_GUARD_HEADER, CTL_GUARD_VALUE)],
             },
         )
         .await

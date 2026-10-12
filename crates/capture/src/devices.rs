@@ -117,16 +117,24 @@ mod win {
         RIDI_DEVICENAME, RIM_TYPEMOUSE,
     };
 
+    /// Longest device name accepted, in UTF-16 units. Real HID paths are a
+    /// couple of hundred; anything past this is a bogus length, not a name.
+    const MAX_NAME_CHARS: u32 = 4096;
+
     /// Name of one raw-input device, e.g. `\\?\HID#VID_1532&PID_0099#...`.
     pub(super) fn device_name(handle: isize) -> Option<String> {
         let h = HANDLE(handle as *mut core::ffi::c_void);
         let mut chars = 0u32;
         // First call with a null buffer asks for the required length.
+        // SAFETY: a null buffer is the documented size query; the length is
+        // written through a valid local. A stale handle just fails.
         let probe = unsafe { GetRawInputDeviceInfoW(Some(h), RIDI_DEVICENAME, None, &mut chars) };
-        if probe == u32::MAX || chars == 0 || chars > 4096 {
+        if probe == u32::MAX || chars == 0 || chars > MAX_NAME_CHARS {
             return None;
         }
         let mut buf = vec![0u16; chars as usize];
+        // SAFETY: `buf` holds exactly `chars` UTF-16 units, the capacity
+        // `chars` tells the API, and it outlives the call.
         let written = unsafe {
             GetRawInputDeviceInfoW(
                 Some(h),
@@ -150,11 +158,16 @@ mod win {
     pub fn enumerate_mice() -> Vec<(isize, String)> {
         let mut count = 0u32;
         let size = size_of::<RAWINPUTDEVICELIST>() as u32;
+        // SAFETY: a null list is the documented count query; the count is
+        // written through a valid local.
         let probe = unsafe { GetRawInputDeviceList(None, &mut count, size) };
         if probe == u32::MAX || count == 0 {
             return Vec::new();
         }
         let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+        // SAFETY: `list` has room for `count` entries of `size` bytes each,
+        // which is what `count` and `size` tell the API; a device added in
+        // between makes the call fail rather than overrun.
         let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size) };
         if got == u32::MAX {
             return Vec::new();

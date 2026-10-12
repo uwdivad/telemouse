@@ -37,7 +37,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::flicks::reversals;
-use crate::series::Prepared;
+use crate::series::{Prepared, Run};
 use crate::stats::{self, Summary};
 
 /// Sample rate the spectral estimate runs at, Hz. Nyquist 25 Hz covers the
@@ -84,7 +84,9 @@ pub struct MicroReport {
     /// RMS of the high-passed velocity over every moving sample, counts/s.
     pub tremor_rms_counts_s: f64,
     pub tremor_rms_cm_s: f64,
-    /// Fraction of the session's moving samples that fed the tremor estimate.
+    /// Share of the session's grid cells that carried any motion and so fed
+    /// the tremor estimate (idle cells are excluded from it; see the module
+    /// docs).
     pub tremor_sample_fraction: f64,
     /// Per-Hz band power of the high-passed velocity.
     pub band_power: Vec<BandBin>,
@@ -100,7 +102,9 @@ pub struct MicroReport {
     pub spectrum_fs_hz: f64,
 
     pub micro_adjustments: Vec<AmplitudeBucket>,
-    /// Net amplitude of each movement segment, degrees.
+    /// Net amplitude of each movement segment, degrees — over the segments
+    /// that start where `Params::locked_only` admits aim (all of them when it
+    /// is off).
     pub segment_amplitude_deg: Summary,
 }
 
@@ -122,21 +126,30 @@ impl TremorSeries {
         }
         let sum: f64 = self.sumsq[a..b].iter().sum();
         let n: u32 = self.active[a..b].iter().sum();
-        if n == 0 { 0.0 } else { (sum / n as f64).sqrt() }
+        stats::rms_of_energy(sum, n as usize)
     }
 }
 
-/// Centered boxcar of width `2 * half + 1`, computed with prefix sums so a long
-/// session stays linear-time. Edges shrink the window rather than pad it.
-pub fn boxcar(x: &[f64], half: usize) -> Vec<f64> {
-    let n = x.len();
-    let mut prefix = Vec::with_capacity(n + 1);
+/// `prefix[i]` = sum of `x[..i]`, written into a reused buffer.
+fn prefix_sums(x: &[f64], prefix: &mut Vec<f64>) {
+    prefix.clear();
+    prefix.reserve(x.len() + 1);
     prefix.push(0.0);
     let mut acc = 0.0;
     for &v in x {
         acc += v;
         prefix.push(acc);
     }
+}
+
+/// Centered boxcar of width `2 * half + 1`, computed with prefix sums so a long
+/// session stays linear-time. Edges shrink the window rather than pad it. The
+/// dense reference [`residual_into`] is tested against.
+#[cfg(test)]
+pub(crate) fn boxcar(x: &[f64], half: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut prefix = Vec::new();
+    prefix_sums(x, &mut prefix);
     (0..n)
         .map(|i| {
             let a = i.saturating_sub(half);
@@ -161,13 +174,7 @@ fn residual_into(
     out: &mut Vec<f64>,
     prefix: &mut Vec<f64>,
 ) {
-    prefix.clear();
-    prefix.push(0.0);
-    let mut acc = 0.0;
-    for &v in x {
-        acc += v;
-        prefix.push(acc);
-    }
+    prefix_sums(x, prefix);
     out.clear();
     out.reserve(x.len());
     for (i, &v) in x.iter().enumerate() {
@@ -208,43 +215,36 @@ const BUCKET_EDGES: [f64; 10] = [
     2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0,
 ];
 
+/// The micro-adjustment size histogram. Buckets are `[lo, hi)`: a 5-count
+/// adjustment is in `5–10`, not `2–5`.
 fn histogram(p: &Prepared, amps_counts: &[f64]) -> Vec<AmplitudeBucket> {
     let (kx, _) = p.aim_scale();
     let total = amps_counts.len().max(1) as f64;
+    let counts = stats::bucket_counts(&BUCKET_EDGES, amps_counts, stats::Edge::Exclusive);
     let mut buckets: Vec<AmplitudeBucket> = Vec::with_capacity(BUCKET_EDGES.len() + 1);
     let mut lo = 0.0;
-    for &hi in &BUCKET_EDGES {
+    for (&hi, &count) in BUCKET_EDGES.iter().zip(&counts) {
         buckets.push(AmplitudeBucket {
             label: format!("{lo:.0}–{hi:.0}"),
             lo_counts: lo,
             hi_counts: Some(hi),
             lo_deg: lo * kx,
             hi_deg: Some(hi * kx),
-            count: 0,
-            fraction: 0.0,
+            count,
+            fraction: count as f64 / total,
         });
         lo = hi;
     }
+    let count = counts[BUCKET_EDGES.len()];
     buckets.push(AmplitudeBucket {
         label: format!("{lo:.0}+"),
         lo_counts: lo,
         hi_counts: None,
         lo_deg: lo * kx,
         hi_deg: None,
-        count: 0,
-        fraction: 0.0,
+        count,
+        fraction: count as f64 / total,
     });
-
-    for &a in amps_counts {
-        let idx = BUCKET_EDGES
-            .iter()
-            .position(|&e| a < e)
-            .unwrap_or(BUCKET_EDGES.len());
-        buckets[idx].count += 1;
-    }
-    for b in &mut buckets {
-        b.fraction = b.count as f64 / total;
-    }
     buckets
 }
 
@@ -252,94 +252,145 @@ pub fn compute(p: &Prepared) -> MicroReport {
     compute_full(p).0
 }
 
-/// The micro report plus the per-second tremor energy the longitudinal tables
-/// slice up.
-pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
-    let g = &p.grid;
-    let segs = p.segments();
+/// Per-segment corrections and amplitudes.
+struct SegmentPass {
+    /// Reversals per segment, as `f64` for the summary.
+    corrections: Vec<f64>,
+    /// Net amplitude per segment, counts — every segment.
+    amps_counts: Vec<f64>,
+    /// Net amplitude per segment, degrees — the segments `locked_only`
+    /// admits as aim.
+    amps_deg: Vec<f64>,
+}
 
-    let mut corr_counts = Vec::with_capacity(segs.len());
-    let mut amps_counts = Vec::with_capacity(segs.len());
-    let mut amps_deg = Vec::with_capacity(segs.len());
+fn segment_pass(p: &Prepared) -> SegmentPass {
+    let segs = p.segments();
+    let mut out = SegmentPass {
+        corrections: Vec::with_capacity(segs.len()),
+        amps_counts: Vec::with_capacity(segs.len()),
+        amps_deg: Vec::with_capacity(segs.len()),
+    };
     for s in segs {
-        let (dx, dy) = g.displacement(s.start, s.end);
+        let (dx, dy) = p.grid.displacement(s.start, s.end);
         let mag = stats::mag(dx, dy);
-        amps_counts.push(mag);
-        amps_deg.push(p.deg_mag(dx, dy));
+        out.amps_counts.push(mag);
+        if p.aim_cell_ok(s.start) {
+            out.amps_deg.push(p.aim_mag(dx, dy));
+        }
         let (ux, uy) = if mag > 0.0 {
             (dx / mag, dy / mag)
         } else {
             (1.0, 0.0)
         };
-        corr_counts.push(reversals(p, s.start, s.end, ux, uy) as f64);
+        out.corrections
+            .push(reversals(p, s.start, s.end, ux, uy) as f64);
     }
-    let total_corrections: usize = corr_counts.iter().sum::<f64>() as usize;
-    let clean = corr_counts.iter().filter(|&&c| c <= 1.0).count();
+    out
+}
 
-    // --- tremor -----------------------------------------------------------
-    let half = p.params.tremor_baseline_ms / 2;
-    let fs = 1.0 / g.dt;
-    let dec = ((fs / DEC_TARGET_HZ).round() as usize).max(1);
-    let fs_dec = fs / dec as f64;
-    let block = ((BLOCK_S * fs_dec).round() as usize).max(8);
-    let hop = (block / 2).max(1);
-    let min_block = ((MIN_BLOCK_S * fs_dec).round() as usize).max(4);
-    let n_dec = g.len().div_ceil(dec);
-    let wlen = block.min(n_dec.max(1));
-    let usable = n_dec >= wlen && wlen >= min_block;
+/// The broadband half of the tremor estimate: residual energy over every
+/// cell that carried motion, at full rate, and per second.
+struct TremorEnergy {
+    per_sec: usize,
+    series: TremorSeries,
+    energy: f64,
+    active: usize,
+}
 
-    let win = hann(wlen);
-    let wsum: f64 = win.iter().sum();
-    let norm = 2.0 / (wsum * wsum);
+impl TremorEnergy {
+    fn new(cells: usize, per_sec: usize) -> Self {
+        let n_sec = cells.div_ceil(per_sec);
+        Self {
+            per_sec,
+            series: TremorSeries {
+                sumsq: vec![0.0; n_sec],
+                active: vec![0u32; n_sec],
+            },
+            energy: 0.0,
+            active: 0,
+        }
+    }
 
-    let per_sec = ((1.0 / g.dt).round() as usize).max(1);
-    let n_sec = g.len().div_ceil(per_sec);
-    let mut tremor = TremorSeries {
-        sumsq: vec![0.0; n_sec],
-        active: vec![0u32; n_sec],
-    };
-
-    // Scratch, allocated once and reused for every run and every Welch block.
-    let mut prefix: Vec<f64> = Vec::new();
-    let mut rx: Vec<f64> = Vec::new();
-    let mut ry: Vec<f64> = Vec::new();
-    let mut dx: Vec<f64> = Vec::new();
-    let mut dy: Vec<f64> = Vec::new();
-    let mut dact: Vec<bool> = Vec::new();
-    let mut bx = vec![0.0f64; wlen];
-    let mut by = vec![0.0f64; wlen];
-
-    let mut acc_bins = vec![0.0; BAND_HI_HZ - BAND_LO_HZ + 1];
-    let mut blocks = 0usize;
-    let mut energy = 0.0;
-    let mut n_active = 0usize;
-
-    for r in &g.runs {
-        residual_into(&r.vx, r.start, g.len(), half, &mut rx, &mut prefix);
-        residual_into(&r.vy, r.start, g.len(), half, &mut ry, &mut prefix);
-
+    fn add_run(&mut self, r: &Run, rx: &[f64], ry: &[f64]) {
         for j in 0..r.len() {
             if r.speed_raw[j] > 0.0 {
                 let e = rx[j] * rx[j] + ry[j] * ry[j];
-                energy += e;
-                n_active += 1;
-                let s = (r.start + j) / per_sec;
-                tremor.sumsq[s] += e;
-                tremor.active[s] += 1;
+                self.energy += e;
+                self.active += 1;
+                let s = (r.start + j) / self.per_sec;
+                self.series.sumsq[s] += e;
+                self.series.active[s] += 1;
             }
         }
+    }
 
-        if !usable {
-            continue;
+    fn rms(&self) -> f64 {
+        stats::rms_of_energy(self.energy, self.active)
+    }
+}
+
+/// The spectral half: a Welch estimate over Hann-windowed blocks of the
+/// residual, block-averaged down to [`DEC_TARGET_HZ`] first (see the module
+/// docs). All scratch is allocated once and reused for every run and block.
+struct Welch {
+    dec: usize,
+    fs_dec: f64,
+    wlen: usize,
+    hop: usize,
+    usable: bool,
+    win: Vec<f64>,
+    norm: f64,
+    dx: Vec<f64>,
+    dy: Vec<f64>,
+    dact: Vec<bool>,
+    bx: Vec<f64>,
+    by: Vec<f64>,
+    acc_bins: Vec<f64>,
+    blocks: usize,
+}
+
+impl Welch {
+    fn new(dt: f64, cells: usize) -> Self {
+        let fs = 1.0 / dt;
+        let dec = ((fs / DEC_TARGET_HZ).round() as usize).max(1);
+        let fs_dec = fs / dec as f64;
+        let block = ((BLOCK_S * fs_dec).round() as usize).max(8);
+        let hop = (block / 2).max(1);
+        let min_block = ((MIN_BLOCK_S * fs_dec).round() as usize).max(4);
+        let n_dec = cells.div_ceil(dec);
+        let wlen = block.min(n_dec.max(1));
+        let win = hann(wlen);
+        let wsum: f64 = win.iter().sum();
+        Self {
+            dec,
+            fs_dec,
+            wlen,
+            hop,
+            usable: n_dec >= wlen && wlen >= min_block,
+            norm: 2.0 / (wsum * wsum),
+            win,
+            dx: Vec::new(),
+            dy: Vec::new(),
+            dact: Vec::new(),
+            bx: vec![0.0; wlen],
+            by: vec![0.0; wlen],
+            acc_bins: vec![0.0; BAND_HI_HZ - BAND_LO_HZ + 1],
+            blocks: 0,
         }
+    }
 
+    fn add_run(&mut self, r: &Run, rx: &[f64], ry: &[f64]) {
+        if !self.usable {
+            return;
+        }
+        let (dec, wlen) = (self.dec, self.wlen);
         // Block-average down to `fs_dec`. Cells the last sample reaches past
         // the run are exactly zero, so dividing by `dec` throughout is right.
         let k0 = r.start / dec;
         let k1 = r.end().div_ceil(dec);
-        dx.clear();
-        dy.clear();
-        dact.clear();
+        self.dx.clear();
+        self.dy.clear();
+        self.dact.clear();
         for k in k0..k1 {
             let a = (k * dec).max(r.start) - r.start;
             let b = ((k + 1) * dec).min(r.end()) - r.start;
@@ -351,51 +402,86 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
                 sy += ry[j];
                 act |= r.speed_raw[j] > 0.0;
             }
-            dx.push(sx / dec as f64);
-            dy.push(sy / dec as f64);
-            dact.push(act);
+            self.dx.push(sx / dec as f64);
+            self.dy.push(sy / dec as f64);
+            self.dact.push(act);
         }
 
         // Blocks sit on global hop boundaries so the estimate does not depend
         // on where a run happens to start.
-        let mut k = k0.div_ceil(hop) * hop;
+        let mut k = k0.div_ceil(self.hop) * self.hop;
         while k + wlen <= k1 {
             let lo = k - k0;
-            if dact[lo..lo + wlen].iter().any(|&a| a) {
-                bx.copy_from_slice(&dx[lo..lo + wlen]);
-                by.copy_from_slice(&dy[lo..lo + wlen]);
-                let mx = stats::mean(&bx).unwrap_or(0.0);
-                let my = stats::mean(&by).unwrap_or(0.0);
+            if self.dact[lo..lo + wlen].iter().any(|&a| a) {
+                self.bx.copy_from_slice(&self.dx[lo..lo + wlen]);
+                self.by.copy_from_slice(&self.dy[lo..lo + wlen]);
+                let mx = stats::mean(&self.bx).unwrap_or(0.0);
+                let my = stats::mean(&self.by).unwrap_or(0.0);
                 for i in 0..wlen {
-                    bx[i] = (bx[i] - mx) * win[i];
-                    by[i] = (by[i] - my) * win[i];
+                    self.bx[i] = (self.bx[i] - mx) * self.win[i];
+                    self.by[i] = (self.by[i] - my) * self.win[i];
                 }
-                for (b, a) in acc_bins.iter_mut().enumerate() {
+                for (b, a) in self.acc_bins.iter_mut().enumerate() {
                     let hz = (BAND_LO_HZ + b) as f64;
-                    *a += (goertzel_mag2(&bx, hz, fs_dec) + goertzel_mag2(&by, hz, fs_dec)) * norm;
+                    *a += (goertzel_mag2(&self.bx, hz, self.fs_dec)
+                        + goertzel_mag2(&self.by, hz, self.fs_dec))
+                        * self.norm;
                 }
-                blocks += 1;
+                self.blocks += 1;
             }
-            k += hop;
+            k += self.hop;
         }
     }
 
-    let scale = if blocks > 0 { 1.0 / blocks as f64 } else { 0.0 };
-    let band_power: Vec<BandBin> = acc_bins
-        .into_iter()
-        .enumerate()
-        .map(|(b, a)| BandBin {
-            hz: (BAND_LO_HZ + b) as f64,
-            power: a * scale,
-        })
-        .collect();
+    /// Mean power per Hz bin over the blocks that carried movement.
+    fn band_power(&self) -> Vec<BandBin> {
+        let scale = if self.blocks > 0 {
+            1.0 / self.blocks as f64
+        } else {
+            0.0
+        };
+        self.acc_bins
+            .iter()
+            .enumerate()
+            .map(|(b, a)| BandBin {
+                hz: (BAND_LO_HZ + b) as f64,
+                power: a * scale,
+            })
+            .collect()
+    }
+}
 
-    let tremor_rms = if n_active > 0 {
-        (energy / n_active as f64).sqrt()
-    } else {
-        0.0
-    };
+/// One sweep over the grid runs: each run's residual is computed once and fed
+/// to both halves of the tremor estimate.
+fn tremor_pass(p: &Prepared) -> (TremorEnergy, Welch) {
+    let g = &p.grid;
+    let half = p.params.tremor_baseline_ms / 2;
+    let mut energy = TremorEnergy::new(g.len(), g.cells_per_second());
+    let mut welch = Welch::new(g.dt, g.len());
+    let mut prefix: Vec<f64> = Vec::new();
+    let mut rx: Vec<f64> = Vec::new();
+    let mut ry: Vec<f64> = Vec::new();
+    for r in &g.runs {
+        residual_into(&r.vx, r.start, g.len(), half, &mut rx, &mut prefix);
+        residual_into(&r.vy, r.start, g.len(), half, &mut ry, &mut prefix);
+        energy.add_run(r, &rx, &ry);
+        welch.add_run(r, &rx, &ry);
+    }
+    (energy, welch)
+}
 
+/// The micro report plus the per-second tremor energy the longitudinal tables
+/// slice up.
+pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
+    let g = &p.grid;
+    let segs = segment_pass(p);
+    let segment_count = segs.corrections.len();
+    let total_corrections: usize = segs.corrections.iter().sum::<f64>() as usize;
+    let clean = segs.corrections.iter().filter(|&&c| c <= 1.0).count();
+
+    let (energy, welch) = tremor_pass(p);
+    let tremor_rms = energy.rms();
+    let band_power = welch.band_power();
     let band_power_total: f64 = band_power.iter().map(|b| b.power).sum();
     let band_power_8_12: f64 = band_power
         .iter()
@@ -412,20 +498,20 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
         .map_or(0.0, |b| b.hz);
 
     let report = MicroReport {
-        corrections_per_segment: Summary::of_vec(corr_counts),
-        total_corrections,
-        clean_segment_fraction: if segs.is_empty() {
+        clean_segment_fraction: if segment_count == 0 {
             0.0
         } else {
-            clean as f64 / segs.len() as f64
+            clean as f64 / segment_count as f64
         },
-        segment_count: segs.len(),
+        segment_count,
+        total_corrections,
+        corrections_per_segment: Summary::of_vec(segs.corrections),
         tremor_rms_counts_s: tremor_rms,
         tremor_rms_cm_s: p.counts_to_cm(tremor_rms),
         tremor_sample_fraction: if g.is_empty() {
             0.0
         } else {
-            n_active as f64 / g.len() as f64
+            energy.active as f64 / g.len() as f64
         },
         band_power,
         band_power_8_12,
@@ -436,12 +522,12 @@ pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
             0.0
         },
         dominant_hz,
-        analyzed_blocks: blocks,
-        spectrum_fs_hz: fs_dec,
-        micro_adjustments: histogram(p, &amps_counts),
-        segment_amplitude_deg: Summary::of_vec(amps_deg),
+        analyzed_blocks: welch.blocks,
+        spectrum_fs_hz: welch.fs_dec,
+        micro_adjustments: histogram(p, &segs.amps_counts),
+        segment_amplitude_deg: Summary::of_vec(segs.amps_deg),
     };
-    (report, tremor)
+    (report, energy.series)
 }
 
 #[cfg(test)]

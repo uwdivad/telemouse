@@ -1,0 +1,110 @@
+{
+  "schema": "telemouse-report-summary/2",
+  "analyzer_version": "0.0.0-fixture",
+  "session": {
+    "session_id": "s-20260101-120000-abcd",
+    "path": "recordings/s-20260101-120000-abcd.jsonl",
+    "started_utc_us": 1767268800000000,
+    "started_utc": "2026-01-01T12:00:00Z",
+    "duration_s": 754.2,
+    "analysis_duration_s": 754.0,
+    "event_count": 612345,
+    "batch_count": 30168,
+    "marker_count": 2,
+    "mouse_cpi": 1600.0,
+    "capture_version": "0.0.0-fixture",
+    "game": "mygame.exe",
+    "sens": 1.25,
+    "yaw_coeff": 0.022,
+    "pitch_coeff": 0.022,
+    "deg_per_count": 0.0275,
+    "cm_per_360": 20.78,
+    "aim_profile_missing": false
+  },
+  "quality": {
+    "events": 612345,
+    "ring_drops": 0,
+    "lost_batches": 0,
+    "seq_gaps": 0,
+    "monotonicity_violations": 0,
+    "bad_lines": 0,
+    "pct_within_1ms": 99.2,
+    "median_interval_ms": 1.0,
+    "p99_interval_ms": 1.9,
+    "gaps_over_10ms": 3,
+    "poll_hz": 1000.0,
+    "locked_fraction": 0.81,
+    "clean": true,
+    "threads_clean": true,
+    "exit": "stopped",
+    "unfinished": false,
+    "capture_profile": "release",
+    "sink_losses": [["kafka", 4], ["jsonl", 0]]
+  },
+  "flicks": {
+    "count": 212,
+    "per_minute": 16.9,
+    "amplitude_deg_median": 31.4,
+    "peak_velocity_deg_s_median": 640.0,
+    "duration_ms_median": 118.0,
+    "overshoot_ratio_median": 0.072,
+    "overshoot_ratio_p90": 0.19,
+    "settle_ms_median": 96.0,
+    "settle_ms_p90": 210.0,
+    "time_to_click_ms_median": 180.0,
+    "clicked_fraction": 0.61
+  },
+  "micro": {
+    "total_corrections": 1840,
+    "clean_segment_fraction": 0.42,
+    "tremor_rms_counts_s": 41.0,
+    "tremor_rms_cm_s": 0.65,
+    "band_ratio_8_12": 0.21,
+    "dominant_hz": 9.5
+  },
+  "clicks": {
+    "total": 455,
+    "per_minute": 36.2,
+    "still_click_fraction": 0.38,
+    "click_to_still_ms_median": 64.0,
+    "hold_ms_median": 92.0,
+    "double_clicks": 4
+  },
+  "kinematics": {
+    "total_distance_m": 48.7,
+    "distance_cm_per_min": 387.5,
+    "moving_fraction": 0.57,
+    "path_efficiency_weighted": 0.83,
+    "speed_cm_per_s_median": 9.1,
+    "speed_cm_per_s_p99": 140.0,
+    "speed_deg_per_s_p99": 1210.0
+  },
+  "lifts": {
+    "count": 37,
+    "per_minute": 2.9,
+    "mean_drift_cm": 0.4
+  },
+  "markers": [
+    { "t_s": 12.5, "label": "sens A <b>" },
+    { "t_s": 400.0, "label": "sens B" }
+  ],
+  "markers_total": 2,
+  "segments": [
+    {
+      "index": 0,
+      "label": "",
+      "next_label": "sens A <b>",
+      "t_start_s": 0.0,
+      "t_end_s": 12.5,
+      "flicks": 3,
+      "flicks_per_min": 14.4,
+      "overshoot_median": 0.05,
+      "settle_median_ms": 90.0,
+      "tremor_rms_counts_s": 40.0,
+      "path_efficiency": 0.8,
+      "clicks_per_min": 30.0
+    }
+  ],
+  "segments_total": 3,
+  "warnings": ["4 envelopes were not delivered to kafka"]
+}

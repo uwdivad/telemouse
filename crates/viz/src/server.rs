@@ -24,16 +24,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures_util::{SinkExt, StreamExt};
-use telemouse_core::config::ObsConfig;
+use futures_util::{Sink, SinkExt, StreamExt};
+use telemouse_core::config::{DEFAULT_VIZ_HTTP_ADDR, ObsConfig};
 use telemouse_core::localhost::{SECURITY_HEADERS, host_is_trusted, origin_is_trusted};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::io::ReaderStream;
-#[cfg(not(feature = "observability"))]
-use tracing::debug;
-#[cfg(feature = "observability")]
-use tracing::info;
-use tracing::warn;
+use tracing::{Level, event, warn};
 
 use crate::hub::Hub;
 use crate::recordings::{self, SessionEntry};
@@ -74,9 +70,84 @@ pub const MAX_WS_CLIENTS: i64 = 16;
 /// client gauge until the TCP timeout, tens of minutes on Windows.
 pub const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 
+/// A WebSocket send that has not completed after this long is a peer that
+/// stopped reading (a suspended laptop, a wedged browser tab). Its task would
+/// otherwise sit inside the send forever, holding a client slot.
+pub const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The port the refusal pages name when the bind address is unreadable: the
-/// documented default, and what a user's notes will say.
-pub const DEFAULT_HTTP_PORT: u16 = 7879;
+/// documented default ([`DEFAULT_VIZ_HTTP_ADDR`]), and what a user's notes
+/// will say.
+pub const DEFAULT_HTTP_PORT: u16 = port_of(DEFAULT_VIZ_HTTP_ADDR);
+
+/// The digits after the last `:` of a `host:port` constant. Compile-time only,
+/// for [`DEFAULT_HTTP_PORT`]; a test checks it against a real parse.
+const fn port_of(addr: &str) -> u16 {
+    let b = addr.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] != b':' {
+        i -= 1;
+    }
+    let mut port: u16 = 0;
+    while i < b.len() {
+        port = port * 10 + (b[i] - b'0') as u16;
+        i += 1;
+    }
+    port
+}
+
+/// How long a refusal from one peer stays quiet in the log after it was
+/// logged, and how long the limiter remembers that peer at all.
+pub const REFUSAL_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Upper bound on peers the refusal limiter remembers inside one minute: a
+/// LAN scan from many addresses stops being logged rather than growing the
+/// map without limit.
+const REFUSAL_LOG_MAX_PEERS: usize = 4096;
+
+/// Which gate refused a request; each is rate-limited separately per peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusalKind {
+    /// [`lan_gate`]: a network peer asked for a route outside [`LAN_ROUTES`].
+    Lan,
+    /// [`require_local_host`]: a `Host` header that is not this machine.
+    Host,
+}
+
+/// Shared rate limiter for both refusal gates: the first refusal of a kind
+/// from a peer is logged, then that peer is quiet for [`REFUSAL_WARN_EVERY`].
+/// Entries older than that are evicted as new ones arrive, so a long-running
+/// LAN bind does not accumulate every address that ever knocked.
+#[derive(Debug, Default)]
+pub struct RefusalLog {
+    seen: Mutex<HashMap<(RefusalKind, IpAddr), Instant>>,
+}
+
+impl RefusalLog {
+    /// True if a refusal of `kind` from `ip` at `now` should be logged.
+    pub fn should_warn(&self, kind: RefusalKind, ip: IpAddr, now: Instant) -> bool {
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|_, at| now.saturating_duration_since(*at) < REFUSAL_WARN_EVERY);
+        if seen.contains_key(&(kind, ip)) || seen.len() >= REFUSAL_LOG_MAX_PEERS {
+            return false;
+        }
+        seen.insert((kind, ip), now);
+        true
+    }
+
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+/// The level the per-client connect/disconnect lines log at: `info` when the
+/// build reports observability, `debug` otherwise.
+const CLIENT_LOG_LEVEL: Level = if cfg!(feature = "observability") {
+    Level::INFO
+} else {
+    Level::DEBUG
+};
 
 /// How long a `/api/sessions` listing is reused. Listing probes 128 KB of
 /// every recording, so a poll loop against a LAN bind would otherwise cost
@@ -133,17 +204,19 @@ const SESSION_STREAM_CAPACITY: usize = 256 * 1024;
 
 /// The two flavours of the page, rendered once at startup: the dashboard and
 /// the OBS browser-source variant. Same HTML, different injected config.
+/// Held as [`Bytes`] so serving one is a refcount bump, not a copy of a page
+/// well over 100 KB.
 pub struct Pages {
-    pub index: String,
-    pub obs: String,
+    pub index: Bytes,
+    pub obs: Bytes,
 }
 
 impl Pages {
     pub fn render(obs: &ObsConfig, udp_addr: &str) -> Self {
         let page = page_source();
         Self {
-            index: inject_config(&page, obs, false, udp_addr),
-            obs: inject_config(&page, obs, true, udp_addr),
+            index: Bytes::from(inject_config(&page, obs, false, udp_addr)),
+            obs: Bytes::from(inject_config(&page, obs, true, udp_addr)),
         }
     }
 }
@@ -182,6 +255,9 @@ pub struct AppState {
     /// HTTP connection it was upgraded from, so nothing else would tell these
     /// tasks to let go.
     pub shutdown: Shutdown,
+    /// Once-a-minute-per-peer gate for the refusal warnings of both
+    /// [`lan_gate`] and [`require_local_host`].
+    pub refusals: Arc<RefusalLog>,
 }
 
 /// Layers, innermost first: the `Host` rule on every route, then the
@@ -203,7 +279,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_local_host,
         ))
-        .layer(middleware::from_fn(lan_gate))
+        .layer(middleware::from_fn_with_state(state.clone(), lan_gate))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -241,67 +317,96 @@ fn refusal(title: &str, body: String) -> Response {
 /// placeholder when the bind is a wildcard (`0.0.0.0` is where the server
 /// listens, not somewhere a browser can go).
 fn overlay_url_hint(http_addr: &str) -> String {
-    let port = match http_addr.trim().parse::<SocketAddr>() {
-        Ok(addr) if !addr.ip().is_unspecified() => {
-            let url = format!(
-                "http://{}/obs",
-                telemouse_core::localhost::browse_addr(addr)
-            );
-            return format!("<a href=\"{url}\">{url}</a>");
-        }
-        Ok(addr) => addr.port(),
-        Err(_) => DEFAULT_HTTP_PORT,
-    };
-    format!("<code>http://&lt;this PC's IPv4&gt;:{port}/obs</code>")
+    if let Ok(addr) = http_addr.trim().parse::<SocketAddr>()
+        && !addr.ip().is_unspecified()
+    {
+        let url = format!(
+            "http://{}/obs",
+            telemouse_core::localhost::browse_addr(addr)
+        );
+        return format!("<a href=\"{url}\">{url}</a>");
+    }
+    format!(
+        "<code>http://&lt;this PC's IPv4&gt;:{}/obs</code>",
+        bound_port(http_addr)
+    )
 }
 
-/// Whether a request from `peer` for `path` is served. Loopback peers (and
-/// requests with no peer address, which only happens in tests) get
-/// everything; anyone else gets [`LAN_ROUTES`]. Pure, so the policy is
-/// tested without sockets.
+/// The port of the configured HTTP bind, or [`DEFAULT_HTTP_PORT`] when the
+/// address does not parse.
+fn bound_port(http_addr: &str) -> u16 {
+    http_addr
+        .trim()
+        .parse::<SocketAddr>()
+        .map(|a| a.port())
+        .unwrap_or(DEFAULT_HTTP_PORT)
+}
+
+/// [`LAN_ROUTES`] as an HTML list for the refusal page:
+/// `<code>/obs</code>, <code>/ws</code> and <code>/healthz</code>`.
+fn lan_routes_html() -> String {
+    let codes: Vec<String> = LAN_ROUTES
+        .iter()
+        .map(|r| format!("<code>{r}</code>"))
+        .collect();
+    match codes.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
+/// Whether a request from `peer` for `path` is served. Loopback peers get
+/// everything; anyone else gets [`LAN_ROUTES`]. A request with no peer
+/// address is refused: the real listener always attaches one, so its absence
+/// means something is wired wrong, and the gate fails closed. Pure, so the
+/// policy is tested without sockets.
 pub fn peer_may_reach(peer: Option<IpAddr>, path: &str) -> bool {
     match peer {
-        Some(ip) if !ip.is_loopback() => LAN_ROUTES.contains(&path),
-        _ => true,
+        Some(ip) if ip.is_loopback() => true,
+        Some(_) => LAN_ROUTES.contains(&path),
+        None => false,
     }
+}
+
+/// The peer IP a middleware sees, if the listener attached one.
+fn request_peer_ip(req: &Request) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<Peer>>()
+        .map(|c| c.0.0.ip())
 }
 
 /// Refuse a network peer anything but the overlay routes. The bind decides
 /// whether a network peer can connect at all; this decides what it sees.
-/// Refusals are logged at most once a minute per address, so a scanner on
-/// the LAN cannot fill the log.
-async fn lan_gate(req: Request, next: Next) -> Response {
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<Peer>>()
-        .map(|c| c.0.0.ip());
+/// Refusals are logged at most once a minute per address (see
+/// [`RefusalLog`]), so a scanner on the LAN cannot fill the log.
+async fn lan_gate(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let peer = request_peer_ip(&req);
     let path = req.uri().path();
     if !peer_may_reach(peer, path) {
-        static LAST_WARNED: Mutex<Option<HashMap<IpAddr, Instant>>> = Mutex::new(None);
         let ip = peer.unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        let mut guard = LAST_WARNED.lock().unwrap_or_else(|p| p.into_inner());
-        let map = guard.get_or_insert_with(HashMap::new);
-        let now = Instant::now();
-        let quiet = map
-            .get(&ip)
-            .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(60));
-        if !quiet {
-            map.insert(ip, now);
+        if st
+            .refusals
+            .should_warn(RefusalKind::Lan, ip, Instant::now())
+        {
             warn!(
                 peer = %ip,
+                peer_known = peer.is_some(),
                 path,
-                "refusing a network peer; only /obs, /ws and /healthz are served off this machine (further refusals from this address are quiet for a minute)"
+                served_to_network = ?LAN_ROUTES,
+                "refusing a network peer a route that is not served off this machine (further refusals from this address are quiet for a minute)"
             );
         }
         return refusal(
             "not served to the network",
             format!(
-                "<p>This is the telemouse viz bridge on another machine. Only \
-                 <code>/obs</code> (the OBS browser source), <code>/ws</code> (its live \
-                 socket) and <code>/healthz</code> are served off that machine — the \
-                 dashboard and the recordings stay on the PC that captured them.</p>\
+                "<p>This is the telemouse viz bridge on another machine. Only {} \
+                 (the OBS browser source, its live socket and the health check) are \
+                 served off that machine — the dashboard and the recordings stay on \
+                 the PC that captured them.</p>\
                  <p><a href=\"/obs\">Open the overlay instead → /obs</a></p>\
                  <p>You asked for <code>{}</code>.</p>",
+                lan_routes_html(),
                 html_escape(path)
             ),
         );
@@ -348,7 +453,18 @@ async fn require_local_host(State(st): State<AppState>, req: Request, next: Next
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !host_is_trusted(host) {
-        warn!(host, path = %req.uri().path(), "refusing request with a non-local Host header");
+        let ip = request_peer_ip(&req).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        if st
+            .refusals
+            .should_warn(RefusalKind::Host, ip, Instant::now())
+        {
+            warn!(
+                host,
+                peer = %ip,
+                path = %req.uri().path(),
+                "refusing request with a non-local Host header (further refusals from this address are quiet for a minute)"
+            );
+        }
         return refusal(
             "host not allowed",
             format!(
@@ -359,12 +475,7 @@ async fn require_local_host(State(st): State<AppState>, req: Request, next: Next
                  <p>Open {} instead (or <code>http://localhost:{}/</code> on this machine).</p>",
                 html_escape(host),
                 overlay_url_hint(&st.addrs.http),
-                st.addrs
-                    .http
-                    .trim()
-                    .parse::<SocketAddr>()
-                    .map(|a| a.port())
-                    .unwrap_or(DEFAULT_HTTP_PORT),
+                bound_port(&st.addrs.http),
             ),
         );
     }
@@ -384,7 +495,7 @@ async fn api_stats(State(st): State<AppState>) -> impl IntoResponse {
     axum::Json(stats_payload(&st.hub))
 }
 
-fn html_response(body: String) -> Response {
+fn html_response(body: Bytes) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -447,6 +558,7 @@ async fn api_sessions(State(st): State<AppState>) -> impl IntoResponse {
 /// until the whole file had been read. `ReaderStream` hands the socket bounded
 /// 256 KiB chunks as they come off disk, and the page parses lines as they
 /// arrive.
+#[cfg_attr(not(feature = "observability"), allow(unused_variables))]
 async fn api_session(
     State(st): State<AppState>,
     peer: MaybePeer,
@@ -512,8 +624,6 @@ async fn api_session(
             item
         })
     };
-    #[cfg(not(feature = "observability"))]
-    let _ = (peer, want);
     (headers, Body::from_stream(stream)).into_response()
 }
 
@@ -540,7 +650,7 @@ impl Drop for ReplayLog {
     fn drop(&mut self) {
         let secs = self.started.elapsed().as_secs_f64();
         let mb = self.bytes as f64 / (1024.0 * 1024.0);
-        info!(
+        tracing::info!(
             id = %self.id,
             peer = self.peer.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             bytes = self.bytes,
@@ -585,19 +695,71 @@ async fn ws_upgrade(
         // one will answer.
         return (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response();
     }
-    let clients = st.hub.stats.snapshot().clients;
-    if clients >= MAX_WS_CLIENTS {
+    // Reserve the slot before the handshake: a check followed by an increment
+    // after the upgrade let concurrent upgrades all see a free slot.
+    let Some(slot) = ClientSlot::reserve(&st.hub) else {
         warn!(
-            clients,
+            clients = st.hub.stats.snapshot().clients,
             max = MAX_WS_CLIENTS,
             "refusing websocket: too many live clients"
         );
         return (StatusCode::SERVICE_UNAVAILABLE, "too many live clients").into_response();
-    }
+    };
     let peer = peer_addr(peer);
     match ws {
-        Ok(ws) => ws.on_upgrade(move |socket| client_loop(socket, st, peer, origin)),
+        // The slot moves into the callback. If the upgrade then fails, the
+        // callback is dropped unrun and the slot is released with it.
+        Ok(ws) => ws.on_upgrade(move |socket| client_loop(socket, st, slot, peer, origin)),
+        // Dropping `slot` here releases it.
         Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// One reserved place under [`MAX_WS_CLIENTS`], released when dropped —
+/// whichever way the connection ends, the upgrade included.
+struct ClientSlot(Arc<Hub>);
+
+impl ClientSlot {
+    fn reserve(hub: &Arc<Hub>) -> Option<Self> {
+        hub.stats
+            .try_reserve_client(MAX_WS_CLIENTS)
+            .then(|| Self(hub.clone()))
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.stats.release_client();
+    }
+}
+
+/// Why a bounded send did not go through.
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailed {
+    /// The socket is gone (the peer closed, or the connection broke).
+    Closed,
+    /// The peer stopped reading for [`WS_SEND_TIMEOUT`].
+    TimedOut,
+}
+
+/// One WebSocket send, bounded by [`WS_SEND_TIMEOUT`]. A stalled peer costs
+/// at most that long and then the connection, never the task.
+async fn send_bounded<S>(sink: &mut S, msg: Message) -> Result<(), SendFailed>
+where
+    S: Sink<Message> + Unpin,
+{
+    send_within(sink, msg, WS_SEND_TIMEOUT).await
+}
+
+/// [`send_bounded`] with the limit injected, so the timeout is testable.
+async fn send_within<S>(sink: &mut S, msg: Message, limit: Duration) -> Result<(), SendFailed>
+where
+    S: Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(limit, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SendFailed::Closed),
+        Err(_) => Err(SendFailed::TimedOut),
     }
 }
 
@@ -616,27 +778,30 @@ fn text_frame(frame: &crate::hub::Frame) -> Message {
 async fn client_loop(
     socket: WebSocket,
     st: AppState,
+    slot: ClientSlot,
     peer: Option<SocketAddr>,
     origin: Option<String>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (catch_up, mut rx) = st.hub.subscribe();
-    st.hub.stats.client_connected();
     let connected_at = Instant::now();
     let mut frames_sent: u64 = 0;
     // Did this client go because the *server* is going? The page treats every
     // close the same (disconnect, then reconnect), but the log should not read
     // as a browser that walked away during a stop.
     let mut stopped = false;
+    // Did it go because it stopped reading? That is the one ending the peer
+    // cannot report itself.
+    let mut timed_out = false;
+    let peer_s = peer.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
     // Who is watching, and from where: on a LAN bind the answer to "why are
     // there four clients" is a second PC's OBS reconnecting, and the peer is
     // the only thing that says so.
-    let _ = (&peer, &origin);
-    #[cfg(feature = "observability")]
-    info!(
+    event!(
+        CLIENT_LOG_LEVEL,
         clients = st.hub.stats.snapshot().clients,
         catch_up = catch_up.len(),
-        peer = peer.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        peer = %peer_s,
         loopback = peer.is_some_and(|p| p.ip().is_loopback()),
         origin = origin.as_deref().unwrap_or("-"),
         "ws client connected"
@@ -646,10 +811,10 @@ async fn client_loop(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // the first tick fires at once; the client just connected
 
-    'relay: {
+    let ended: Result<(), SendFailed> = 'relay: {
         for frame in catch_up {
-            if sink.send(text_frame(&frame)).await.is_err() {
-                break 'relay;
+            if let Err(e) = send_bounded(&mut sink, text_frame(&frame)).await {
+                break 'relay Err(e);
             }
             frames_sent += 1;
         }
@@ -660,29 +825,29 @@ async fn client_loop(
                 // closed stream within a few intervals, instead of a TCP
                 // timeout; browsers answer pongs automatically.
                 _ = ping.tick() => {
-                    if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                        break;
+                    if let Err(e) = send_bounded(&mut sink, Message::Ping(Bytes::new())).await {
+                        break 'relay Err(e);
                     }
                 },
                 received = rx.recv() => match received {
                     Ok(text) => {
-                        if sink.send(text_frame(&text)).await.is_err() {
-                            break;
+                        if let Err(e) = send_bounded(&mut sink, text_frame(&text)).await {
+                            break 'relay Err(e);
                         }
                         frames_sent += 1;
                     }
                     Err(RecvError::Lagged(missed)) => {
                         st.hub.stats.record_lag(missed);
                         warn!(missed, "ws client lagged behind the broadcast channel; disconnecting");
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
+                        let _ = send_bounded(&mut sink, Message::Close(None)).await;
+                        break 'relay Ok(());
                     }
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break 'relay Ok(()),
                 },
                 // Drain client→server traffic so pings/closes are handled; the
                 // browser never sends anything meaningful.
                 incoming = stream.next() => match incoming {
-                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break 'relay Ok(()),
                     Some(Ok(_)) => {}
                 },
                 // The process is stopping. This socket was upgraded out of
@@ -692,33 +857,34 @@ async fn client_loop(
                 // quiet until TCP notices — and this task ends, which is what
                 // lets the stop finish in milliseconds.
                 () = st.shutdown.wait() => {
-                    let _ = sink.send(Message::Close(None)).await;
+                    let _ = send_bounded(&mut sink, Message::Close(None)).await;
                     stopped = true;
-                    break;
+                    break 'relay Ok(());
                 },
             }
         }
+    };
+    if ended == Err(SendFailed::TimedOut) {
+        timed_out = true;
+        warn!(
+            peer = %peer_s,
+            timeout_s = WS_SEND_TIMEOUT.as_secs(),
+            "ws client stopped reading; disconnecting"
+        );
     }
 
-    st.hub.stats.client_disconnected();
+    drop(slot);
     // A disconnect is what an operator actually chases (an OBS source that
     // drops every few minutes, a second PC that never holds the socket), so
     // it carries how long the client lasted and how much it got.
-    #[cfg(feature = "observability")]
-    info!(
+    event!(
+        CLIENT_LOG_LEVEL,
         clients = st.hub.stats.snapshot().clients,
         frames_sent,
         held_s = format_args!("{:.1}", connected_at.elapsed().as_secs_f64()),
-        peer = peer.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        peer = %peer_s,
         stopped,
-        "ws client disconnected"
-    );
-    #[cfg(not(feature = "observability"))]
-    debug!(
-        clients = st.hub.stats.snapshot().clients,
-        frames_sent,
-        held_s = format_args!("{:.1}", connected_at.elapsed().as_secs_f64()),
-        stopped,
+        timed_out,
         "ws client disconnected"
     );
 }
@@ -748,27 +914,37 @@ mod tests {
                 http: TEST_HTTP.into(),
             }),
             shutdown: Shutdown::new(),
+            refusals: Arc::default(),
         }
     }
 
-    /// A request as it arrives from a real socket: with the peer address
-    /// that `into_make_service_with_connect_info` attaches.
+    /// The peer a test request comes from unless it says otherwise: a
+    /// browser on this machine. (The gate refuses a request with no peer.)
+    const LOOPBACK_PEER: &str = "127.0.0.1:50000";
+
+    /// The headers of a WebSocket upgrade from a page on this machine, with
+    /// `origin` added when given.
+    fn ws_headers(origin: Option<&'static str>) -> Vec<(&'static str, &'static str)> {
+        let mut h = vec![
+            ("host", "127.0.0.1:7879"),
+            ("connection", "upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+        if let Some(o) = origin {
+            h.push(("origin", o));
+        }
+        h
+    }
+
+    /// A request from `peer` that names the server by its LAN address.
     async fn get_from_peer(
         state: AppState,
         uri: &str,
         peer: SocketAddr,
     ) -> (StatusCode, HeaderMap, String) {
-        let mut req = Request::builder()
-            .uri(uri)
-            .header("host", "192.168.1.168:7879")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(Peer(peer)));
-        let res = router(state).oneshot(req).await.unwrap();
-        let status = res.status();
-        let headers = res.headers().clone();
-        let body = to_bytes(res.into_body(), 64 * 1024 * 1024).await.unwrap();
-        (status, headers, String::from_utf8_lossy(&body).to_string())
+        request(state, uri, &[("host", "192.168.1.168:7879")], peer).await
     }
 
     /// The injected config object literal, parsed back out of the page.
@@ -871,8 +1047,8 @@ mod tests {
         }
     }
 
-    /// `node --check` over the app: the syntax gate a 2,400-line script
-    /// embedded in a Rust binary would otherwise not have.
+    /// `node --check` over the app: the syntax gate a script of several
+    /// thousand lines embedded in a Rust binary would otherwise not have.
     #[test]
     fn app_js_parses_under_node_when_available() {
         if let Some(out) = node(&["--check", "src/app.js"]).unwrap() {
@@ -908,6 +1084,7 @@ mod tests {
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         for path in LAN_ROUTES {
             assert!(peer_may_reach(Some(lan), path), "{path}");
+            assert!(!peer_may_reach(None, path), "{path}: no peer fails closed");
         }
         for path in [
             "/",
@@ -918,7 +1095,7 @@ mod tests {
         ] {
             assert!(!peer_may_reach(Some(lan), path), "{path}");
             assert!(peer_may_reach(Some(local), path), "{path}");
-            assert!(peer_may_reach(None, path), "{path}");
+            assert!(!peer_may_reach(None, path), "{path}: no peer fails closed");
         }
         assert!(peer_may_reach(
             Some("::1".parse().unwrap()),
@@ -953,13 +1130,11 @@ mod tests {
             assert!(body.contains("/healthz"), "{uri}: names what is served");
             assert!(!body.contains("<script"), "{uri}: no script in a refusal");
         }
-        // `/api/stats` is only routed with the feature on; without it the
-        // gate never sees the request (404 is the router's answer).
-        #[cfg(feature = "observability")]
-        {
-            let (status, _, _) = get_from_peer(st.clone(), "/api/stats", lan).await;
-            assert_eq!(status, StatusCode::FORBIDDEN);
-        }
+        // `/api/stats` is only routed with the feature on, but `Router::layer`
+        // wraps the fallback too, so the gate refuses it either way: a LAN
+        // peer never learns which build this is.
+        let (status, _, _) = get_from_peer(st.clone(), "/api/stats", lan).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let (status, _, _) = get_from_peer(st.clone(), "/obs", lan).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = get_from_peer(st.clone(), "/healthz", lan).await;
@@ -968,6 +1143,109 @@ mod tests {
         let here: SocketAddr = "127.0.0.1:51000".parse().unwrap();
         let (status, _, _) = get_from_peer(st, "/api/sessions", here).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A request that carries no peer address never came off the real
+    /// listener; the gate refuses it rather than treating it as local.
+    #[tokio::test]
+    async fn a_request_without_a_peer_is_refused() {
+        let req = Request::builder()
+            .uri("/healthz")
+            .header("host", "127.0.0.1:7879")
+            .body(Body::empty())
+            .unwrap();
+        let res = router(state_with(PathBuf::from("recordings")))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn the_refusal_log_is_once_a_minute_per_peer_and_kind_and_forgets() {
+        let log = RefusalLog::default();
+        let a: IpAddr = "192.168.1.20".parse().unwrap();
+        let b: IpAddr = "192.168.1.21".parse().unwrap();
+        let t0 = Instant::now();
+        assert!(log.should_warn(RefusalKind::Lan, a, t0));
+        assert!(!log.should_warn(RefusalKind::Lan, a, t0 + Duration::from_secs(30)));
+        assert!(
+            log.should_warn(RefusalKind::Host, a, t0),
+            "each gate has its own budget"
+        );
+        assert!(log.should_warn(RefusalKind::Lan, b, t0), "and each peer");
+        assert_eq!(log.remembered(), 3);
+        // A minute later every entry has aged out and is evicted.
+        let later = t0 + REFUSAL_WARN_EVERY + Duration::from_secs(1);
+        assert!(log.should_warn(RefusalKind::Lan, a, later));
+        assert_eq!(log.remembered(), 1, "stale peers are pruned");
+    }
+
+    #[test]
+    fn the_refusal_log_is_bounded() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+        for i in 0..REFUSAL_LOG_MAX_PEERS as u32 + 10 {
+            log.should_warn(RefusalKind::Lan, IpAddr::from(i.to_be_bytes()), t0);
+        }
+        assert_eq!(log.remembered(), REFUSAL_LOG_MAX_PEERS);
+    }
+
+    #[test]
+    fn the_default_port_is_the_core_default() {
+        assert_eq!(
+            DEFAULT_VIZ_HTTP_ADDR.parse::<SocketAddr>().unwrap().port(),
+            DEFAULT_HTTP_PORT
+        );
+        assert_eq!(bound_port("not an address"), DEFAULT_HTTP_PORT);
+        assert_eq!(bound_port(" 0.0.0.0:9000 "), 9000);
+    }
+
+    #[test]
+    fn the_lan_refusal_lists_every_lan_route() {
+        let html = lan_routes_html();
+        for r in LAN_ROUTES {
+            assert!(html.contains(&format!("<code>{r}</code>")), "{html}");
+        }
+    }
+
+    /// A sink that never accepts anything: a peer that stopped reading.
+    struct StalledSink;
+
+    impl Sink<Message> for StalledSink {
+        type Error = axum::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_stalled_peer_times_out() {
+        let r = send_within(
+            &mut StalledSink,
+            Message::Ping(Bytes::new()),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(r, Err(SendFailed::TimedOut));
     }
 
     #[tokio::test]
@@ -1044,22 +1322,18 @@ mod tests {
     async fn the_client_cap_answers_503_before_the_handshake() {
         let st = state_with(PathBuf::from("recordings"));
         for _ in 0..MAX_WS_CLIENTS {
-            st.hub.stats.client_connected();
+            assert!(st.hub.stats.try_reserve_client(MAX_WS_CLIENTS));
         }
-        let headers = [
-            ("host", "127.0.0.1:7879"),
-            ("connection", "upgrade"),
-            ("upgrade", "websocket"),
-            ("sec-websocket-version", "13"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-            ("origin", "http://127.0.0.1:7879"),
-        ];
+        let headers = ws_headers(Some("http://127.0.0.1:7879"));
         let (status, _, body) = get_with(st.clone(), "/ws", &headers).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "too many live clients");
-        st.hub.stats.client_disconnected();
-        let (status, _, _) = get_with(st, "/ws", &headers).await;
+        assert_eq!(st.hub.stats.snapshot().clients, MAX_WS_CLIENTS);
+        st.hub.stats.release_client();
+        let (status, _, _) = get_with(st.clone(), "/ws", &headers).await;
         assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "one slot free again");
+        // The handshake failed, so the slot it reserved was given back.
+        assert_eq!(st.hub.stats.snapshot().clients, MAX_WS_CLIENTS - 1);
     }
 
     /// While the process is stopping, a page that reconnects is told to try
@@ -1067,14 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopping_server_refuses_new_websockets() {
         let st = state_with(PathBuf::from("recordings"));
-        let headers = [
-            ("host", "127.0.0.1:7879"),
-            ("connection", "upgrade"),
-            ("upgrade", "websocket"),
-            ("sec-websocket-version", "13"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-            ("origin", "http://127.0.0.1:7879"),
-        ];
+        let headers = ws_headers(Some("http://127.0.0.1:7879"));
         let (status, _, _) = get_with(st.clone(), "/ws", &headers).await;
         assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "serving normally");
 
@@ -1125,19 +1392,32 @@ mod tests {
         get_with(state, uri, &[("host", "127.0.0.1:7879")]).await
     }
 
+    /// A request from a browser on this machine with exactly `extra` as its
+    /// headers.
     async fn get_with(
         state: AppState,
         uri: &str,
         extra: &[(&str, &str)],
     ) -> (StatusCode, HeaderMap, String) {
+        request(state, uri, extra, LOOPBACK_PEER.parse().unwrap()).await
+    }
+
+    /// One request through the whole router, as it arrives from a real
+    /// socket: with the peer address `into_make_service_with_connect_info`
+    /// attaches.
+    async fn request(
+        state: AppState,
+        uri: &str,
+        extra: &[(&str, &str)],
+        peer: SocketAddr,
+    ) -> (StatusCode, HeaderMap, String) {
         let mut req = Request::builder().uri(uri);
         for (k, v) in extra {
             req = req.header(*k, *v);
         }
-        let res = router(state)
-            .oneshot(req.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(Peer(peer)));
+        let res = router(state).oneshot(req).await.unwrap();
         let status = res.status();
         let headers = res.headers().clone();
         let body = to_bytes(res.into_body(), 64 * 1024 * 1024).await.unwrap();
@@ -1229,19 +1509,6 @@ mod tests {
     #[tokio::test]
     async fn websocket_refuses_foreign_origins() {
         let st = state_with(PathBuf::from("recordings"));
-        let ws_headers = |origin: Option<&'static str>| {
-            let mut h = vec![
-                ("host", "127.0.0.1:7879"),
-                ("connection", "upgrade"),
-                ("upgrade", "websocket"),
-                ("sec-websocket-version", "13"),
-                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-            ];
-            if let Some(o) = origin {
-                h.push(("origin", o));
-            }
-            h
-        };
         let (status, _, body) =
             get_with(st.clone(), "/ws", &ws_headers(Some("http://evil.com"))).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1370,12 +1637,51 @@ mod tests {
         }
     }
 
+    /// The page's knob limits are defined once in app.js and mirror core's
+    /// config validator; the markup's copy (what shows before the script
+    /// runs) agrees with both.
     #[test]
-    fn index_live_buffer_defaults_are_consistent() {
-        assert!(INDEX_HTML.contains(r#"id="buf" min="10" max="200" step="5" value="35""#));
-        assert!(INDEX_HTML.contains(r#"id="bufVal">35ms"#));
-        assert!(APP_JS.contains("buffer_ms: 35,"));
-        assert!(APP_JS.contains("const LIVE_BUFFER_DEFAULT = 0.035;"));
+    fn page_limits_and_defaults_match_core() {
+        use telemouse_core::config::{OBS_BUFFER_MS_RANGE, OBS_SCALE_RANGE, OBS_TRAIL_SECS_RANGE};
+        let d = ObsConfig::default();
+        let buffer = format!(
+            "const BUFFER_MS = Object.freeze({{ min: {}, max: {}, step: 5, dflt: {} }});",
+            OBS_BUFFER_MS_RANGE.start(),
+            OBS_BUFFER_MS_RANGE.end(),
+            d.buffer_ms
+        );
+        let trail = format!(
+            "const TRAIL_SECS = Object.freeze({{ min: {}, max: {}, step: 0.1, dflt: {} }});",
+            OBS_TRAIL_SECS_RANGE.start(),
+            OBS_TRAIL_SECS_RANGE.end(),
+            d.trail_secs
+        );
+        let scale = format!(
+            "const OBS_SCALE = Object.freeze({{ min: {}, max: {}, dflt: {} }});",
+            OBS_SCALE_RANGE.start(),
+            OBS_SCALE_RANGE.end(),
+            d.scale
+        );
+        for line in [&buffer, &trail, &scale] {
+            assert!(
+                APP_JS.contains(line.as_str()),
+                "app.js no longer says {line}"
+            );
+        }
+        assert!(APP_JS.contains("const LIVE_BUFFER_DEFAULT = BUFFER_MS.dflt / 1000;"));
+        assert!(INDEX_HTML.contains(&format!(
+            r#"id="buf" min="{}" max="{}" step="5" value="{}""#,
+            OBS_BUFFER_MS_RANGE.start(),
+            OBS_BUFFER_MS_RANGE.end(),
+            d.buffer_ms
+        )));
+        assert!(INDEX_HTML.contains(&format!(r#"id="bufVal">{}ms"#, d.buffer_ms)));
+        assert!(INDEX_HTML.contains(&format!(
+            r#"id="decay" min="{}" max="{}" step="0.1" value="{}""#,
+            OBS_TRAIL_SECS_RANGE.start(),
+            OBS_TRAIL_SECS_RANGE.end(),
+            d.trail_secs
+        )));
     }
 
     #[test]

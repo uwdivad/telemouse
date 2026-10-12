@@ -18,7 +18,7 @@ use telemouse_core::hotkey::Hotkey;
 use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
-use crate::manager::{ComponentState, Manager, StartRequest, StopError};
+use crate::manager::{CAPTURE, ComponentState, Manager, StartRequest, StopError};
 use crate::places::Places;
 use crate::procs::{ProcInfo, Scanner};
 
@@ -150,10 +150,20 @@ pub async fn run_publisher(p: Publisher) {
             // for a start or a stop (from the tray *or* the web page, which
             // is why the manager's own notify is in here), for the window
             // to come back, or for the long fallback.
-            tokio::select! {
-                _ = p.poke.notified() => {}
-                _ = p.manager.work().notified() => {}
-                _ = tokio::time::sleep(IDLE_WAIT) => {}
+            //
+            // The manager's notify keeps no permit, so the wait is
+            // registered first and "still idle?" asked second: a start that
+            // landed after the last snapshot is seen now, not after
+            // IDLE_WAIT.
+            let work = p.manager.work().notified();
+            tokio::pin!(work);
+            work.as_mut().enable();
+            if !p.manager.any_running().await {
+                tokio::select! {
+                    _ = p.poke.notified() => {}
+                    _ = &mut work => {}
+                    _ = tokio::time::sleep(IDLE_WAIT) => {}
+                }
             }
             true
         } else {
@@ -245,7 +255,7 @@ pub fn new_session(link: &GuiLink) {
         link.restarting.clone(),
     );
     link.handle.spawn(async move {
-        match m.stop("capture", false).await {
+        match m.stop(CAPTURE, false).await {
             Ok(outcome) => info!(?outcome, "new session: previous capture stopped"),
             Err(StopError::NotRunning) => {}
             Err(e) => warn!(error = %e, "new session: stop refused"),
@@ -254,7 +264,7 @@ pub fn new_session(link: &GuiLink) {
             save: Some(true),
             ..Default::default()
         };
-        match m.start("capture", &req).await {
+        match m.start(CAPTURE, &req).await {
             Ok(pid) => info!(pid, "new session: capture started, saving"),
             Err(e) => warn!(error = %e, "new session: start refused"),
         }

@@ -16,6 +16,8 @@
      color-scheme hint so the page stays exactly as transparent as it was. -->
 <script>
 (function () {
+  /* The OBS test and the "tmTheme" key are app.js's (OBS_MODE, THEME_KEY),
+     repeated because this runs before app.js exists; change them together. */
   var root = document.documentElement, cfg = window.TELEMOUSE_CONFIG || {};
   if (cfg.obs_route === true || /[?&]obs=1(&|$)/.test(location.search)) {
     root.dataset.theme = "dark";
@@ -24,6 +26,11 @@
     if (m) m.remove();
     return;
   }
+  /* The system's preference, for the token rule below; app.js keeps it
+     current when Windows switches. */
+  try {
+    root.dataset.sys = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  } catch (e) { root.dataset.sys = "dark"; }
   try {
     var t = localStorage.getItem("tmTheme");
     if (t === "light" || t === "dark") root.dataset.theme = t;
@@ -49,7 +56,10 @@
     --head: #ffffff; --lmb: #46d68a; --rmb: #7c8cff; --aux: #ffb02e;
     color-scheme: dark;
   }
-  :root[data-theme="light"] {
+  /* Light: picked, or not picked and the system is light. `data-sys` is the
+     system's preference, set before first paint by the script above and kept
+     current by app.js, so one rule covers both cases. */
+  :root[data-theme="light"], :root:not([data-theme])[data-sys="light"] {
     --bg: #f4f6fa; --surface: #ffffff; --surface-2: #eef2f7; --line: #dde3ec; --line-strong: #c9d2df;
     --fg: #16202c; --fg-2: #4e5d70; --fg-3: #7b8899;
     --accent: #0b8f9c; --accent-ink: #ffffff;
@@ -59,19 +69,6 @@
     --canvas: #ffffff; --grid: #edf1f6; --grid-axis: #c9d2df; --grid-wrap: #d6c3ea;
     --head: #16202c; --lmb: #178f4f; --rmb: #4a5ad6; --aux: #b26a00;
     color-scheme: light;
-  }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme]) {
-      --bg: #f4f6fa; --surface: #ffffff; --surface-2: #eef2f7; --line: #dde3ec; --line-strong: #c9d2df;
-      --fg: #16202c; --fg-2: #4e5d70; --fg-3: #7b8899;
-      --accent: #0b8f9c; --accent-ink: #ffffff;
-      --ok: #178f4f; --warn: #b26a00; --bad: #c62b2b;
-      --shadow: 0 8px 28px #0002;
-
-      --canvas: #ffffff; --grid: #edf1f6; --grid-axis: #c9d2df; --grid-wrap: #d6c3ea;
-      --head: #16202c; --lmb: #178f4f; --rmb: #4a5ad6; --aux: #b26a00;
-      color-scheme: light;
-    }
   }
 
   /* ---------- base ---------- */
@@ -187,6 +184,7 @@
     gap: 1px; background: var(--line); min-height: 0; position: relative;
   }
   .panel { position: relative; background: var(--canvas); min-width: 0; min-height: 0; overflow: hidden; }
+  #ptrPanel { display: none; }
   .panel canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
   .panel .title {
     position: absolute; left: 14px; top: 10px; pointer-events: none;
@@ -280,11 +278,17 @@
   .obs .panels { gap: 0; background: transparent; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
   .obs .panel { background: transparent; }
   .obs.layout-stack .panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
-  .obs.layout-desk .panels, .obs.layout-aim .panels { grid-template-columns: 1fr; }
+  .obs.layout-desk .panels, .obs.layout-aim .panels, .obs.layout-pointer .panels { grid-template-columns: 1fr; }
   .obs.layout-desk #aimPanel, .obs.layout-aim #deskPanel { display: none; }
-  /* Dashboard single-panel view (?view=desk / ?view=aim, or the View toggle). */
-  .view-desk .panels, .view-aim .panels { grid-template-columns: 1fr; }
+  /* The pointer panel (Windows' cursor, in pixels) only appears in the views
+     that ask for it: on its own, or beside the raw hand path in place of aim. */
+  .obs.layout-pointer #ptrPanel, .obs.layout-compare #ptrPanel { display: block; }
+  .obs.layout-pointer #deskPanel, .obs.layout-pointer #aimPanel, .obs.layout-compare #aimPanel { display: none; }
+  /* Dashboard views (?view=, or the View toggle): one panel, or a chosen pair. */
+  .view-desk .panels, .view-aim .panels, .view-pointer .panels { grid-template-columns: 1fr; }
   .view-desk #aimPanel, .view-aim #deskPanel { display: none; }
+  .view-pointer #ptrPanel, .view-compare #ptrPanel { display: block; }
+  .view-pointer #deskPanel, .view-pointer #aimPanel, .view-compare #aimPanel { display: none; }
   .obs:not(.labels) .panel .title, .obs:not(.labels) .panel .hint { display: none; }
   .obs .panel .title { font-size: calc(12px * var(--s, 1)); color: #c8d2df; text-shadow: 0 1px 3px #000c; }
   .obs .panel .title b { color: #fff; }
@@ -345,15 +349,17 @@
 <div class="topbar">
   <div class="brand">tele<span>mouse</span></div>
 
-  <div class="seg" id="modeSwitch">
-    <button data-mode="live" class="on">Live</button>
-    <button data-mode="replay">Replay</button>
+  <div class="seg" id="modeSwitch" role="group" aria-label="Mode">
+    <button data-mode="live" class="on" aria-pressed="true">Live</button>
+    <button data-mode="replay" aria-pressed="false">Replay</button>
   </div>
 
-  <div class="seg" id="viewSwitch" title="Which panel(s) to show (?view=both|desk|aim). V cycles.">
-    <button data-view="both" class="on">Both</button>
-    <button data-view="desk">Desk</button>
-    <button data-view="aim">Aim</button>
+  <div class="seg" id="viewSwitch" role="group" aria-label="View" title="Which panel(s) to show (?view=both|desk|aim|pointer|compare). Pointer is the raw input after Windows' pointer acceleration, as the desktop cursor moves; Compare puts it beside the raw hand path. V cycles.">
+    <button data-view="both" class="on" aria-pressed="true">Both</button>
+    <button data-view="desk" aria-pressed="false">Desk</button>
+    <button data-view="aim" aria-pressed="false">Aim</button>
+    <button data-view="pointer" aria-pressed="false">Pointer</button>
+    <button data-view="compare" aria-pressed="false">Raw vs Pointer</button>
   </div>
 
   <div class="pill" id="connPill"><span class="dot"></span><span id="connText">idle</span></div>
@@ -363,13 +369,13 @@
   <div class="grow"></div>
 
   <div class="ctl" id="bufCtl" title="Live buffer: how far the play head trails the newest event. Lower = less latency, more chance of a visible stutter when a batch is late. Saved in this browser.">
-    <span>buffer</span>
-    <input type="range" id="buf" min="10" max="200" step="5" value="35">
+    <label for="buf">buffer</label>
+    <input type="range" id="buf" min="10" max="200" step="5" value="35" aria-describedby="bufVal">
     <span class="val" id="bufVal">35ms</span>
   </div>
   <div class="ctl">
-    <span>trail</span>
-    <input type="range" id="decay" min="0.3" max="12" step="0.1" value="3">
+    <label for="decay">trail</label>
+    <input type="range" id="decay" min="0.3" max="12" step="0.1" value="3" aria-describedby="decayVal">
     <span class="val" id="decayVal">3.0s</span>
   </div>
   <button class="btn small" id="btnReset">Recenter<kbd>R</kbd></button>
@@ -379,10 +385,10 @@
 
 <div class="transport hidden" id="transport">
   <button class="btn small" id="btnPlay">Play</button>
-  <button class="btn small" id="btnPrevMarker" title="Previous marker">&#9664;|</button>
-  <button class="btn small" id="btnNextMarker" title="Next marker">|&#9654;</button>
-  <select class="btn small" id="sessionSel"><option value="">— loading sessions —</option></select>
-  <select class="btn small" id="speedSel">
+  <button class="btn small" id="btnPrevMarker" title="Previous marker" aria-label="Previous marker">&#9664;|</button>
+  <button class="btn small" id="btnNextMarker" title="Next marker" aria-label="Next marker">|&#9654;</button>
+  <select class="btn small" id="sessionSel" aria-label="Recording"><option value="">— loading sessions —</option></select>
+  <select class="btn small" id="speedSel" aria-label="Replay speed">
     <option value="0.25">0.25&times;</option>
     <option value="0.5">0.5&times;</option>
     <option value="1" selected>1&times;</option>
@@ -393,28 +399,34 @@
   <div class="scrubwrap">
     <div class="track"><div class="fill" id="scrubFill"></div></div>
     <div id="notches"></div>
-    <input type="range" id="scrub" min="0" max="1000" step="1" value="0">
+    <input type="range" id="scrub" min="0" max="1000" step="1" value="0" aria-label="Replay position" aria-describedby="timeText">
   </div>
   <div class="time" id="timeText">0:00.00 / 0:00.00</div>
   <div class="wall" id="wallText" title="Wall-clock time (local) of the play head"></div>
   <label class="goto" title="Jump to a moment in the past: picks the recording that was running then and seeks to it. Also ?at=2026-08-29T21:14:03 on the URL.">
-    <input type="datetime-local" step="1" id="gotoTime">
+    <input type="datetime-local" step="1" id="gotoTime" aria-label="Moment to go to">
     <button class="btn small" id="btnGoto">Go to time</button>
   </label>
 </div>
 
 <div class="panels">
   <div class="panel" id="deskPanel">
-    <canvas id="deskCanvas"></canvas>
+    <canvas id="deskCanvas" role="img" aria-label="Desk space: the hand path, in centimetres"></canvas>
     <div class="title"><b>Desk space</b> — hand path<span class="sub" id="deskSub">grid 1 cm</span></div>
     <div class="hint" id="deskHint"></div>
     <div class="flash" id="deskFlash"></div>
   </div>
   <div class="panel" id="aimPanel">
-    <canvas id="aimCanvas"></canvas>
+    <canvas id="aimCanvas" role="img" aria-label="Aim space: the crosshair path, in degrees"></canvas>
     <div class="title"><b>Aim space</b> — crosshair path<span class="sub" id="aimSub">grid 10&deg;</span></div>
     <div class="hint" id="aimHint"></div>
     <div class="flash" id="aimFlash"></div>
+  </div>
+  <div class="panel" id="ptrPanel">
+    <canvas id="ptrCanvas" role="img" aria-label="Pointer space: the Windows cursor path, in pixels"></canvas>
+    <div class="title"><b>Pointer space</b> — Windows cursor path<span class="sub" id="ptrSub">grid 100 px</span></div>
+    <div class="hint" id="ptrHint"></div>
+    <div class="flash" id="ptrFlash"></div>
   </div>
   <div class="hud hidden" id="hud"></div>
   <div class="feed-badge" id="feedBadge">no feed</div>
@@ -423,6 +435,7 @@
 <div class="stats" id="stats">
   <div class="stat"><div class="k">speed</div><div class="v"><span id="sSpeedCm">0.0</span> <small>cm/s</small></div></div>
   <div class="stat"><div class="k">aim speed</div><div class="v"><span id="sSpeedDeg">0</span> <small>&deg;/s</small></div></div>
+  <div class="stat" title="The same input after Windows' pointer acceleration and speed slider, as the desktop cursor moves (the Pointer view). Uses the settings recorded with the session; a fresh install's defaults when it has none."><div class="k">pointer speed</div><div class="v"><span id="sSpeedPx">0</span> <small>px/s</small></div></div>
   <div class="stat"><div class="k">hand distance</div><div class="v"><span id="sDistM">0.00</span> <small>m</small></div></div>
   <div class="stat"><div class="k">aim distance</div><div class="v"><span id="sDistDeg">0</span> <small>&deg;</small></div></div>
   <div class="stat"><div class="k">clicks / min</div><div class="v"><span id="sCpm">0</span> <small id="sClicks">0 total</small></div></div>
@@ -451,7 +464,7 @@
     <div class="v"><span id="sProf">—</span></div></div>
 </div>
 
-<div id="toasts"></div>
+<div id="toasts" role="status" aria-live="polite"></div>
 
 <!-- The whole app lives in app.js: opened from disk this tag loads it as a
      file; served by telemouse-viz the script is inlined so the page stays a

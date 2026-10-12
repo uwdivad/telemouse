@@ -170,11 +170,13 @@ mod tests {
 
     #[test]
     fn this_test_run_is_not_a_double_click() {
-        // cargo passes the harness arguments or pipes its output; either way
-        // the real probe must come back false here, or CI would hang.
+        // A test binary is always started by cargo (or another runner), and
+        // a child shares its parent's console: there is either no console at
+        // all (CI) or one with at least two processes on it. So the real
+        // probe must come back false here, unconditionally — if it ever did
+        // not, the guard would block on stdin and hang the run.
         let l = Launch::detect();
-        if l.arg_count > 0 || !l.stdout_is_terminal {
-            assert!(!should_hold_window(l));
-        }
+        assert_ne!(l.console_processes, Some(1), "{l:?}");
+        assert!(!should_hold_window(l), "{l:?}");
     }
 }

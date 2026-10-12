@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
-use telemouse_core::recordings::{SessionMeta, meta_file_name};
+use telemouse_core::recordings::{RECORDING_EXT, SessionMeta, meta_file_name};
 
 /// One recorded session offered to the replay mode.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -90,7 +90,7 @@ pub fn probe_time_range(path: &Path) -> (Option<i64>, Option<i64>) {
 ///
 /// A batch's `ts_anchor_us` is its first event; adding the last event's QPC
 /// offset would need the session's `qpc_freq`, and a batch spans ≤ one
-/// `window_ms` (50 ms by default), which is below what "go to a time" can
+/// `window_ms` (25 ms by default), which is below what "go to a time" can
 /// usefully resolve anyway.
 fn line_utc_us(line: &[u8]) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_slice(line).ok()?;
@@ -113,6 +113,10 @@ pub use telemouse_core::recordings::is_safe_id;
 
 /// List `*.jsonl` files directly inside `dir`, newest first.
 ///
+/// Only regular files are listed, judged without following links — the same
+/// rule [`resolve_recording`] serves by, so nothing is listed that would then
+/// answer 404.
+///
 /// A missing or unreadable directory is not an error: the replay UI simply
 /// shows an empty list (conventions: no panics on degraded environments).
 pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
@@ -123,12 +127,9 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            if !path.is_file() {
-                return None;
-            }
             if !path
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+                .is_some_and(|e| e.eq_ignore_ascii_case(RECORDING_EXT))
             {
                 return None;
             }
@@ -136,7 +137,10 @@ pub fn list_recordings(dir: &Path) -> Vec<SessionEntry> {
             if !is_safe_id(&id) {
                 return None;
             }
-            let meta = entry.metadata().ok()?;
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if !meta.file_type().is_file() {
+                return None;
+            }
             let modified_epoch_ms = meta
                 .modified()
                 .ok()
@@ -330,13 +334,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bundled_demo_recording_reports_its_time_range() {
+    /// The checked-in demo recording, when this checkout has one.
+    fn bundled_demo() -> Option<PathBuf> {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .and_then(|p| p.parent())
-            .unwrap();
-        let Some(path) = resolve_recording(&repo_root.join("recordings"), "demo-session") else {
+            .and_then(|p| p.parent())?;
+        resolve_recording(&repo_root.join("recordings"), "demo-session")
+    }
+
+    #[test]
+    fn bundled_demo_recording_reports_its_time_range() {
+        let Some(path) = bundled_demo() else {
             return;
         };
         let (started, ended) = probe_time_range(&path);
@@ -402,13 +410,7 @@ mod tests {
     /// it is what replay mode loads out of the box.
     #[test]
     fn bundled_demo_recording_is_a_valid_envelope_stream() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .to_path_buf();
-        let dir = repo_root.join("recordings");
-        let Some(path) = resolve_recording(&dir, "demo-session") else {
+        let Some(path) = bundled_demo() else {
             return; // fixture not present in this checkout; nothing to verify
         };
         let text = std::fs::read_to_string(path).unwrap();
@@ -453,13 +455,43 @@ mod tests {
         assert!(events > 1000, "expected a dense 1kHz path, got {events}");
     }
 
+    /// A link named like a recording is neither listed nor served: listing
+    /// and resolving judge it by the same rule.
+    #[cfg(unix)]
     #[test]
-    fn safe_id_charset() {
-        assert!(is_safe_id("s-2026-08-23_120000"));
-        assert!(is_safe_id("abc123"));
-        assert!(!is_safe_id("a b"));
-        assert!(!is_safe_id("a/b"));
-        assert!(!is_safe_id("a.b"));
-        assert!(!is_safe_id(&"x".repeat(129)));
+    fn a_symlinked_recording_is_neither_listed_nor_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "real.jsonl", "{}");
+        std::os::unix::fs::symlink(tmp.path().join("real.jsonl"), tmp.path().join("link.jsonl"))
+            .unwrap();
+        let ids: Vec<String> = list_recordings(tmp.path())
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["real".to_string()]);
+        assert!(resolve_recording(tmp.path(), "link").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_symlinked_recording_is_neither_listed_nor_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "real.jsonl", "{}");
+        // Creating a link needs Developer Mode or elevation; without either
+        // there is nothing to test, which is not a failure.
+        if std::os::windows::fs::symlink_file(
+            tmp.path().join("real.jsonl"),
+            tmp.path().join("link.jsonl"),
+        )
+        .is_err()
+        {
+            return;
+        }
+        let ids: Vec<String> = list_recordings(tmp.path())
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["real".to_string()]);
+        assert!(resolve_recording(tmp.path(), "link").is_none());
     }
 }

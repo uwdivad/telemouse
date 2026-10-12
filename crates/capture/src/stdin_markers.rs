@@ -14,16 +14,16 @@ use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
+use telemouse_core::session::MAX_MARKER_LABEL_CHARS;
+
 use crate::platform;
 use crate::raw_input::RingWaker;
 use crate::shipping::MarkerSignal;
 
-/// Longest label kept, in characters. A marker is a tag, not a note.
-pub const MAX_LABEL_CHARS: usize = 120;
-
 /// The label one input line asks for, or `None` for a line that is not a
 /// marker: blank, JSON without a string `label` (or `marker`), or nothing
-/// left after control characters are dropped.
+/// left after control characters are dropped. Capped at the workspace-wide
+/// [`MAX_MARKER_LABEL_CHARS`]: a marker is a tag, not a note.
 pub fn parse_line(line: &str) -> Option<String> {
     let s = line.trim();
     if s.is_empty() {
@@ -42,7 +42,7 @@ pub fn parse_line(line: &str) -> Option<String> {
     let cleaned: String = label
         .chars()
         .filter(|c| !c.is_control())
-        .take(MAX_LABEL_CHARS)
+        .take(MAX_MARKER_LABEL_CHARS)
         .collect();
     (!cleaned.trim().is_empty()).then(|| cleaned.trim().to_string())
 }
@@ -127,7 +127,10 @@ mod tests {
 
     #[test]
     fn labels_are_capped() {
-        let long = "x".repeat(MAX_LABEL_CHARS * 2);
-        assert_eq!(parse_line(&long).unwrap().chars().count(), MAX_LABEL_CHARS);
+        let long = "x".repeat(MAX_MARKER_LABEL_CHARS * 2);
+        assert_eq!(
+            parse_line(&long).unwrap().chars().count(),
+            MAX_MARKER_LABEL_CHARS
+        );
     }
 }

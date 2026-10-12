@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
-use telemouse_analyze::{load, report, series::Params, testutil, trend};
-use telemouse_core::{Marker, RawEvent, event::buttons};
+use telemouse_analyze::{load, report, report::Report, series::Params, testutil, trend};
+use telemouse_core::RawEvent;
 
 /// Three flicks-with-correction-and-click, a slow drag that must *not* be a
 /// flick, and a marker. Amplitudes are exact count sums by construction.
@@ -16,14 +16,8 @@ fn synthetic_events() -> Vec<RawEvent> {
     let mut b = testutil::StreamBuilder::new();
     b.idle_ms(250);
     for _ in 0..3 {
-        b.move_ms(25, 60, 0) // 1500 counts ballistic
-            .idle_ms(10)
-            .move_ms(10, -10, 0) // 100 counts back
-            .idle_ms(5)
-            .button(buttons::LEFT_DOWN)
-            .idle_ms(39)
-            .button(buttons::LEFT_UP) // 40ms hold
-            .idle_ms(600);
+        // 1500 counts ballistic, 100 back, a 40 ms click.
+        b.flick_cycle(1, 0, 600);
     }
     // A long slow drag: lots of travel, never fast enough to be a flick.
     b.move_at_ms(1500, 400.0, 0.0).idle_ms(500);
@@ -33,17 +27,13 @@ fn synthetic_events() -> Vec<RawEvent> {
 fn write_fixture(dir: &Path) -> std::path::PathBuf {
     let cfg = testutil::session_cfg();
     let events = synthetic_events();
-    let marker = Marker {
-        session_id: cfg.session_id.clone(),
-        seq_no: 0,
-        ts_qpc: cfg.anchor.qpc + cfg.anchor.ms_to_ticks(1000),
-        ts_utc_us: cfg
-            .anchor
-            .qpc_to_utc_us(cfg.anchor.qpc + cfg.anchor.ms_to_ticks(1000)),
-        label: "round-start".into(),
-    };
+    let marker = testutil::marker_at(1000, "round-start");
     // 448 events per batch, matching the capture agent's cap.
     testutil::write_session(dir, &cfg, Some("cs2.exe"), &events, &[marker], 448)
+}
+
+fn build(session: load::LoadedSession) -> Report {
+    report::build(session, Params::default()).expect("default params validate")
 }
 
 #[test]
@@ -66,7 +56,7 @@ fn full_pipeline_over_a_written_recording() {
     assert!(session.batches[0].first_event_qpc.is_some());
 
     // --- analyze ----------------------------------------------------------
-    let r = report::build(session, Params::default());
+    let r = build(session);
 
     assert_eq!(r.schema, report::SCHEMA);
     assert_eq!(r.analyzer_version, report::ANALYZER_VERSION);
@@ -207,7 +197,7 @@ fn json_and_csv_outputs_are_well_formed() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_fixture(dir.path());
     let session = load::load_session(&path).unwrap();
-    let r = report::build(session, Params::default());
+    let r = build(session);
 
     // JSON: parse back as an untyped value and index the documented shape.
     let json = r.to_json_pretty().unwrap();
@@ -302,7 +292,7 @@ fn a_recording_without_a_sensitivity_profile_warns_but_still_reports() {
     let path = testutil::write_session(dir.path(), &cfg, Some("valorant.exe"), &events, &[], 448);
 
     let session = load::load_session(&path).unwrap();
-    let r = report::build(session, Params::default());
+    let r = build(session);
 
     assert!(r.session.aim_profile_missing);
     assert_eq!(r.session.sens, 1.0);
@@ -337,10 +327,19 @@ fn a_cached_report_is_reused_and_matches_a_fresh_one() {
     assert_eq!(second.generated_utc_us, first.generated_utc_us);
     assert_eq!(second.per_second.len(), first.per_second.len());
 
-    // Touching the recording invalidates it.
-    let text = std::fs::read_to_string(&path).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(&path, text).unwrap();
+    // Touching the recording invalidates it. The new mtime is set outright
+    // rather than waited for, so the test does not depend on the
+    // filesystem's timestamp resolution or on a sleep being long enough.
+    let cached_at = std::fs::metadata(cache.join("s-test.report.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(cached_at + std::time::Duration::from_secs(2))
+        .unwrap();
     let (_, why) = trend::report_for(&path, Some(&cache), Params::default()).unwrap();
     assert_eq!(why, trend::CacheOutcome::Stale);
 }

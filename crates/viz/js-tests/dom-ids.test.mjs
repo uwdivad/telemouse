@@ -29,6 +29,9 @@ export function idsLookedUp(js) {
   for (const block of js.matchAll(/for \(const id of \[([^\]]*)\]\) SE\[id\] = \$\(id\)/g)) {
     for (const m of block[1].matchAll(/"([A-Za-z0-9_-]+)"/g)) ids.add(m[1]);
   }
+  // Panels: `new Panel("canvasId", { subId: "…", hintId: "…", flashId: "…" })`.
+  for (const m of js.matchAll(/new Panel\("([A-Za-z0-9_-]+)"/g)) ids.add(m[1]);
+  for (const m of js.matchAll(/\b(?:subId|hintId|flashId):\s*"([A-Za-z0-9_-]+)"/g)) ids.add(m[1]);
   return ids;
 }
 
@@ -47,8 +50,10 @@ test("every id app.js looks up exists in index.html", () => {
   assert.deepEqual(missing, [], `ids app.js uses that index.html lacks: ${missing.join(", ")}`);
 });
 
-test("the stats-bar cache list is found by the test", () => {
-  // If the loop is ever rewritten, this test must be updated too, or the
-  // cache list silently drops out of the check above.
-  assert.ok(idsLookedUp(APP_JS).has("sSpeedCm"));
+test("the stats-bar cache list and the panel options are found by the test", () => {
+  // If either is ever rewritten, this test must be updated too, or those ids
+  // silently drop out of the check above.
+  const ids = idsLookedUp(APP_JS);
+  assert.ok(ids.has("sSpeedCm"));
+  for (const id of ["deskCanvas", "aimSub", "ptrHint", "deskFlash"]) assert.ok(ids.has(id), id);
 });

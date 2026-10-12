@@ -25,11 +25,15 @@
 //! use telemouse_analyze::{load, report, series::Params};
 //! # fn main() -> anyhow::Result<()> {
 //! let session = load::load_session(std::path::Path::new("recordings/s-1.jsonl"))?;
-//! let report = report::build(session, Params::default());
+//! let report = report::build(session, Params::default())?;
 //! println!("{}", report.render());
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Library functions return typed errors ([`load::LoadError`],
+//! [`series::ParamsError`], and [`AnalyzeError`] for the paths that combine
+//! them); the binary turns them into `anyhow` at the edge.
 //!
 //! Numerics live in [`savgol`] (Savitzky–Golay smoothing/differentiation) and
 //! [`stats`]; neither pulls in a dependency.
@@ -43,7 +47,9 @@
 //! is linear with no per-item allocation. `benches/hot_math.rs` covers the hot
 //! paths at 1 M and 10 M cells.
 
+mod atomic;
 pub mod clicks;
+mod error;
 pub mod flicks;
 pub mod kinematics;
 pub mod lifts;
@@ -57,10 +63,37 @@ pub mod report;
 pub mod savgol;
 pub mod series;
 pub mod stats;
+/// Synthetic-recording builders for this crate's tests and benches.
+///
+/// Public only because integration tests, benches and `telemouse-mcp`'s tests
+/// link the library as an outside crate and cannot see `#[cfg(test)]` items;
+/// it is not part of the supported API and is hidden from the docs. The
+/// proper fix is a `testutil` Cargo feature enabled from `[dev-dependencies]`.
+#[doc(hidden)]
 pub mod testutil;
 pub mod timefmt;
 pub mod trend;
 
+pub use error::AnalyzeError;
 pub use load::{LoadedSession, SessionIndexEntry, load_session, scan_dir, scan_session};
 pub use report::{Report, build};
-pub use series::{Params, Prepared, prepare};
+pub use series::{Params, ParamsError, Prepared, prepare};
+
+/// One row of a `--json` listing with its schema tag in front of the row's own
+/// fields, so a consumer can tell which shape it is reading without the
+/// listing changing from an array into an object.
+#[derive(serde::Serialize)]
+struct Tagged<'a, T> {
+    schema: &'static str,
+    #[serde(flatten)]
+    row: &'a T,
+}
+
+/// `rows` as a pretty JSON array, every element tagged with `schema`.
+pub(crate) fn tagged_rows_json<T: serde::Serialize>(
+    schema: &'static str,
+    rows: &[T],
+) -> serde_json::Result<String> {
+    let tagged: Vec<Tagged<'_, T>> = rows.iter().map(|row| Tagged { schema, row }).collect();
+    serde_json::to_string_pretty(&tagged)
+}

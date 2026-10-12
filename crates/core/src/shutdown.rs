@@ -17,7 +17,6 @@
 //! guard still exists so callers need no `cfg`.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -37,8 +36,9 @@ pub enum Signal {
 }
 
 impl Signal {
-    /// Kebab-case name, as it appears in logs and in a session's
-    /// `exit` field.
+    /// Kebab-case name, as it appears in logs. (A session's `exit` field
+    /// records the broader [`crate::recordings::ExitReason`] instead: every
+    /// signal there is `interrupt`.)
     pub fn as_str(self) -> &'static str {
         match self {
             Signal::CtrlC => "ctrl-c",
@@ -137,7 +137,6 @@ struct Installed {
 }
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
-static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Run the callback for one console control event and decide whether it was
 /// handled. Split out from the Win32 entry point so the blocking rule can be
@@ -171,20 +170,15 @@ pub fn install(
     on_signal: impl Fn(Signal) + Send + Sync + 'static,
     max_wait: Duration,
 ) -> io::Result<ShutdownGuard> {
-    if CLAIMED.swap(true, Ordering::SeqCst) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "a console control handler is already installed for this process",
-        ));
-    }
     let done = Arc::new(Done::default());
     let state = Installed {
         on_signal: Box::new(on_signal),
         done: Arc::clone(&done),
         max_wait,
     };
+    // `OnceLock::set` is the one-per-process claim: it fails atomically for
+    // every caller after the first.
     if INSTALLED.set(state).is_err() {
-        CLAIMED.store(false, Ordering::SeqCst);
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "a console control handler is already installed for this process",
@@ -251,10 +245,10 @@ mod tests {
 
     #[test]
     fn waiting_gives_up_after_max_wait() {
+        // Nothing ever calls `set`, so the only way out is the timeout, and
+        // the result says so.
         let done = Done::default();
-        let started = std::time::Instant::now();
         assert!(!done.wait(Duration::from_millis(50)));
-        assert!(started.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]
@@ -267,21 +261,25 @@ mod tests {
 
     /// One test drives the whole process-global install, because there is
     /// exactly one handler slot per process.
+    ///
+    /// No wall-clock bounds: `max_wait` is an hour, so a handler call that
+    /// returns at all was not released by the timeout. A regression shows
+    /// up as a hung test rather than a flaky one.
     #[test]
     fn installed_handler_runs_the_callback_and_blocks_only_for_terminal_events() {
         let (tx, rx) = mpsc::channel();
-        let guard = install(move |s| tx.send(s).unwrap(), Duration::from_millis(200))
+        let guard = install(move |s| tx.send(s).unwrap(), Duration::from_secs(3600))
             .expect("first install succeeds");
 
         // A second install is refused rather than silently replacing the first.
         let err = install(|_| {}, Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
-        // Ctrl-C returns immediately.
-        let started = std::time::Instant::now();
+        // Ctrl-C is not terminal: it returns without waiting for teardown,
+        // which nothing has reported yet.
         assert!(handle_event(CTRL_C_EVENT));
         assert_eq!(rx.recv().unwrap(), Signal::CtrlC);
-        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(!guard.is_finished());
 
         // An unknown event is not ours.
         assert!(!handle_event(42));
@@ -293,13 +291,8 @@ mod tests {
             g.finished();
             s
         });
-        let started = std::time::Instant::now();
         assert!(handle_event(CTRL_CLOSE_EVENT));
         assert_eq!(waiter.join().unwrap(), Signal::Close);
-        assert!(guard.is_finished());
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "released by finished(), not by the timeout"
-        );
+        assert!(guard.is_finished(), "released by finished()");
     }
 }

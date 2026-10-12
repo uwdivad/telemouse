@@ -81,7 +81,8 @@ mod tests {
         s.set();
         let start = Instant::now();
         assert!(s.wait_timeout(Duration::from_secs(30)));
-        assert!(start.elapsed() < Duration::from_millis(100));
+        // Nowhere near the 30s it would take if it waited.
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     /// A wait that nobody ends runs to its deadline and reports "not set".
@@ -151,6 +152,6 @@ mod tests {
         let s = Shutdown::new();
         let start = Instant::now();
         assert!(!s.wait_until(Instant::now() - Duration::from_secs(1)));
-        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

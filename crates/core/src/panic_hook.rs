@@ -35,7 +35,8 @@ fn describe(info: &PanicHookInfo<'_>) -> (String, String, String) {
 }
 
 /// Install the hook once per process. `component` names the binary in the
-/// log line (`capture`, `viz`, `ctl`, `analyze`). Safe to call more than
+/// log line: the binary's short name (`capture`, `viz`, `ctl`, `analyze`,
+/// `mcp`). Safe to call more than
 /// once; only the first call installs.
 pub fn install(component: &'static str) {
     INSTALLED.call_once(|| {

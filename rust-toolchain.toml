@@ -1,7 +1,8 @@
 # One toolchain for CI and every developer. `cargo clippy -D warnings` is a
 # merge gate, and a new stable's lints used to turn it red without any change
-# to the tree; bumping this file (and the matching `toolchain:` input in
-# .github/workflows/*.yml) is how a toolchain change happens now.
+# to the tree; bumping this file is how a toolchain change happens now. It is
+# the only place the version is written: the workflows run a bare
+# `rustup toolchain install`, which installs what this file names.
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]

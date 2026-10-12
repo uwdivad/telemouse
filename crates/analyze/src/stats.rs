@@ -64,7 +64,8 @@ pub fn stddev(xs: &[f64]) -> Option<f64> {
 }
 
 /// Root mean square.
-pub fn rms(xs: &[f64]) -> Option<f64> {
+#[cfg(test)]
+pub(crate) fn rms(xs: &[f64]) -> Option<f64> {
     let mut n = 0usize;
     let mut acc = 0.0;
     for &x in xs {
@@ -73,7 +74,47 @@ pub fn rms(xs: &[f64]) -> Option<f64> {
             n += 1;
         }
     }
-    (n > 0).then(|| (acc / n as f64).sqrt())
+    (n > 0).then(|| rms_of_energy(acc, n))
+}
+
+/// The RMS of `n` samples whose squares sum to `sum_sq`; zero for no samples.
+/// The tremor estimate accumulates energy rather than keeping samples, so it
+/// reaches the RMS through here.
+pub fn rms_of_energy(sum_sq: f64, n: usize) -> f64 {
+    if n == 0 {
+        0.0
+    } else {
+        (sum_sq / n as f64).sqrt()
+    }
+}
+
+/// Which side of a histogram edge a value exactly on it falls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// Buckets are `(lo, hi]`: a value equal to an edge is in the bucket
+    /// that edge closes ("≤ 1 ms").
+    Inclusive,
+    /// Buckets are `[lo, hi)`: a value equal to an edge opens the next one
+    /// ("5–10 counts" holds 5).
+    Exclusive,
+}
+
+/// Counts of `values` per bucket of ascending `edges`: `edges.len() + 1`
+/// buckets, the last one open-ended. Non-finite values are skipped, except
+/// `+∞`, which lands in the open bucket like any other large value would.
+pub fn bucket_counts(edges: &[f64], values: &[f64], edge: Edge) -> Vec<usize> {
+    let mut counts = vec![0usize; edges.len() + 1];
+    for &v in values {
+        if v.is_nan() {
+            continue;
+        }
+        let idx = match edge {
+            Edge::Inclusive => edges.partition_point(|&e| e < v),
+            Edge::Exclusive => edges.partition_point(|&e| e <= v),
+        };
+        counts[idx] += 1;
+    }
+    counts
 }
 
 /// Linear-interpolated percentile, `q` in `[0, 1]`.
@@ -131,7 +172,8 @@ pub fn median(xs: &[f64]) -> Option<f64> {
     percentile(xs, 0.5)
 }
 
-pub fn max(xs: &[f64]) -> Option<f64> {
+#[cfg(test)]
+pub(crate) fn max(xs: &[f64]) -> Option<f64> {
     xs.iter()
         .copied()
         .filter(|x| x.is_finite())
@@ -140,7 +182,8 @@ pub fn max(xs: &[f64]) -> Option<f64> {
         })
 }
 
-pub fn min(xs: &[f64]) -> Option<f64> {
+#[cfg(test)]
+pub(crate) fn min(xs: &[f64]) -> Option<f64> {
     xs.iter()
         .copied()
         .filter(|x| x.is_finite())
@@ -363,7 +406,20 @@ mod tests {
     #[test]
     fn rms_and_stddev() {
         assert_eq!(rms(&[3.0, 4.0]), Some(((9.0 + 16.0) / 2.0f64).sqrt()));
+        assert_eq!(rms_of_energy(25.0, 2), rms(&[3.0, 4.0]).unwrap());
+        assert_eq!(rms_of_energy(7.0, 0), 0.0);
         assert_eq!(stddev(&[2.0, 2.0, 2.0]), Some(0.0));
+    }
+
+    /// The two histograms in the crate differ only in which bucket owns an
+    /// edge, and that is now the one argument that says so.
+    #[test]
+    fn bucket_edges_are_inclusive_or_exclusive_on_request() {
+        let edges = [1.0, 2.0];
+        let values = [0.5, 1.0, 1.5, 2.0, 9.0, f64::NAN, f64::INFINITY];
+        assert_eq!(bucket_counts(&edges, &values, Edge::Inclusive), [2, 2, 2]);
+        assert_eq!(bucket_counts(&edges, &values, Edge::Exclusive), [1, 2, 3]);
+        assert_eq!(bucket_counts(&edges, &[], Edge::Inclusive), [0, 0, 0]);
     }
 
     #[test]

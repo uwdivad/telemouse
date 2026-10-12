@@ -12,16 +12,39 @@ description = "Raw mouse telemetry for gaming: HID deltas with microsecond times
 # this, so it is the version the code actually needs, not the edition's floor.
 rust-version = "1.98"
 
+# Every external crate used by more than one member is declared here once;
+# members write `{ workspace = true, features = [...] }` and add only the
+# features they need (features are additive, a member cannot remove one set
+# here, which is why these entries carry none or the minimum).
 [workspace.dependencies]
 telemouse-core = { path = "crates/core" }
+# mcp links the analyzer as a library and never wants its bin-only `logging`.
+telemouse-analyze = { path = "crates/analyze", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
-toml = "0.9"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+tokio = "1.53.1"
+axum = "0.8.9"
+windows = "0.62.2"
+winresource = "0.1.31"
+tempfile = "3.27.0"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+# Every member opts in with `[lints] workspace = true`. Only lints the whole
+# tree already passes under `clippy -D warnings` are listed; `print_stdout`
+# is deliberately not here (analyze and capture print on purpose).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
 
 # Profile notes (2026-08 perf audit):
 # - lto stays "thin": a fat-LTO/panic=abort evaluation came out net-negative
@@ -29,8 +52,11 @@ clap = { version = "4", features = ["derive"] }
 # - panic stays "unwind": ordered teardown depends on it (partial-batch flush,
 #   bounded Kafka drain on shutdown).
 # - `-C target-cpu=znver3` is a worthwhile OPT-IN for telemouse-analyze math
-#   kernels on the 5950X, e.g.
-#     $env:RUSTFLAGS="-C target-cpu=znver3"; cargo bench -p telemouse-analyze
+#   kernels on the 5950X. RUSTFLAGS would REPLACE the `+crt-static` flag that
+#   .cargo/config.toml sets for this target, so set the target-specific
+#   variable with both flags instead:
+#     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=znver3"
+#     cargo bench -p telemouse-analyze
 #   It is deliberately not forced workspace-wide so binaries stay portable.
 [profile.release]
 lto = "thin"

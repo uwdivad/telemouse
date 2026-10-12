@@ -77,6 +77,7 @@ pub async fn listen(addr: SocketAddr, hub: Arc<Hub>) -> std::io::Result<()> {
     info!(%addr, "udp listener bound");
     let mut buf = vec![0u8; RECV_BUF];
     let mut rejects = RejectLog::default();
+    let mut recv_errors = RecvErrorLog::default();
     loop {
         match sock.recv_from(&mut buf).await {
             Ok((n, from)) => {
@@ -96,8 +97,39 @@ pub async fn listen(addr: SocketAddr, hub: Arc<Hub>) -> std::io::Result<()> {
             }
             Err(e) => {
                 // On Windows a UDP send to a closed port can surface as
-                // ConnectionReset on the *receiving* socket. Never fatal.
-                warn!(error = %e, "udp recv error");
+                // ConnectionReset on the *receiving* socket. Never fatal, but
+                // a persistent error would spin this loop: warn at most once
+                // a minute and back off briefly before the next receive.
+                if recv_errors.should_warn(Instant::now()) {
+                    warn!(
+                        error = %e,
+                        "udp recv error (further ones are logged at most once a minute)"
+                    );
+                }
+                tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// Pause after a failed `recv_from`, so a socket stuck in an error state
+/// cannot turn the receive loop into a busy loop.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Once-a-minute gate for receive errors (the same cadence as [`RejectLog`]).
+#[derive(Debug, Default)]
+pub struct RecvErrorLog {
+    last: Option<Instant>,
+}
+
+impl RecvErrorLog {
+    /// True if a receive error at `now` should be logged.
+    pub fn should_warn(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(prev) if now.duration_since(prev) < REJECT_WARN_EVERY => false,
+            _ => {
+                self.last = Some(now);
+                true
             }
         }
     }
@@ -135,6 +167,16 @@ mod tests {
         assert!(!log.should_warn(&RejectReason::Empty, t0));
         assert!(!log.should_warn(&RejectReason::NotUtf8, t0));
         assert!(!log.should_warn(&RejectReason::BadEnvelope("y".into()), t0));
+    }
+
+    #[test]
+    fn recv_errors_warn_once_a_minute() {
+        let mut log = RecvErrorLog::default();
+        let t0 = Instant::now();
+        assert!(log.should_warn(t0));
+        assert!(!log.should_warn(t0 + Duration::from_secs(1)));
+        assert!(!log.should_warn(t0 + Duration::from_secs(59)));
+        assert!(log.should_warn(t0 + Duration::from_secs(61)));
     }
 
     #[test]

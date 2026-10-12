@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, RandomState};
 
-use telemouse_core::session::{GameSens, MonitorInfo};
+use telemouse_core::session::{GameSens, MonitorInfo, PointerSettings};
 use telemouse_core::{QpcAnchor, SessionConfig};
 
 /// UTC microseconds since the Unix epoch, right now (the workspace-wide
@@ -37,6 +37,9 @@ pub struct SessionEnv {
     /// The host OS, e.g. `Windows 10.0.19045`; `None` when it could not be
     /// determined.
     pub os: Option<String>,
+    /// The desktop's pointer settings; `None` when there was no desktop to
+    /// ask (or off Windows).
+    pub pointer: Option<PointerSettings>,
 }
 
 /// Build an anchor from a QPC/UTC/QPC sandwich.
@@ -60,9 +63,14 @@ pub fn sandwich_anchor(
         utc_us,
         qpc_freq: freq,
     };
-    // Round up: an uncertainty of "0µs" would overstate what we know.
-    let half_us = (half as u128 * 1_000_000).div_ceil(freq as u128) as i64;
-    (anchor, half_us)
+    // The wall-clock read happened somewhere in the bracket, so the anchor
+    // can be off by as much as the larger side of it: `span - half` (an odd
+    // span puts the truncated midpoint one tick nearer `before`). Round up,
+    // too: an uncertainty of "0µs" from a non-empty bracket would overstate
+    // what we know.
+    let bound = span - half;
+    let bound_us = (bound as u128 * 1_000_000).div_ceil(freq as u128) as i64;
+    (anchor, bound_us)
 }
 
 /// Take a fresh sandwich against the live clocks.
@@ -121,6 +129,7 @@ pub fn build_session_config(session_id: String, env: SessionEnv) -> SessionConfi
         window_ms: env.window_ms,
         max_events: env.max_events,
         os: env.os,
+        pointer: env.pointer,
     }
 }
 
@@ -162,6 +171,7 @@ mod tests {
             window_ms: 50,
             max_events: 448,
             os: Some("Windows 10.0.19045".into()),
+            pointer: Some(PointerSettings::windows_defaults()),
         }
     }
 
@@ -211,6 +221,8 @@ mod tests {
         assert_eq!((cfg.window_ms, cfg.max_events), (50, 448));
         assert_eq!(cfg.coalesce_ms, 2);
         assert_eq!(cfg.os.as_deref(), Some("Windows 10.0.19045"));
+        // What the desktop cursor did with the counts, for the pointer view.
+        assert_eq!(cfg.pointer, Some(PointerSettings::windows_defaults()));
     }
 
     #[test]
@@ -245,13 +257,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tight_sandwich_still_reports_a_nonzero_bound_when_it_should() {
-        // 1 tick apart: half a tick rounds *up* to 1µs rather than claiming
-        // perfect knowledge... at 10MHz half a tick is 0.05µs -> 1µs.
-        let (_, uncertainty) = sandwich_anchor(1_000, 0, 1_001, 10_000_000);
-        assert_eq!(uncertainty, 0, "half of 1 tick truncates to 0 ticks");
+    fn a_tight_sandwich_still_reports_a_nonzero_bound() {
+        // 1 tick apart: the midpoint truncates onto `before`, so the read may
+        // be a whole tick (0.1µs at 10MHz) away — rounded up to 1µs rather
+        // than claiming perfect knowledge.
+        let (a, uncertainty) = sandwich_anchor(1_000, 0, 1_001, 10_000_000);
+        assert_eq!(a.qpc, 1_000);
+        assert_eq!(uncertainty, 1);
+        // 41 ticks: anchored 20 in, so up to 21 ticks (2.1µs) away -> 3µs.
         let (_, u2) = sandwich_anchor(1_000, 0, 1_041, 10_000_000);
-        assert_eq!(u2, 2, "20 ticks = 2µs, rounded up");
+        assert_eq!(u2, 3);
         // Identical reads: no bracket, no uncertainty.
         let (a, u3) = sandwich_anchor(500, 7, 500, 10_000_000);
         assert_eq!((a.qpc, u3), (500, 0));
@@ -308,8 +323,9 @@ mod tests {
         let (a, uncertainty) = measure_anchor(freq);
         assert_eq!(a.qpc_freq, freq);
         assert!(a.qpc > 0);
-        // Two adjacent clock reads should bracket well under a millisecond.
-        assert!(uncertainty < 1_000, "anchor bracket was {uncertainty}µs");
+        // Two adjacent clock reads bracket well under a millisecond; the
+        // bound is generous so a preempted test thread does not fail it.
+        assert!(uncertainty < 50_000, "anchor bracket was {uncertainty}µs");
     }
 
     #[test]

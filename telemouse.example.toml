@@ -90,9 +90,9 @@ hotkey = "ctrl+alt+r"
 # These are the defaults; any of them can be overridden per source with URL
 # query parameters, e.g. /obs?layout=aim&hud=speed,aim&scale=1.5&bg=0e131c80
 [viz.obs]
-layout = "split"            # split | stack | desk | aim
+layout = "split"            # split | stack | desk | aim | pointer | compare (desk beside the Windows cursor path)
 background = "transparent"  # or "#rrggbb" / "#rrggbbaa"
-hud = ["speed", "aim", "cpm"]  # also: eps, dist, aimdist, clicks, game, latency, eventage; [] hides it
+hud = ["speed", "aim", "cpm"]  # also: pointer, eps, dist, aimdist, clicks, game, latency, eventage; [] hides it
 hud_position = "bottom-left"
 scale = 1.0                 # stroke/marker/HUD size multiplier for small sources
 trail_secs = 3.0

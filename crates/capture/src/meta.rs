@@ -18,14 +18,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use telemouse_core::recordings::{ExitReason, SessionMeta, SinkMeta, meta_file_name};
 
 use crate::PROFILE;
-use crate::stats::{Stats, StatsSnapshot, poll_hz};
+use crate::sinks::SinkKind;
+use crate::stats::{Stats, StatsSnapshot, Throttle, poll_hz};
+
+/// A sidecar that cannot be written warns at most this often (CONVENTIONS:
+/// anything that stays wrong is repeated once a minute, never only once).
+const WRITE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Everything the sidecar records besides the counters.
 #[derive(Debug, Clone)]
@@ -48,8 +54,8 @@ pub struct RunInfo<'a> {
     pub max_anchor_drift_us: i64,
     pub window_ms: u64,
     pub coalesce_ms: u64,
-    /// Names of the sinks that were enabled for this run, in fan-out order.
-    pub sinks: &'a [&'static str],
+    /// The sinks that were enabled for this run, in fan-out order.
+    pub sinks: &'a [SinkKind],
 }
 
 /// Assemble the sidecar from the counters as they stand. Only the sinks named
@@ -57,9 +63,9 @@ pub struct RunInfo<'a> {
 /// of zeroes that reads as "delivered everything".
 pub fn build(run: &RunInfo<'_>, s: &StatsSnapshot) -> SessionMeta {
     let mut sinks = BTreeMap::new();
-    for name in run.sinks {
-        let m = match *name {
-            "udp" => SinkMeta {
+    for &kind in run.sinks {
+        let m = match kind {
+            SinkKind::Udp => SinkMeta {
                 errors: s.udp_errors,
                 // A datagram nobody was listening for is not a loss of the
                 // recording; an oversized envelope and a socket buffer with
@@ -67,19 +73,18 @@ pub fn build(run: &RunInfo<'_>, s: &StatsSnapshot) -> SessionMeta {
                 dropped: s.udp_oversized.saturating_add(s.udp_would_block),
                 abandoned: 0,
             },
-            "jsonl" => SinkMeta {
+            SinkKind::Jsonl => SinkMeta {
                 errors: s.jsonl_errors,
                 dropped: s.jsonl_dropped,
                 abandoned: s.jsonl_abandoned,
             },
-            "kafka" => SinkMeta {
+            SinkKind::Kafka => SinkMeta {
                 errors: s.kafka_errors,
                 dropped: s.kafka_dropped,
                 abandoned: s.kafka_abandoned,
             },
-            _ => SinkMeta::default(),
         };
-        sinks.insert((*name).to_string(), m);
+        sinks.insert(kind.as_str().to_string(), m);
     }
     SessionMeta {
         session_id: run.session_id.to_string(),
@@ -138,60 +143,51 @@ struct State {
     clean: bool,
 }
 
+/// Everything a run knows about itself before it starts: the part of the
+/// sidecar that never changes.
+#[derive(Debug, Clone)]
+pub struct SidecarRun {
+    /// Where the recording (and so the sidecar) lives.
+    pub dir: PathBuf,
+    pub session_id: String,
+    pub capture_version: &'static str,
+    pub started_utc_us: i64,
+    pub qpc_freq: u64,
+    pub anchor_uncertainty_us: i64,
+    pub window_ms: u64,
+    pub coalesce_ms: u64,
+    /// The sinks that actually started, in fan-out order.
+    pub sinks: Vec<SinkKind>,
+}
+
 /// The live sidecar: everything fixed at startup, plus the handle the three
 /// threads use to refresh it.
 ///
-/// Cheap to call from anywhere — the per-write mutex is uncontended (four
-/// writes a minute) and a write that fails warns exactly once for the life of
-/// the run, so a full disk cannot turn into a log of its own.
+/// Cheap to call from anywhere. Writes are serialized by one mutex (T3's
+/// periodic refresh and T2's at-close refresh can otherwise race on the same
+/// temp file at shutdown); it is uncontended in practice, a dozen writes a
+/// minute. A write that fails warns at most once a minute, so a full disk
+/// cannot turn into a log of its own.
 pub struct Sidecar {
-    dir: PathBuf,
-    session_id: String,
-    capture_version: &'static str,
-    started_utc_us: i64,
-    qpc_freq: u64,
-    anchor_uncertainty_us: i64,
-    window_ms: u64,
-    coalesce_ms: u64,
-    sinks: Vec<&'static str>,
+    run: SidecarRun,
     stats: Arc<Stats>,
     state: Mutex<State>,
     max_drift_us: AtomicI64,
-    warned: AtomicBool,
+    /// Held across every write; also rate-limits the failure warning.
+    write: Mutex<Throttle>,
 }
 
 impl Sidecar {
-    /// Everything a run knows about itself before it starts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        dir: PathBuf,
-        session_id: String,
-        capture_version: &'static str,
-        started_utc_us: i64,
-        qpc_freq: u64,
-        anchor_uncertainty_us: i64,
-        window_ms: u64,
-        coalesce_ms: u64,
-        sinks: Vec<&'static str>,
-        stats: Arc<Stats>,
-    ) -> Self {
+    pub fn new(run: SidecarRun, stats: Arc<Stats>) -> Self {
         Self {
-            dir,
-            session_id,
-            capture_version,
-            started_utc_us,
-            qpc_freq,
-            anchor_uncertainty_us,
-            window_ms,
-            coalesce_ms,
-            sinks,
+            run,
             stats,
             state: Mutex::new(State {
                 exit: ExitReason::Running,
                 clean: false,
             }),
             max_drift_us: AtomicI64::new(0),
-            warned: AtomicBool::new(false),
+            write: Mutex::new(Throttle::new(WRITE_WARN_INTERVAL)),
         }
     }
 
@@ -199,19 +195,8 @@ impl Sidecar {
     /// magnitude survives, which is the number that says whether absolute
     /// timestamps late in the recording can be trusted.
     pub fn observe_drift(&self, drift_us: i64) {
-        let magnitude = drift_us.saturating_abs();
-        let mut best = self.max_drift_us.load(Ordering::Relaxed);
-        while magnitude > best {
-            match self.max_drift_us.compare_exchange_weak(
-                best,
-                magnitude,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => best = actual,
-            }
-        }
+        self.max_drift_us
+            .fetch_max(drift_us.saturating_abs(), Ordering::Relaxed);
     }
 
     /// Settle why the run ended. Called once, before the workers are joined,
@@ -226,37 +211,42 @@ impl Sidecar {
     /// The document as it would be written right now.
     pub fn document(&self) -> SessionMeta {
         let state = *self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let run = &self.run;
         build(
             &RunInfo {
-                session_id: &self.session_id,
-                capture_version: self.capture_version,
+                session_id: &run.session_id,
+                capture_version: run.capture_version,
                 capture_profile: PROFILE,
-                started_utc_us: self.started_utc_us,
+                started_utc_us: run.started_utc_us,
                 ended_utc_us: telemouse_core::now_utc_us(),
                 exit: state.exit,
                 clean: state.clean,
-                qpc_freq: self.qpc_freq,
-                anchor_uncertainty_us: self.anchor_uncertainty_us,
+                qpc_freq: run.qpc_freq,
+                anchor_uncertainty_us: run.anchor_uncertainty_us,
                 max_anchor_drift_us: self.max_drift_us.load(Ordering::Relaxed),
-                window_ms: self.window_ms,
-                coalesce_ms: self.coalesce_ms,
-                sinks: &self.sinks,
+                window_ms: run.window_ms,
+                coalesce_ms: run.coalesce_ms,
+                sinks: &run.sinks,
             },
             &self.stats.snapshot(),
         )
     }
 
-    /// Refresh the file. Never fails the caller: the first failure warns, the
-    /// rest are silent, and the run carries on either way.
+    /// Refresh the file. Never fails the caller: a failure warns (at most
+    /// once a minute) and the run carries on either way.
     pub fn refresh(&self) -> Option<PathBuf> {
+        // One writer at a time: two refreshes share `<id>.meta.json.tmp`, and
+        // the loser of an unserialized race would fail its rename.
+        let mut warn = self.write.lock().unwrap_or_else(|p| p.into_inner());
         let doc = self.document();
-        match write(&self.dir, &doc) {
+        match write(&self.run.dir, &doc) {
             Ok(path) => Some(path),
             Err(e) => {
-                if !self.warned.swap(true, Ordering::Relaxed) {
+                if let Some(suppressed) = warn.allow(Instant::now()) {
                     tracing::warn!(
-                        dir = %self.dir.display(),
+                        dir = %self.run.dir.display(),
                         error = %format!("{e:#}"),
+                        suppressed,
                         "could not write session metadata; the run continues without a sidecar"
                     );
                 }
@@ -293,7 +283,7 @@ mod tests {
         }
     }
 
-    fn run<'a>(sinks: &'a [&'static str]) -> RunInfo<'a> {
+    fn run<'a>(sinks: &'a [SinkKind]) -> RunInfo<'a> {
         RunInfo {
             session_id: "s-20260908-120000-abcd",
             capture_version: "0.1.0",
@@ -324,7 +314,10 @@ mod tests {
 
     #[test]
     fn only_enabled_sinks_appear_and_losses_are_summed() {
-        let m = build(&run(&["udp", "jsonl", "kafka"]), &snapshot());
+        let m = build(
+            &run(&[SinkKind::Udp, SinkKind::Jsonl, SinkKind::Kafka]),
+            &snapshot(),
+        );
         assert_eq!(m.sinks.len(), 3);
         assert_eq!(m.sinks["kafka"].dropped, 397);
         assert_eq!(m.sinks["kafka"].abandoned, 3);
@@ -342,14 +335,14 @@ mod tests {
         assert_eq!(m.events, 12_345);
         assert_eq!(m.ring_drops, 3);
 
-        let m = build(&run(&["udp"]), &snapshot());
+        let m = build(&run(&[SinkKind::Udp]), &snapshot());
         assert_eq!(m.sinks.len(), 1);
         assert!(!m.sinks.contains_key("kafka"));
     }
 
     #[test]
     fn the_run_parameters_reach_the_document() {
-        let m = build(&run(&["jsonl"]), &snapshot());
+        let m = build(&run(&[SinkKind::Jsonl]), &snapshot());
         assert_eq!(m.capture_profile, "release");
         assert_eq!(m.qpc_freq, 10_000_000);
         assert_eq!(m.anchor_uncertainty_us, 12);
@@ -360,7 +353,7 @@ mod tests {
 
         // No drain yet: the polling rate is absent, not zero.
         let m = build(
-            &run(&["jsonl"]),
+            &run(&[SinkKind::Jsonl]),
             &StatsSnapshot {
                 report_interval_us: 0,
                 ..snapshot()
@@ -375,7 +368,7 @@ mod tests {
             &RunInfo {
                 exit: ExitReason::Running,
                 clean: false,
-                ..run(&["jsonl"])
+                ..run(&[SinkKind::Jsonl])
             },
             &snapshot(),
         );
@@ -386,7 +379,7 @@ mod tests {
     #[test]
     fn the_sidecar_lands_next_to_the_recording_and_parses_back() {
         let dir = tempdir("write");
-        let m = build(&run(&["jsonl"]), &snapshot());
+        let m = build(&run(&[SinkKind::Jsonl]), &snapshot());
         let path = write(&dir, &m).unwrap();
         assert_eq!(path, dir.join("s-20260908-120000-abcd.meta.json"));
         let back = SessionMeta::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -402,12 +395,12 @@ mod tests {
         let first = build(
             &RunInfo {
                 exit: ExitReason::Running,
-                ..run(&["jsonl"])
+                ..run(&[SinkKind::Jsonl])
             },
             &snapshot(),
         );
         let path = write(&dir, &first).unwrap();
-        let second = build(&run(&["jsonl"]), &snapshot());
+        let second = build(&run(&[SinkKind::Jsonl]), &snapshot());
         assert_eq!(write(&dir, &second).unwrap(), path);
         let back = SessionMeta::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back.exit, "interrupt");
@@ -424,17 +417,37 @@ mod tests {
 
     fn sidecar(dir: PathBuf, stats: Arc<Stats>) -> Sidecar {
         Sidecar::new(
-            dir,
-            "s-20260908-120000-abcd".into(),
-            "0.1.0",
-            1_756_000_000_000_000,
-            10_000_000,
-            12,
-            50,
-            8,
-            vec!["jsonl", "kafka"],
+            SidecarRun {
+                dir,
+                session_id: "s-20260908-120000-abcd".into(),
+                capture_version: "0.1.0",
+                started_utc_us: 1_756_000_000_000_000,
+                qpc_freq: 10_000_000,
+                anchor_uncertainty_us: 12,
+                window_ms: 50,
+                coalesce_ms: 8,
+                sinks: vec![SinkKind::Jsonl, SinkKind::Kafka],
+            },
             stats,
         )
+    }
+
+    /// T3's periodic refresh and T2's at-close refresh can land together at
+    /// shutdown; serialized, neither loses its rename to the other.
+    #[test]
+    fn concurrent_refreshes_never_collide_on_the_temp_file() {
+        let dir = tempdir("race");
+        let s = Arc::new(sidecar(dir.clone(), Arc::new(Stats::default())));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || (0..25).all(|_| s.refresh().is_some()))
+            })
+            .collect();
+        for t in threads {
+            assert!(t.join().unwrap(), "a refresh lost a race");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -471,7 +484,7 @@ mod tests {
         s.observe_drift(-4_000);
         s.observe_drift(30);
         assert_eq!(s.document().max_anchor_drift_us, 4_000);
-        let _ = std::fs::remove_dir_all(&s.dir);
+        let _ = std::fs::remove_dir_all(&s.run.dir);
     }
 
     #[test]

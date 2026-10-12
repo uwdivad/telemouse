@@ -124,17 +124,22 @@ pub(crate) fn click_times_us(p: &Prepared) -> Vec<i64> {
 
 /// Detect flicks over the prepared series.
 pub fn detect(p: &Prepared) -> Vec<Flick> {
+    detect_with_cells(p).into_iter().map(|(f, _)| f).collect()
+}
+
+/// [`detect`], with the grid cell each flick starts in — what the aggregate
+/// needs to apply `locked_only` without going back through `f64` seconds.
+fn detect_with_cells(p: &Prepared) -> Vec<(Flick, usize)> {
     let g = &p.grid;
     let n = g.len();
     let prm = &p.params;
-    let hold = ((prm.still_hold_ms as f64 / 1000.0) / g.dt)
-        .round()
-        .max(1.0) as usize;
+    // The settle hold in whole cells, rounded to nearest, on the µs clock.
+    let hold_us = prm.still_hold_ms as i64 * 1000;
+    let hold = ((hold_us + p.grid_dt_us / 2) / p.grid_dt_us).max(1) as usize;
     let clicks = click_times_us(p);
-    let (kx, ky) = p.aim_scale();
     let dt_ms = p.dt_ms();
 
-    let mut out: Vec<Flick> = Vec::new();
+    let mut out: Vec<(Flick, usize)> = Vec::new();
     // Flick starts are non-decreasing, and so are `clicks`, so the "first
     // button-down at or after this flick started" walks forward once across
     // the whole session instead of rescanning the click vector per flick.
@@ -191,26 +196,27 @@ pub fn detect(p: &Prepared) -> Vec<Flick> {
             });
 
             let (adx, ady) = p.to_deg(ax, ay);
-            out.push(Flick {
+            // Per-flick degree values describe this movement as the aim
+            // profile maps it, whatever `locked_only` says; the aggregate in
+            // `summarize` is where the flag decides which flicks count.
+            let flick = Flick {
                 index: out.len(),
                 t_start_s: g.t(start),
                 t_ballistic_end_s: g.t(ballistic_end),
                 t_end_s: g.t(settle_at),
                 duration_ms: (ballistic_end - start) as f64 * dt_ms,
-                amplitude_deg: stats::mag(adx, ady),
+                amplitude_deg: p.aim_mag(ax, ay),
                 amplitude_counts,
-                peak_velocity_deg_s: p.peak_aim_speed(start, ballistic_end),
+                peak_velocity_deg_s: p.peak_aim_speed_all(start, ballistic_end),
                 peak_velocity_counts_s: g.peak_speed(start, ballistic_end),
                 overshoot_ratio: correction_counts / amplitude_counts,
-                correction_deg: stats::mag(
-                    correction_counts * ux * kx,
-                    correction_counts * uy * ky,
-                ),
+                correction_deg: p.aim_mag(correction_counts * ux, correction_counts * uy),
                 settle_ms: (settle_at.saturating_sub(ballistic_end)) as f64 * dt_ms,
                 time_to_click_ms,
                 direction_deg: ady.atan2(adx).to_degrees(),
                 corrections: reversals(p, start, settle_at, ux, uy),
-            });
+            };
+            out.push((flick, start));
 
             next_i = settle_at.max(r.start + j + 1);
             break;
@@ -295,13 +301,27 @@ pub(crate) fn reversals(p: &Prepared, a: usize, b: usize, ux: f64, uy: f64) -> u
 
 /// Detect and aggregate.
 pub fn compute(p: &Prepared) -> FlickReport {
-    let flicks = detect(p);
-    summarize(p, flicks)
+    summarize(p, detect_with_cells(p))
 }
 
-fn summarize(p: &Prepared, flicks: Vec<Flick>) -> FlickReport {
-    let amp: Vec<f64> = flicks.iter().map(|f| f.amplitude_deg).collect();
-    let pv: Vec<f64> = flicks.iter().map(|f| f.peak_velocity_deg_s).collect();
+/// The aggregate. Count-space and timing summaries cover every flick; the
+/// degree-valued ones (amplitude, peak velocity) only the flicks that start
+/// where `Params::locked_only` admits aim — every flick when it is off.
+fn summarize(p: &Prepared, detected: Vec<(Flick, usize)>) -> FlickReport {
+    let aim_ok: Vec<bool> = detected
+        .iter()
+        .map(|&(_, cell)| p.aim_cell_ok(cell))
+        .collect();
+    let flicks: Vec<Flick> = detected.into_iter().map(|(f, _)| f).collect();
+    let in_aim = || {
+        flicks
+            .iter()
+            .zip(&aim_ok)
+            .filter(|&(_, ok)| *ok)
+            .map(|(f, _)| f)
+    };
+    let amp: Vec<f64> = in_aim().map(|f| f.amplitude_deg).collect();
+    let pv: Vec<f64> = in_aim().map(|f| f.peak_velocity_deg_s).collect();
     let dur: Vec<f64> = flicks.iter().map(|f| f.duration_ms).collect();
     let os: Vec<f64> = flicks.iter().map(|f| f.overshoot_ratio).collect();
     let st: Vec<f64> = flicks.iter().map(|f| f.settle_ms).collect();

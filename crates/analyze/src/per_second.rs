@@ -52,7 +52,7 @@ pub fn compute(p: &Prepared, flicks: &[Flick], intervals: &[MarkerInterval]) -> 
     if g.is_empty() {
         return Vec::new();
     }
-    let per_sec = (1.0 / g.dt).round() as usize;
+    let per_sec = g.cells_per_second();
     // A truncated grid ends mid-second; that partial second is not a second of
     // session, so it is not reported as one.
     let n_sec = if p.grid_truncated {
@@ -94,7 +94,6 @@ pub fn compute(p: &Prepared, flicks: &[Flick], intervals: &[MarkerInterval]) -> 
         })
         .collect();
 
-    let (kx, ky) = p.aim_scale();
     for (i, (e, &us)) in p.events().iter().zip(&p.event_us).enumerate() {
         let s = (us.max(0) / 1_000_000) as usize;
         if s >= n_sec {
@@ -102,10 +101,9 @@ pub fn compute(p: &Prepared, flicks: &[Flick], intervals: &[MarkerInterval]) -> 
         }
         let row = &mut rows[s];
         row.events += 1;
-        let (dx, dy) = (e.dx as f64, e.dy as f64);
-        row.distance_counts += stats::mag(dx, dy);
-        if p.aim_event_ok(i) {
-            row.distance_deg += stats::mag(dx * kx, dy * ky);
+        row.distance_counts += stats::mag(e.dx as f64, e.dy as f64);
+        if let Some(deg) = p.event_aim_deg(i) {
+            row.distance_deg += deg;
         }
     }
 
@@ -169,7 +167,8 @@ pub fn write_csv<W: Write>(w: &mut W, rows: &[SecondRow]) -> io::Result<()> {
 }
 
 /// CSV rendering of the per-second table (header included).
-pub fn to_csv(rows: &[SecondRow]) -> String {
+#[cfg(test)]
+pub(crate) fn to_csv(rows: &[SecondRow]) -> String {
     let mut buf = Vec::new();
     write_csv(&mut buf, rows).expect("writing to a Vec cannot fail");
     String::from_utf8(buf).expect("ASCII/UTF-8 output")
@@ -208,7 +207,8 @@ pub fn write_flicks_csv<W: Write>(w: &mut W, rows: &[Flick]) -> io::Result<()> {
 }
 
 /// CSV rendering of the detected flicks (header included).
-pub fn flicks_to_csv(rows: &[Flick]) -> String {
+#[cfg(test)]
+pub(crate) fn flicks_to_csv(rows: &[Flick]) -> String {
     let mut buf = Vec::new();
     write_flicks_csv(&mut buf, rows).expect("writing to a Vec cannot fail");
     String::from_utf8(buf).expect("ASCII/UTF-8 output")
@@ -308,7 +308,7 @@ mod tests {
         b.move_ms(500, 5, 0).idle_ms(2000).move_ms(600, 5, 0);
         let mut s = crate::testutil::loaded_from(b.into_events(), Some("cs2.exe"));
         s.markers = vec![crate::testutil::marker_at(2000, "round-2")];
-        let p = crate::series::prepare(s, crate::series::Params::default());
+        let p = crate::series::prepare(s, crate::series::Params::default()).unwrap();
         let iv = markers::intervals(&p, &markers::rows(&p));
         let rows = compute(&p, &[], &iv);
         assert_eq!(rows[0].marker_label, "");

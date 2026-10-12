@@ -252,11 +252,9 @@ impl Hub {
     /// [`Hub::publish`] with the wall clock injected, so the latency estimator
     /// is testable without sleeping.
     pub fn publish_at(&self, bytes: &[u8], now_utc_us: i64) -> Result<(), RejectReason> {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.stats.datagrams.fetch_add(1, Relaxed);
-        // The feed clock is liveness and takes everything the agent sends,
-        // heartbeats included — that is the whole point of them, and it is
-        // what `/healthz` reports as `feed`.
+        // Counted, and the feed clock moved. The feed clock is liveness and
+        // takes everything the agent sends, heartbeats included — that is the
+        // whole point of them, and it is what `/healthz` reports as `feed`.
         let gap_us = self.stats.note_datagram(now_utc_us);
         match classify_datagram(bytes) {
             Ok(accepted) => {
@@ -297,12 +295,12 @@ impl Hub {
                 // forwarded work done; the session cache above is what matters
                 // for a browser that connects later.
                 let _ = self.tx.send(accepted.text);
-                self.stats.forwarded.fetch_add(1, Relaxed);
+                self.stats.note_forwarded();
                 self.stats.note_queue_depth(self.queued() as u64);
                 Ok(())
             }
             Err(reason) => {
-                self.stats.parse_errors.fetch_add(1, Relaxed);
+                self.stats.note_parse_error();
                 Err(reason)
             }
         }
@@ -410,6 +408,12 @@ mod tests {
         batch_at(1_756_000_000_000_000)
     }
 
+    /// The smallest batch the seq-gap counter reads: session `s-1`, `seq`.
+    #[cfg(feature = "observability")]
+    fn seq_batch(seq: u64) -> String {
+        format!(r#"{{"type":"batch","session_id":"s-1","seq_no":{seq},"events":[]}}"#)
+    }
+
     #[test]
     fn good_batch_datagram_is_accepted_verbatim() {
         let json = batch_json();
@@ -502,16 +506,13 @@ mod tests {
         // consecutive batches — they carry no `seq_no` at all, so they are
         // invisible to it.
         let hub = Hub::new();
-        let batch = |seq: u64| {
-            format!(r#"{{"type":"batch","session_id":"s-1","seq_no":{seq},"events":[]}}"#)
-        };
-        hub.publish(batch(0).as_bytes()).unwrap();
+        hub.publish(seq_batch(0).as_bytes()).unwrap();
         for _ in 0..10 {
             hub.publish(heartbeat_json().as_bytes()).unwrap();
         }
-        hub.publish(batch(1).as_bytes()).unwrap();
+        hub.publish(seq_batch(1).as_bytes()).unwrap();
         assert_eq!(hub.stats.seq_gaps(), 0);
-        hub.publish(batch(4).as_bytes()).unwrap();
+        hub.publish(seq_batch(4).as_bytes()).unwrap();
         assert_eq!(hub.stats.seq_gaps(), 2, "2 and 3, and nothing else");
     }
 
@@ -692,11 +693,8 @@ mod tests {
     #[test]
     fn publish_counts_seq_gaps_the_way_the_page_does() {
         let hub = Hub::new();
-        let batch = |seq: u64| {
-            format!(r#"{{"type":"batch","session_id":"s-1","seq_no":{seq},"events":[]}}"#)
-        };
         for seq in [0, 1, 5, 4, 6] {
-            hub.publish(batch(seq).as_bytes()).unwrap();
+            hub.publish(seq_batch(seq).as_bytes()).unwrap();
         }
         assert_eq!(hub.stats.seq_gaps(), 3, "2, 3 and 4 never arrived");
 

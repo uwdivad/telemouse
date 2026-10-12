@@ -139,6 +139,12 @@ pub fn compute(p: &Prepared) -> ClickReport {
     let mut last_down: BTreeMap<Button, i64> = BTreeMap::new();
     let mut per_button: BTreeMap<Button, Tally> = BTreeMap::new();
 
+    // The pre-click window, in whole µs before the press. Every timeline
+    // decision below is made on the integer µs clock (see
+    // `Prepared::event_us`); only the reported values become `f64`.
+    let pre_lo_us = (prm.pre_click_lo_ms * 1000.0).round() as i64;
+    let pre_hi_us = (prm.pre_click_hi_ms * 1000.0).round() as i64;
+
     // Durations come off the integer µs timeline so a 40 ms hold reports as
     // 40.0, not 40.000000000000036. Only the events inside the analysed span
     // are counted, because `clicks_per_min` divides by that span.
@@ -151,21 +157,12 @@ pub fn compute(p: &Prepared) -> ClickReport {
             let slot = per_button.entry(name).or_default();
             if e.buttons & down != 0 {
                 slot.downs += 1;
-                // Button transitions are sparse, so converting the handful of
-                // timestamps used here is much cheaper than retaining a second
-                // 8-byte timestamp vector for every motion event.
-                let t = us as f64 / 1e6;
-                let pre = mean_speed_in_window(
-                    p,
-                    t - prm.pre_click_lo_ms / 1000.0,
-                    t - prm.pre_click_hi_ms / 1000.0,
-                )
-                .unwrap_or(0.0);
+                let pre = mean_speed_in_window(p, us - pre_lo_us, us - pre_hi_us).unwrap_or(0.0);
                 let idx = clicks.len();
                 clicks.push(ClickEvent {
                     index: idx,
                     button: name,
-                    t_s: t,
+                    t_s: us as f64 / 1e6,
                     pre_click_speed_counts_s: pre,
                     pre_click_speed_cm_s: p.counts_to_cm(pre),
                     click_to_still_ms: last_movement_before(p, us)
@@ -175,7 +172,7 @@ pub fn compute(p: &Prepared) -> ClickReport {
                 if let Some(prev) = last_down.insert(name, us) {
                     let gap = (us - prev) as f64 / 1000.0;
                     if gap <= prm.double_click_max_ms {
-                        per_button.get_mut(&name).unwrap().double_gaps_ms.push(gap);
+                        slot.double_gaps_ms.push(gap);
                     }
                 }
                 // A down while already held (no up seen) replaces the pending
@@ -183,12 +180,11 @@ pub fn compute(p: &Prepared) -> ClickReport {
                 pending.insert(name, (idx, us));
             }
             if e.buttons & up != 0 {
-                let slot = per_button.get_mut(&name).unwrap();
                 slot.ups += 1;
                 if let Some((idx, us_down)) = pending.remove(&name) {
                     let hold = (us - us_down) as f64 / 1000.0;
                     clicks[idx].hold_ms = Some(hold);
-                    per_button.get_mut(&name).unwrap().holds_ms.push(hold);
+                    slot.holds_ms.push(hold);
                 }
             }
         }

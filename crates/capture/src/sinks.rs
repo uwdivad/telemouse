@@ -12,18 +12,47 @@
 pub mod jsonl;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+pub mod queue;
 pub mod udp;
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
+use telemouse_core::recordings::{SINK_JSONL, SINK_KAFKA, SINK_UDP};
 
 pub use jsonl::JsonlSink;
 #[cfg(feature = "kafka")]
 pub use kafka::KafkaSink;
 pub use udp::UdpSink;
 
+/// Which sink a [`Sink`] is. The string form ([`Self::as_str`]) is the one
+/// the sidecar, the logs and `telemouse-analyze` use, from core's `SINK_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SinkKind {
+    Udp,
+    Jsonl,
+    Kafka,
+}
+
+impl SinkKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SinkKind::Udp => SINK_UDP,
+            SinkKind::Jsonl => SINK_JSONL,
+            SinkKind::Kafka => SINK_KAFKA,
+        }
+    }
+}
+
+impl std::fmt::Display for SinkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub trait Sink: Send {
-    /// Stable short name, also the key used by [`crate::stats::Stats`].
-    fn name(&self) -> &'static str;
+    /// Which sink this is; also the key used by [`crate::stats::Stats`].
+    fn kind(&self) -> SinkKind;
     /// Deliver one envelope, already serialized as `payload` — sinks that ship
     /// JSON must use it rather than re-serializing. `topic` and `key` carry
     /// the routing (`Envelope::topic()`/`key()` or the `EnvelopeView`
@@ -32,6 +61,32 @@ pub trait Sink: Send {
     /// Periodic housekeeping (flushes). Called roughly once per second.
     fn tick(&mut self) -> Result<()> {
         Ok(())
+    }
+    /// True for a sink whose `Drop` waits (boundedly) for queued envelopes to
+    /// drain, and so needs a share of the shutdown budget.
+    fn drains_on_close(&self) -> bool {
+        false
+    }
+    /// The latest instant this sink's `Drop` may wait until. Sinks with no
+    /// queue ignore it; the others still never wait past their own cap.
+    fn set_drain_deadline(&mut self, _deadline: Instant) {}
+}
+
+/// Close `sinks` in order, sharing what is left of the budget up to
+/// `deadline` evenly between the sinks that drain — counting `later` more
+/// draining sinks still to be closed after these. A sink that finishes early
+/// leaves its unused share to the ones after it, so the whole close stays
+/// inside one budget instead of each sink spending its own full timeout.
+pub fn close_within(sinks: Vec<Box<dyn Sink>>, deadline: Instant, later: usize) {
+    let mut draining = sinks.iter().filter(|s| s.drains_on_close()).count() + later;
+    for mut sink in sinks {
+        if sink.drains_on_close() {
+            let now = Instant::now();
+            let share = deadline.saturating_duration_since(now) / draining.max(1) as u32;
+            sink.set_drain_deadline(now + share);
+            draining = draining.saturating_sub(1);
+        }
+        drop(sink);
     }
 }
 
@@ -96,7 +151,7 @@ impl EnvelopeEncoder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkFailure {
-    pub sink: &'static str,
+    pub sink: SinkKind,
     pub error: String,
 }
 
@@ -111,7 +166,7 @@ pub fn fan_out(
     for sink in sinks.iter_mut() {
         if let Err(e) = sink.send(topic, key, payload) {
             failures.push(SinkFailure {
-                sink: sink.name(),
+                sink: sink.kind(),
                 error: format!("{e:#}"),
             });
         }
@@ -130,16 +185,16 @@ pub fn fan_out(
 /// envelope.
 pub fn send_to(
     sinks: &mut [Box<dyn Sink>],
-    name: &str,
+    kind: SinkKind,
     topic: &'static str,
     key: &str,
     payload: &str,
 ) -> Option<SinkFailure> {
-    let sink = sinks.iter_mut().find(|s| s.name() == name)?;
+    let sink = sinks.iter_mut().find(|s| s.kind() == kind)?;
     match sink.send(topic, key, payload) {
         Ok(()) => None,
         Err(e) => Some(SinkFailure {
-            sink: sink.name(),
+            sink: kind,
             error: format!("{e:#}"),
         }),
     }
@@ -151,7 +206,7 @@ pub fn tick_all(sinks: &mut [Box<dyn Sink>]) -> Vec<SinkFailure> {
     for sink in sinks.iter_mut() {
         if let Err(e) = sink.tick() {
             failures.push(SinkFailure {
-                sink: sink.name(),
+                sink: sink.kind(),
                 error: format!("{e:#}"),
             });
         }
@@ -170,18 +225,18 @@ pub(crate) mod mock {
     /// Records everything it receives. `received` holds the typed envelopes
     /// parsed back from the JSON payloads (the trait no longer hands sinks a
     /// typed envelope); payloads that do not parse are still counted.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub struct RecordingSink {
-        pub name: &'static str,
+        pub kind: SinkKind,
         pub received: Arc<Mutex<Vec<Envelope>>>,
         pub payloads: Arc<Mutex<Vec<String>>>,
         pub ticks: Arc<Mutex<usize>>,
     }
 
     impl RecordingSink {
-        pub fn new(name: &'static str) -> Self {
+        pub fn new(kind: SinkKind) -> Self {
             Self {
-                name,
+                kind,
                 received: Arc::new(Mutex::new(Vec::new())),
                 payloads: Arc::new(Mutex::new(Vec::new())),
                 ticks: Arc::new(Mutex::new(0)),
@@ -194,8 +249,8 @@ pub(crate) mod mock {
     }
 
     impl Sink for RecordingSink {
-        fn name(&self) -> &'static str {
-            self.name
+        fn kind(&self) -> SinkKind {
+            self.kind
         }
         fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
             if let Ok(env) = Envelope::from_json(payload) {
@@ -212,22 +267,22 @@ pub(crate) mod mock {
 
     /// Always fails.
     pub struct FailingSink {
-        pub name: &'static str,
+        pub kind: SinkKind,
         pub calls: Arc<Mutex<usize>>,
     }
 
     impl FailingSink {
-        pub fn new(name: &'static str) -> Self {
+        pub fn new(kind: SinkKind) -> Self {
             Self {
-                name,
+                kind,
                 calls: Arc::new(Mutex::new(0)),
             }
         }
     }
 
     impl Sink for FailingSink {
-        fn name(&self) -> &'static str {
-            self.name
+        fn kind(&self) -> SinkKind {
+            self.kind
         }
         fn send(&mut self, _topic: &'static str, _key: &str, _payload: &str) -> Result<()> {
             *self.calls.lock().unwrap() += 1;
@@ -241,6 +296,8 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use telemouse_core::{Batch, Envelope};
 
     use super::mock::{FailingSink, RecordingSink};
@@ -266,9 +323,9 @@ mod tests {
 
     #[test]
     fn a_failing_sink_does_not_starve_the_others() {
-        let first = RecordingSink::new("udp");
-        let last = RecordingSink::new("jsonl");
-        let failing = FailingSink::new("kafka");
+        let first = RecordingSink::new(SinkKind::Udp);
+        let last = RecordingSink::new(SinkKind::Jsonl);
+        let failing = FailingSink::new(SinkKind::Kafka);
         let failing_calls = failing.calls.clone();
         let mut sinks: Vec<Box<dyn Sink>> = vec![
             Box::new(first.clone()),
@@ -279,7 +336,7 @@ mod tests {
         let e = env();
         let failures = fan_out(&mut sinks, e.topic(), e.key(), "{}");
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].sink, "kafka");
+        assert_eq!(failures[0].sink, SinkKind::Kafka);
         assert!(failures[0].error.contains("boom"));
         assert_eq!(*failing_calls.lock().unwrap(), 1);
         // Both healthy sinks got it, including the one *after* the failure.
@@ -290,8 +347,8 @@ mod tests {
     #[test]
     fn failures_map_onto_per_sink_counters() {
         let mut sinks: Vec<Box<dyn Sink>> = vec![
-            Box::new(FailingSink::new("kafka")),
-            Box::new(FailingSink::new("udp")),
+            Box::new(FailingSink::new(SinkKind::Kafka)),
+            Box::new(FailingSink::new(SinkKind::Udp)),
         ];
         let stats = Stats::default();
         let e = env();
@@ -305,31 +362,109 @@ mod tests {
     }
 
     #[test]
+    fn sink_kinds_spell_the_shared_names() {
+        assert_eq!(SinkKind::Udp.as_str(), "udp");
+        assert_eq!(SinkKind::Jsonl.as_str(), "jsonl");
+        assert_eq!(SinkKind::Kafka.to_string(), "kafka");
+    }
+
+    #[test]
     fn a_targeted_send_reaches_one_sink_and_no_other() {
-        let udp = RecordingSink::new("udp");
-        let jsonl = RecordingSink::new("jsonl");
+        let udp = RecordingSink::new(SinkKind::Udp);
+        let jsonl = RecordingSink::new(SinkKind::Jsonl);
         let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(udp.clone()), Box::new(jsonl.clone())];
         let e = env();
-        assert!(send_to(&mut sinks, "udp", e.topic(), e.key(), "{}").is_none());
+        assert!(send_to(&mut sinks, SinkKind::Udp, e.topic(), e.key(), "{}").is_none());
         assert_eq!(udp.count(), 1);
         assert_eq!(jsonl.count(), 0, "the recording must not see it");
 
         // A sink that is not running is not an error: there is nobody to tell.
-        assert!(send_to(&mut sinks, "kafka", e.topic(), e.key(), "{}").is_none());
+        assert!(send_to(&mut sinks, SinkKind::Kafka, e.topic(), e.key(), "{}").is_none());
 
         // A failure is reported, and still reaches nobody else.
-        let mut sinks: Vec<Box<dyn Sink>> =
-            vec![Box::new(FailingSink::new("udp")), Box::new(jsonl.clone())];
-        let failure = send_to(&mut sinks, "udp", e.topic(), e.key(), "{}").unwrap();
-        assert_eq!(failure.sink, "udp");
+        let mut sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(FailingSink::new(SinkKind::Udp)),
+            Box::new(jsonl.clone()),
+        ];
+        let failure = send_to(&mut sinks, SinkKind::Udp, e.topic(), e.key(), "{}").unwrap();
+        assert_eq!(failure.sink, SinkKind::Udp);
         assert_eq!(jsonl.count(), 0);
+    }
+
+    /// A sink that records the deadline it was given and how much budget
+    /// was left when it was closed.
+    struct DrainingSink {
+        given: Arc<std::sync::Mutex<Vec<std::time::Duration>>>,
+        hold: std::time::Duration,
+        deadline: Option<Instant>,
+    }
+
+    impl Sink for DrainingSink {
+        fn kind(&self) -> SinkKind {
+            SinkKind::Jsonl
+        }
+        fn send(&mut self, _: &'static str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn drains_on_close(&self) -> bool {
+            true
+        }
+        fn set_drain_deadline(&mut self, deadline: Instant) {
+            self.deadline = Some(deadline);
+        }
+    }
+
+    impl Drop for DrainingSink {
+        fn drop(&mut self) {
+            let share = self
+                .deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            self.given.lock().unwrap().push(share);
+            std::thread::sleep(self.hold.min(share));
+        }
+    }
+
+    #[test]
+    fn closing_shares_one_budget_between_the_draining_sinks() {
+        use std::time::Duration;
+        let given = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = |hold| -> Box<dyn Sink> {
+            Box::new(DrainingSink {
+                given: Arc::clone(&given),
+                hold,
+                deadline: None,
+            })
+        };
+        let budget = Duration::from_secs(4);
+        let deadline = Instant::now() + budget;
+        // UDP does not drain and takes no share; one more draining sink is
+        // still to come after these two.
+        let sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(RecordingSink::new(SinkKind::Udp)),
+            sink(Duration::ZERO),
+            sink(Duration::ZERO),
+        ];
+        close_within(sinks, deadline, 1);
+        let shares = given.lock().unwrap().clone();
+        assert_eq!(shares.len(), 2);
+        // A third of the budget, then (nothing spent) half of what is left.
+        assert!(shares[0] <= budget / 3, "{shares:?}");
+        assert!(
+            shares[1] <= budget / 2 && shares[1] > budget / 3,
+            "{shares:?}"
+        );
+        // Whatever they get, together they never exceed the budget.
+        assert!(shares.iter().sum::<Duration>() <= budget);
     }
 
     #[test]
     fn tick_reaches_every_sink() {
-        let ok = RecordingSink::new("jsonl");
-        let mut sinks: Vec<Box<dyn Sink>> =
-            vec![Box::new(FailingSink::new("kafka")), Box::new(ok.clone())];
+        let ok = RecordingSink::new(SinkKind::Jsonl);
+        let mut sinks: Vec<Box<dyn Sink>> = vec![
+            Box::new(FailingSink::new(SinkKind::Kafka)),
+            Box::new(ok.clone()),
+        ];
         let failures = tick_all(&mut sinks);
         assert_eq!(failures.len(), 1);
         assert_eq!(*ok.ticks.lock().unwrap(), 1);
@@ -361,8 +496,8 @@ mod tests {
 
     #[test]
     fn every_sink_receives_the_same_bytes() {
-        let a = RecordingSink::new("udp");
-        let b = RecordingSink::new("jsonl");
+        let a = RecordingSink::new(SinkKind::Udp);
+        let b = RecordingSink::new(SinkKind::Jsonl);
         let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(a.clone()), Box::new(b.clone())];
         let mut enc = EnvelopeEncoder::new();
         let e = env();

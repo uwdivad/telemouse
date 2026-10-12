@@ -27,6 +27,14 @@
 //! property of the server rather than of the process: a second transport
 //! gets its own tool profile without touching a tool body.
 
+// stdout is the MCP channel: a stray `println!` (or `dbg!`, which writes to
+// stderr but has no business in a release) is a compile error, not a
+// desynchronised client. `print_stderr` is denied too: nothing here prints
+// before logging is up, and a fatal startup error leaves `main` as an
+// `anyhow::Error`, which std writes to stderr itself. clap's `--help` and
+// `--version` write through clap, not these macros, and are unaffected.
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+
 mod analysis;
 mod args;
 mod digest;
@@ -50,12 +58,19 @@ use crate::server::{Deps, Telemouse};
 
 /// The features this binary was built with, for the startup line — the one
 /// fact a bug report needs and nobody thinks to include.
-fn features() -> &'static str {
-    match (cfg!(feature = "logging"), cfg!(feature = "observability")) {
-        (true, true) => "logging,observability",
-        (true, false) => "logging",
-        (false, true) => "observability",
-        (false, false) => "minimal",
+fn features() -> String {
+    let on: Vec<&str> = [
+        ("logging", cfg!(feature = "logging")),
+        ("observability", cfg!(feature = "observability")),
+        ("quiet", cfg!(feature = "quiet")),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect();
+    if on.is_empty() {
+        "minimal".to_string()
+    } else {
+        on.join(",")
     }
 }
 
@@ -158,7 +173,7 @@ async fn main() -> Result<()> {
     )?;
 
     let telemouse = Telemouse::new(Deps {
-        analysis: Analysis::new(recordings.clone()),
+        analysis: Analysis::new(recordings.clone(), cli.read_only),
         ctl: Local::ctl(ctl_addr),
         viz: Local::viz(viz_addr),
         log_dir: log_dir.clone(),
@@ -167,7 +182,7 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        features = features(),
+        features = %features(),
         config = %config.display(),
         config_found = config.is_file(),
         recordings = %recordings.display(),
@@ -264,5 +279,6 @@ mod tests {
         let f = features();
         assert_eq!(f.contains("logging"), cfg!(feature = "logging"));
         assert_eq!(f.contains("observability"), cfg!(feature = "observability"));
+        assert_eq!(f.contains("quiet"), cfg!(feature = "quiet"));
     }
 }

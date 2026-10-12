@@ -1,8 +1,10 @@
 //! Synthetic-recording builders.
 //!
-//! Public (not `#[cfg(test)]`) so the integration test, the benches — and
-//! anyone who wants to eyeball the report without a mouse — can build a
-//! recording with known ground truth. Every metric test in this crate is
+//! Public (not `#[cfg(test)]`) so the integration test, the benches and
+//! `telemouse-mcp`'s tests — which link this crate from outside and cannot see
+//! `#[cfg(test)]` items — can build a recording with known ground truth. Not a
+//! supported API: it is `#[doc(hidden)]`, may `unwrap`, and should move behind
+//! a `testutil` Cargo feature. Every metric test in this crate is
 //! written against streams constructed here, so the fixture constants are
 //! effectively part of the test contract: CPI 1600 (1600 counts = 2.54 cm) and
 //! `cs2.exe` at sens 2.0 with 0.022 coefficients (1 count = 0.044°, so
@@ -63,6 +65,19 @@ pub fn session_cfg() -> SessionConfig {
         coalesce_ms: 0,
         ..Default::default()
     }
+}
+
+/// [`session_cfg`] for another session id and start time. The anchor moves
+/// with the start, as a real capture's does: the loader refuses a header
+/// whose `started_utc_us` disagrees with `anchor.utc_us`
+/// (`SessionConfig::validate`), so setting only the top-level copy makes a
+/// recording every reader skips.
+pub fn session_cfg_at(session_id: &str, started_utc_us: i64) -> SessionConfig {
+    let mut cfg = session_cfg();
+    cfg.session_id = session_id.to_string();
+    cfg.started_utc_us = started_utc_us;
+    cfg.anchor.utc_us = started_utc_us;
+    cfg
 }
 
 /// Wrap `events` in a batch envelope carrying `drops` ring drops.
@@ -155,30 +170,19 @@ pub fn batch_meta(seq_no: u64, game: Option<&str>, locked: bool, count: usize) -
     }
 }
 
-/// Wrap raw events in a [`LoadedSession`] without touching the filesystem.
+/// Wrap raw events in a [`LoadedSession`] without touching the filesystem:
+/// one locked batch attributed to `game`.
 pub fn loaded_from(events: Vec<RawEvent>, game: Option<&str>) -> LoadedSession {
-    let cfg = session_cfg();
-    LoadedSession {
-        path: PathBuf::from("<memory>"),
-        config: cfg,
-        batches: vec![batch_meta(0, game, true, events.len())],
-        events,
-        markers: Vec::new(),
-        total_drops: 0,
-        total_abs_frames: 0,
-        bad_lines: crate::load::BadLines::default(),
-        bytes: 0,
-        load_ms: 0.0,
-    }
+    let batches = vec![batch_meta(0, game, true, events.len())];
+    loaded_with_batches(events, batches)
 }
 
 /// A [`LoadedSession`] whose events are split across explicit batches — for
 /// the pointer-lock, seq-gap and batch-latency checks.
 pub fn loaded_with_batches(events: Vec<RawEvent>, batches: Vec<BatchMeta>) -> LoadedSession {
-    let cfg = session_cfg();
     LoadedSession {
         path: PathBuf::from("<memory>"),
-        config: cfg,
+        config: session_cfg(),
         batches,
         events,
         markers: Vec::new(),
@@ -187,17 +191,18 @@ pub fn loaded_with_batches(events: Vec<RawEvent>, batches: Vec<BatchMeta>) -> Lo
         bad_lines: crate::load::BadLines::default(),
         bytes: 0,
         load_ms: 0.0,
+        sidecar: None,
     }
 }
 
 /// Prepared series over raw events, default parameters.
 pub fn prepared_from(events: Vec<RawEvent>, game: Option<&str>) -> Prepared {
-    prepare(loaded_from(events, game), Params::default())
+    prepared_with(events, game, Params::default())
 }
 
-/// Prepared series with explicit parameters.
+/// Prepared series with explicit parameters, which must validate.
 pub fn prepared_with(events: Vec<RawEvent>, game: Option<&str>, params: Params) -> Prepared {
-    prepare(loaded_from(events, game), params)
+    prepare(loaded_from(events, game), params).expect("fixture params validate")
 }
 
 /// The common case: events attributed to the profiled fixture game.
@@ -349,6 +354,25 @@ impl StreamBuilder {
         self.push(0, 0, bits, 0)
     }
 
+    /// The canonical aim cycle every report-level fixture is built from: a
+    /// 1500-count pull (25 ms at 60 counts/ms, `dy` per ms vertically), a
+    /// 10 ms pause, a 100-count correction back, 5 ms of stillness, a left
+    /// click held 40 ms, then `rest_ms` of silence.
+    ///
+    /// The click goes down exactly 50 ms after the pull starts. With
+    /// `sign = -1` the whole cycle is mirrored.
+    pub fn flick_cycle(&mut self, sign: i32, dy: i32, rest_ms: u64) -> &mut Self {
+        use telemouse_core::event::buttons;
+        self.move_ms(25, 60 * sign, dy)
+            .idle_ms(10)
+            .move_ms(10, -10 * sign, 0)
+            .idle_ms(5)
+            .button(buttons::LEFT_DOWN)
+            .idle_ms(39)
+            .button(buttons::LEFT_UP)
+            .idle_ms(rest_ms)
+    }
+
     pub fn events(&self) -> Vec<RawEvent> {
         self.events.clone()
     }
@@ -362,20 +386,12 @@ impl StreamBuilder {
 /// the benches: flick, correct, click, rest — the shape a real aim session has,
 /// including the long idle stretches the sparse grid exists to skip.
 pub fn bench_events(cells: usize) -> Vec<RawEvent> {
-    use telemouse_core::event::buttons;
     let mut b = StreamBuilder::new();
     // One cycle is 25 + 10 + 10 + 5 + 1 + 39 + 1 + 400 = 491 ms.
     let cycles = (cells / 491).max(1);
     for i in 0..cycles {
         let sign = if i % 3 == 0 { -1 } else { 1 };
-        b.move_ms(25, 60 * sign, (i % 7) as i32 - 3)
-            .idle_ms(10)
-            .move_ms(10, -10 * sign, 0)
-            .idle_ms(5)
-            .button(buttons::LEFT_DOWN)
-            .idle_ms(39)
-            .button(buttons::LEFT_UP)
-            .idle_ms(400);
+        b.flick_cycle(sign, (i % 7) as i32 - 3, 400);
     }
     b.into_events()
 }

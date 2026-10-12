@@ -27,7 +27,7 @@ pub enum ConfigError {
     /// PowerShell 5.1 redirection, which writes UTF-16. Carries the fix
     /// rather than the byte offset, because the byte offset helps nobody.
     #[error("cannot read {path}: {hint}")]
-    Encoding { path: PathBuf, hint: String },
+    Encoding { path: PathBuf, hint: &'static str },
     #[error("failed to parse {path}: {source}")]
     Parse {
         path: PathBuf,
@@ -51,6 +51,22 @@ fn invalid_message(path: Option<&Path>, field: &str, reason: &str) -> String {
         None => format!("invalid config: {field}: {reason}"),
     }
 }
+
+/// [`ConfigError::Invalid`] for `field`, naming `path` when there is one.
+fn invalid(path: Option<&Path>, field: &'static str, reason: String) -> ConfigError {
+    ConfigError::Invalid {
+        field,
+        reason,
+        path: path.map(Path::to_path_buf),
+    }
+}
+
+/// Default `udp.addr`: where the capture agent sends live envelopes.
+pub const DEFAULT_UDP_ADDR: &str = "127.0.0.1:7878";
+/// Default `viz.http_addr`.
+pub const DEFAULT_VIZ_HTTP_ADDR: &str = "127.0.0.1:7879";
+/// Default `ctl.http_addr`.
+pub const DEFAULT_CTL_HTTP_ADDR: &str = "127.0.0.1:7880";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -91,7 +107,7 @@ pub const MAX_RING_CAPACITY: usize = 4_194_304;
 /// The `[games]` key a process name should be written as: the bare file
 /// name, lowercased. Matching is done on `GetModuleFileNameEx`'s base name
 /// in lower case, so anything else in the table is a row that can never fire.
-pub fn normalize_game_key(key: &str) -> String {
+pub(crate) fn normalize_game_key(key: &str) -> String {
     let base = key.rsplit(['/', '\\']).next().unwrap_or(key);
     base.trim().to_ascii_lowercase()
 }
@@ -125,8 +141,11 @@ fn game_key_problem(key: &str) -> Result<(), String> {
 pub struct BatchConfig {
     /// Batch window in milliseconds: how long the shipping thread
     /// accumulates events before one batch goes to every sink. It sets the
-    /// live-viz latency floor (a batch's first event is this old when it
-    /// leaves) and, with it, the batches/s that the UDP hop, the recording
+    /// live-viz latency floor (a batch's oldest event is at most
+    /// `window_ms + coalesce_ms + 1` old when it leaves, since raw-input
+    /// stamps are back-dated by up to one coalescing period; see
+    /// [`crate::batcher::Batcher`]) and, with it, the batches/s (exactly
+    /// `1000 / window_ms` while the stream is live) that the UDP hop, the recording
     /// and every WebSocket client pay for — each batch costs ~150µs of
     /// kernel CPU across the pipeline whatever it holds. The 25ms default
     /// favors responsive live visualization; use 50ms to halve the per-batch
@@ -220,7 +239,7 @@ pub struct CtlConfig {
 impl Default for CtlConfig {
     fn default() -> Self {
         Self {
-            http_addr: "127.0.0.1:7880".into(),
+            http_addr: DEFAULT_CTL_HTTP_ADDR.into(),
             bin_dir: None,
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             log_dir: PathBuf::from("logs"),
@@ -231,10 +250,11 @@ impl Default for CtlConfig {
 
 /// Layouts the OBS page understands. Kept as a list so validation and the
 /// page agree on the vocabulary.
-pub const OBS_LAYOUTS: &[&str] = &["split", "stack", "desk", "aim"];
+pub const OBS_LAYOUTS: &[&str] = &["split", "stack", "desk", "aim", "pointer", "compare"];
 /// HUD readouts the OBS page can show, in the order they are listed.
 pub const OBS_HUD_ITEMS: &[&str] = &[
-    "speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency", "eventage",
+    "speed", "aim", "pointer", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency",
+    "eventage",
 ];
 pub const OBS_HUD_POSITIONS: &[&str] = &["top-left", "top-right", "bottom-left", "bottom-right"];
 
@@ -244,7 +264,9 @@ pub const OBS_HUD_POSITIONS: &[&str] = &["top-left", "top-right", "bottom-left",
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObsConfig {
-    /// `split` (desk | aim side by side), `stack` (desk over aim), `desk`, `aim`.
+    /// `split` (desk | aim side by side), `stack` (desk over aim), `desk`,
+    /// `aim`, `pointer` (the Windows cursor path alone) or `compare`
+    /// (desk | pointer side by side).
     pub layout: String,
     /// `transparent`, or `#rrggbb` / `#rrggbbaa` painted behind the panels.
     pub background: String,
@@ -274,6 +296,12 @@ pub struct ObsConfig {
 /// Upper bound on `viz.obs.stale_secs`: past a minute the indicator would
 /// outlive the stream it is meant to warn about.
 pub const MAX_OBS_STALE_SECS: f64 = 60.0;
+/// Accepted range of `viz.obs.scale`.
+pub const OBS_SCALE_RANGE: std::ops::RangeInclusive<f64> = 0.5..=4.0;
+/// Accepted range of `viz.obs.trail_secs`.
+pub const OBS_TRAIL_SECS_RANGE: std::ops::RangeInclusive<f64> = 0.3..=12.0;
+/// Accepted range of `viz.obs.buffer_ms`.
+pub const OBS_BUFFER_MS_RANGE: std::ops::RangeInclusive<u64> = 10..=200;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -306,7 +334,7 @@ impl Default for UdpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            addr: "127.0.0.1:7878".into(),
+            addr: DEFAULT_UDP_ADDR.into(),
         }
     }
 }
@@ -332,7 +360,7 @@ impl Default for RecordingConfig {
 impl Default for VizConfig {
     fn default() -> Self {
         Self {
-            http_addr: "127.0.0.1:7879".into(),
+            http_addr: DEFAULT_VIZ_HTTP_ADDR.into(),
             obs: ObsConfig::default(),
         }
     }
@@ -373,11 +401,7 @@ impl ObsConfig {
 
     /// Same, naming the file the values came from in the error.
     fn validate_at(&self, path: Option<&Path>) -> Result<(), ConfigError> {
-        let invalid = |field: &'static str, reason: String| ConfigError::Invalid {
-            field,
-            reason,
-            path: path.map(Path::to_path_buf),
-        };
+        let invalid = |field, reason| invalid(path, field, reason);
         if !OBS_LAYOUTS.contains(&self.layout.as_str()) {
             return Err(invalid(
                 "viz.obs.layout",
@@ -411,19 +435,34 @@ impl ObsConfig {
                 ),
             ));
         }
-        if !(self.scale.is_finite() && (0.5..=4.0).contains(&self.scale)) {
-            return Err(invalid("viz.obs.scale", "must be between 0.5 and 4".into()));
-        }
-        if !(self.trail_secs.is_finite() && (0.3..=12.0).contains(&self.trail_secs)) {
+        if !(self.scale.is_finite() && OBS_SCALE_RANGE.contains(&self.scale)) {
             return Err(invalid(
-                "viz.obs.trail_secs",
-                "must be between 0.3 and 12".into(),
+                "viz.obs.scale",
+                format!(
+                    "must be between {} and {}",
+                    OBS_SCALE_RANGE.start(),
+                    OBS_SCALE_RANGE.end()
+                ),
             ));
         }
-        if !(10..=200).contains(&self.buffer_ms) {
+        if !(self.trail_secs.is_finite() && OBS_TRAIL_SECS_RANGE.contains(&self.trail_secs)) {
+            return Err(invalid(
+                "viz.obs.trail_secs",
+                format!(
+                    "must be between {} and {}",
+                    OBS_TRAIL_SECS_RANGE.start(),
+                    OBS_TRAIL_SECS_RANGE.end()
+                ),
+            ));
+        }
+        if !OBS_BUFFER_MS_RANGE.contains(&self.buffer_ms) {
             return Err(invalid(
                 "viz.obs.buffer_ms",
-                "must be between 10 and 200".into(),
+                format!(
+                    "must be between {} and {}",
+                    OBS_BUFFER_MS_RANGE.start(),
+                    OBS_BUFFER_MS_RANGE.end()
+                ),
             ));
         }
         if !(self.stale_secs.is_finite() && (0.0..=MAX_OBS_STALE_SECS).contains(&self.stale_secs)) {
@@ -440,7 +479,7 @@ impl ObsConfig {
 /// (or `[v6]:port`) with a non-empty host and a non-zero port. A bare host
 /// is rejected rather than defaulted, because the client connects with the
 /// string as written and a port-less entry can never be reached.
-pub fn broker_is_valid(broker: &str) -> bool {
+pub(crate) fn broker_is_valid(broker: &str) -> bool {
     let s = broker.trim();
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
         let Some(end) = rest.find(']') else {
@@ -468,12 +507,13 @@ pub fn broker_is_valid(broker: &str) -> bool {
 /// Decode a config file's bytes as UTF-8, turning the two ways a Windows
 /// editor gets this wrong into an error that says how to fix it.
 ///
-/// A UTF-8 BOM is stripped here rather than left to the parser, so the file
-/// Notepad writes as "UTF-8 with BOM" parses like any other.
+/// A UTF-8 BOM is left in place: [`AppConfig::from_toml`] strips it (without
+/// copying), so the file Notepad writes as "UTF-8 with BOM" parses like any
+/// other whichever way the text arrived.
 fn decode_config(path: &Path, bytes: Vec<u8>) -> Result<String, ConfigError> {
-    let encoding = |hint: &str| ConfigError::Encoding {
+    let encoding = |hint: &'static str| ConfigError::Encoding {
         path: path.to_path_buf(),
-        hint: hint.to_string(),
+        hint,
     };
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         return Err(encoding(
@@ -481,13 +521,9 @@ fn decode_config(path: &Path, bytes: Vec<u8>) -> Result<String, ConfigError> {
              save it as UTF-8",
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| {
+    String::from_utf8(bytes).map_err(|_| {
         encoding("not valid UTF-8; save it as UTF-8 (Notepad: Save As → Encoding: UTF-8)")
-    })?;
-    Ok(text
-        .strip_prefix('\u{feff}')
-        .map(str::to_string)
-        .unwrap_or(text))
+    })
 }
 
 impl AppConfig {
@@ -524,11 +560,7 @@ impl AppConfig {
 
     /// Same, naming the file the values came from in the error.
     fn validate_at(&self, path: Option<&Path>) -> Result<(), ConfigError> {
-        let invalid = |field: &'static str, reason: String| ConfigError::Invalid {
-            field,
-            reason,
-            path: path.map(Path::to_path_buf),
-        };
+        let invalid = |field, reason| invalid(path, field, reason);
         if !(self.mouse_cpi.is_finite() && self.mouse_cpi > 0.0) {
             return Err(invalid(
                 "mouse_cpi",
@@ -605,16 +637,13 @@ impl AppConfig {
                 format!("must be at most {MAX_STOP_GRACE_SECS}s"),
             ));
         }
-        if let Err(reason) = crate::hotkey::Hotkey::parse(&self.ctl.hotkey) {
-            return Err(invalid("ctl.hotkey", reason));
-        }
-        let marker = match crate::hotkey::Hotkey::parse(&self.marker_hotkey) {
-            Ok(hk) => hk,
-            Err(reason) => return Err(invalid("marker_hotkey", reason)),
-        };
+        let ctl_hotkey = crate::hotkey::Hotkey::parse(&self.ctl.hotkey)
+            .map_err(|e| invalid("ctl.hotkey", e.to_string()))?;
+        let marker = crate::hotkey::Hotkey::parse(&self.marker_hotkey)
+            .map_err(|e| invalid("marker_hotkey", e.to_string()))?;
         // Both chords are system-wide and only one owner gets a chord;
         // whichever registered second would silently lose.
-        if let (Some(a), Ok(Some(b))) = (marker, crate::hotkey::Hotkey::parse(&self.ctl.hotkey))
+        if let (Some(a), Some(b)) = (marker, ctl_hotkey)
             && a == b
         {
             return Err(invalid(
@@ -647,17 +676,18 @@ impl AppConfig {
     /// anything launched by the tray or a shortcut is not a place the user
     /// picked, and a recording written there is a recording nobody finds.
     pub fn resolve_paths(&mut self, base: &Path) {
-        fn absolutize(p: &Path, base: &Path) -> PathBuf {
+        /// `p` joined onto `base` when it is relative (and not empty).
+        fn rebase(p: &Path, base: &Path) -> PathBuf {
             if p.is_absolute() || p.as_os_str().is_empty() {
                 p.to_path_buf()
             } else {
                 base.join(p)
             }
         }
-        self.recording.dir = absolutize(&self.recording.dir, base);
-        self.ctl.log_dir = absolutize(&self.ctl.log_dir, base);
+        self.recording.dir = rebase(&self.recording.dir, base);
+        self.ctl.log_dir = rebase(&self.ctl.log_dir, base);
         if let Some(dir) = &self.ctl.bin_dir {
-            self.ctl.bin_dir = Some(absolutize(dir, base));
+            self.ctl.bin_dir = Some(rebase(dir, base));
         }
     }
 
@@ -709,6 +739,40 @@ impl AppConfig {
         }
         if self.viz.http_addr != d.viz.http_addr {
             add("viz.http_addr", self.viz.http_addr.clone());
+        }
+        let (obs, dobs) = (&self.viz.obs, &d.viz.obs);
+        if obs.layout != dobs.layout {
+            add("viz.obs.layout", obs.layout.clone());
+        }
+        if obs.background != dobs.background {
+            add("viz.obs.background", obs.background.clone());
+        }
+        if obs.hud != dobs.hud {
+            add("viz.obs.hud", obs.hud.join(", "));
+        }
+        if obs.hud_position != dobs.hud_position {
+            add("viz.obs.hud_position", obs.hud_position.clone());
+        }
+        if obs.scale != dobs.scale {
+            add("viz.obs.scale", obs.scale.to_string());
+        }
+        if obs.trail_secs != dobs.trail_secs {
+            add("viz.obs.trail_secs", obs.trail_secs.to_string());
+        }
+        if obs.buffer_ms != dobs.buffer_ms {
+            add("viz.obs.buffer_ms", obs.buffer_ms.to_string());
+        }
+        if obs.grid != dobs.grid {
+            add("viz.obs.grid", obs.grid.to_string());
+        }
+        if obs.legend != dobs.legend {
+            add("viz.obs.legend", obs.legend.to_string());
+        }
+        if obs.labels != dobs.labels {
+            add("viz.obs.labels", obs.labels.to_string());
+        }
+        if obs.stale_secs != dobs.stale_secs {
+            add("viz.obs.stale_secs", obs.stale_secs.to_string());
         }
         if self.ctl.http_addr != d.ctl.http_addr {
             add("ctl.http_addr", self.ctl.http_addr.clone());
@@ -816,6 +880,10 @@ mod tests {
     fn ctl_section_parses_and_defaults() {
         let c = AppConfig::default();
         assert_eq!(c.ctl.http_addr, "127.0.0.1:7880");
+        assert_eq!(c.ctl.http_addr, DEFAULT_CTL_HTTP_ADDR);
+        assert_eq!(c.udp.addr, "127.0.0.1:7878");
+        assert_eq!(c.udp.addr, DEFAULT_UDP_ADDR);
+        assert_eq!(c.viz.http_addr, DEFAULT_VIZ_HTTP_ADDR);
         assert_eq!(c.ctl.bin_dir, None);
         assert_eq!(c.ctl.stop_grace_secs, DEFAULT_STOP_GRACE_SECS);
         assert!(
@@ -902,7 +970,7 @@ mod tests {
             [viz.obs]
             layout = "aim"
             background = "#0e131ccc"
-            hud = ["speed", "aim", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency", "eventage"]
+            hud = ["speed", "aim", "pointer", "cpm", "eps", "dist", "aimdist", "clicks", "game", "latency", "eventage"]
             hud_position = "top-right"
             scale = 1.5
             trail_secs = 2.0
@@ -1146,6 +1214,100 @@ mod tests {
         );
         assert_eq!(fields[2].1, "0.0.0.0:7879");
         assert_eq!(fields[3].1, "1 entries");
+    }
+
+    /// Every leaf key of a serialized config, dotted (`viz.obs.scale`). The
+    /// `games` table is one entry: the banner reports it as a count.
+    fn leaf_keys(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) if prefix != "games" => {
+                for (k, child) in map {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    leaf_keys(&key, child, out);
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    /// `non_default_fields` is hand-maintained, so it drifts: it once missed
+    /// every `viz.obs.*` key. Every field below is spelled out (no
+    /// `..Default::default()`), so a new config key does not compile until
+    /// it is given a non-default value here, and then this test fails until
+    /// the banner lists it too.
+    #[test]
+    fn every_config_key_appears_in_the_banner_when_changed() {
+        let mut games = BTreeMap::new();
+        games.insert(
+            "cs2.exe".to_string(),
+            GameSens {
+                sens: 1.0,
+                yaw_coeff: 0.022,
+                pitch_coeff: 0.022,
+            },
+        );
+        let all = AppConfig {
+            mouse_cpi: 800.0,
+            marker_hotkey: "f10".into(),
+            batch: BatchConfig {
+                window_ms: 50,
+                max_events: 100,
+                ring_capacity: 1024,
+                coalesce_ms: 2,
+            },
+            udp: UdpConfig {
+                enabled: false,
+                addr: "127.0.0.1:1".into(),
+            },
+            kafka: KafkaConfig {
+                enabled: true,
+                brokers: vec!["10.0.0.1:9092".into()],
+            },
+            recording: RecordingConfig {
+                enabled: false,
+                dir: PathBuf::from("elsewhere"),
+            },
+            viz: VizConfig {
+                http_addr: "127.0.0.1:2".into(),
+                obs: ObsConfig {
+                    layout: "aim".into(),
+                    background: "#000000".into(),
+                    hud: vec!["eps".into()],
+                    hud_position: "top-left".into(),
+                    scale: 2.0,
+                    trail_secs: 5.0,
+                    buffer_ms: 50,
+                    grid: false,
+                    legend: true,
+                    labels: true,
+                    stale_secs: 10.0,
+                },
+            },
+            ctl: CtlConfig {
+                http_addr: "127.0.0.1:3".into(),
+                bin_dir: Some(PathBuf::from("bin")),
+                stop_grace_secs: 2,
+                log_dir: PathBuf::from("var"),
+                hotkey: "ctrl+alt+t".into(),
+            },
+            games,
+        };
+        all.validate().unwrap();
+
+        let mut want = Vec::new();
+        leaf_keys("", &serde_json::to_value(&all).unwrap(), &mut want);
+        want.sort();
+        let mut got: Vec<String> = all
+            .non_default_fields()
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "non_default_fields has drifted from AppConfig");
     }
 
     /// The shipped sample is the defaults written down. If a default moves

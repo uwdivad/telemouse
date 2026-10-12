@@ -1,5 +1,7 @@
 //! The two local servers, as seen from a tool call.
 //!
+//! (Why there is no HTTP client crate: see the module doc of `http.rs`.)
+//!
 //! `telemouse-ctl` and `telemouse-viz` are the only things this server talks
 //! to, and neither is required to be running: a panel that is not up is a
 //! tool result that says so, never a panic and never a dead MCP session. So
@@ -15,12 +17,13 @@
 use std::net::SocketAddr;
 
 use serde_json::Value;
+use telemouse_core::localhost::{CTL_GUARD_HEADER, CTL_GUARD_VALUE};
 
 use crate::http::{self, HttpError, Request};
 
 /// The guard header ctl requires on every mutating call
 /// (`docs/API.md`, "Two rules every HTTP client must follow").
-const GUARD: (&str, &str) = ("X-Telemouse-Ctl", "1");
+const GUARD: (&str, &str) = (CTL_GUARD_HEADER, CTL_GUARD_VALUE);
 
 /// One of the two servers, with the words to use when it is not there.
 #[derive(Debug, Clone)]

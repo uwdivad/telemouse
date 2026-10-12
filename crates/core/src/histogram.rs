@@ -139,6 +139,9 @@ impl LatencySnapshot {
 
     /// The `q` quantile in µs, `0` when nothing was recorded — the shape the
     /// periodic report lines want, where a bare number is all that fits.
+    /// This deliberately flattens [`Self::percentile`]'s `None`: a caller
+    /// that must tell "no data" from "instant" (anything a person reads as a
+    /// measurement) uses `percentile` instead.
     pub fn percentile_us(&self, q: f64) -> u64 {
         self.percentile(q).map_or(0, |p| p.us)
     }

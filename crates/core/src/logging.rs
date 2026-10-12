@@ -97,8 +97,8 @@ mod imp {
 
     /// How a binary wants to log.
     pub struct LogOptions<'a> {
-        /// `capture` | `viz` | `analyze` | `ctl`; the file is
-        /// `<component>.log`.
+        /// The binary's short name (`capture`, `viz`, `analyze`, `ctl`,
+        /// `mcp`); the file is `<component>.log`.
         pub component: &'a str,
         /// When `Some`, also write `<log_dir>/<component>.log` (never
         /// colourised, size-rotated). The directory is created if needed.
@@ -114,11 +114,17 @@ mod imp {
     pub struct LogInit {
         /// The log file actually opened.
         pub file: Option<PathBuf>,
-        /// Why no file was opened, when one was asked for. A log directory
-        /// that cannot be written is a warning, never a refusal to start.
+        /// Why no file was opened, when one was asked for, or what went
+        /// wrong with it short of that (an oversized file that could not be
+        /// rotated aside, so the log keeps growing). A log directory that
+        /// cannot be written is a warning, never a refusal to start.
         pub file_error: Option<String>,
         /// Whether the stderr layer emits colour.
         pub ansi: bool,
+        /// Whether this call installed the process's subscriber. False when
+        /// one was already set (a second call): nothing above then applies,
+        /// and no file was opened.
+        pub installed: bool,
     }
 
     /// Colour only when a human is looking: a terminal on stderr, `NO_COLOR`
@@ -131,8 +137,14 @@ mod imp {
     /// Install the process-wide subscriber. Never panics and never fails:
     /// a bad `RUST_LOG` directive is ignored (the rest of the filter still
     /// applies), an unwritable log directory costs the file layer only, and
-    /// a second call is a no-op because a subscriber is already installed.
+    /// a second call is a no-op because a subscriber is already installed
+    /// (it opens no file and reports `installed: false`).
     pub fn init(opts: LogOptions<'_>) -> LogInit {
+        // Checked first so a second call does not create or rotate a log
+        // file it will never write to.
+        if tracing::dispatcher::has_been_set() {
+            return LogInit::default();
+        }
         let filter = match std::env::var("RUST_LOG") {
             Ok(v) if !v.trim().is_empty() => EnvFilter::builder().parse_lossy(v),
             _ => EnvFilter::builder().parse_lossy(opts.default_filter),
@@ -147,11 +159,13 @@ mod imp {
             file: None,
             file_error: None,
             ansi,
+            installed: false,
         };
         let file_layer = match opts.log_dir {
             Some(dir) => match LogFile::open(dir, opts.component) {
                 Ok(f) => {
                     out.file = Some(f.path().to_path_buf());
+                    out.file_error = f.rotation_error().map(str::to_string);
                     Some(
                         tracing_subscriber::fmt::layer()
                             .with_ansi(false)
@@ -172,13 +186,19 @@ mod imp {
             .with_target(false)
             .with_writer(io::stderr);
 
-        // `try_init` rather than `init`: a second call (a test binary, a
-        // library embedding us) must not take the process down.
-        let _ = tracing_subscriber::registry()
+        // `try_init` rather than `init`: a racing second call (a test
+        // binary, a library embedding us) must not take the process down.
+        out.installed = tracing_subscriber::registry()
             .with(filter)
             .with(stderr_layer)
             .with(file_layer)
-            .try_init();
+            .try_init()
+            .is_ok();
+        if !out.installed {
+            // Lost a race with another `init`: the file layer went nowhere.
+            out.file = None;
+            out.file_error = None;
+        }
         out
     }
 
@@ -195,18 +215,29 @@ mod imp {
         rotated: PathBuf,
         /// Bytes in the current file: its size at open, plus what we wrote.
         written: u64,
+        /// Why the oversized file found at open could not be rotated aside.
+        rotation_error: Option<String>,
     }
 
     impl LogFile {
         /// Open `<dir>/<component>.log` for appending, creating `dir` and
         /// rotating first if the file is already over
-        /// [`LOG_ROTATE_BYTES`].
+        /// [`LOG_ROTATE_BYTES`]. A rotation that fails (the file is locked,
+        /// say) does not stop the open: the file is appended to as it is,
+        /// and [`Self::rotation_error`] says why.
         pub fn open(dir: &Path, component: &str) -> io::Result<Self> {
             std::fs::create_dir_all(dir)?;
             let path = dir.join(format!("{component}.log"));
             let rotated = dir.join(format!("{component}.log.1"));
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
-                let _ = std::fs::rename(&path, &rotated);
+            let mut rotation_error = None;
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES)
+                && let Err(e) = std::fs::rename(&path, &rotated)
+            {
+                rotation_error = Some(format!(
+                    "could not rotate {} to {}: {e}",
+                    path.display(),
+                    rotated.display()
+                ));
             }
             let file = File::options().create(true).append(true).open(&path)?;
             let written = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -215,12 +246,19 @@ mod imp {
                 path,
                 rotated,
                 written,
+                rotation_error,
             })
         }
 
         /// The file currently being written.
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        /// Why the oversized file found at [`Self::open`] could not be
+        /// rotated aside, if it could not.
+        pub fn rotation_error(&self) -> Option<&str> {
+            self.rotation_error.as_deref()
         }
 
         /// Move the full file aside and start a new one. A failure here
@@ -352,13 +390,17 @@ mod imp {
                 Some(dir.path().join("test.log").as_path())
             );
             assert_eq!(first.file_error, None);
-            // A second call cannot install a subscriber, and must not panic.
+            assert!(first.installed);
+            // A second call cannot install a subscriber, must not panic, and
+            // must not create a log file it would never write to.
             let second = init(LogOptions {
-                component: "test",
-                log_dir: None,
+                component: "second",
+                log_dir: Some(dir.path()),
                 default_filter: "not a valid filter!!",
             });
             assert_eq!(second.file, None);
+            assert!(!second.installed);
+            assert!(!dir.path().join("second.log").exists());
         }
     }
 }

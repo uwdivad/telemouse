@@ -6,6 +6,113 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+- **Raw input next to the Windows pointer.** Everything telemouse records is
+  raw input — the counts before *Enhance pointer precision* and the speed
+  slider — so the dashboard never showed what the desktop cursor did with
+  them. It now has a third panel, **Pointer space**, that re-runs every
+  report through Windows' pointer ballistics (Microsoft's published curve:
+  `|Δ|/3.5` in, `SmoothMouse{X,Y}Curve` lookup, `× dpi/150 × slider` out,
+  whole pixels with the remainder carried) and draws where the cursor went.
+  The View toggle gains *Pointer* (alone) and *Raw vs Pointer* (beside the
+  hand path); `?view=pointer|compare` bookmarks it; `/obs` takes
+  `layout=pointer` for the cursor path as the whole overlay and
+  `layout=compare` for the pair, with a `pointer` HUD readout in px/s and
+  a *pointer speed* stat tile on the dashboard. The capture agent now
+  records the settings the model needs — precision on/off, the slider, the
+  registry curves, the system DPI — in the session envelope (`pointer`),
+  and `telemouse doctor` shows them; a recording that predates them plays
+  back with a fresh install's settings and the panel says so.
+
+- **Cleanliness audit, 2026-10-11.** A read-only audit of the whole
+  workspace (one reviewer per crate plus pedantic clippy) was followed by a
+  fix pass. Nothing changes the wire format or the recording files. What a
+  user can notice:
+
+  - **Two rule breaks closed.** The panel's *Force stop* (and the MCP `kill`
+    tool) no longer opens any process whose name is not a telemouse one, and
+    reads and terminates the target through a single handle, so a recycled
+    PID can never be hit. A recording whose session line has `qpc_freq = 0`
+    no longer crashes the analyzer or the MCP tools: timestamps convert as
+    if the frequency were 1, and a header that cannot convert anything (zero
+    frequency, bad CPI, anchor fields that disagree) is refused by `report`
+    with the reason and skipped with a warning by `list` and `trend`.
+  - **Analyzer flags are checked up front.** Out-of-range detector flags
+    (`--sg-order` above twice `--sg-half`, `--grid-dt` outside 0.0001–1 s,
+    non-positive thresholds, `--max-grid-cells` past 2³²−2, …) are refused
+    with the flag named instead of panicking or producing NaN.
+  - **Analyzer numbers that moved.** Aim-space metrics now honour
+    `--locked-only` and the game's pitch coefficient everywhere:
+    `kinematics.accel_deg_per_s2` / `jerk_deg_per_s3` are their own samples
+    (unchanged to rounding when pitch = yaw and `--locked-only` is off);
+    `per_second[].max_speed_deg_s`, the flick degree summaries and
+    `micro.segment_amplitude_deg` leave out spans that start outside a locked
+    span under `--locked-only`; per-marker-interval `distance_deg` /
+    `distance_cm` are summed per event like the session totals, so the
+    intervals now add up to `kinematics.total_distance_*`. A cached report
+    picks up the capture agent's final `.meta.json`, so a session analyzed
+    while recording no longer stays "unfinished" forever. `list`'s `BAD`
+    column agrees with `report` (the listing cache rebuilds once). `list
+    --json` and `trend --json` rows carry a `schema` field; the full report
+    gains `quality.sidecar.sink_losses`. A `.jsonl` whose name is not a safe
+    session id is no longer listed or trended.
+  - **Capture.** `telemouse doctor --json` prints its document as one compact
+    line so the panel and the MCP `doctor` tool receive it whole. Shutdown
+    fits inside the time Windows gives a closing console: the JSONL flush and
+    the Kafka drain share one 2.5 s budget, so the final sidecar rewrite is
+    no longer cut off. A live edit of `batch.coalesce_ms` (or any
+    `batch`/`udp`/`kafka`/`recording` key) is detected and leaves a
+    `config_changed` marker; overlay and panel edits no longer count. A
+    Kafka forwarder that dies now counts its accepted envelopes as
+    `abandoned` like JSONL does. Sidecar-write and Kafka-produce failures
+    warn once a minute instead of once per run. Kafka linger follows
+    `batch.window_ms`. `udp.addr` may point at another machine or an IPv6
+    address. Sink-failure log lines are one `sink failed` message with
+    `sink`/`op` fields.
+  - **Panel.** Exiting, or a logoff/shutdown, stops capture and viz together
+    in one grace period. A capture agent that stops reading stdin no longer
+    freezes the panel while a marker is sent (it fails after 2 s). The tray's
+    "running with problems" colour is amber again (it rendered sky blue).
+    Every non-GET request without `X-Telemouse-Ctl: 1` gets 403 before its
+    body is read; `restart_required` says `"ctl.hotkey"` like `changed`. The
+    page polls single-flight and fetches only new log lines
+    (`log_since=capture:N,viz:M`), shows an error when settings cannot be
+    read, and closing the first-run guide mid-demo stops the demo recording.
+    The page script now lives in `panel.js` with its own Node tests.
+  - **Viz.** A UDP socket stuck in an error state no longer floods
+    `viz.log`. Foreign-`Host` refusals are rate-limited per peer and the
+    limiter forgets peers after a minute. A request with no peer address is
+    refused rather than treated as local. The 16-client WebSocket cap holds
+    under concurrent connects, and a client that stops reading is dropped
+    after 5 s. A recording reached through a symlink is no longer listed. On
+    the dashboard, a session switch no longer carries the previous session's
+    CPI and colour scale; non-JSON replay lines count in *bad frames*; a
+    failed recording list says so; `?session=` accepts exactly the ids the
+    server serves. Canvases, switches, sliders and toasts carry
+    accessibility attributes.
+  - **MCP.** `doctor` returns the structured `telemouse-doctor/1` report (text
+    fallback with a `note` when it cannot). `capture_start` drops its no-op
+    `session` field. `session_summary` accepts `id.jsonl`. `logs_tail` can
+    read `mcp.log` and `analyze.log`. `--read-only` no longer writes
+    `recordings/.reports/`. `trend` takes `metrics`/`limit` and
+    `sessions_list` takes `last` as aliases. The binary now refuses to
+    compile with a `println!` in it.
+  - **Build and release.** `telemouse.toml` is git-ignored (it is this
+    machine's live config; ctl seeds a fresh one from the example). Release
+    runs the same gates as CI, including the Node tests and `cargo audit`.
+    Every action is pinned to a commit SHA and Dependabot bumps them; the
+    toolchain version is written only in `rust-toolchain.toml`. Shared
+    dependency versions and lints live in the workspace `Cargo.toml`, the
+    five `build.rs` files share `build-support/resource.rs`, and every exe
+    carries a proper copyright line. `telemouse-analyze` gains `quiet`.
+  - **Under the hood.** Every `unsafe` block in the tree has a `SAFETY`
+    note; the queue accounting shared by the JSONL and Kafka sinks, the sink
+    names, the marker-label limit, the guard header and the capture flag
+    allow-list each live in one place in `telemouse-core`; the hand-kept
+    lists that had drifted (`non_default_fields`, `describe_config_change`,
+    the dashboard's `engine.reset`) are generated or tested complete; the
+    longest functions (`cmd_run`, `raw_input::run`, `serve`, `wndproc`,
+    `report.rs`, `load.rs`) are split; wall-clock test thresholds are gone.
+
 ## [0.2.3] — 2026-09-23
 
 - **Panel controls line up.** Under *Tools* the report picker and its *Run*
