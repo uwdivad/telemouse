@@ -263,6 +263,7 @@ struct SegmentPass {
     amps_deg: Vec<f64>,
 }
 
+#[hotpath::measure]
 fn segment_pass(p: &Prepared) -> SegmentPass {
     let segs = p.segments();
     let mut out = SegmentPass {
@@ -453,6 +454,7 @@ impl Welch {
 
 /// One sweep over the grid runs: each run's residual is computed once and fed
 /// to both halves of the tremor estimate.
+#[hotpath::measure]
 fn tremor_pass(p: &Prepared) -> (TremorEnergy, Welch) {
     let g = &p.grid;
     let half = p.params.tremor_baseline_ms / 2;
@@ -472,6 +474,7 @@ fn tremor_pass(p: &Prepared) -> (TremorEnergy, Welch) {
 
 /// The micro report plus the per-second tremor energy the longitudinal tables
 /// slice up.
+#[hotpath::measure]
 pub fn compute_full(p: &Prepared) -> (MicroReport, TremorSeries) {
     let g = &p.grid;
     let segs = segment_pass(p);

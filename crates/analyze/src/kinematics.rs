@@ -65,6 +65,7 @@ pub struct Kinematics {
     pub degrees_locked_only: bool,
 }
 
+#[hotpath::measure]
 pub fn compute(p: &Prepared) -> Kinematics {
     let g = &p.grid;
     let dt = g.dt;

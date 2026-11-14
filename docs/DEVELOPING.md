@@ -36,9 +36,9 @@ target\release\telemouse-ctl.exe
 ```
 
 UDP live-viz and JSONL recording are always on and need no external services.
-Kafka is on in the repo config and expects the local broker from `compose.yaml`
-(`docker compose up -d`); if it is not running, capture logs a warning and
-carries on without it. A bundled demo recording
+Kafka is an opt-in Cargo feature (`--features telemouse-capture/kafka`, see
+*Kafka* below); a default build has no Kafka sink and ignores `[kafka]
+enabled = true` with a warning. A bundled demo recording
 (`recordings/demo-session.jsonl`) lets you try replay and analysis immediately.
 
 Rust users can install straight from the repository (one command per binary;
@@ -61,7 +61,7 @@ later (its embedded Chromium).
 
 | Binary | Crate | Role |
 |---|---|---|
-| `telemouse` | `crates/capture` | Capture agent: raw input → 25ms batches → UDP + asynchronous JSONL recording + optional Kafka (full build) |
+| `telemouse` | `crates/capture` | Capture agent: raw input → 25ms batches → UDP + asynchronous JSONL recording + optional Kafka (`kafka` feature) |
 | `telemouse-viz` | `crates/viz` | Live browser visualization + session replay (UDP→WebSocket bridge, single-file page) |
 | `telemouse-analyze` | `crates/analyze` | Offline metrics over recorded sessions |
 | `telemouse-ctl` | `crates/ctl` | Control panel: a native window (WebView2) and tray icon over an HTTP JSON API; starts/stops the others, runs the tools, sees and kills telemouse processes |
@@ -450,13 +450,19 @@ session configs), `mouse.markers` (hotkey/game-state annotations). JSON
 envelopes today; the tagged wire format leaves a seam for a binary schema.
 Capture creates the three topics on connect.
 
+The sink is behind the `kafka` Cargo feature, which is **off by default**
+and not in the release zip: build capture with
+`--features telemouse-capture/kafka` (or `--features kafka` with
+`-p telemouse-capture`) and set `[kafka] enabled = true`. `telemouse doctor`
+says whether the binary in front of you has it.
+
 A single-node KRaft broker for local use ships as `compose.yaml` (Apache Kafka
 3.9, data in a named volume, bound to `127.0.0.1:9092`):
 
 ```powershell
 docker compose up -d                                  # start the broker
-cargo run -p telemouse-capture -- doctor              # ...should now say "reachable"
-cargo run --release -p telemouse-capture -- run       # ships every batch to Kafka too
+cargo run -p telemouse-capture --features kafka -- doctor          # ...should now say "reachable"
+cargo run --release -p telemouse-capture --features kafka -- run   # ships every batch to Kafka too
 
 # watch batches arrive (Ctrl-C to stop)
 docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh `
@@ -477,25 +483,31 @@ afterwards without re-deriving it from the JSONL.
 
 ## Build flavours
 
-Logging, Kafka and observability are Cargo features, on by default. The
-release zip is the default build: all five binaries with everything on
-(Kafka compiled in, off in the shipped config). A **minimal** flavour with
-the three features compiled out still exists as a build-it-yourself
-option; it is no longer published, but CI lints and tests it on every push
-so the flags keep working.
+Logging and observability are Cargo features, on by default. The release
+zip is the default build: all five binaries with both. Everything else is
+opt-in: the Kafka sink (it needs a broker, which nobody running a release
+has), `quiet`, and the `hotpath*` profiling features
+([PROFILING.md](PROFILING.md)). A **minimal** flavour with logging and
+observability compiled out still exists as a build-it-yourself option; it
+is no longer published, but CI lints and tests it on every push so the
+flags keep working, and it builds and tests capture with `kafka` on as
+well.
 
-| Feature | Crates | What it adds |
-|---|---|---|
-| `logging` | capture, viz, analyze, ctl | the `tracing` subscriber: stderr (colour only on a terminal, `NO_COLOR` honoured) plus `logs/<component>.log`, size-rotated |
-| `observability` | capture, viz, ctl | the 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the stall flag in `/healthz`, child health on the panel and tray |
-| `kafka` | capture | the Kafka sink (`rskafka`, zstd); without it `[kafka] enabled = true` is ignored with a warning |
-| `quiet` | capture, viz, ctl | compiles every `tracing` call out (`release_max_level_off`) |
+| Feature | Default | Crates | What it adds |
+|---|---|---|---|
+| `logging` | on | capture, viz, analyze, ctl, mcp | the `tracing` subscriber: stderr (colour only on a terminal, `NO_COLOR` honoured) plus `logs/<component>.log`, size-rotated |
+| `observability` | on | capture, viz, ctl, mcp | the 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the stall flag in `/healthz`, child health on the panel and tray |
+| `kafka` | off | capture | the Kafka sink (`rskafka`, zstd, and tokio with it); without it `[kafka] enabled = true` is ignored with a warning |
+| `quiet` | off | capture, viz, analyze, ctl, mcp | compiles every `tracing` call out (`release_max_level_off`) |
+| `hotpath`, `hotpath-alloc`, `hotpath-prometheus`, `hotpath-cloud` | off | capture, analyze | the profiler's instrumentation |
 
 ```powershell
-cargo build --release --workspace                      # everything (what you want on your own machine)
+cargo build --release --workspace                      # the default: what the release zip ships
+cargo build --release --workspace --features telemouse-capture/kafka
+                                                        # the same plus the Kafka sink
 cargo build --release -p telemouse-capture -p telemouse-viz -p telemouse-ctl `
   --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet
-                                                        # minimal: tracking and visuals only, no log files, no stats, no Kafka
+                                                        # minimal: tracking and visuals only, no log files, no stats
 ```
 
 The panel starts children with whatever features it was built with; mixing
@@ -545,6 +557,11 @@ node --test "crates/viz/js-tests/*.test.mjs"    # the page's engine against a st
 cargo bench -p telemouse-analyze                # criterion benches over the loader + hot math
 cargo bench -p telemouse-core                   # wire encode/decode, batcher
 cargo build --profile profiling                 # release speed + debug symbols for flamegraphs
+cargo run --release -p telemouse-analyze --features hotpath -- report <id> --quiet
+cargo run --release -p telemouse-capture --features hotpath -- run --duration-secs 30
+                                                # hotpath per-function timing report on exit; add `hotpath-alloc`
+                                                # for allocation counts. Off by default, nothing extra compiled.
+                                                # What is measured and how to read it: docs/PROFILING.md
 ```
 
 What CI (`.github/workflows/ci.yml`) runs on every push, and what to run
@@ -554,7 +571,9 @@ before calling a change done — a formatting or clippy miss fails CI:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet -- -D warnings
+cargo clippy -p telemouse-capture --all-targets --locked --features kafka -- -D warnings
 cargo test --workspace --locked
+cargo test -p telemouse-capture --locked --features kafka
 cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl --locked --no-default-features
 node --check crates/viz/src/app.js
 node --test "crates/viz/js-tests/*.test.mjs"

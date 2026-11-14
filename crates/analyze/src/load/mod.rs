@@ -387,6 +387,7 @@ fn warn_bad_lines(path: &Path, bad: &BadLines) {
 /// `PARALLEL_MIN_BYTES` is split into one byte range per core and parsed on
 /// worker threads. The result is the same either way. The metadata sidecar
 /// is read here too, once, into [`LoadedSession::sidecar`].
+#[hotpath::measure]
 pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     match parallel::load_workers(size) {
@@ -400,6 +401,7 @@ pub fn load_session(path: &Path) -> Result<LoadedSession, LoadError> {
 /// Every line goes through the same classifier as the full load, so the
 /// counts and the `BAD` column agree with what `report` will read; the events
 /// of each batch are counted as they deserialize rather than collected.
+#[hotpath::measure]
 pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
     let (mut reader, _) = open(path)?;
     let mut line = String::with_capacity(64 * 1024);
@@ -471,6 +473,7 @@ pub fn scan_session(path: &Path) -> Result<SessionIndexEntry, LoadError> {
 /// whose header fails validation are skipped with a warning rather than
 /// failing the listing; a `.jsonl` whose name is not a session id is skipped
 /// with a debug line, because nothing else in telemouse would serve it.
+#[hotpath::measure]
 pub fn scan_dir(dir: &Path) -> Result<Vec<SessionIndexEntry>, LoadError> {
     let rd = std::fs::read_dir(dir).map_err(|source| LoadError::Io {
         path: dir.to_path_buf(),

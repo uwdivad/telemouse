@@ -275,6 +275,7 @@ fn next_line_start(path: &Path, file: &mut File, from: u64, size: u64) -> Result
 
 /// Parse the body lines in `[from, to)`. Both ends are line boundaries, so this
 /// is the same loop the sequential path runs, over a slice of the same file.
+#[hotpath::measure]
 fn parse_range(path: &Path, from: u64, to: u64) -> Result<Body, LoadError> {
     if from >= to {
         return Ok(Body::default());

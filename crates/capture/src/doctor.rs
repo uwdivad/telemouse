@@ -451,7 +451,7 @@ impl Facts {
                 "Kafka",
                 "[kafka] enabled = true, but this build has no Kafka support",
             )
-            .hint("use a default-feature build, or set [kafka] enabled = false"),
+            .hint("use a build with the `kafka` feature, or set [kafka] enabled = false"),
             (false, false) => {
                 Check::pass("kafka", "Kafka", "not built into this binary, not enabled")
             }

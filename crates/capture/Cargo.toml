@@ -11,27 +11,39 @@ rust-version.workspace = true
 name = "telemouse"
 path = "src/main.rs"
 
-# What a build pays for. The default is the developer build; a packaged agent
-# that only has to record can drop every one of them.
+# What a build pays for. The default is what the release ships; a packaged
+# agent that only has to record can drop every one of them.
 #
 # * `logging` installs the `tracing-subscriber` (the macros stay either way —
 #   with no subscriber they compile to a relaxed load and a branch).
 # * `observability` is the 5s report line, the latency histograms' recording,
 #   the polling-rate counters and the `<session>.meta.json` sidecar.
-# * `kafka` is the Kafka sink and, with it, `rskafka` + `tokio`. Without it
-#   `[kafka] enabled = true` warns once and the run continues.
+# * `kafka` is the Kafka sink and, with it, `rskafka` + `tokio`. Opt-in
+#   (`--features telemouse-capture/kafka`): it needs a broker nobody running
+#   a release has. Without it `[kafka] enabled = true` warns once and the
+#   run continues.
 [features]
-default = ["logging", "observability", "kafka"]
+default = ["logging", "observability"]
 logging = ["telemouse-core/logging"]
 observability = []
-kafka = ["dep:rskafka", "dep:tokio"]
+# `hotpath/tokio` rides along so the Kafka queue can be wrapped; it is the
+# only place tokio is in the tree anyway.
+kafka = ["dep:rskafka", "dep:tokio", "hotpath/tokio"]
 # `quiet` compiles every `tracing` event out of a release build: all levels,
 # `error!` and `warn!` included (debug builds keep them). Cargo unifies
 # `tracing`'s features, so it applies to every binary built in the same cargo
 # invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
+# Profiling (https://hotpath.rs): off by default, zero cost until one of these
+# is passed. `cargo run --features hotpath` prints a report on exit;
+# `hotpath-alloc` adds per-function allocation counts.
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus"]
+hotpath-cloud = ["hotpath/hotpath-cloud"]
 [dependencies]
 telemouse-core = { workspace = true }
+hotpath = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

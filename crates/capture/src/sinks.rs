@@ -110,6 +110,7 @@ impl EnvelopeEncoder {
     /// — split in two so the payload can be borrowed while the sinks are
     /// borrowed mutably. Takes anything serializable so the owned [`Envelope`]
     /// and the borrowing `EnvelopeView` share one path.
+    #[hotpath::measure(impl_type = "EnvelopeEncoder")]
     pub fn encode<T: serde::Serialize>(&mut self, env: &T) -> Result<()> {
         // Serialize into the buffer's bytes, then validate UTF-8 exactly once
         // on the way back into the `String` — `payload` is then a free borrow,
@@ -156,6 +157,7 @@ pub struct SinkFailure {
 }
 
 /// Deliver one envelope to every sink, collecting (not propagating) failures.
+#[hotpath::measure]
 pub fn fan_out(
     sinks: &mut [Box<dyn Sink>],
     topic: &'static str,
@@ -183,6 +185,7 @@ pub fn fan_out(
 /// `mouse.sessions` is a record nobody asked for. `None` when the sink is not
 /// present (disabled, or it failed to start) or when it accepted the
 /// envelope.
+#[hotpath::measure]
 pub fn send_to(
     sinks: &mut [Box<dyn Sink>],
     kind: SinkKind,
@@ -201,6 +204,7 @@ pub fn send_to(
 }
 
 /// Housekeeping pass over every sink, same isolation rules.
+#[hotpath::measure]
 pub fn tick_all(sinks: &mut [Box<dyn Sink>]) -> Vec<SinkFailure> {
     let mut failures = Vec::new();
     for sink in sinks.iter_mut() {

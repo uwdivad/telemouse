@@ -699,6 +699,7 @@ impl Segment {
 ///
 /// Silent cells are below any sane threshold, so a movement can never span two
 /// grid runs and this only ever walks the stored cells.
+#[hotpath::measure]
 pub fn movement_segments(grid: &Grid, threshold: f64, min_len: usize) -> Vec<Segment> {
     let mut out = Vec::new();
     for r in &grid.runs {
@@ -1056,6 +1057,7 @@ pub(crate) struct SgScratch {
 /// [`sg_run`] without the per-call allocations: returns the framed output
 /// buffer and the offset at which the run's `x.len()` results start, so the
 /// caller reads `out[from..from + x.len()]`. Bit-identical to `sg_run`.
+#[hotpath::measure]
 pub(crate) fn sg_run_into<'s>(
     sg: &SavGol,
     x: &[f64],
@@ -1086,6 +1088,7 @@ pub(crate) fn sg_run_into<'s>(
 ///
 /// Fails only on parameters [`Params::validate`] refuses; any recording the
 /// loader accepted prepares.
+#[hotpath::measure]
 pub fn prepare(session: LoadedSession, params: Params) -> Result<Prepared, ParamsError> {
     params.validate()?;
     // One tally of events-per-process for the whole pipeline: the dominant

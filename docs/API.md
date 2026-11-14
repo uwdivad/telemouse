@@ -351,7 +351,10 @@ default `recordings`).
   log_dir`) — `tracing` lines, size-rotated; a `capture stats` line every
   5 s and a `warn` once a minute for anything that stays wrong.
 
-## Kafka (full build, `[kafka] enabled`)
+## Kafka (opt-in `kafka` build, `[kafka] enabled`)
+
+The sink is not in the default build or the release zip; build capture with
+`--features kafka` (`docs/DEVELOPING.md`).
 
 Topics `mouse.events` (batches), `mouse.sessions` (session envelopes),
 `mouse.markers`; key = session id; value = the same JSON envelope as the

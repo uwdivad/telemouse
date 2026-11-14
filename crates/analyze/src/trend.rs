@@ -79,6 +79,7 @@ pub fn cache_path(dir: &Path, session_id: &str) -> PathBuf {
 /// same-size replacement on a filesystem with coarse timestamps; it is kept as
 /// the cheap first test, and as the only test for a cache written before
 /// signatures were stamped.
+#[hotpath::measure]
 pub fn read_cache(
     cache: &Path,
     recording: &Path,
@@ -145,6 +146,7 @@ fn recording_id(recording: &Path) -> Option<&str> {
 /// Publish a report into the cache atomically: a reader either sees the
 /// previous document or this one, never a half-written one, even if two
 /// analyzers race on the same session.
+#[hotpath::measure]
 fn write_cache(path: &Path, report: &Report) -> Result<(), AnalyzeError> {
     crate::atomic::write_atomic(path, |w| report.write_json_to(w))
         .map_err(AnalyzeError::io("writing the report cache", path))
@@ -160,6 +162,7 @@ fn write_cache(path: &Path, report: &Report) -> Result<(), AnalyzeError> {
 ///
 /// A recording whose file name is not `<session id>.jsonl` is analyzed but
 /// never cached: the cache is keyed by that id.
+#[hotpath::measure]
 pub fn report_for(
     recording: &Path,
     json_dir: Option<&Path>,
@@ -380,6 +383,7 @@ fn recording_paths(dir: &Path) -> Result<Vec<PathBuf>, AnalyzeError> {
 /// as they always were. A session that cannot be analyzed is skipped with a
 /// warning; only an unreadable `dir`, or parameters that do not validate, fail
 /// the whole table.
+#[hotpath::measure]
 pub fn compute(
     dir: &Path,
     json_dir: Option<&Path>,

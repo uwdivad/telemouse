@@ -116,6 +116,7 @@ pub fn build(run: &RunInfo<'_>, s: &StatsSnapshot) -> SessionMeta {
 /// real name, which is atomic on both NTFS and POSIX: a reader that opens the
 /// file while the agent is halfway through a refresh gets the previous
 /// document, never a truncated one.
+#[hotpath::measure]
 pub fn write(dir: &Path, meta: &SessionMeta) -> Result<PathBuf> {
     let name = meta_file_name(&meta.session_id).with_context(|| {
         format!(
@@ -234,6 +235,7 @@ impl Sidecar {
 
     /// Refresh the file. Never fails the caller: a failure warns (at most
     /// once a minute) and the run carries on either way.
+    #[hotpath::measure(impl_type = "Sidecar")]
     pub fn refresh(&self) -> Option<PathBuf> {
         // One writer at a time: two refreshes share `<id>.meta.json.tmp`, and
         // the loser of an unserialized race would fail its rename.

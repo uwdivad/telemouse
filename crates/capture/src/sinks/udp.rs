@@ -90,6 +90,7 @@ impl Sink for UdpSink {
         SinkKind::Udp
     }
 
+    #[hotpath::measure(impl_type = "UdpSink")]
     fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
         if payload.len() > MAX_UDP_PAYLOAD {
             self.stats.udp_oversized.fetch_add(1, Ordering::Relaxed);

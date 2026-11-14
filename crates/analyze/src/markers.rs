@@ -66,6 +66,7 @@ pub struct MarkerInterval {
 /// The cuts are placed on the integer µs timeline (each marker's UTC minus
 /// the session zero) and floored to a cell there; the `f64` seconds in the
 /// result are for reading, not for deciding anything.
+#[hotpath::measure]
 pub fn intervals(p: &Prepared, markers: &[MarkerRow]) -> Vec<MarkerInterval> {
     let n = p.grid.len();
     let end_us = p.cell_start_us(n);
@@ -159,6 +160,7 @@ pub struct SegmentReport {
 
 /// Per-interval headline metrics, reusing the already-computed flick, click and
 /// tremor series rather than re-running the detectors.
+#[hotpath::measure]
 pub fn segment_reports(
     p: &Prepared,
     flicks: &[Flick],

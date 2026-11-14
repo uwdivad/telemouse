@@ -49,9 +49,12 @@ all members and shared `[workspace.dependencies]`; add crate-local deps with
   metrics are logs here, no metrics server. Anything that stays wrong is
   repeated as a `warn` once a minute, never only as a number in the stats
   line.
-- Build flavours: `logging`, `observability` and (capture only) `kafka` are
-  Cargo features, on by default, off in a minimal build; `quiet`
-  compiles `tracing` calls out. New code that logs to a file, reports
+- Build flavours: `logging` and `observability` are Cargo features, on by
+  default, off in a minimal build. `kafka` (capture only) is off by default
+  and not in the release; CI builds and tests capture with it on. `quiet`
+  compiles `tracing` calls out. A new feature that a release user would not
+  use (needs external infrastructure, profiling, diagnostics) starts out of
+  `default`. New code that logs to a file, reports
   stats, or talks to Kafka goes behind the matching feature; the pipeline
   itself (capture → UDP → viz, JSONL recording, the pages) never does. Every
   crate must build and pass tests with `--no-default-features` as well as

@@ -56,6 +56,7 @@ impl Report {
     }
 
     /// The terminal summary.
+    #[hotpath::measure(impl_type = "Report")]
     pub fn render(&self) -> String {
         let mut o = String::new();
         self.render_header(&mut o);

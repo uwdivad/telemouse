@@ -150,6 +150,7 @@ pub enum Decoded {
 }
 
 /// Turn the raw `RAWMOUSE` fields into a [`RawEvent`].
+#[hotpath::measure]
 pub fn decode_mouse(
     us_flags: u16,
     button_flags: u16,

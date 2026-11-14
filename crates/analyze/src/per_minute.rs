@@ -50,6 +50,7 @@ pub struct MinuteRow {
 }
 
 /// Roll the per-second table up into minutes.
+#[hotpath::measure]
 pub fn compute(
     p: &Prepared,
     seconds: &[SecondRow],

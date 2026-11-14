@@ -221,6 +221,7 @@ struct MetricCosts {
 ///   lifts);
 /// * then the marker, per-second and per-minute aggregation, which needs the
 ///   flicks, the clicks and the tremor series.
+#[hotpath::measure]
 fn compute_metrics(p: &Prepared, parallel: bool) -> MetricResults {
     let (((quality, quality_ms), (kin, kinematics_ms)), rest) = fork(
         parallel,
@@ -327,6 +328,7 @@ macro_rules! phase {
     }};
 }
 
+#[hotpath::measure]
 fn build_with_parallelism(
     session: LoadedSession,
     params: Params,
@@ -505,6 +507,7 @@ impl Report {
     /// A three-hour session's report is tens of megabytes of `per_second`
     /// rows; `to_string` then `write` holds two copies of that in memory for
     /// no reason.
+    #[hotpath::measure(impl_type = "Report")]
     pub fn write_json(&self, path: &Path) -> Result<(), AnalyzeError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(AnalyzeError::io("creating", parent))?;
@@ -532,6 +535,7 @@ impl Report {
     }
 
     /// Write the derived tables into `dir`, creating it first.
+    #[hotpath::measure(impl_type = "Report")]
     pub fn write_csvs(&self, dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
         std::fs::create_dir_all(dir)?;
         let mut out = Vec::new();

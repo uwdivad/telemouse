@@ -114,6 +114,7 @@ impl Reporter {
         }
     }
 
+    #[hotpath::measure(impl_type = "Reporter")]
     fn maybe_report(&mut self, stats: &Stats, game: Option<&str>, locked: bool) {
         if self.last_at.elapsed() < self.interval {
             return;
@@ -212,6 +213,7 @@ impl Reporter {
 /// call into [`crate::platform`]. `screen` is passed in rather than read
 /// here: the primary screen only changes on `WM_DISPLAYCHANGE`, which T1
 /// flags, so the loop re-reads it then instead of four times a second.
+#[hotpath::measure]
 pub fn sample(
     detector: &mut PointerLockDetector,
     foreground: &mut ForegroundCache,

@@ -422,7 +422,11 @@ pub struct Shipper<'a> {
     print: bool,
 }
 
+// Every T2 per-batch step is timed under `--features hotpath`; construction
+// and the rate-limited warning path are excluded as noise.
+#[hotpath::measure_all]
 impl<'a> Shipper<'a> {
+    #[hotpath::skip]
     pub fn new(
         sinks: Vec<Box<dyn Sink>>,
         stats: &'a Stats,
@@ -442,6 +446,7 @@ impl<'a> Shipper<'a> {
     /// Count a sink failure, and warn about it at most once per
     /// [`WARN_INTERVAL`] per sink, with how many were swallowed. `op` says
     /// what was being attempted (`send`, `tick`, `session`, `heartbeat`).
+    #[hotpath::skip]
     fn report_failure(&mut self, failure: &SinkFailure, op: &'static str) {
         self.stats.count_sink_error(failure.sink);
         if let Some(suppressed) = self.limiter.allow(failure.sink.as_str(), Instant::now()) {
@@ -788,6 +793,7 @@ pub fn run(
 
 /// Record how long the batch's oldest and newest events waited to be shipped.
 #[cfg(feature = "observability")]
+#[hotpath::measure]
 fn record_latency(anchor: QpcAnchor, stats: &Stats, events: &[RawEvent]) {
     let now = platform::qpc();
     let (Some(first), Some(last)) = (events.first(), events.last()) else {

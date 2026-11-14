@@ -77,8 +77,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy (minimal)
         run: cargo clippy -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-analyze/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
+      # The opt-in Kafka sink: not in the zip, but it must keep building.
+      - name: clippy (capture with kafka)
+        run: cargo clippy -p telemouse-capture --all-targets --locked --features kafka -- -D warnings
       - name: Test (full)
         run: cargo test --workspace --locked
+      - name: Test (capture with kafka)
+        run: cargo test -p telemouse-capture --locked --features kafka
       - name: Test (minimal)
         run: cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-analyze -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
       - name: viz page syntax
@@ -159,7 +164,8 @@ jobs:
         run: |
           $dir = "telemouse-${{ github.ref_name }}-windows-x86_64"
           # Beside the binaries: the loopback sample as telemouse.toml (never
-          # the repository's own dev config; Kafka is off in it), the license,
+          # the repository's own dev config; Kafka is off in it and not
+          # compiled into the shipped agent), the license,
           # the user-facing docs (help, guide, fair-play statement, API
           # reference, the README's screenshot)
           # and the demo recording the README tells people to try first.

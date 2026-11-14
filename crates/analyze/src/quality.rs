@@ -472,6 +472,7 @@ pub fn compute(p: &Prepared) -> QualityReport {
 
 /// The quality report, and its [`QualityReport::warnings`] — computed once,
 /// used both for `clean` and for the report's own warning list.
+#[hotpath::measure]
 pub fn compute_with_warnings(p: &Prepared) -> (QualityReport, Vec<String>) {
     let session = &p.session;
 

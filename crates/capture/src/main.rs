@@ -173,6 +173,9 @@ fn explain_and_wait() -> Result<()> {
     Ok(())
 }
 
+// Profiling report on exit when built with `--features hotpath`; a no-op
+// attribute otherwise (https://hotpath.rs/functions).
+#[hotpath::main]
 fn main() -> Result<()> {
     // Before anything reads a screen size, a monitor rectangle or the cursor:
     // on a scaled desktop those are virtualised until this is called, and
@@ -1112,7 +1115,15 @@ mod tests {
             features.contains("observability")
         );
         assert_eq!(cfg!(feature = "kafka"), features.contains("kafka"));
-        // A default build lists all three, in a stable order.
+        // A default build lists these two; with the opt-in Kafka sink all
+        // three, in a stable order.
+        #[cfg(all(
+            feature = "logging",
+            feature = "observability",
+            not(feature = "kafka"),
+            not(feature = "quiet")
+        ))]
+        assert_eq!(features, "logging,observability");
         #[cfg(all(
             feature = "logging",
             feature = "observability",

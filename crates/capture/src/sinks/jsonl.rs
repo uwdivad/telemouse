@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct JsonlSink {
     path: PathBuf,
-    tx: Option<SyncSender<Vec<u8>>>,
+    /// A `hotpath::wrap` type so the queue can be profiled: a plain
+    /// `std::sync::mpsc::SyncSender` re-export unless `--features hotpath`.
+    tx: Option<hotpath::wrap::std::sync::mpsc::SyncSender<Vec<u8>>>,
     /// Gates enqueue and flush acknowledgement against the worker's terminal
     /// transition. This is what makes outstanding/loss accounting exact even
     /// when a shutdown timeout races a late writer failure.
@@ -86,7 +88,13 @@ impl JsonlSink {
         flush_interval: Duration,
         drain_timeout: Duration,
     ) -> Result<Self> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(queue_capacity);
+        // Profiled under `--features hotpath` (throughput, send→recv latency,
+        // queue depth); `capacity` must equal the constructor's argument.
+        let (tx, rx) = hotpath::channel!(
+            std::sync::mpsc::sync_channel::<Vec<u8>>(queue_capacity),
+            capacity = queue_capacity,
+            label = "jsonl_queue"
+        );
         let (done_tx, done) = std::sync::mpsc::channel();
         let queue = Arc::new(QueueAccounting::new(
             SinkKind::Jsonl,
@@ -167,7 +175,7 @@ impl JsonlSink {
 }
 
 fn write_loop(
-    rx: &Receiver<Vec<u8>>,
+    rx: &hotpath::wrap::std::sync::mpsc::Receiver<Vec<u8>>,
     mut writer: BufWriter<Box<dyn Write + Send>>,
     stats: &Stats,
     queue: &QueueAccounting,
@@ -217,6 +225,7 @@ impl Sink for JsonlSink {
         SinkKind::Jsonl
     }
 
+    #[hotpath::measure(impl_type = "JsonlSink")]
     fn send(&mut self, _topic: &'static str, _key: &str, payload: &str) -> Result<()> {
         // Avoid copying a line after a terminal writer failure. `enqueue`
         // repeats this check under the same mutex to close the transition race.
@@ -471,7 +480,10 @@ mod tests {
 
     #[test]
     fn sustained_backlog_cannot_starve_periodic_flushes() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        // Wrapped like the real queue so `write_loop`'s parameter type lines
+        // up in both build flavours (a no-op without `--features hotpath`).
+        let (tx, rx) =
+            hotpath::channel!(std::sync::mpsc::sync_channel::<Vec<u8>>(64), capacity = 64);
         let stats = Arc::new(Stats::default());
         let queue =
             QueueAccounting::new(SinkKind::Jsonl, 64, Arc::clone(&stats), Stats::jsonl_queue);

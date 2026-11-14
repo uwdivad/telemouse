@@ -35,6 +35,9 @@ winresource = "0.1.31"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tower = { version = "0.5.3", features = ["util"] }
+# Opt-in profiler (https://hotpath.rs). Every macro is a no-op and no
+# dependency is compiled unless a member's `hotpath` feature is on.
+hotpath = "0.28"
 
 # Every member opts in with `[lints] workspace = true`. Only lints the whole
 # tree already passes under `clippy -D warnings` are listed; `print_stdout`

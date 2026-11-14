@@ -6,6 +6,16 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+- **The Kafka sink is no longer in the default build.** `kafka` was the one
+  default-on Cargo feature that a release user cannot use without standing
+  up a broker, and it brought `rskafka`, zstd and tokio into the capture
+  agent. It is now opt-in: the release zip's `telemouse.exe` has no Kafka
+  sink, and `[kafka] enabled = true` there is ignored with a warning (in
+  the log and in `telemouse doctor`). To keep producing to Kafka, build
+  from source with `--features telemouse-capture/kafka`. `logging` and
+  `observability` stay on by default; CI still builds and tests the Kafka
+  sink.
+
 - **Raw input next to the Windows pointer.** Everything telemouse records is
   raw input — the counts before *Enhance pointer precision* and the speed
   slider — so the dashboard never showed what the desktop cursor did with

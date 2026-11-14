@@ -129,6 +129,7 @@ pub fn detect(p: &Prepared) -> Vec<Flick> {
 
 /// [`detect`], with the grid cell each flick starts in — what the aggregate
 /// needs to apply `locked_only` without going back through `f64` seconds.
+#[hotpath::measure]
 fn detect_with_cells(p: &Prepared) -> Vec<(Flick, usize)> {
     let g = &p.grid;
     let n = g.len();
@@ -300,6 +301,7 @@ pub(crate) fn reversals(p: &Prepared, a: usize, b: usize, ux: f64, uy: f64) -> u
 }
 
 /// Detect and aggregate.
+#[hotpath::measure]
 pub fn compute(p: &Prepared) -> FlickReport {
     summarize(p, detect_with_cells(p))
 }

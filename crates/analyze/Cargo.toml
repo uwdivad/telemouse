@@ -27,9 +27,17 @@ logging = ["telemouse-core/logging"]
 # `tracing`'s features, so it applies to every binary built in the same cargo
 # invocation, not only this one.
 quiet = ["tracing/release_max_level_off"]
+# Profiling (https://hotpath.rs): off by default, zero cost until one of these
+# is passed. `cargo run --features hotpath -- report <id>` prints a report
+# on exit; `hotpath-alloc` adds per-function allocation counts.
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus"]
+hotpath-cloud = ["hotpath/hotpath-cloud"]
 
 [dependencies]
 telemouse-core = { workspace = true }
+hotpath = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 clap.workspace = true

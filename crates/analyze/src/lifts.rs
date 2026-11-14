@@ -138,6 +138,7 @@ pub fn detect(p: &Prepared) -> Vec<Lift> {
     out
 }
 
+#[hotpath::measure]
 pub fn compute(p: &Prepared) -> LiftReport {
     let lifts = detect(p);
     let mean_drift_cm = if lifts.is_empty() {

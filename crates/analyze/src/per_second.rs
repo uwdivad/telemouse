@@ -47,6 +47,7 @@ pub struct SecondRow {
 /// Build the per-second table. `flicks` are attributed to the second their
 /// ballistic phase starts in, and each row carries the label of the marker
 /// interval it belongs to.
+#[hotpath::measure]
 pub fn compute(p: &Prepared, flicks: &[Flick], intervals: &[MarkerInterval]) -> Vec<SecondRow> {
     let g = &p.grid;
     if g.is_empty() {

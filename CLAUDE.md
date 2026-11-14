@@ -29,7 +29,9 @@ tools on recorded sessions.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --all-targets --locked --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet,telemouse-mcp/quiet -- -D warnings
+cargo clippy -p telemouse-capture --all-targets --locked --features kafka -- -D warnings
 cargo test --workspace --locked
+cargo test -p telemouse-capture --locked --features kafka
 cargo test -p telemouse-core -p telemouse-capture -p telemouse-viz -p telemouse-ctl -p telemouse-mcp --locked --no-default-features
 node --check crates/viz/src/app.js
 node --test "crates/viz/js-tests/*.test.mjs"
@@ -42,10 +44,13 @@ saying a change is done; a formatting or clippy miss fails CI.
 
 ## Rules that are easy to get wrong
 
-- **Two build flavours.** `logging`, `observability`, `kafka` are Cargo
+- **Two build flavours.** `logging` and `observability` are Cargo
   features, on by default, off in a minimal build (CI-gated, no longer
   published: the release is one zip with the default features); `quiet` compiles
-  `tracing` out. Anything that logs to a file, emits stats, writes a sidecar
+  `tracing` out. `kafka` (capture) is **off by default** and not in the zip:
+  default-feature commands never compile it, so check Kafka code with
+  `--features kafka`, and this machine's Kafka-on `telemouse.toml` needs
+  `cargo build --release --workspace --features telemouse-capture/kafka`. Anything that logs to a file, emits stats, writes a sidecar
   or talks to Kafka goes behind the matching feature. Every crate must build
   and test with `--no-default-features` too.
 - **Embedded pages need a rebuild.** `crates/viz` (`index.html`, `app.js`) and
@@ -137,7 +142,11 @@ WebView2 cache in `%LOCALAPPDATA%\telemouse\WebView2`.
 
 `docs/AUDIT-2026-08.md` (performance/observability audit),
 `docs/PERFORMANCE-2026-09.md` (measured before/after), `docs/BENCHMARKS.md`
-(criterion + cpubench numbers), `CHANGELOG.md` (the 2026-09-12 field audit
+(criterion + cpubench numbers), `docs/PROFILING.md` (the opt-in hotpath
+instrumentation in capture and analyze: what each row measures, how to run
+it, rules for adding more), `docs/PERFORMANCE-2026-10-12.md` (first full
+hotpath pass: 20-min capture + analyzer over all recordings, ranked fixes
+A1–A6/C1–C2, none landed yet), `CHANGELOG.md` (the 2026-09-12 field audit
 fixes are under v0.1.2), `docs/AGENTIC-2026-09-13.md` (the agentic-workflow
 menu, build order and what has landed; steps 1-3 are done, the post-session
 triage note and the log-health loop are next),

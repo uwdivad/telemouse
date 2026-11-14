@@ -34,7 +34,10 @@ use rskafka::client::producer::{BatchProducer, BatchProducerBuilder};
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
 use telemouse_core::wire::{TOPIC_EVENTS, TOPIC_MARKERS, TOPIC_SESSIONS};
-use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
+// `hotpath::wrap` types so the queue can be profiled: plain tokio re-exports
+// unless `--features hotpath` (https://hotpath.rs/data_flow).
+use hotpath::wrap::tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
@@ -113,7 +116,10 @@ impl KafkaSink {
     /// durability lag.
     pub fn connect(brokers: &[String], linger: Duration, stats: Arc<Stats>) -> Result<Self> {
         anyhow::ensure!(!brokers.is_empty(), "no kafka brokers configured");
-        let (tx, rx) = tokio::sync::mpsc::channel::<KafkaJob>(QUEUE_CAPACITY);
+        let (tx, rx) = hotpath::channel!(
+            tokio::sync::mpsc::channel::<KafkaJob>(QUEUE_CAPACITY),
+            label = "kafka_queue"
+        );
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<Option<Instant>>();
         let queue = Arc::new(new_queue(stats));
         let worker_queue = Arc::clone(&queue);
@@ -373,6 +379,7 @@ impl Sink for KafkaSink {
         SinkKind::Kafka
     }
 
+    #[hotpath::measure(impl_type = "KafkaSink")]
     fn send(&mut self, topic: &'static str, key: &str, payload: &str) -> Result<()> {
         // After a terminal failure the worker has already logged the cause;
         // staying on the successful Sink path avoids allocating and
@@ -529,7 +536,7 @@ mod tests {
     fn terminal_initialization_failure_drops_later_jobs_without_error_churn() {
         let stats = Arc::new(Stats::default());
         stats.kafka_errors.store(1, Ordering::Relaxed);
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel::<KafkaJob>(1));
         let mut sink = sink_with(new_queue(Arc::clone(&stats)), None);
         sink.tx = Some(tx);
         assert!(sink.queue.mark_failed());
@@ -551,7 +558,7 @@ mod tests {
     #[test]
     fn a_closed_forwarder_channel_claims_the_loss() {
         let stats = Arc::new(Stats::default());
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = hotpath::channel!(tokio::sync::mpsc::channel::<KafkaJob>(4));
         let mut sink = sink_with(new_queue(Arc::clone(&stats)), None);
         sink.tx = Some(tx);
         sink.send(TOPIC_EVENTS, "s-1", "{}").unwrap();

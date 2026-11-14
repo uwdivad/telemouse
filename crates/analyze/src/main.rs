@@ -363,6 +363,11 @@ fn main() -> ! {
     finish(run())
 }
 
+// The profiling guard lives here, not on `main`: `finish` leaves through
+// `std::process::exit`, which would skip the report that is printed when the
+// guarded function returns (https://hotpath.rs/profiling_modes). A no-op
+// attribute unless built with `--features hotpath`.
+#[hotpath::main]
 fn run() -> Result<()> {
     // Before anything else: a double-click from Explorer gets an explanation
     // instead of a window that flashes and vanishes. Exit 2 is what clap's

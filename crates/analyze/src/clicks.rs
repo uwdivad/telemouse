@@ -131,6 +131,7 @@ fn last_movement_before(p: &Prepared, us: i64) -> Option<i64> {
         .map(|i| p.cell_start_us(i))
 }
 
+#[hotpath::measure]
 pub fn compute(p: &Prepared) -> ClickReport {
     let prm = &p.params;
     let mut clicks: Vec<ClickEvent> = Vec::new();

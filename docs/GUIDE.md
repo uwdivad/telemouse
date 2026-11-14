@@ -217,7 +217,8 @@ Requirements: recent stable Rust; Windows for actual capture. Everything
 `#[cfg(windows)]`, and `doctor`, the viz, and the analyzer are portable).
 
 ```powershell
-# optional: the local Kafka broker (compose.yaml). Capture runs fine without it.
+# optional: the local Kafka broker (compose.yaml). Capture runs fine without
+# it, and only a build with `--features kafka` produces to it.
 docker compose up -d
 
 # sanity-check the machine: QPC, monitors, devices, UDP bind, Kafka reachability
@@ -250,19 +251,21 @@ emitted only when stderr is a terminal (and `NO_COLOR` is unset); the
 subscriber is always set up through `telemouse_core::logging::init`, which
 can also write a size-rotated `<log_dir>/<component>.log`.
 
-**Build flavours.** Logging, Kafka and observability are Cargo features,
-on by default (the release zip has them) and compiled out of a minimal
-build you can make yourself (`docs/DEVELOPING.md`):
+**Build flavours.** Logging and observability are Cargo features, on by
+default (the release zip has them) and compiled out of a minimal build you
+can make yourself (`docs/DEVELOPING.md`). The Kafka sink is a feature too,
+off by default and not in the release zip:
 
-| Feature | Crates | Adds |
-|---|---|---|
-| `logging` | capture, viz, analyze, ctl | the `tracing` subscriber (stderr + rotated log files) |
-| `observability` | capture, viz, ctl | 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the feed/stall fields of `/healthz`, child health on the panel |
-| `kafka` | capture | the Kafka sink; without it `[kafka] enabled = true` is ignored with a warning |
-| `quiet` | capture, viz, ctl | `tracing/release_max_level_off`: every `tracing` call compiled out |
+| Feature | Default | Crates | Adds |
+|---|---|---|---|
+| `logging` | on | capture, viz, analyze, ctl, mcp | the `tracing` subscriber (stderr + rotated log files) |
+| `observability` | on | capture, viz, ctl, mcp | 5-second stats lines, latency histograms, `<session>.meta.json` sidecars, `/api/stats`, the feed/stall fields of `/healthz`, child health on the panel |
+| `kafka` | off | capture | the Kafka sink; without it `[kafka] enabled = true` is ignored with a warning |
+| `quiet` | off | capture, viz, analyze, ctl, mcp | `tracing/release_max_level_off`: every `tracing` call compiled out |
 
 ```powershell
-cargo build --release --workspace                  # everything (the developer build)
+cargo build --release --workspace                  # the default: what the release zip ships
+cargo build --release --workspace --features telemouse-capture/kafka   # plus the Kafka sink
 cargo build --release -p telemouse-capture -p telemouse-viz -p telemouse-ctl `
   --no-default-features --features telemouse-capture/quiet,telemouse-viz/quiet,telemouse-ctl/quiet
 ```
@@ -810,7 +813,8 @@ pub trait Sink: Send {
   Saturation drops quietly without blocking T2 and is visible as
   `jsonl_dropped` / `jsonl_abandoned`. This flush reaches the OS cache; it is
   not a power-loss `sync_data` guarantee.
-- **`KafkaSink`** — `rskafka` (pure Rust; *not* rdkafka despite the plan).
+- **`KafkaSink`** (opt-in `kafka` feature) — `rskafka` (pure Rust; *not*
+  rdkafka despite the plan).
   `connect` creates a bounded channel and returns immediately; the worker owns
   the 5 s broker/topic/producer initialization timeout, so an unavailable
   broker cannot delay capture startup. One `BatchProducer` per topic uses
@@ -1522,8 +1526,8 @@ pointer-locked spans so desktop mousing doesn't count as "aim".
 
 "Metrics are logs here, no metrics server" (CONVENTIONS.md). Every
 long-running loop emits a structured `tracing` line every 5 s. All of this
-chapter is the `logging` and `observability` features (§4): the minimal
-release zip has none of it, the developer build has all of it. Anything that
+chapter is the `logging` and `observability` features (§4): the default
+build and the release zip have all of it, a minimal build none. Anything that
 stays wrong is repeated as a `warn` once a minute — a sink that is dead or
 dropping, a ring overflow, no input for a minute — so a problem is never only
 a number in the stats line. Every binary opens with one line naming its
