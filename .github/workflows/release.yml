@@ -56,7 +56,7 @@ jobs:
       # account are all configured; anything else is an unsigned release.
       SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' && vars.SIGNING_ENDPOINT != '' && vars.SIGNING_ACCOUNT_NAME != '' && vars.SIGNING_CERTIFICATE_PROFILE != '' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # rust-toolchain.toml is the single source of truth for the version and
       # components: with no argument rustup installs exactly what it names.
       - name: Install the pinned toolchain
