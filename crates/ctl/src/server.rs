@@ -1386,7 +1386,20 @@ mod tests {
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert!(v["error"].as_str().unwrap().contains("telemouse-analyze"));
 
-        // Nothing stored yet; then a stored summary newer than the recording is served.
+        // Nothing stored yet; then a stored summary stamped with the
+        // recording's modification time is served (what the page asks for
+        // before it runs anything; `manager::stored_summary` has the rest).
+        let stamp_like_the_recording = |summary: &std::path::Path| {
+            let t = std::fs::metadata(d.join("recordings").join("s-1.jsonl"))
+                .and_then(|m| m.modified())
+                .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(summary)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
         let (s, _, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         let cache = d.join("recordings").join(crate::manager::REPORTS_DIR);
@@ -1399,16 +1412,25 @@ mod tests {
             r#"{"schema":"telemouse-report-summary/1"}"#,
         )
         .unwrap();
+        stamp_like_the_recording(&cache.join("s-1.summary.json"));
         let (s, _, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "a stale summary shape is ignored");
         std::fs::write(
             cache.join("s-1.summary.json"),
             format!(
-                r#"{{"schema":"{}","markers":[]}}"#,
-                crate::manager::SUMMARY_SCHEMA
+                r#"{{"schema":"{}","analyzer_version":"{}","markers":[]}}"#,
+                crate::manager::SUMMARY_SCHEMA,
+                env!("CARGO_PKG_VERSION")
             ),
         )
         .unwrap();
+        let (s, _, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "a summary nobody vouched for is not served"
+        );
+        stamp_like_the_recording(&cache.join("s-1.summary.json"));
         let (s, v, _) = call(st.clone(), Method::GET, "/api/reports/s-1", false, None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["schema"], crate::manager::SUMMARY_SCHEMA);

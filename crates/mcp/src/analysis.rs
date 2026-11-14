@@ -137,10 +137,26 @@ impl Analysis {
     }
 
     /// The `telemouse-report-summary/2` headline for one recording.
+    ///
+    /// A current cached report is read for its headline sections only
+    /// (`trend::read_cache_summary`), never its row tables; that is the same
+    /// answer `telemouse-analyze report --summary` gives.
     pub fn summary(&self, id: &str) -> Result<ReportSummary, String> {
         let path = self.recording(id)?;
-        let (report, _from_cache) = self.report(&path)?;
-        Ok(report.summary(sidecar_losses(&path)))
+        let params = Params::default();
+        if self.read_only {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let cached = trend::cache_path(&self.cache, stem);
+                if let (Some(summary), _) = trend::read_cache_summary(&cached, &path, params) {
+                    return Ok(summary);
+                }
+            }
+            let (report, _from_cache) = self.report(&path)?;
+            return Ok(report.summary(sidecar_losses(&path)));
+        }
+        trend::summary_for(&path, self.writable_cache(), params)
+            .map(|(summary, _)| summary)
+            .map_err(|e| format!("analyzing {}: {}", path.display(), load::error_chain(&e)))
     }
 
     /// One row per session, oldest first, optionally cut to the last `last`.
@@ -184,6 +200,17 @@ impl Analysis {
         paths.sort();
         let mut rows = Vec::with_capacity(paths.len());
         for path in &paths {
+            // Without extra columns a current cache gives the row from its
+            // headline sections alone.
+            if metrics.is_empty()
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                let cached = trend::cache_path(&self.cache, stem);
+                if let (Some(row), _) = trend::read_cache_row(&cached, path, Params::default()) {
+                    rows.push(row);
+                    continue;
+                }
+            }
             match self.report(path) {
                 Ok((report, from_cache)) => rows.push(trend::row(&report, from_cache, metrics)),
                 Err(error) => tracing::warn!(path = %path.display(), %error, "skipping session"),

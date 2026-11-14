@@ -90,12 +90,23 @@ test("arrival latency stays fixed while event age increases, then becomes idle",
   assert.equal(elements.get("sLatUnit").textContent, "");
   assert.equal(elements.get("statLat").classList.contains("warn"), false);
   assert.equal(_test.hudValue("latency", engine), "idle");
-  assert.equal(_test.hudValue("eventage", engine), "3010.0");
+  // The age stops counting too: a tile that changes ten times a second for
+  // as long as the mouse is still is a repaint loop that says nothing.
+  assert.equal(_test.hudValue("eventage", engine), "idle");
+  assert.equal(elements.get("sAge").textContent, "idle");
+  assert.equal(elements.get("sAgeUnit").textContent, "");
+  assert.equal(elements.get("statAge").classList.contains("dim"), true);
+  clock.utcMs += 60_000; clock.monotonicMs += 60_000;
+  paint();
+  assert.equal(elements.get("sAge").textContent, "idle", "and stays put");
   // The first sample after idle starts fresh instead of averaging old data.
-  receive(batchEnvelope(2, [ev(4.025, 1, 0)]));
+  receive(batchEnvelope(2, [ev(64.025, 1, 0)]));
   paint();
   assert.equal(elements.get("sLat").textContent, "5.0");
   assert.equal(elements.get("sLatUnit").textContent, "ms");
+  assert.equal(elements.get("sAge").textContent, "5.0");
+  assert.equal(elements.get("sAgeUnit").textContent, "ms");
+  assert.equal(elements.get("statAge").classList.contains("dim"), false);
 });
 
 test("timing samples need a live arrival and anchor, reset on restart, and preserve clock skew", () => {

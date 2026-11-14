@@ -42,8 +42,9 @@ use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ANSI_FIXED_FONT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateBitmap,
-    CreateFontW, DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetStockObject,
-    HBRUSH, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
+    CreateFontW, DEFAULT_CHARSET, DeleteObject, FF_MODERN, FIXED_PITCH, FW_NORMAL, GetMonitorInfoW,
+    GetStockObject, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
@@ -56,7 +57,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+    NOTIFYICONDATAW, SHQueryUserNotificationState, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
@@ -68,11 +69,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SC_MINIMIZE, SIZE_MINIMIZED, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DPICHANGED, WM_ENDSESSION, WM_GETMINMAXINFO, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_MOVE, WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETFONT, WM_SETREDRAW, WM_SIZE,
-    WM_SYSCOMMAND, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_APPWINDOW, WS_HSCROLL,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_GETMINMAXINFO, WM_HOTKEY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOVE, WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP,
+    WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -95,6 +96,8 @@ const EM_SETSEL: u32 = 0x00B1;
 const EM_LINESCROLL: u32 = 0x00B6;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_GETFIRSTVISIBLELINE: u32 = 0x00CE;
+/// `MONITORINFO.dwFlags`: this is the primary display (winuser.h).
+const MONITORINFOF_PRIMARY: u32 = 1;
 const TRAY_ID: u32 = 1;
 /// `RegisterHotKey` id of the new-session chord (arrives in `WM_HOTKEY`'s wParam).
 const HOTKEY_ID: i32 = 1;
@@ -124,7 +127,20 @@ pub(super) struct UiState {
     tooltip: model::Painted,
     /// `RegisterWindowMessageW("TaskbarCreated")`: Explorer restarted.
     taskbar_created: u32,
+    /// On the desktop rather than hidden to the tray. What the tray menu's
+    /// Show/Hide item and a tray click toggle.
     pub(super) visible: bool,
+    /// Minimised (`WM_SIZE`). Only reachable without the tray icon or by a
+    /// minimise that did not come through `SC_MINIMIZE` (Win+M, another
+    /// program); with the icon, the minimise button hides to the tray.
+    minimized: bool,
+    /// The active window (`WM_ACTIVATE`).
+    pub(super) active: bool,
+    /// Somebody can be looking at the window: `model::Presence::watched`
+    /// as last applied by [`apply_presence`]. Everything that costs
+    /// something per second — the publisher's cadence, the text view's
+    /// repaint, the hosted page — follows this, not `visible`.
+    pub(super) watched: bool,
     /// Exit was requested; the tooltip says so until `main` posts quit.
     exiting: bool,
     /// A double-click's trailing `WM_LBUTTONUP` must not toggle the window.
@@ -330,6 +346,10 @@ pub fn run(link: GuiLink, hwnd_slot: Arc<AtomicIsize>, tid_slot: Arc<AtomicU32>)
             tooltip: model::Painted::default(),
             taskbar_created,
             visible: true,
+            minimized: false,
+            // Set by the WM_ACTIVATE that `ShowWindow` below sends.
+            active: false,
+            watched: true,
             exiting: false,
             swallow_up: false,
             hotkey_registered: false,
@@ -671,22 +691,111 @@ unsafe fn tray_modify(s: *mut UiState) {
 }
 
 unsafe fn set_visible(s: *mut UiState, show: bool) {
-    // SAFETY: `s` is live; ShowWindow re-enters wndproc (WM_SIZE), which is
-    // why no `&mut` is held here.
+    // SAFETY: `s` is live; ShowWindow re-enters wndproc (WM_SIZE,
+    // WM_ACTIVATE), which is why no `&mut` is held here.
     unsafe {
         let hwnd = (*s).hwnd;
-        (*s).visible = show;
-        (*s).link.visible.store(show, Ordering::Relaxed);
+        // Both calls send WM_ACTIVATE, which re-decides the presence from
+        // `visible`. Hiding stores it first, so that nested decision is
+        // already "out of sight"; showing stores it after, so the page is
+        // woken once, below, and not a second time from inside ShowWindow.
         if show {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
-            // Fresh numbers now, not at the next cadence tick.
-            (*s).link.poke.notify_one();
+            (*s).visible = true;
         } else {
+            (*s).visible = false;
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
-        webview::set_visible(s, show);
         debug!(show, "window visibility");
+        // An explicit show refreshes the page even when the window never
+        // left (a tray double-click on a window that is already up).
+        apply_presence(s, show);
+    }
+}
+
+/// Whether a full-screen application is in front of this window, by the
+/// shell's account. `SHQueryUserNotificationState` is the question Explorer
+/// answers for anyone deciding whether to show a notification; it takes no
+/// window and no process, so nothing here looks at — let alone opens — the
+/// application in front (`docs/ANTICHEAT-2026-09-14.md`). The answer is
+/// about the primary display, which is where notifications go, so a window
+/// on another monitor is never considered covered by it: a panel left open
+/// on a second screen next to the game stays live.
+unsafe fn covered_by_fullscreen(hwnd: HWND) -> bool {
+    // SAFETY: an out-parameter the call fills, and two calls about our own
+    // window's monitor with a correctly sized struct.
+    unsafe {
+        let Ok(state) = SHQueryUserNotificationState() else {
+            return false;
+        };
+        if !model::shell_says_fullscreen(Some(state.0)) {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &mut info).as_bool() && info.dwFlags & MONITORINFOF_PRIMARY != 0
+    }
+}
+
+/// What Win32 has told us about the window, as the model wants it. The
+/// shell is only asked when its answer could matter.
+unsafe fn presence(s: *mut UiState) -> model::Presence {
+    // SAFETY: plain field reads on the live state.
+    unsafe {
+        let (shown, minimized, active) = ((*s).visible, (*s).minimized, (*s).active);
+        model::Presence {
+            shown,
+            minimized,
+            active,
+            covered: shown && !minimized && !active && covered_by_fullscreen((*s).hwnd),
+        }
+    }
+}
+
+/// Re-decide whether anybody can be looking at the window and, when that
+/// changed, move everything that follows it: the publisher's cadence (and
+/// its process scan), the text view's repaint, and the hosted page's power
+/// state. Called from every message that can change the answer — show/hide,
+/// minimise/restore, activation — and from `refresh` while the window is up
+/// but inactive, which is how a game that went full-screen (or closed)
+/// without touching our window is noticed. `again` repeats the "now
+/// watched" side even without a change.
+unsafe fn apply_presence(s: *mut UiState, again: bool) {
+    // SAFETY: `s` is live; `webview::set_visible` makes COM calls that may
+    // re-enter wndproc, so the new value is stored before it is acted on.
+    unsafe {
+        let p = presence(s);
+        let watched = p.watched();
+        let changed = watched != (*s).watched;
+        if !changed && !(again && watched) {
+            return;
+        }
+        (*s).watched = watched;
+        (*s).link.visible.store(watched, Ordering::Relaxed);
+        if watched {
+            // Fresh numbers now, not at the next cadence tick.
+            (*s).link.poke.notify_one();
+        }
+        webview::set_visible(s, watched);
+        if changed {
+            debug!(watched, ?p, "window presence");
+        }
+    }
+}
+
+/// `WM_ACTIVATE`, after `DefWindowProc` has had it.
+unsafe fn on_activate(s: *mut UiState, wparam: WPARAM) {
+    // SAFETY: `s` is live.
+    unsafe {
+        (*s).active = loword(wparam.0) != WA_INACTIVE;
+        // Activation wakes at once. Deactivation asks the shell now, which
+        // catches a switch to something already full-screen; a game that is
+        // still starting up is caught by the next `refresh`.
+        apply_presence(s, false);
     }
 }
 
@@ -731,15 +840,23 @@ unsafe fn set_text(edit: HWND, text: &str) {
 unsafe fn refresh(s: *mut UiState) {
     // SAFETY: `s` is live; the snapshot is cloned out before any Win32 call.
     unsafe {
+        // A window that is up but not active is where a full-screen game
+        // can arrive (or leave) without sending us anything: ask the shell
+        // again on the snapshot cadence — every second while watched, every
+        // five once covered — rather than run a timer of our own.
+        if (*s).visible && !(*s).minimized && !(*s).active {
+            apply_presence(s, false);
+        }
         let snap = (*s).link.state.borrow().clone();
         let now = snap.now_unix_s;
         // The text view is only worth rendering while it is what the user
-        // sees: not behind the hosted page, not while hidden to the tray.
+        // sees: not behind the hosted page, not while hidden to the tray,
+        // minimised or underneath a full-screen game.
         // And rewriting it is only worth it when the render actually says
         // something new: a full repaint of this EDIT is ~0.3% of a core at
         // one refresh a second, and the clock alone moves every time
         // (`model::worth_painting`).
-        if (*s).visible && !(*s).web.hosted() {
+        if (*s).watched && !(*s).web.hosted() {
             let status = (*s).web.status();
             let text = model::window_text(&snap, &status);
             // The borrow of `shown_text` ends with the call, before the
@@ -839,6 +956,7 @@ unsafe fn request_exit(s: *mut UiState) {
         tray_modify(s);
         let hwnd = (*s).hwnd;
         (*s).visible = false;
+        (*s).watched = false;
         (*s).link.visible.store(false, Ordering::Relaxed);
         let _ = ShowWindow(hwnd, SW_HIDE);
         (*s).link.quit.notify_one();
@@ -940,22 +1058,28 @@ unsafe fn command(s: *mut UiState, id: u16) {
     }
 }
 
-/// `WM_SIZE`: the text view and the page follow the client area.
+/// `WM_SIZE`: the text view and the page follow the client area, and a
+/// minimised window is out of sight — the same cheap state as the tray —
+/// until it is restored.
 ///
 /// # Safety
 /// `s` is this thread's live `UiState`.
 unsafe fn on_size(s: *mut UiState, wparam: WPARAM, lparam: LPARAM) {
-    if wparam.0 as u32 == SIZE_MINIMIZED {
-        return;
-    }
-    let (w, h) = (
-        loword(lparam.0 as usize) as i32,
-        hiword(lparam.0 as usize) as i32,
-    );
+    let minimized = wparam.0 as u32 == SIZE_MINIMIZED;
     // SAFETY: the caller's state is live; `edit` is its child window.
     unsafe {
-        let _ = MoveWindow((*s).edit, 0, 0, w, h, true);
-        webview::resize(s, w, h);
+        if !minimized {
+            let (w, h) = (
+                loword(lparam.0 as usize) as i32,
+                hiword(lparam.0 as usize) as i32,
+            );
+            let _ = MoveWindow((*s).edit, 0, 0, w, h, true);
+            webview::resize(s, w, h);
+        }
+        if minimized != (*s).minimized {
+            (*s).minimized = minimized;
+            apply_presence(s, false);
+        }
     }
 }
 
@@ -1090,6 +1214,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
             WM_GETMINMAXINFO => on_min_max(lparam),
             WM_TIMER => webview::timer(s, wparam.0),
+            // DefWindowProc first: it puts the keyboard focus on this
+            // window, and waking the page moves it on into the page.
+            WM_ACTIVATE => {
+                let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+                on_activate(s, wparam);
+                return r;
+            }
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE && (*s).tray_added => {
                 set_visible(s, false)
             }

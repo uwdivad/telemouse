@@ -207,6 +207,9 @@ pointer-lock heuristic, cursor, screen
   left open behind a game does not compete with it for the GPU. The data
   is untouched: only repaints are skipped.
 - `?profile=1` shows an in-page frame-time breakdown.
+- `?desync=0` creates the canvases without `desynchronized: true` (the
+  low-latency presentation hint, on by default). A diagnostic switch for
+  A/B-ing frame pacing next to a game; it works on `/obs` too.
 
 ### OBS browser source
 
@@ -472,7 +475,7 @@ docker compose down                                   # stop; "down -v" also wip
 ```
 
 The sink is a bounded queue in front of a forwarder thread (rskafka, zstd,
-25ms linger). If the broker stalls the queue fills and envelopes are dropped
+250 ms linger). If the broker stalls the queue fills and envelopes are dropped
 and counted (`kafka_dropped` in the stats line) rather than ever blocking
 capture; `--no-kafka` turns the sink off for one run. The recording is the
 source of truth: when the agent stops it writes

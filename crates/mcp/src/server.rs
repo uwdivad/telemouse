@@ -71,7 +71,17 @@ pub struct Deps {
 pub struct Telemouse {
     deps: Arc<Deps>,
     tool_router: ToolRouter<Telemouse>,
+    /// One analysis at a time ([`ANALYSES_AT_ONCE`]), across every clone of
+    /// this server: see [`Telemouse::analysing`].
+    analysis_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// How many analyzer runs (`session_summary`, `trend`) may be in flight. A
+/// client issues tool calls in parallel, and each cold analysis is a full
+/// set of loader threads and hundreds of megabytes; N of them at once is N
+/// times that next to a game. The control panel allows itself one
+/// (`Manager::summary_lock`); so does this.
+const ANALYSES_AT_ONCE: usize = 1;
 
 // --- results ---------------------------------------------------------------
 
@@ -277,6 +287,7 @@ impl Telemouse {
         Self {
             deps: Arc::new(deps),
             tool_router,
+            analysis_gate: Arc::new(tokio::sync::Semaphore::new(ANALYSES_AT_ONCE)),
         }
     }
 
@@ -317,7 +328,7 @@ impl Telemouse {
     ) -> Result<CallToolResult, McpError> {
         let call = Call::start("session_summary");
         let id = a.id.trim().to_string();
-        call.finish(self.blocking(move |an| {
+        call.finish(self.analysing(move |an| {
             let summary = an.summary(&id)?;
             serde_json::to_value(summary).map_err(|e| {
                 format!("session_summary: the summary of recording {id:?} could not be turned into JSON: {e}")
@@ -337,7 +348,7 @@ impl Telemouse {
         let metrics = a.metric.unwrap_or_default();
         let last = args::last_rows(a.last);
         call.finish(
-            self.blocking(move |an| an.trend(&metrics, last))
+            self.analysing(move |an| an.trend(&metrics, last))
                 .await
                 .map(|rows| json!({ "rows": rows.len(), "sessions": rows })),
         )
@@ -460,6 +471,33 @@ impl Telemouse {
             Ok(r) => r,
             Err(e) => Err(format!("the analyzer task did not finish: {e}")),
         }
+    }
+
+    /// [`Self::blocking`] for the calls that actually analyse recordings
+    /// (`session_summary`, `trend`): they queue for the one permit, so
+    /// parallel tool calls run one after another instead of all at once.
+    /// The header-only `sessions_list` and everything that talks to ctl or
+    /// viz do not wait behind them.
+    ///
+    /// The permit travels into the blocking closure and is released when
+    /// the analysis itself ends — not when this future does. A request the
+    /// client cancels drops the future, but the blocking thread runs on; a
+    /// permit held out here would be handed to the next call while that
+    /// one was still using every core.
+    async fn analysing<T, F>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(Analysis) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Ok(permit) = self.analysis_gate.clone().acquire_owned().await else {
+            // Only a closed semaphore fails, and nothing closes this one.
+            return Err("the analyzer is shutting down".into());
+        };
+        self.blocking(move |analysis| {
+            let _permit = permit;
+            f(analysis)
+        })
+        .await
     }
 
     /// A mutating call to ctl, with its guard header.
@@ -981,6 +1019,95 @@ mod tests {
             assert!(!ro.contains(&(*name).to_string()), "{name} must be gone");
         }
         assert_eq!(ro.len(), READ_TOOLS.len());
+    }
+
+    /// Four analyses asked for at once (a model's parallel tool calls) run
+    /// one after another; a call that is not an analysis does not queue.
+    #[tokio::test]
+    async fn analyses_run_one_at_a_time_and_other_calls_do_not_wait() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (c, v) = (dead().await, dead().await);
+        let server = Telemouse::new(deps(c, v, true));
+        let (live, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // Holds the first analysis inside its closure until the test lets go.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+
+        let mut runs = Vec::new();
+        for _ in 0..4 {
+            let (s, live, peak, held) = (server.clone(), live.clone(), peak.clone(), held.clone());
+            runs.push(tokio::spawn(async move {
+                s.analysing(move |_| {
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // The first one in waits here; with a cap of one, the
+                    // other three cannot have started.
+                    let _ = held
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_millis(300));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        // While an analysis is held, an ungated call is answered.
+        let light = tokio::time::timeout(Duration::from_secs(5), server.blocking(|_| Ok(7)))
+            .await
+            .expect("a light call must not queue behind an analysis");
+        assert_eq!(light, Ok(7));
+        assert_eq!(server.analysis_gate.available_permits(), 0);
+
+        for _ in 0..4 {
+            let _ = release.send(());
+        }
+        for r in runs {
+            assert_eq!(r.await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            ANALYSES_AT_ONCE,
+            "never more than the cap at once"
+        );
+        assert_eq!(server.analysis_gate.available_permits(), ANALYSES_AT_ONCE);
+    }
+
+    /// A request the client gives up on must not free the slot while its
+    /// analysis is still running on the blocking pool.
+    #[tokio::test]
+    async fn a_cancelled_analysis_keeps_its_slot_until_it_really_ends() {
+        let (c, v) = (dead().await, dead().await);
+        let server = Telemouse::new(deps(c, v, true));
+        let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+
+        let s = server.clone();
+        let call = tokio::spawn(async move {
+            s.analysing(move |_| {
+                let _ = started_tx.send(());
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                Ok(())
+            })
+            .await
+        });
+        started.await.expect("the analysis started");
+        call.abort();
+        let _ = call.await;
+        assert_eq!(
+            server.analysis_gate.available_permits(),
+            0,
+            "the cancelled call's analysis is still running"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.analysis_gate.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slot is freed once the analysis ends");
     }
 
     #[tokio::test]

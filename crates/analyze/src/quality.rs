@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use telemouse_core::recordings::SessionMeta;
 
 use crate::series::Prepared;
-use crate::stats::{self, Summary};
+use crate::stats::Summary;
 
 /// Upper edges of the inter-event interval histogram, ms.
 const INTERVAL_EDGES: [f64; 9] = [0.5, 1.0, 2.0, 4.0, 8.0, 10.0, 20.0, 50.0, 100.0];
@@ -436,14 +436,137 @@ impl QualityReport {
     }
 }
 
-/// The interval histogram. Buckets are `(lo, hi]`, so a clean 1 kHz stream
-/// lands in `≤1ms` rather than straddling it.
-fn histogram(intervals: &[f64]) -> Vec<IntervalBucket> {
-    let total = intervals.len().max(1) as f64;
-    let counts = stats::bucket_counts(&INTERVAL_EDGES, intervals, stats::Edge::Inclusive);
+/// Intervals shorter than this many µs are tallied per exact value; longer
+/// ones (the hand resting) are kept individually. 131 ms covers every
+/// interval a moving mouse produces, in 1 MB of counters.
+const INTERVAL_TALLY_US: usize = 1 << 17;
+
+/// Everything the quality report says about the inter-event intervals.
+#[derive(Debug, Clone, PartialEq)]
+struct IntervalStats {
+    /// Events whose timestamp went backwards; they contribute no interval.
+    violations: usize,
+    /// Intervals counted (every non-negative one).
+    n: usize,
+    gaps_over_10ms: usize,
+    within_1ms: usize,
+    histogram: Vec<IntervalBucket>,
+    median_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+/// The interval in ms, the one way every statistic here converts it: at
+/// 1 kHz the whole histogram hinges on `<= 1.0 ms`, and f64 seconds put most
+/// of a clean stream at 1.000000000000112 ms.
+#[inline]
+fn interval_ms(us: i64) -> f64 {
+    us as f64 / 1000.0
+}
+
+/// One pass over the µs timeline, then every statistic from the tally.
+///
+/// The intervals are integer µs and almost all of them are a handful of
+/// distinct small values, so they are counted per value instead of collected:
+/// a 15 M-event session used to build a 122 MB `f64` vector, walk it three
+/// times and sort it for three order statistics. The numbers are the same —
+/// `us → ms` is monotonic, so the k-th smallest interval in ms is the k-th
+/// smallest in µs converted, and each value is classified by the same `f64`
+/// comparisons as before (`interval_stats_by_sorting` in the tests is the
+/// old implementation, kept as the reference).
+fn interval_stats(event_us: &[i64]) -> IntervalStats {
+    let mut tally = vec![0usize; INTERVAL_TALLY_US];
+    let mut long: Vec<i64> = Vec::new();
+    let mut violations = 0usize;
+    for w in event_us.windows(2) {
+        let d = w[1] - w[0];
+        if d < 0 {
+            violations += 1;
+        } else if (d as u64) < INTERVAL_TALLY_US as u64 {
+            tally[d as usize] += 1;
+        } else {
+            long.push(d);
+        }
+    }
+    long.sort_unstable();
+
+    let mut gaps_over_10ms = 0usize;
+    let mut within_1ms = 0usize;
+    let mut buckets = [0usize; INTERVAL_EDGES.len() + 1];
+    let mut classify = |us: i64, count: usize| {
+        let ms = interval_ms(us);
+        if ms > GAP_MS {
+            gaps_over_10ms += count;
+        }
+        if ms <= 1.0 {
+            within_1ms += count;
+        }
+        buckets[INTERVAL_EDGES.partition_point(|&e| e < ms)] += count;
+    };
+    let mut tallied = 0usize;
+    for (us, &count) in tally.iter().enumerate() {
+        if count > 0 {
+            classify(us as i64, count);
+            tallied += count;
+        }
+    }
+    for &us in &long {
+        classify(us, 1);
+    }
+    let n = tallied + long.len();
+
+    // The k-th smallest interval (0-based), ms. Three lookups per report, so
+    // a walk of the tally each time is nothing.
+    let kth = |k: usize| -> f64 {
+        if k >= tallied {
+            return interval_ms(long[k - tallied]);
+        }
+        let mut seen = 0usize;
+        for (us, &count) in tally.iter().enumerate() {
+            seen += count;
+            if k < seen {
+                return interval_ms(us as i64);
+            }
+        }
+        unreachable!("k < tallied, and the tally sums to it")
+    };
+    // `stats::percentile_sorted`, reading its two order statistics from the
+    // tally instead of a sorted slice.
+    let percentile = |q: f64| -> f64 {
+        match n {
+            0 => 0.0,
+            1 => kth(0),
+            _ => {
+                let pos = q * (n - 1) as f64;
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                let frac = pos - lo as f64;
+                let lo_val = kth(lo);
+                lo_val + (kth(hi) - lo_val) * frac
+            }
+        }
+    };
+
+    IntervalStats {
+        violations,
+        n,
+        gaps_over_10ms,
+        within_1ms,
+        histogram: histogram(&buckets, n),
+        median_ms: percentile(0.5),
+        p99_ms: percentile(0.99),
+        max_ms: if n == 0 { 0.0 } else { kth(n - 1) },
+    }
+}
+
+/// The interval histogram, from the count in each of the
+/// `INTERVAL_EDGES.len() + 1` buckets. Buckets are `(lo, hi]`, so a clean
+/// 1 kHz stream lands in `≤1ms` rather than straddling it.
+fn histogram(counts: &[usize], intervals: usize) -> Vec<IntervalBucket> {
+    let total = intervals.max(1) as f64;
     let mut out: Vec<IntervalBucket> = Vec::with_capacity(INTERVAL_EDGES.len() + 1);
     let mut lo = 0.0;
-    for (&hi, &count) in INTERVAL_EDGES.iter().zip(&counts) {
+    for (&hi, &count) in INTERVAL_EDGES.iter().zip(counts) {
         out.push(IntervalBucket {
             label: format!("≤{hi}ms"),
             lo_ms: lo,
@@ -476,34 +599,17 @@ pub fn compute(p: &Prepared) -> QualityReport {
 pub fn compute_with_warnings(p: &Prepared) -> (QualityReport, Vec<String>) {
     let session = &p.session;
 
-    // Intervals come off the integer µs timeline: at 1 kHz the whole histogram
-    // hinges on `<= 1.0 ms`, and f64 seconds put most of a clean stream at
-    // 1.000000000000112 ms.
-    let mut intervals = Vec::with_capacity(p.event_us.len().saturating_sub(1));
-    let mut violations = 0usize;
-    for w in p.event_us.windows(2) {
-        let d = w[1] - w[0];
-        if d < 0 {
-            violations += 1;
-        } else {
-            intervals.push(d as f64 / 1000.0);
-        }
-    }
-
-    let gaps = intervals.iter().filter(|&&d| d > GAP_MS).count();
-    let within_1ms = intervals.iter().filter(|&&d| d <= 1.0).count();
-    let histogram = histogram(&intervals);
+    let IntervalStats {
+        violations,
+        n: n_intervals,
+        gaps_over_10ms: gaps,
+        within_1ms,
+        histogram,
+        median_ms: median_interval_ms,
+        p99_ms: p99_interval_ms,
+        max_ms: max_interval_ms,
+    } = interval_stats(&p.event_us);
     let polling = polling_stats(p.analysed_event_us());
-    // One sort for all three order statistics, in place: the intervals are
-    // owned here and already finite (they come off the integer µs timeline),
-    // so `sorted_finite`'s filtered copy was a second 64 MB allocation on an
-    // 8 M-event session for nothing.
-    let n_intervals = intervals.len();
-    intervals.sort_unstable_by(f64::total_cmp);
-    let median_interval_ms = stats::percentile_sorted(&intervals, 0.5).unwrap_or(0.0);
-    let p99_interval_ms = stats::percentile_sorted(&intervals, 0.99).unwrap_or(0.0);
-    let max_interval_ms = intervals.last().copied().unwrap_or(0.0);
-    drop(intervals);
 
     let batches_with_drops = session
         .batches
@@ -605,6 +711,7 @@ mod tests {
     use super::*;
     use crate::load::LoadedSession;
     use crate::series::{Params, prepare};
+    use crate::stats;
     use crate::testutil::{StreamBuilder, batch_meta, loaded_from, loaded_with_batches};
 
     fn analyze(session: LoadedSession) -> QualityReport {
@@ -614,6 +721,113 @@ mod tests {
     #[test]
     fn the_polling_histogram_covers_exactly_up_to_the_cap() {
         assert_eq!(POLL_BUCKETS, 161);
+    }
+
+    /// The implementation `interval_stats` replaced: collect every interval
+    /// as `f64` ms, filter twice, bucket, sort, read the order statistics.
+    fn interval_stats_by_sorting(event_us: &[i64]) -> IntervalStats {
+        let mut intervals = Vec::new();
+        let mut violations = 0usize;
+        for w in event_us.windows(2) {
+            let d = w[1] - w[0];
+            if d < 0 {
+                violations += 1;
+            } else {
+                intervals.push(d as f64 / 1000.0);
+            }
+        }
+        let gaps_over_10ms = intervals.iter().filter(|&&d| d > GAP_MS).count();
+        let within_1ms = intervals.iter().filter(|&&d| d <= 1.0).count();
+        let counts = stats::bucket_counts(&INTERVAL_EDGES, &intervals, stats::Edge::Inclusive);
+        let n = intervals.len();
+        intervals.sort_unstable_by(f64::total_cmp);
+        IntervalStats {
+            violations,
+            n,
+            gaps_over_10ms,
+            within_1ms,
+            histogram: histogram(&counts, n),
+            median_ms: stats::percentile_sorted(&intervals, 0.5).unwrap_or(0.0),
+            p99_ms: stats::percentile_sorted(&intervals, 0.99).unwrap_or(0.0),
+            max_ms: intervals.last().copied().unwrap_or(0.0),
+        }
+    }
+
+    /// The tally must give the numbers the sort gave, to the bit: every
+    /// count, every histogram fraction and all three order statistics, on
+    /// timelines that exercise the interpolation (even and odd counts), the
+    /// bucket edges, timestamp inversions, duplicates, and intervals on both
+    /// sides of the tally's limit.
+    #[test]
+    fn the_interval_tally_matches_sorting_the_intervals() {
+        fn same(event_us: &[i64], what: &str) {
+            let (tally, sorted) = (
+                interval_stats(event_us),
+                interval_stats_by_sorting(event_us),
+            );
+            assert_eq!(tally, sorted, "{what}");
+            for (a, b) in [
+                (tally.median_ms, sorted.median_ms),
+                (tally.p99_ms, sorted.p99_ms),
+                (tally.max_ms, sorted.max_ms),
+            ] {
+                assert_eq!(a.to_bits(), b.to_bits(), "{what}");
+            }
+        }
+
+        same(&[], "no events");
+        same(&[5], "one event, no interval");
+        same(&[5, 1_005], "one interval");
+        same(&[0, 1_000, 3_000], "two intervals");
+        same(&[9, 3, 1], "only inversions");
+        // Every histogram edge exactly, and one µs either side of it.
+        let mut t = 0i64;
+        let mut edges = vec![t];
+        for edge_us in [
+            500, 1_000, 2_000, 4_000, 8_000, 10_000, 20_000, 50_000, 100_000,
+        ] {
+            for d in [edge_us - 1, edge_us, edge_us + 1] {
+                t += d;
+                edges.push(t);
+            }
+        }
+        same(&edges, "bucket edges");
+        // Around the tally limit: the last tallied value and the first long one.
+        let limit = INTERVAL_TALLY_US as i64;
+        same(
+            &[0, limit - 1, 2 * limit - 1, 3 * limit, 3 * limit],
+            "the tally limit",
+        );
+
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in [2usize, 3, 4, 10, 11, 100, 101, 1_000, 4_097, 50_000] {
+            for long_every in [0u64, 2, 7, 97] {
+                let mut t = 0i64;
+                let mut events = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = next();
+                    t += match r % 100 {
+                        // A timestamp inversion.
+                        0 => -(((r >> 8) % 3_000) as i64),
+                        // The hand resting: past the tally, up to minutes.
+                        _ if long_every > 0 && (r >> 16) % long_every == 0 => {
+                            limit + ((r >> 24) % 200_000_000) as i64
+                        }
+                        // USB jitter around 1 ms, and the odd stall.
+                        1..=90 => 990 + ((r >> 8) % 21) as i64,
+                        _ => ((r >> 8) % 60_000) as i64,
+                    };
+                    events.push(t);
+                }
+                same(&events, &format!("n={n} long_every={long_every}"));
+            }
+        }
     }
 
     /// A report that was computed while the run was going is brought up to

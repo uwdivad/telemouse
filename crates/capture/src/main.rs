@@ -407,11 +407,7 @@ mod agent {
         }
         if cfg.kafka.enabled {
             #[cfg(feature = "kafka")]
-            match crate::sinks::KafkaSink::connect(
-                &cfg.kafka.brokers,
-                Duration::from_millis(cfg.batch.window_ms),
-                Arc::clone(stats),
-            ) {
+            match crate::sinks::KafkaSink::connect(&cfg.kafka.brokers, Arc::clone(stats)) {
                 Ok(s) => {
                     tracing::info!(brokers = ?cfg.kafka.brokers, "kafka sink starting");
                     sinks.push(Box::new(s));

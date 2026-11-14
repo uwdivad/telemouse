@@ -334,10 +334,19 @@ pub enum PowerState {
     /// Hidden and suspended: no timers, no polling, no rendering.
     Suspended,
     /// Hidden but awake — a runtime too old for `ICoreWebView2_3`, a page
-    /// that had not finished loading, or a suspension the runtime refused.
-    /// What the window did before: rendering stops and nothing else.
+    /// that had not finished loading, or a suspension the runtime refused
+    /// (which is asked for again, [`SUSPEND_RETRIES`] times). Rendering and
+    /// polling have stopped; the runtime's processes are still resident.
     HiddenAwake,
 }
+
+/// How many more times a refused `TrySuspend` is asked for again before the
+/// page is left hidden-but-awake for the rest of that stay in the tray.
+pub const SUSPEND_RETRIES: u8 = 3;
+/// How long after a refusal the next attempt is made. A refusal is usually
+/// the runtime not having caught up with `SetIsVisible(false)` yet, or the
+/// page still finishing a request; both are over in well under this.
+pub const SUSPEND_RETRY_MS: u32 = 2_000;
 
 /// What `webview.rs` has to do to the controller for a transition. Every
 /// step is best-effort; nothing blocks on a completion.
@@ -356,6 +365,12 @@ pub enum PowerAction {
     /// `Resume` alone: a `TrySuspend` answered after the window was back,
     /// so a page that did suspend has to be woken under a visible window.
     Resume,
+    /// `TrySuspend` was refused: arm the one-shot retry timer
+    /// ([`SUSPEND_RETRY_MS`]). Showing the window cancels it.
+    RetrySuspend,
+    /// The retry timer fired: `TrySuspend` alone. The page is already
+    /// asleep and the controller already hidden.
+    Suspend,
 }
 
 /// The window is being shown — tray click, tray menu, or anything else that
@@ -380,15 +395,77 @@ pub fn power_hide(state: PowerState, can_suspend: bool) -> (PowerState, PowerAct
     }
 }
 
-/// `TrySuspend` answered (or was refused outright).
-pub fn power_suspended(state: PowerState, ok: bool) -> (PowerState, PowerAction) {
+/// `TrySuspend` answered (or was refused outright). `retries_left` is how
+/// many more attempts this stay in the tray is still allowed; a refusal with
+/// any left arms the retry timer, one with none left is final.
+pub fn power_suspended(state: PowerState, ok: bool, retries_left: u8) -> (PowerState, PowerAction) {
     match (state, ok) {
         (PowerState::Suspending, true) => (PowerState::Suspended, PowerAction::Nothing),
+        (PowerState::Suspending, false) if retries_left > 0 => {
+            (PowerState::HiddenAwake, PowerAction::RetrySuspend)
+        }
         (PowerState::Suspending, false) => (PowerState::HiddenAwake, PowerAction::Nothing),
         // Shown again before the answer arrived: a suspension that went
         // through anyway would leave a frozen page in a visible window.
         (PowerState::Visible, true) => (PowerState::Visible, PowerAction::Resume),
         (s, _) => (s, PowerAction::Nothing),
+    }
+}
+
+/// The retry timer fired. Only a page that is still hidden, still awake and
+/// still suspendable is asked again; a window that came back in the meantime
+/// (the timer is cancelled then, but a `WM_TIMER` may already be queued) or
+/// a suspension that has since gone through changes nothing.
+pub fn power_retry(state: PowerState, can_suspend: bool) -> (PowerState, PowerAction) {
+    match (state, can_suspend) {
+        (PowerState::HiddenAwake, true) => (PowerState::Suspending, PowerAction::Suspend),
+        (s, _) => (s, PowerAction::Nothing),
+    }
+}
+
+/// `SHQueryUserNotificationState` values that mean "something else owns the
+/// whole screen": a full-screen window (`QUNS_BUSY`, which is what a
+/// borderless game reports), exclusive-mode Direct3D
+/// (`QUNS_RUNNING_D3D_FULL_SCREEN`) and presentation mode
+/// (`QUNS_PRESENTATION_MODE`). Everything else — including a query that
+/// failed, passed here as `None` — is an ordinary desktop.
+pub fn shell_says_fullscreen(quns: Option<i32>) -> bool {
+    const QUNS_BUSY: i32 = 2;
+    const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+    const QUNS_PRESENTATION_MODE: i32 = 4;
+    matches!(
+        quns,
+        Some(QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+    )
+}
+
+/// Whether anybody can be looking at the window, from what Win32 told us.
+///
+/// "Not in the tray" used to be the whole answer, which left the page
+/// polling and compositing behind a game for as long as the window had
+/// merely been left open (`docs/PERFORMANCE-2026-11-14.md`, T1). A window
+/// that is not [`Presence::watched`] takes the same cheap path as one in the
+/// tray: the publisher slows down and skips the process scan, the text view
+/// is not repainted, and the hosted page is put to sleep and suspended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Presence {
+    /// On the desktop rather than hidden to the tray.
+    pub shown: bool,
+    /// Minimised (`WM_SIZE` with `SIZE_MINIMIZED`).
+    pub minimized: bool,
+    /// The active window (`WM_ACTIVATE`). An active window is always
+    /// watched, whatever the shell says: the user is typing into it.
+    pub active: bool,
+    /// The shell reports a full-screen application
+    /// ([`shell_says_fullscreen`]) and this window is on the display that
+    /// report is about, so the window is underneath it. Only asked while
+    /// the window is shown, not minimised and not active.
+    pub covered: bool,
+}
+
+impl Presence {
+    pub fn watched(self) -> bool {
+        self.shown && !self.minimized && (self.active || !self.covered)
     }
 }
 
@@ -1125,7 +1202,7 @@ mod tests {
         let (hidden, act) = power_hide(PowerState::Visible, true);
         assert_eq!(hidden, PowerState::Suspending);
         assert_eq!(act, PowerAction::HideAndSuspend);
-        let (asleep, act) = power_suspended(hidden, true);
+        let (asleep, act) = power_suspended(hidden, true, SUSPEND_RETRIES);
         assert_eq!(asleep, PowerState::Suspended);
         assert_eq!(act, PowerAction::Nothing);
         // A second hide while already hidden asks for nothing again.
@@ -1172,24 +1249,159 @@ mod tests {
     #[test]
     fn a_suspension_that_lands_after_the_window_is_back_is_undone() {
         assert_eq!(
-            power_suspended(PowerState::Visible, true),
+            power_suspended(PowerState::Visible, true, SUSPEND_RETRIES),
             (PowerState::Visible, PowerAction::Resume)
         );
         assert_eq!(
-            power_suspended(PowerState::Visible, false),
-            (PowerState::Visible, PowerAction::Nothing)
+            power_suspended(PowerState::Visible, false, SUSPEND_RETRIES),
+            (PowerState::Visible, PowerAction::Nothing),
+            "a refusal under a visible window is not retried"
         );
         assert_eq!(
-            power_suspended(PowerState::Suspending, false),
+            power_suspended(PowerState::Suspending, false, 0),
             (PowerState::HiddenAwake, PowerAction::Nothing),
             "a refusal leaves the page awake, not half-suspended"
         );
         // A late answer for a state nobody is waiting on changes nothing.
         assert_eq!(
-            power_suspended(PowerState::Suspended, true),
+            power_suspended(PowerState::Suspended, true, SUSPEND_RETRIES),
             (PowerState::Suspended, PowerAction::Nothing)
         );
         assert_eq!(PowerState::default(), PowerState::Visible);
+    }
+
+    /// A refused suspension is asked for again a bounded number of times,
+    /// the way `webview.rs` drives it: the counter goes down once per timer.
+    #[test]
+    fn a_refused_suspension_is_retried_a_bounded_number_of_times() {
+        let (mut state, act) = power_hide(PowerState::Visible, true);
+        assert_eq!(act, PowerAction::HideAndSuspend);
+        let mut left = SUSPEND_RETRIES;
+        let mut attempts = 1;
+        loop {
+            let (next, act) = power_suspended(state, false, left);
+            assert_eq!(next, PowerState::HiddenAwake);
+            if act == PowerAction::Nothing {
+                break;
+            }
+            assert_eq!(act, PowerAction::RetrySuspend);
+            // The timer fires.
+            left -= 1;
+            let (next, act) = power_retry(next, true);
+            assert_eq!(
+                (next, act),
+                (PowerState::Suspending, PowerAction::Suspend),
+                "the retry asks for the suspension alone"
+            );
+            state = next;
+            attempts += 1;
+            assert!(attempts <= 10, "the retries must end");
+        }
+        assert_eq!(attempts, 1 + u32::from(SUSPEND_RETRIES));
+        assert_eq!(left, 0);
+
+        // A retry that succeeds ends in Suspended like a first attempt does.
+        let (hidden, _) = power_suspended(PowerState::Suspending, false, 1);
+        let (again, _) = power_retry(hidden, true);
+        assert_eq!(
+            power_suspended(again, true, 0),
+            (PowerState::Suspended, PowerAction::Nothing)
+        );
+    }
+
+    /// The timer can fire after the world moved on; it must then do nothing.
+    #[test]
+    fn a_retry_timer_that_fires_late_changes_nothing() {
+        for state in [
+            PowerState::Visible,
+            PowerState::Suspending,
+            PowerState::Suspended,
+        ] {
+            assert_eq!(power_retry(state, true), (state, PowerAction::Nothing));
+        }
+        // Hidden and awake, but the page was navigated away meanwhile.
+        assert_eq!(
+            power_retry(PowerState::HiddenAwake, false),
+            (PowerState::HiddenAwake, PowerAction::Nothing)
+        );
+        // Showing the window from the retry wait is an ordinary show: there
+        // is nothing to resume, and the state the late timer finds is Visible.
+        assert_eq!(
+            power_show(PowerState::HiddenAwake),
+            (PowerState::Visible, PowerAction::Show { resume: false })
+        );
+    }
+
+    #[test]
+    fn only_the_three_fullscreen_answers_count_as_fullscreen() {
+        // QUNS_NOT_PRESENT, _ACCEPTS_NOTIFICATIONS, _QUIET_TIME, _APP.
+        for ordinary in [1, 5, 6, 7, 0, -1, 99] {
+            assert!(!shell_says_fullscreen(Some(ordinary)), "{ordinary}");
+        }
+        // QUNS_BUSY, _RUNNING_D3D_FULL_SCREEN, _PRESENTATION_MODE.
+        for full in [2, 3, 4] {
+            assert!(shell_says_fullscreen(Some(full)), "{full}");
+        }
+        assert!(!shell_says_fullscreen(None), "a failed query hides nothing");
+    }
+
+    /// The window is watched unless it is in the tray, minimised, or sitting
+    /// inactive underneath a full-screen application.
+    #[test]
+    fn a_minimised_or_covered_window_is_not_watched() {
+        let open = Presence {
+            shown: true,
+            minimized: false,
+            active: true,
+            covered: false,
+        };
+        assert!(open.watched());
+        assert!(!Presence::default().watched(), "in the tray");
+        assert!(
+            !Presence {
+                shown: false,
+                ..open
+            }
+            .watched()
+        );
+        assert!(
+            !Presence {
+                minimized: true,
+                ..open
+            }
+            .watched(),
+            "minimised is hidden, active or not"
+        );
+        // Merely inactive (another window has focus, ours is still on
+        // screen next to it) stays live.
+        let beside = Presence {
+            active: false,
+            ..open
+        };
+        assert!(beside.watched());
+        // Inactive under a full-screen game: asleep.
+        let under = Presence {
+            covered: true,
+            ..beside
+        };
+        assert!(!under.watched());
+        // Activated again (alt-tab back): awake at once, whatever the shell
+        // still says in that instant.
+        assert!(
+            Presence {
+                active: true,
+                ..under
+            }
+            .watched()
+        );
+        // And the game closing without activating us is enough too.
+        assert!(
+            Presence {
+                covered: false,
+                ..under
+            }
+            .watched()
+        );
     }
 
     #[test]

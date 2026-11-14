@@ -19,6 +19,13 @@ const TOOL_TITLES = { doctor: "Check my setup", report: "Report", trend: "Trend"
 const WORDS = { jsonl: "not written to the recording file", kafka: "not delivered to Kafka", udp: "not delivered to the live view" };
 const WIZ_DEMO_SECS = 30;
 const POLL_MS = 2000;
+/* The recordings folder is listed (a directory read on the server) only when
+   it can have changed: on each of the SESS_HOT polls after a component
+   started or stopped (a new recording appears a moment after capture
+   starts), and otherwise every SESS_EVERY-th poll, which is how a file
+   copied in by hand shows up. */
+const SESS_HOT = 5;
+const SESS_EVERY = 15;
 /* A server error naming a setting → the input to mark. One entry per line:
    a test in settings.rs reads this table against the Patch allow-list. */
 const FIELD_INPUTS = {
@@ -36,6 +43,7 @@ const FIELD_INPUTS = {
    function can run, so nothing reads a binding before it exists ---------- */
 let state = null;                // last GET /api/state, with each log merged to a full tail
 let sessions = [];
+const sess = { key: null, hot: 0, age: 0 }; // when /api/sessions is next worth asking (sessionsDue)
 let pollTimer = null;            // the next scheduled poll
 let pollRun = null;              // the poll in flight (a promise), so there is only ever one
 let pollAgain = false;           // something asked for a fresh poll while one was in flight
@@ -54,8 +62,10 @@ let formDirty = false;
 const removedGames = new Set();
 /* The first-run guide. `demo.timer` is the countdown, cleared on close. */
 const wiz = { open: false, auto: true, step: 0, shown: -1, watching: false, seenKey: "", demo: null, busy: false };
-/* The report card. */
-const report = { id: null, summary: null, error: "", loading: false, watch: null, key: "" };
+/* The report card. `text` is whether the analyzer was run for this card, so
+   that the report task's output is this recording's text report; a card
+   drawn from the stored summary has none. */
+const report = { id: null, summary: null, error: "", loading: false, watch: null, key: "", text: false };
 
 /* ---------- helpers ---------- */
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -158,15 +168,25 @@ function mergeLogs(components) {
     c.log = lines;
   }
 }
+/* Whether this poll should also list the recordings: see SESS_HOT. The key
+   is everything in the state that can make the list change by itself. */
+function sessionsDue(s) {
+  const key = (s.components || []).map((c) => c.id + ":" + (c.running ? 1 : 0) + ":" + (c.exits || 0)).join(",") +
+    "|" + (s.recording ? s.recording.dir : "");
+  if (key !== sess.key) { sess.key = key; sess.hot = SESS_HOT; }
+  if (sess.hot > 0) { sess.hot--; sess.age = 0; return true; }
+  if (++sess.age >= SESS_EVERY) { sess.age = 0; return true; }
+  return false;
+}
 async function pollOnce() {
   try {
     const cursor = logCursor();
-    const [s, sess] = await Promise.all([
-      api("GET", "/api/state" + (cursor ? "?log_since=" + encodeURIComponent(cursor) : "")),
-      api("GET", "/api/sessions"),
-    ]);
+    const s = await api("GET", "/api/state" + (cursor ? "?log_since=" + encodeURIComponent(cursor) : ""));
+    // After the state, not beside it: whoever awaits this poll right after
+    // stopping a recording must see the list that has the new file in it.
+    const list = sessionsDue(s) ? await api("GET", "/api/sessions") : sessions;
     mergeLogs(s.components || []);
-    state = s; sessions = sess;
+    state = s; sessions = list;
     setConn(true, "Connected");
     const mt = s.config ? (s.config.mtime_unix_s || 0) : 0;
     if (mt !== cfgMtime) { cfgMtime = mt; loadConfig(false); }
@@ -193,10 +213,11 @@ function poll() {
 }
 /* A page nobody is looking at does nothing at all — no fetches, no clock —
    and catches up the moment it is back. That is a hidden browser tab, a
-   minimised window, and the native window hidden to the tray: there
-   `SetIsVisible(false)` does not make the document `hidden`, so the window
-   calls these two hooks through ExecuteScript instead (gui/webview.rs), and
-   suspends the page on top of it. */
+   minimised window, and the native window hidden to the tray, minimised or
+   left open underneath a full-screen game: there `SetIsVisible(false)` does
+   not make the document `hidden`, so the window calls these two hooks
+   through ExecuteScript instead (gui/webview.rs), and suspends the page on
+   top of it. */
 function sleepPage() {
   awake = false;
   clearTimeout(pollTimer); pollTimer = null;
@@ -204,6 +225,7 @@ function sleepPage() {
 }
 function wakePage() {
   awake = true;
+  sess.hot = Math.max(sess.hot, 1); // anything may have been recorded while nobody looked
   clearTimeout(pollTimer); pollTimer = null;
   if (elapsedTimer === null) elapsedTimer = setInterval(tickElapsed, 1000);
   poll();
@@ -237,6 +259,26 @@ function stopComponent(id, force, label) {
     const r = await api("POST", "/api/components/" + id + "/stop", { force: !!force });
     toast(label + (r.outcome === "graceful" ? " stopped" : " stopped (forced)"), r.outcome === "graceful" ? "ok" : "");
   });
+}
+/* "Report" on a recording: show what is already known, run only what is
+   not. The server keeps the summary of the last analysis and vouches for
+   it only while the recording, the summary's shape and the analyzer are
+   what they were (manager.rs `stored_summary`), so a 200 here is the card,
+   at once and without starting the analyzer; anything else is a run.
+   Tools → Report → Run always runs: that is what asking for it means. */
+async function showReport(session) {
+  const id = session.replace(/\.jsonl$/, "");
+  chosen.session = session;
+  Object.assign(report, { id, summary: null, error: "", loading: true, watch: null, key: "", text: false });
+  paint();
+  let stored = null;
+  try { stored = await api("GET", "/api/reports/" + encodeURIComponent(id)); }
+  catch (_) { /* 404: none, or no longer current. Anything else: the run says why. */ }
+  if (report.id !== id || !report.loading || report.text) return; // closed, or superseded, meanwhile
+  if (!stored) return runTool("report");
+  report.summary = stored; report.loading = false;
+  paint();
+  $("reportCard").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function runTool(id) {
   const body = { flags: [] };
@@ -463,7 +505,7 @@ async function wizDemo() {
   await runTool("report");
 }
 $("wizDemo").addEventListener("click", () => { wizDemo(); });
-$("wizSampleReport").addEventListener("click", () => { chosen.session = DEMO_SESSION + ".jsonl"; runTool("report"); });
+$("wizSampleReport").addEventListener("click", () => { showReport(DEMO_SESSION + ".jsonl"); });
 $("wizSampleDash").addEventListener("click", async () => {
   // A window must be opened from the click itself or it is blocked; the
   // live view is started alongside and the dashboard retries until it is up.
@@ -703,12 +745,18 @@ function durWords(secs) {
 }
 function watchReport(id) {
   const c = comp("report");
-  Object.assign(report, { id, summary: null, error: "", loading: true, watch: c ? c.exits : 0, key: "" });
+  Object.assign(report, { id, summary: null, error: "", loading: true, watch: c ? c.exits : 0, key: "", text: true });
 }
+/* The summary behind the card, once the text report has run: the stored one
+   when the server still vouches for it (a file read), else a summary run. */
 async function fetchSummary() {
   const id = report.id;
+  const url = "/api/reports/" + encodeURIComponent(id);
   try {
-    const s = await api("POST", "/api/reports/" + encodeURIComponent(id));
+    let s = null;
+    try { s = await api("GET", url); } catch (e) { if (e.status !== 404) throw e; }
+    if (report.id !== id) return;
+    if (!s) s = await api("POST", url);
     if (report.id !== id) return;
     report.summary = s;
   } catch (e) {
@@ -809,7 +857,10 @@ function paintReport() {
       : renderReport(report.summary);
     $("rcDetails").open = !!report.error;
   }
-  const raw = c ? c.log.join("\n") : "";
+  // The task's output is this recording's text only if it was run for it.
+  const raw = !report.text
+    ? "This card is the summary kept from the last time this recording was analysed. The recording has not changed since, so nothing was run again.\nFor the full text report, pick the recording under Tools → Report and press Run."
+    : c ? c.log.join("\n") : "";
   const pre = $("rcRaw");
   if (pre.textContent !== raw) pre.textContent = raw;
 }
@@ -978,7 +1029,7 @@ function paintTools() {
       : "ended with an error at " + clock(ex.at_unix_s) + (ex.hint ? ": " + ex.hint : ex.code === null ? "" : " (code " + ex.code + ")");
   }
   // A report that made it into the card keeps its text there, under Details.
-  const inCard = show.id === "report" && !!report.id && !report.error && !show.running;
+  const inCard = show.id === "report" && !!report.id && report.text && !report.error && !show.running;
   setText($("toolStatus"), inCard ? status + " · shown in the report card above" : status);
   const stop = $("toolStop");
   setHidden(stop, !show.running);
@@ -1075,7 +1126,7 @@ document.addEventListener("click", (e) => {
   if (b.dataset.open) openPlace(b.dataset.open);
   else if (b.dataset.run) runTool(b.dataset.run);
   else if (b.dataset.stop) stopComponent(b.dataset.stop, true, TOOL_TITLES[b.dataset.stop] || b.dataset.stop);
-  else if (b.dataset.report) { chosen.session = b.dataset.report; $("reportSel").value = b.dataset.report; runTool("report"); }
+  else if (b.dataset.report) { $("reportSel").value = b.dataset.report; showReport(b.dataset.report); }
   else if (b.dataset.kill) {
     const p = state.processes.find((x) => String(x.pid) === b.dataset.kill);
     if (p) killProcess(p);
@@ -1092,7 +1143,7 @@ document.addEventListener("toggle", (e) => {
 
 /* For js-tests (and a curious devtools console): the pure pieces and the
    poll loop, without reaching into the page's scope. */
-window.telemouseCtl = { esc, renderReport, poll, mergeLogs, logCursor, durWords, fnum, FIELD_INPUTS };
+window.telemouseCtl = { esc, renderReport, poll, mergeLogs, logCursor, durWords, fnum, FIELD_INPUTS, showReport, runTool, report };
 
 /* Opened in a background tab: nothing runs until it is looked at. */
 if (document.hidden) sleepPage(); else wakePage();

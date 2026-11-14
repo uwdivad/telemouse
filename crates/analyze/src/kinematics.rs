@@ -65,8 +65,37 @@ pub struct Kinematics {
     pub degrees_locked_only: bool,
 }
 
-#[hotpath::measure]
+/// The kinematics of a prepared series, on the calling thread.
 pub fn compute(p: &Prepared) -> Kinematics {
+    compute_with_parallelism(p, false)
+}
+
+/// Summarize each sample, in order. When `parallel`, every sample gets its
+/// own scoped worker and `beside` runs on this thread while they select;
+/// otherwise everything runs here, one after the other. The results are the
+/// same either way: each summary is a pure function of its own vector.
+fn summarize_all<const N: usize, T>(
+    samples: [Vec<f64>; N],
+    parallel: bool,
+    beside: impl FnOnce() -> T,
+) -> ([Summary; N], T) {
+    if !parallel {
+        return (samples.map(Summary::of_vec), beside());
+    }
+    std::thread::scope(|scope| {
+        let workers = samples.map(|v| scope.spawn(move || Summary::of_vec(v)));
+        let beside = beside();
+        let summaries = workers.map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        (summaries, beside)
+    })
+}
+
+/// [`compute`], with the six sample summaries on scoped workers when
+/// `parallel`. On a long session each one selects over millions of cells and
+/// they used to run back to back on the report's critical thread
+/// (`docs/PERFORMANCE-2026-11-14.md`, N1).
+#[hotpath::measure]
+pub(crate) fn compute_with_parallelism(p: &Prepared, parallel: bool) -> Kinematics {
     let g = &p.grid;
     let dt = g.dt;
     let n = g.len();
@@ -132,32 +161,44 @@ pub fn compute(p: &Prepared) -> Kinematics {
     // own coefficient and `locked_only` drops cells, so they are their own
     // samples.
     let cm_per_count = p.counts_to_cm(1.0);
-    let speed_summary = Summary::of_vec(speeds);
-    let accel_summary = Summary::of_vec(accel);
-    let jerk_summary = Summary::of_vec(jerk);
+    let segs = p.segments();
 
-    // Distances from the raw events, so the totals are exact counts rather
-    // than a re-integration of the grid — over the events the grid covers,
-    // so `distance_*_per_min` below divides like with like. On an untruncated
-    // session that is every event.
-    let mut dist_counts = 0.0;
-    let mut dist_deg = 0.0;
-    let mut net_x = 0i64;
-    let mut net_y = 0i64;
-    for (i, e) in p.analysed_events().iter().enumerate() {
-        dist_counts += stats::mag(e.dx as f64, e.dy as f64);
-        if let Some(deg) = p.event_aim_deg(i) {
-            dist_deg += deg;
-            net_x += e.dx as i64;
-            net_y += e.dy as i64;
-        }
-    }
+    // The event-stream totals and the path efficiencies need none of the
+    // samples, so they run beside the six selections rather than after them.
+    let (summaries, (dist_counts, dist_deg, net_x, net_y, eff)) = summarize_all(
+        [speeds, accel, jerk, speeds_deg, accel_deg, jerk_deg],
+        parallel,
+        || {
+            // Distances from the raw events, so the totals are exact counts
+            // rather than a re-integration of the grid — over the events the
+            // grid covers, so `distance_*_per_min` below divides like with
+            // like. On an untruncated session that is every event.
+            let mut dist_counts = 0.0;
+            let mut dist_deg = 0.0;
+            let mut net_x = 0i64;
+            let mut net_y = 0i64;
+            for (i, e) in p.analysed_events().iter().enumerate() {
+                dist_counts += stats::mag(e.dx as f64, e.dy as f64);
+                if let Some(deg) = p.event_aim_deg(i) {
+                    dist_deg += deg;
+                    net_x += e.dx as i64;
+                    net_y += e.dy as i64;
+                }
+            }
+            (dist_counts, dist_deg, net_x, net_y, efficiencies(p, segs))
+        },
+    );
+    let [
+        speed_summary,
+        accel_summary,
+        jerk_summary,
+        speed_deg_summary,
+        accel_deg_summary,
+        jerk_deg_summary,
+    ] = summaries;
     let total_cm = p.counts_to_cm(dist_counts);
     let net_yaw = units::counts_to_yaw_deg(net_x as f64, &p.aim);
     let net_pitch = units::counts_to_pitch_deg(net_y as f64, &p.aim);
-
-    let segs = p.segments();
-    let eff = efficiencies(p, segs);
 
     let minutes = p.minutes();
     let moving_time_s = moving as f64 * dt;
@@ -166,13 +207,13 @@ pub fn compute(p: &Prepared) -> Kinematics {
     Kinematics {
         speed_counts_per_s: speed_summary,
         speed_cm_per_s: speed_summary.scaled(cm_per_count),
-        speed_deg_per_s: Summary::of_vec(speeds_deg),
+        speed_deg_per_s: speed_deg_summary,
         accel_counts_per_s2: accel_summary,
         accel_cm_per_s2: accel_summary.scaled(cm_per_count),
-        accel_deg_per_s2: Summary::of_vec(accel_deg),
+        accel_deg_per_s2: accel_deg_summary,
         jerk_counts_per_s3: jerk_summary,
         jerk_cm_per_s3: jerk_summary.scaled(cm_per_count),
-        jerk_deg_per_s3: Summary::of_vec(jerk_deg),
+        jerk_deg_per_s3: jerk_deg_summary,
         total_distance_counts: dist_counts,
         total_distance_cm: total_cm,
         total_distance_m: total_cm / 100.0,

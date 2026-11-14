@@ -396,6 +396,26 @@ fn run() -> Result<()> {
             let session = resolve_session(&session, &dir)?;
 
             let t = Instant::now();
+            // The summary alone needs none of the report's row tables, so a
+            // cache hit does not read them. Any other output does.
+            if summary && json.is_none() && csv_dir.is_none() && !timing {
+                let (headline, cache) =
+                    trend::summary_for(&session, json_dir.as_deref(), params)
+                        .with_context(|| format!("analyzing {}", session.display()))?;
+                if cache == trend::CacheOutcome::Hit {
+                    tracing::info!(
+                        path = %session.display(),
+                        elapsed_ms = t.elapsed().as_millis(),
+                        "loaded a cached report's headline"
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&headline)?);
+                tracing::info!(
+                    total_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+                    "analysis complete"
+                );
+                return Ok(());
+            }
             let (mut report, cache) = trend::report_for(&session, json_dir.as_deref(), params)
                 .with_context(|| format!("analyzing {}", session.display()))?;
             if cache == trend::CacheOutcome::Hit {

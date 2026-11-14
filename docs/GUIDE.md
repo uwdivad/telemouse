@@ -770,10 +770,14 @@ opened on the foreground process; see ANTICHEAT-2026-09-14.md), and feeds the
 cursor plus "events since last tick" to `PointerLockDetector`.
 
 **Pointer-lock heuristic** (`pointer_lock.rs`): cursor *frozen* while
-*deltas flow* for 2 consecutive samples ⇒ locked (a game is consuming raw
-input). Cursor moved ⇒ unlocked. Frozen with no events ⇒ unlocked (an idle
-desk is not evidence). This is what `pointer_locked` on every batch means, and
-what `--locked-only` in the analyzer filters on.
+*deltas flow* for 3 consecutive samples (750 ms) ⇒ locked (a game is
+consuming raw input); two samples were not enough, a scroll or a resting hand
+reaches them on a desktop. Cursor moved ⇒ unlocked, at once. Frozen with no
+events is not evidence either way: it discards a run that is still being
+confirmed and keeps a lock that already is (a player holding an angle has not
+left the game). The whole decision is the pure `pointer_lock::decide`. This is
+what `pointer_locked` on every batch means, and what `--locked-only` in the
+analyzer filters on.
 
 Also on its schedule: every 60 s re-measure the anchor and log drift in ppm,
 emitting an `anchor_drift_us=N` marker past ±200 µs (a second `session` record
@@ -817,12 +821,15 @@ pub trait Sink: Send {
   rdkafka despite the plan).
   `connect` creates a bounded channel and returns immediately; the worker owns
   the 5 s broker/topic/producer initialization timeout, so an unavailable
-  broker cannot delay capture startup. One `BatchProducer` per topic uses
-  25 ms linger and zstd. `send` is `try_send` on the bounded (128) channel to
+  broker cannot delay capture startup. One `BatchProducer` per topic uses a
+  fixed 250 ms linger (`LINGER`, deliberately not `batch.window_ms`: about
+  four produce RPCs a second instead of one per batch) and zstd. `send` is
+  `try_send` on the bounded (128) channel to
   the current-thread tokio worker with a bounded `JoinSet`; a full channel
   drops and warns *once on the edge* (and logs recovery). Drop cancels pending
   initialization or waits up to 3 s to drain, caps runtime teardown at 100 ms,
-  and records `kafka_abandoned`. A terminal initialization failure emits one
+  and records `kafka_abandoned`; the drain flushes the open batches at once
+  instead of waiting out the linger, as does a full in-flight set. A terminal initialization failure emits one
   causal error; later envelopes are quiet counted drops instead of repeated
   fan-out errors. Accepted delivery failures and worker/task panics are also
   included in abandonment/error accounting.
@@ -1019,7 +1026,8 @@ desktop mode (a live correctness check on integration).
 **Stat tiles**: speed cm/s, aim °/s, pointer px/s (the Windows-cursor model;
 `pointer` on the OBS HUD), hand distance m, aim distance °,
 clicks/min, events/s, event age (time since the newest received mouse event
-was captured; increases normally while idle), latency (browser arrival time
+was captured; counts up while the hand is still, then shows idle after 3
+seconds without an event), latency (browser arrival time
 minus mean event capture time, smoothed across batches; warn >10 ms, alert
 >25 ms, shows idle after 3 seconds without a sample), lag-behind-live (alert >250 ms),
 FPS, ring drops, lost batches, abs frames, bridge (datagrams/s + p50 from
@@ -1335,6 +1343,17 @@ writes `per_second.csv`, `flicks.csv`, `per_minute.csv`.
 median, settle median, tremor RMS, path efficiency, clicks/min, distance m,
 lifts, plus any `--metric` dotted paths resolved through the report JSON).
 This is the substrate for warm-up curves and sensitivity A/B.
+
+A cached `<id>.report.json` is judged by its stamps first (schema, analyzer
+version, params, session, recording signature — the head of the document,
+`report/slim.rs`), so a cache about to be refused is not parsed. A trend row
+without `--metric` and `report --summary` then read only the sections ahead
+of the row tables and stop there (`trend::read_cache_row`,
+`read_cache_summary`, `summary_for`); everything else still parses the whole
+report (`read_cache`, `report_for`). The file itself is unchanged, pretty
+JSON with the tables last. `trend` runs up to four sessions at once within a
+512 MB budget of recording bytes; an idle worker takes the first recording
+that fits rather than waiting behind one that does not.
 
 Measured on a synthetic 3-hour / 814k-event fixture: full analysis 730 ms.
 
@@ -1822,7 +1841,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `main.rs` | clap CLI (`serve --config --http --bin-dir --no-gui --no-webview --log-dir`), config load, tracing to stderr **and** `<log_dir>/ctl.log` (the console is hidden in tray mode, so the file is where the panel's own warnings live), 2-worker tokio runtime, the 500 ms reaper, the WebView2 data folder (`places::webview_data_dir`, created once, `None` → text view), Ctrl-C *or* the tray's Exit → `stop_all` before exit, then the GUI thread is joined. Binds the HTTP listener *before* `gui::spawn`, so the window's first navigation finds a live server. Warns if bound to a non-loopback address. |
 | `gui/mod.rs` | `spawn(GuiDeps) -> Option<GuiHandle>`: wires the publisher task and the `ctl-gui` OS thread; `None` off Windows or with `--no-gui`. `GuiDeps` carries the panel URL, the WebView2 data folder and `no_webview`. `GuiHandle::shutdown` posts quit to the window (or the thread) and joins. |
 | `gui/feed.rs` | Portable runtime side: `Snapshot`, `GuiLink` (channel, `panel_url`, `webview_data_dir`, `no_webview`), `run_publisher` (1 s while the window is visible, every 5th tick and no process scan while hidden, at once on `poke`), and the spawned `start`/`stop`/`new_session` actions (the last one stop-then-start-saving, guarded against re-entry). |
-| `gui/model.rs` | Pure: `render_text` (the text view's body, CRLF, fixed columns), `WebStatus` + `web_banner` (the lines above it: "Loading the panel…", or why the page is not hosted and where it is instead), `window_text` (banner + body), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text, *Open in browser*, the *Open …* items), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler), and `PowerState` + `power_show` / `power_hide` / `power_suspended` (what a hidden page is allowed to cost — see §19.5). |
+| `gui/model.rs` | Pure: `render_text` (the text view's body, CRLF, fixed columns), `WebStatus` + `web_banner` (the lines above it: "Loading the panel…", or why the page is not hosted and where it is instead), `window_text` (banner + body), `tooltip` (≤127 chars), `icon_state`, `menu` (start *or* stop per service, greyed when the binary is missing, *New session* while capture runs, the hotkey as accelerator text, *Open in browser*, the *Open …* items), `panel_url`, `icon_bitmap` (the disc, drawn at runtime — no `.ico`, no resource compiler), `PowerState` + `power_show` / `power_hide` / `power_suspended` / `power_retry` (what a hidden page is allowed to cost — see §19.5), and `Presence` + `shell_says_fullscreen` (whether anybody can be looking at the window: not in the tray, not minimised, not inactive under a full-screen application). |
 | `gui/win.rs` | `#[cfg(windows)]`: one top-level window (`telemouse`, 1120×760 scaled to DPI, minimum 720×520) that hosts the page through `webview.rs` with one read-only `EDIT` as the text fallback, `Shell_NotifyIcon`, the popup menu, `CreateIconIndirect` icons, `TaskbarCreated` re-add, the `RegisterHotKey` new-session chord with its `WM_HOTKEY` handler and tray balloon, `WM_DPICHANGED`, and the message loop. See §19.5. |
 | `gui/webview.rs` | `#[cfg(windows)]`: the WebView2 host. `begin` probes the runtime and asks for an environment; two completion handlers (`on_environment`, `on_controller`) create the controller, tune the settings and navigate; `on_navigated` retries a refused connection; `timer` (watchdog, navigation retry), `resize`, `position_changed`, `set_visible` (suspend on hide, resume + refresh on show, over the state machine in `model`), `close`, and `fallback` (text view + banner, browser opened once). Handlers capture the window handle, never the state pointer. |
 | `procs.rs` | `classify(name, cmd) -> Option<ProcKind>` — the *only* definition of "related" (`telemouse*.exe`, plus `cargo` whose command line names telemouse). `Scanner` takes one Toolhelp snapshot every 30 s and answers in between with per-PID queries (about 20 µs each) for the few matching names; a process whose handle cannot be opened (an elevated one) is judged alive or gone from the `OpenProcess` error, not from a table walk; `scan_cached(ttl)` serves a short cache; `kill` re-runs `classify` on the live process, refuses itself, and drops the cache. |
@@ -1831,7 +1850,7 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `places.rs` | The absolute locations the panel talks about — version, panel URL, config, logs, binaries, docs, releases, and the WebView2 data folder (`webview_data_dir`: `%LOCALAPPDATA%\telemouse\WebView2`, else `%TEMP%\telemouse\WebView2`, never next to the config) — decided once at startup so the text view's header, the tray's *Open …* items, `/api/open` and the page cannot disagree. |
 | `settings.rs` | The settings editor's pure half. `Settings` is the editable subset of `AppConfig` (`mouse_cpi`, `marker_hotkey`, `[recording] enabled`/`dir`, `[ctl] hotkey`, `[games]`, the `[viz.obs]` basics); `Patch` is the change request, and its `deny_unknown_fields` shape *is* the allow-list: bind addresses, `bin_dir`, `log_dir`, Kafka and `[batch]` cannot be expressed in it. `apply_patch` edits the file's text with `toml_edit` (values are replaced through the existing item so the comment lines above a key, its trailing comment, the ordering and unknown keys survive; a value that already means the same is left as written), `checked` parses the result back through `AppConfig::from_toml` + `validate` and turns the error into `{ field, reason }` without the file path, `token` is an FNV-1a fingerprint of the bytes, `write_atomic` is temp-file-plus-rename in the same directory, and `save` strings them together (token check → patch → validate → seed from the embedded sample when there is no file → write). `game_key` is a shape check on a user-typed exe name (trim, lowercase, `.exe` appended, no separators / control / reserved characters, ≤ 64 chars) — deliberately not a list of names. `changed` + `effects` say which groups moved and who only sees them later (`restart_required`: the tray's hotkey; `next_start`: a running capture or viz). Also owns `SAMPLE_CONFIG` and `seed_config`, which `main.rs` uses on first start. |
 | `stats.rs` | (`observability`) Parses the capture agent's `capture stats` line into `ChildStats` for the card, the tooltip and `/api/state`; `parse_foreground_line` + `note_seen` keep the last 8 distinct programs the agent saw in front during the current run (`foreground_seen` on the capture component; never `-` or a `telemouse*` name), which is what the first-run guide offers as *Use <exe>*; `RecordingLive` is the recording's size and the disk's free space; a sink that drops, a ring overflow, an idle mouse or a viz nobody is listening for turns the tray icon amber. |
-| `index.html` + `panel.js` | Self-contained page: `index.html` is the shell (inline CSS, system fonts, no external URLs — the server test rejects any) and `panel.js` is the script, inlined at `<script src="panel.js">` when the page is rendered, the way viz does `app.js`; it has Node tests in `crates/ctl/js-tests` and strings it must share with Rust (low-disk threshold, demo session id, flag labels, log ring size) arrive through the page config JSON rather than being spelled twice. The page is: dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (`POST /api/reports/{id}` after the text report exits 0: a verdict on loss in words, six tiles, the marker labels and their offsets when the session has any, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` + `/api/sessions` every 2 s, patches values in place, two-click kill (no modal dialogs). A page nobody is looking at — a hidden tab, or the window in the tray, which says so through the `window.telemouseSleep` / `window.telemouseWake` hooks the host calls with `ExecuteScript` (§19.5) — stops polling and stops its clock altogether, and refreshes the moment it is back. Works in the window and in a normal browser. |
+| `index.html` + `panel.js` | Self-contained page: `index.html` is the shell (inline CSS, system fonts, no external URLs — the server test rejects any) and `panel.js` is the script, inlined at `<script src="panel.js">` when the page is rendered, the way viz does `app.js`; it has Node tests in `crates/ctl/js-tests` and strings it must share with Rust (low-disk threshold, demo session id, flag labels, log ring size) arrive through the page config JSON rather than being spelled twice. The page is: dark by default, light via `prefers-color-scheme` with a header toggle; a three-step first-run guide when this start seeded the config (`config.seeded`; CPI → game, picked from `foreground_seen` while a non-saving capture watches, or typed → a 30 s demo recording that ends in the report card; every step skippable, dismissal in `localStorage.tmFirstRunDismissed`, reachable again from *Settings → Run setup again*, plus a sample-recording offer when `demo-session.jsonl` is listed); *Session* (start/stop recording, save switch, elapsed and live numbers, a marker field over the marker route, the dashboard link), *Recordings*, *Tools* with the child's output in a panel, a *Report* card drawn from the analyzer's `ReportSummary` (a recording's *Report* button asks `GET /api/reports/{id}` first and, on a 200, shows the card at once without starting the analyzer — *Details* then says the text report was not re-run; on a 404 it runs the text report and, when that exits 0, asks `GET` again and only then `POST`s for a summary run; *Tools → Report → Run* always runs the text report: a verdict on loss in words, six tiles, the marker labels and their offsets when the session has any, ten aim metrics with one-line explanations, the raw text under *Details*), a collapsed *Settings* form over `/api/config` (inline errors placed by the `field` of a 400, a notice built from `next_start` / `restart_required`), and a collapsed *Advanced* section (capture flags, the process table with force-stop, where things are with *Open* buttons over `/api/open`, the logs). Polls `/api/state?log_since=` every 2 s and `/api/sessions` only when the list can have changed (the five polls after a component starts or stops, then every fifteenth, and on waking), patches values in place, two-click kill (no modal dialogs). A page nobody is looking at — a hidden tab, or the window in the tray, minimised or underneath a full-screen game, which says so through the `window.telemouseSleep` / `window.telemouseWake` hooks the host calls with `ExecuteScript` (§19.5) — stops polling and stops its clock altogether, and refreshes the moment it is back. Works in the window and in a normal browser. |
 
 ### 19.2 The API
 
@@ -1845,8 +1864,8 @@ target\release\telemouse-ctl.exe      # or: cargo run -p telemouse-ctl -- serve 
 | `POST /api/processes/{pid}/kill` | 403 for this panel or an unrelated process, 404 unknown, 500 if the OS refuses. |
 | `GET /api/config` | `{ path, status, exists, token, settings, error, choices, not_editable }`: the editable settings as the file on disk has them now (paths as written, not resolved), the token a save must echo, and the OBS vocabularies for the form. A file that cannot be used gives `settings: null` and `error`; no file gives the shipped sample's values and `token: "none"`. |
 | `POST /api/config` | body `{ token, patch }` → `{ ok, token, created, settings, changed, restart_required, next_start }`. See `settings.rs` in §19.1 for the pipeline. 400 `{ error, field }` when the patched file would not load (nothing is written) or the body is not a `Patch` (which is how a non-editable key is refused); 409 `{ error, token }` when the file is not the one `token` was taken from; 500 when the write fails. Afterwards the manager re-reads the file at once (`reload_config`), so `recording` in `/api/state` and the next start follow; children read the file when they start. |
-| `GET /api/reports/{id}` | The stored `ReportSummary` for that recording when one exists, is not older than the recording, and carries `manager::SUMMARY_SCHEMA` (the analyzer's tag, repeated in ctl because the panel only spawns the exe); 404 otherwise. A finished recording never changes again, so the schema test is what retires a summary cached before the shape grew a field. `id` must pass `is_safe_id` (400). Runs nothing. |
-| `POST /api/reports/{id}` | Runs `telemouse-analyze report <recordings>/<id>.jsonl --summary --json-dir <recordings>/.reports` (fixed arguments, one at a time, 5 min cap), returns the JSON it prints and keeps it as `.reports/<id>.summary.json`. The `report` and `trend` tasks get the same `--json-dir` (`Component::report_cache`), so after a text report this is a cache hit. 400 bad id, 404 no such recording, 503 when `telemouse-analyze` is not there (the minimal zip), 500 when the run fails. |
+| `GET /api/reports/{id}` | The stored `ReportSummary` for that recording when one exists, is stamped with the recording's current modification time (the summary file's own mtime *equals* the recording's — `manager::keep_summary` sets it after a run during which the recording did not change), carries `manager::SUMMARY_SCHEMA` (the analyzer's tag, repeated in ctl because the panel only spawns the exe) and names this version as its `analyzer_version`; 404 otherwise. The page draws the report card from a 200 without running anything, so each of those is a way a summary stops being served: the recording grew or was replaced, the shape grew a field, the analyzer was upgraded. `id` must pass `is_safe_id` (400). Runs nothing. |
+| `POST /api/reports/{id}` | Runs `telemouse-analyze report <recordings>/<id>.jsonl --summary --json-dir <recordings>/.reports` (fixed arguments, one at a time, 5 min cap, below normal priority like the `report` and `trend` tasks — `Component::background`), returns the JSON it prints and keeps it as `.reports/<id>.summary.json`. The `report` and `trend` tasks get the same `--json-dir` (`Component::report_cache`), so after a text report this is a cache hit. 400 bad id, 404 no such recording, 503 when `telemouse-analyze` is not there (the minimal zip), 500 when the run fails. |
 | `POST /api/open` | body `{ target: "config" \| "recordings" \| "logs" \| "docs" }` → `{ ok, target, path }`. Opens that place with the shell's default handler (`gui::open_url` in `spawn_blocking`): the config in an editor, a folder in Explorer, the docs. The target is an allow-listed name mapped to a `Places` string on the server, never a client path. 400 unknown target, 404 when this build has no such place (logs without the `logging` feature), 500 if the shell refused. The page's first-run banner and its *Open* buttons use it; before it, the page could only show paths for the user to copy. |
 
 Every `POST` without `X-Telemouse-Ctl: 1` is a 403. A browser only adds a
@@ -1988,8 +2007,36 @@ resumes the page again. A runtime without `ICoreWebView2_3` (or a page that
 has not finished loading, which cannot be suspended) degrades to
 `HiddenAwake` — `SetIsVisible(false)` alone, what the window did before —
 and is offered to the runtime again from `on_navigated` once the page is up.
-Every show/hide path — tray click, tray menu, the close button, minimise —
-goes through `win::set_visible` into `webview::set_visible`.
+A `TrySuspend` the runtime *refuses* is asked for again: `power_suspended`
+answers `RetrySuspend` while `SUSPEND_RETRIES` (3) remain, which arms a
+one-shot `TIMER_SUSPEND_RETRY` (`SUSPEND_RETRY_MS`, 2 s); the timer goes
+through `power_retry`, which only acts on a page that is still
+`HiddenAwake`, and showing the window kills the timer and refills the
+allowance. Each stay out of sight ends in one `info` line in `ctl.log`,
+either "panel page suspended while the window is out of sight" (with the
+number of attempts) or "the WebView2 runtime would not suspend the hidden
+panel page…", so whether ~300 MiB of WebView2 stayed resident behind a game
+can be read from the log.
+
+**Out of sight is more than "in the tray".** What all of the above follows
+is `UiState::watched`, decided by `model::Presence::watched` from four
+facts: shown (not in the tray), minimised (`WM_SIZE` / `SIZE_MINIMIZED`),
+active (`WM_ACTIVATE`), and covered — the window is inactive and
+`SHQueryUserNotificationState` reports a full-screen application
+(`QUNS_BUSY`, `QUNS_RUNNING_D3D_FULL_SCREEN`, `QUNS_PRESENTATION_MODE`,
+`model::shell_says_fullscreen`) while the window sits on the primary
+display, which is the display that answer is about. That shell call takes
+no window and no process: nothing looks at the application in front. A
+window that is not watched gets exactly the tray's treatment — the
+publisher drops to its hidden cadence with no process scan
+(`GuiLink::visible`), the `EDIT` text view is not repainted, the page is put
+to sleep and suspended — without being hidden. `win::apply_presence`
+re-decides on show/hide, minimise/restore and (de)activation, and from
+`refresh` while the window is up but inactive: that is how a game that
+went full-screen, or closed, without touching our window is noticed, within
+one snapshot (1 s while watched, 5 s once covered). Activating the window
+always wakes it. `UiState::visible` keeps its old meaning — in the tray or
+not — and is what the tray menu's Show/Hide item toggles.
 
 **The fallback.** Every failure ends in `webview::fallback`: a runtime that
 is not installed, an environment or controller that fails, a watchdog timer

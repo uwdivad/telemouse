@@ -6,12 +6,18 @@
 //! Kafka must never stall shipping (the plan's "viz latency never gated on
 //! Kafka" rule, applied to capture as well).
 //!
-//! Produces go through rskafka's [`BatchProducer`] with a linger of one batch
-//! window (`batch.window_ms`, passed to [`KafkaSink::connect`]) and zstd
-//! compression, so a second of capture is a couple of RPCs rather than forty.
-//! That only works if several produce calls are in flight at once — the
+//! Produces go through rskafka's [`BatchProducer`] with a fixed [`LINGER`]
+//! and zstd compression. The linger is deliberately *not* the batch window:
+//! a producer that lingers one window sends one RPC per batch, which is no
+//! batching at all. At [`LINGER`] a topic gets at most one produce RPC per
+//! linger period (four a second, each carrying ~10 batches at the default
+//! 25ms window) instead of forty. Kafka is the archive, not the live path, so
+//! a quarter of a second of extra delay costs nothing a consumer can see.
+//! Coalescing only works if several produce calls are in flight at once — the
 //! forwarder therefore spawns each job onto a [`JoinSet`] instead of awaiting
-//! them one at a time.
+//! them one at a time. An open batch is also sent early, without waiting for
+//! the linger, when [`MAX_INFLIGHT`] produce calls are waiting on it and when
+//! the sink is closing.
 //!
 //! Broker connection, topic discovery, and producer setup also happen on that
 //! worker. Constructing this sink therefore never delays capture startup.
@@ -19,8 +25,9 @@
 //! Shutdown is *bounded*: initialization is cancellable and the forwarder gets
 //! its share of the shutdown budget (never more than [`DRAIN_TIMEOUT`]) to
 //! finish what is queued, then the runtime is dropped and the remainder is
-//! reported as abandoned. An unreachable broker can delay neither capture
-//! startup nor exit.
+//! reported as abandoned. The tail does not sit out the linger first: once
+//! the queue is closed the open batches are flushed at once. An unreachable
+//! broker can delay neither capture startup nor exit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,7 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rskafka::client::partition::{Compression, UnknownTopicHandling};
 use rskafka::client::producer::aggregator::RecordAggregator;
-use rskafka::client::producer::{BatchProducer, BatchProducerBuilder};
+use rskafka::client::producer::{BatchProducer, BatchProducerBuilder, ProducerClient};
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
 use telemouse_core::wire::{TOPIC_EVENTS, TOPIC_MARKERS, TOPIC_SESSIONS};
@@ -47,10 +54,23 @@ use crate::stats::{Stats, Throttle};
 
 /// Envelopes buffered towards Kafka before we start dropping. ~3s of batches.
 const QUEUE_CAPACITY: usize = 128;
-/// Produce calls in flight at once. Past this the forwarder waits for one to
-/// finish, so a stalled broker backs up onto the (bounded, drop-happy)
-/// channel instead of growing the in-flight set without limit.
+/// How long a topic's producer collects records before one produce RPC.
+/// Independent of `batch.window_ms` on purpose (see the module docs): long
+/// enough that an RPC carries several batches, short next to anything a
+/// Kafka consumer of this stream cares about.
+const LINGER: Duration = Duration::from_millis(250);
+/// Produce calls in flight at once. Past this the forwarder sends the open
+/// batches and waits for one call to finish, so a stalled broker backs up
+/// onto the (bounded, drop-happy) channel instead of growing the in-flight
+/// set without limit — and a stream faster than `MAX_INFLIGHT` envelopes per
+/// [`LINGER`] (a 1ms batch window) is flushed by count instead of backing up
+/// behind the linger.
 const MAX_INFLIGHT: usize = 128;
+/// While the forwarder is waiting on in-flight produce calls it has decided
+/// not to linger for (the set is full, or the sink is closing), how often it
+/// re-flushes the open batches. One pass is normally enough; the repeat
+/// covers a call that had not reached its producer yet when the first ran.
+const FLUSH_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Kafka's default `max.message.bytes` is 1MiB; stay comfortably under it.
 const MAX_AGGREGATED_BYTES: usize = 900_000;
@@ -110,11 +130,7 @@ pub struct KafkaSink {
 impl KafkaSink {
     /// Start a forwarder thread. The broker connection and topic setup happen
     /// on that thread; this returns as soon as its bounded channel exists.
-    ///
-    /// `linger` is the producer's coalescing window: the batch window, so one
-    /// RPC covers ~2 batches even under a burst without adding meaningful
-    /// durability lag.
-    pub fn connect(brokers: &[String], linger: Duration, stats: Arc<Stats>) -> Result<Self> {
+    pub fn connect(brokers: &[String], stats: Arc<Stats>) -> Result<Self> {
         anyhow::ensure!(!brokers.is_empty(), "no kafka brokers configured");
         let (tx, rx) = hotpath::channel!(
             tokio::sync::mpsc::channel::<KafkaJob>(QUEUE_CAPACITY),
@@ -127,13 +143,13 @@ impl KafkaSink {
         let worker = std::thread::Builder::new()
             .name("telemouse-kafka".into())
             .spawn(move || {
-                run_worker(brokers, linger, rx, shutdown_rx, worker_queue);
+                run_worker(brokers, rx, shutdown_rx, worker_queue);
                 tracing::debug!("kafka forwarder stopped");
             })
             .context("spawn kafka forwarder")?;
 
         tracing::info!(
-            linger_ms = linger.as_millis() as u64,
+            linger_ms = LINGER.as_millis() as u64,
             compression = "zstd",
             "kafka forwarder started; connecting in background"
         );
@@ -162,7 +178,6 @@ fn drain_timeout(deadline: Option<Instant>) -> Duration {
 
 fn run_worker(
     brokers: Vec<String>,
-    linger: Duration,
     rx: Receiver<KafkaJob>,
     mut shutdown: oneshot::Receiver<Option<Instant>>,
     queue: Arc<QueueAccounting>,
@@ -190,7 +205,7 @@ fn run_worker(
                 queue.claim_loss();
                 return;
             }
-            result = tokio::time::timeout(CONNECT_TIMEOUT, initialize(brokers, linger)) => result,
+            result = tokio::time::timeout(CONNECT_TIMEOUT, initialize(brokers)) => result,
         };
 
         let (client, producers) = match initialized {
@@ -244,15 +259,26 @@ fn run_worker(
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
-async fn initialize(brokers: Vec<String>, linger: Duration) -> Result<(Client, Producers)> {
+async fn initialize(brokers: Vec<String>) -> Result<(Client, Producers)> {
     let client = ClientBuilder::new(brokers)
         .client_id("telemouse-capture")
         .build()
         .await
         .context("kafka connect failed")?;
     ensure_topics(&client).await;
-    let producers = open_producers(&client, linger).await?;
+    let producers = open_producers(&client).await?;
     Ok((client, producers))
+}
+
+/// Send every topic's open batch now instead of when its linger runs out,
+/// and wait for those writes. A failed write is reported to the produce calls
+/// that were waiting on it, which is where it is counted and logged.
+async fn flush_open_batches(producers: &Producers) {
+    for (topic, producer) in producers {
+        if let Err(e) = producer.flush().await {
+            tracing::debug!(topic, error = %e, "kafka flush failed");
+        }
+    }
 }
 
 /// Drain the channel, keeping several produces in flight so the linger window
@@ -268,10 +294,12 @@ async fn forward(mut rx: Receiver<KafkaJob>, producers: Producers, queue: Arc<Qu
         while let Some(result) = inflight.try_join_next() {
             observe_join(result, &queue);
         }
-        if inflight.len() >= MAX_INFLIGHT
-            && let Some(result) = inflight.join_next().await
-        {
-            observe_join(result, &queue);
+        if inflight.len() >= MAX_INFLIGHT {
+            // On a healthy broker these calls are lingering, not stuck: send
+            // what they are waiting on rather than sitting the linger out
+            // with the channel filling behind us. On a stalled one this
+            // waits, as a plain join always did.
+            settle_one(&mut inflight, &producers, &queue).await;
         }
         let producers = Arc::clone(&producers);
         let queue = Arc::clone(&queue);
@@ -299,8 +327,33 @@ async fn forward(mut rx: Receiver<KafkaJob>, producers: Producers, queue: Arc<Qu
             }
         });
     }
-    while let Some(result) = inflight.join_next().await {
-        observe_join(result, &queue);
+    // The queue is closed, so nothing more can join the open batches and
+    // waiting out the linger would only spend the shutdown budget. Flush
+    // until every call has settled; the caller bounds the whole drain.
+    while !inflight.is_empty() {
+        settle_one(&mut inflight, &producers, &queue).await;
+    }
+}
+
+/// Wait for one in-flight produce call to finish, sending the open batches
+/// rather than leaving them to their linger. A call that has already
+/// finished is taken first, so a healthy drain is one flush and then joins.
+/// The flush repeats every [`FLUSH_RETRY_INTERVAL`] because a freshly spawned
+/// call may not have reached its producer when the first one ran.
+async fn settle_one(inflight: &mut JoinSet<()>, producers: &Producers, queue: &QueueAccounting) {
+    let mut flush_tick = tokio::time::interval(FLUSH_RETRY_INTERVAL);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            joined = inflight.join_next() => {
+                if let Some(result) = joined {
+                    observe_join(result, queue);
+                }
+                return;
+            }
+            _ = flush_tick.tick() => flush_open_batches(producers).await,
+        }
     }
 }
 
@@ -337,20 +390,28 @@ async fn ensure_topics(client: &Client) {
     }
 }
 
-async fn open_producers(client: &Client, linger: Duration) -> Result<Producers> {
+async fn open_producers(client: &Client) -> Result<Producers> {
     let mut map = HashMap::new();
     for topic in TOPICS {
         let pc = client
             .partition_client(topic, 0, UnknownTopicHandling::Retry)
             .await
             .with_context(|| format!("open kafka partition for {topic}"))?;
-        let producer = BatchProducerBuilder::new(Arc::new(pc))
-            .with_linger(linger)
-            .with_compression(Compression::Zstd)
-            .build(RecordAggregator::new(MAX_AGGREGATED_BYTES));
-        map.insert(topic, Arc::new(producer));
+        map.insert(topic, Arc::new(batch_producer(Arc::new(pc), LINGER)));
     }
     Ok(map)
+}
+
+/// One topic's producer over `client`: the partition client in production, a
+/// stand-in in tests (which also pick their own linger).
+fn batch_producer(
+    client: Arc<dyn ProducerClient>,
+    linger: Duration,
+) -> BatchProducer<RecordAggregator> {
+    BatchProducerBuilder::new_with_client(client)
+        .with_linger(linger)
+        .with_compression(Compression::Zstd)
+        .build(RecordAggregator::new(MAX_AGGREGATED_BYTES))
 }
 
 async fn produce(producers: &Producers, job: KafkaJob) -> Result<()> {
@@ -455,7 +516,55 @@ mod tests {
         })
     }
 
-    const LINGER: Duration = Duration::from_millis(25);
+    /// Stands in for a partition client: accepts every write and remembers
+    /// how many records each produce RPC carried.
+    #[derive(Debug, Default)]
+    struct FakeBroker {
+        rpcs: Mutex<Vec<usize>>,
+    }
+
+    impl FakeBroker {
+        fn rpcs(&self) -> Vec<usize> {
+            self.rpcs.lock().unwrap().clone()
+        }
+    }
+
+    type ProduceFuture<'a> = std::pin::Pin<
+        Box<
+            dyn Future<Output = std::result::Result<Vec<i64>, rskafka::client::error::Error>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    impl ProducerClient for FakeBroker {
+        fn produce(&self, records: Vec<Record>, _compression: Compression) -> ProduceFuture<'_> {
+            let n = records.len();
+            self.rpcs.lock().unwrap().push(n);
+            Box::pin(async move { Ok((0..n as i64).collect()) })
+        }
+    }
+
+    /// Producers for every topic over one fake broker, with `linger`.
+    fn fake_producers(broker: &Arc<FakeBroker>, linger: Duration) -> Producers {
+        TOPICS
+            .into_iter()
+            .map(|topic| {
+                let client: Arc<dyn ProducerClient> = broker.clone();
+                (topic, Arc::new(batch_producer(client, linger)))
+            })
+            .collect()
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Long enough that a test which waited for it would time out instead.
+    const NEVER: Duration = Duration::from_secs(3600);
 
     fn sink_with(queue: QueueAccounting, worker: Option<JoinHandle<()>>) -> KafkaSink {
         KafkaSink {
@@ -470,7 +579,114 @@ mod tests {
     #[test]
     fn connect_without_brokers_is_an_error_not_a_panic() {
         let stats = Arc::new(Stats::default());
-        assert!(KafkaSink::connect(&[], LINGER, stats).is_err());
+        assert!(KafkaSink::connect(&[], stats).is_err());
+    }
+
+    /// K1: the linger used to be the batch window, i.e. one RPC per batch.
+    #[test]
+    fn the_linger_is_long_enough_to_coalesce_and_short_enough_to_drain() {
+        let default_window = Duration::from_millis(25);
+        assert!(LINGER >= default_window * 8, "several batches per RPC");
+        // The tail is flushed on close rather than lingered, but keep the
+        // linger well inside the drain cap anyway.
+        assert!(LINGER * 4 <= DRAIN_TIMEOUT);
+    }
+
+    /// Ten batches handed over inside one linger period are one produce RPC.
+    #[test]
+    fn batches_inside_one_linger_share_a_produce_rpc() {
+        let stats = Arc::new(Stats::default());
+        let queue = Arc::new(new_queue(Arc::clone(&stats)));
+        queue.preload(10);
+        let broker = Arc::new(FakeBroker::default());
+        let producers = fake_producers(&broker, LINGER);
+        let (tx, rx) = hotpath::channel!(tokio::sync::mpsc::channel::<KafkaJob>(16));
+        runtime().block_on(async {
+            let forwarder = tokio::spawn(forward(rx, producers, Arc::clone(&queue)));
+            for _ in 0..10 {
+                tx.send(KafkaJob::new(TOPIC_EVENTS, "s-1", "{}"))
+                    .await
+                    .unwrap();
+            }
+            // The queue stays open: only the linger can send these.
+            let waiting = Instant::now();
+            while stats.snapshot().kafka_queued > 0 {
+                assert!(waiting.elapsed() < Duration::from_secs(5), "never produced");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                waiting.elapsed() >= LINGER / 2,
+                "sent after {:?}, without lingering",
+                waiting.elapsed()
+            );
+            drop(tx);
+            forwarder.await.unwrap();
+        });
+        assert_eq!(broker.rpcs(), vec![10]);
+        assert_eq!(stats.snapshot().kafka_abandoned, 0);
+    }
+
+    /// A clean stop must not spend its drain budget waiting for the linger:
+    /// here the linger never ends, and the tail is still delivered at once.
+    #[test]
+    fn closing_the_queue_flushes_the_tail_without_waiting_for_the_linger() {
+        let stats = Arc::new(Stats::default());
+        let queue = Arc::new(new_queue(Arc::clone(&stats)));
+        queue.preload(5);
+        let broker = Arc::new(FakeBroker::default());
+        let producers = fake_producers(&broker, NEVER);
+        let (tx, rx) = hotpath::channel!(tokio::sync::mpsc::channel::<KafkaJob>(16));
+        runtime().block_on(async {
+            for topic in [
+                TOPIC_SESSIONS,
+                TOPIC_EVENTS,
+                TOPIC_EVENTS,
+                TOPIC_MARKERS,
+                TOPIC_EVENTS,
+            ] {
+                tx.send(KafkaJob::new(topic, "s-1", "{}")).await.unwrap();
+            }
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(5), forward(rx, producers, queue))
+                .await
+                .expect("the drain waited on the linger");
+        });
+        assert_eq!(broker.rpcs().iter().sum::<usize>(), 5);
+        let snap = stats.snapshot();
+        assert_eq!(snap.kafka_queued, 0);
+        assert_eq!(snap.kafka_abandoned, 0);
+        assert_eq!(snap.kafka_errors, 0);
+    }
+
+    /// A stream faster than `MAX_INFLIGHT` per linger is sent by count, not
+    /// left to back up onto the drop-happy channel behind the linger.
+    #[test]
+    fn a_full_inflight_set_is_flushed_instead_of_lingering() {
+        const JOBS: usize = MAX_INFLIGHT * 2;
+        let stats = Arc::new(Stats::default());
+        let queue = Arc::new(new_queue(Arc::clone(&stats)));
+        queue.preload(JOBS as u64);
+        let broker = Arc::new(FakeBroker::default());
+        let producers = fake_producers(&broker, NEVER);
+        let (tx, rx) = hotpath::channel!(tokio::sync::mpsc::channel::<KafkaJob>(JOBS));
+        runtime().block_on(async {
+            let forwarder = tokio::spawn(forward(rx, producers, Arc::clone(&queue)));
+            for _ in 0..JOBS {
+                tx.send(KafkaJob::new(TOPIC_EVENTS, "s-1", "{}"))
+                    .await
+                    .unwrap();
+            }
+            // Still open, and the linger never ends: only the cap sends.
+            let waiting = Instant::now();
+            while broker.rpcs().iter().sum::<usize>() < MAX_INFLIGHT {
+                assert!(waiting.elapsed() < Duration::from_secs(5), "never flushed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(tx);
+            forwarder.await.unwrap();
+        });
+        assert_eq!(broker.rpcs().iter().sum::<usize>(), JOBS);
+        assert_eq!(stats.snapshot().kafka_queued, 0);
     }
 
     #[test]
@@ -521,7 +737,7 @@ mod tests {
     fn unreachable_broker_does_not_delay_sink_construction_or_shutdown() {
         let stats = Arc::new(Stats::default());
         let started = Instant::now();
-        let sink = KafkaSink::connect(&["203.0.113.1:9092".into()], LINGER, stats).unwrap();
+        let sink = KafkaSink::connect(&["203.0.113.1:9092".into()], stats).unwrap();
         // Before initialization moved to the worker this call could consume
         // the full 5s connection timeout before capture even started. The
         // bounds are generous on purpose: what matters is "not the connect

@@ -10,9 +10,12 @@
 //! exactly as `wndproc` does — a callback that fires after the window is
 //! gone finds nothing and returns.
 //!
-//! While the window is in the tray the page is suspended
+//! While nobody can be looking at the window — it is in the tray,
+//! minimised, or inactive underneath a full-screen application
+//! (`model::Presence`) — the page is suspended
 //! (`ICoreWebView2_3::TrySuspend`, decided by the state machine in
 //! `model::power_*`) so that a panel nobody is looking at costs nothing; a
+//! refused suspension is asked for again a few times on a timer, and a
 //! runtime too old for that interface falls back to what this did before,
 //! `SetIsVisible(false)` alone.
 //!
@@ -49,6 +52,9 @@ use super::win::{self, UiState};
 pub(super) const TIMER_WATCHDOG: usize = 1;
 /// `SetTimer` id: navigate again after a refused connection.
 pub(super) const TIMER_NAV_RETRY: usize = 2;
+/// `SetTimer` id: ask again for a suspension the runtime refused. One-shot,
+/// re-armed per refusal, killed when the window is shown again.
+pub(super) const TIMER_SUSPEND_RETRY: usize = 3;
 const WATCHDOG_MS: u32 = 10_000;
 const NAV_RETRY_MS: u32 = 500;
 /// Six tries half a second apart: the listener is bound before this window
@@ -97,6 +103,9 @@ pub(super) struct WebHost {
     suspend: Option<ICoreWebView2_3>,
     /// What the page costs while the window is hidden.
     power: PowerState,
+    /// How many more times a refused `TrySuspend` may be asked for again
+    /// during this stay out of sight. Refilled when the window is shown.
+    suspend_retries_left: u8,
     nav_retries: u8,
     /// The first successful navigation was logged.
     page_shown: bool,
@@ -112,6 +121,7 @@ impl WebHost {
             webview: None,
             suspend: None,
             power: PowerState::Visible,
+            suspend_retries_left: model::SUSPEND_RETRIES,
             nav_retries: 0,
             page_shown: false,
             browser_opened: false,
@@ -294,7 +304,7 @@ unsafe fn attach(
         let mut rc = RECT::default();
         GetClientRect(hwnd, &mut rc)?;
         controller.SetBounds(rc)?;
-        controller.SetIsVisible((*s).visible)?;
+        controller.SetIsVisible((*s).watched)?;
 
         let wv = controller.CoreWebView2()?;
         let st = wv.Settings()?;
@@ -347,10 +357,10 @@ unsafe fn attach(
             );
         }
         (*s).web.suspend = suspend;
-        (*s).web.power = if (*s).visible {
+        (*s).web.power = if (*s).watched {
             PowerState::Visible
         } else {
-            // Hidden before the page was ready: `on_navigated` offers it to
+            // Out of sight before the page was ready: `on_navigated` offers it to
             // the runtime again once the first navigation succeeds.
             PowerState::HiddenAwake
         };
@@ -386,10 +396,10 @@ unsafe fn on_navigated(
                 (*s).web.page_shown = true;
                 info!(url = %(*s).link.panel_url, "panel page hosted in the window");
             }
-            // The window went to the tray while this navigation was still
+            // The window went out of sight while this navigation was still
             // running (or an earlier suspension was refused because of it):
             // a loaded page can be suspended, so ask again.
-            if !(*s).visible {
+            if !(*s).watched {
                 power(s, model::power_hide((*s).web.power, can_suspend(s)));
             }
             return;
@@ -438,6 +448,17 @@ pub(super) unsafe fn timer(s: *mut UiState, id: usize) {
                     }
                 }
             }
+            TIMER_SUSPEND_RETRY => {
+                // One-shot: a refusal re-arms it, nothing else does.
+                let _ = KillTimer(Some(hwnd), TIMER_SUSPEND_RETRY);
+                let next = model::power_retry((*s).web.power, can_suspend(s));
+                if next.1 == PowerAction::Suspend {
+                    // Counted before the call: the answer may arrive inside
+                    // it (see `try_suspend`) and reads what is left.
+                    (*s).web.suspend_retries_left = (*s).web.suspend_retries_left.saturating_sub(1);
+                }
+                power(s, next);
+            }
             _ => {}
         }
     }
@@ -468,11 +489,12 @@ pub(super) unsafe fn position_changed(s: *mut UiState) {
     }
 }
 
-/// Hidden to the tray: the page stops rendering, stops polling and — on a
-/// runtime that can — is suspended, so the window costs nothing while a game
-/// is in front. Shown: resumed, focused, and refreshed at once so nothing on
-/// screen is a poll period old. Every show/hide path (tray click, tray menu,
-/// the close button, minimise) comes through `win::set_visible` into here.
+/// Out of sight (in the tray, minimised, or inactive underneath a
+/// full-screen application — `model::Presence`): the page stops rendering,
+/// stops polling and — on a runtime that can — is suspended, so the window
+/// costs nothing while a game is in front. Back in sight: resumed, focused,
+/// and refreshed at once so nothing on screen is a poll period old. Every
+/// such change comes through `win::apply_presence` into here.
 pub(super) unsafe fn set_visible(s: *mut UiState, show: bool) {
     // SAFETY: as `resize`.
     unsafe {
@@ -502,11 +524,26 @@ unsafe fn power(s: *mut UiState, next: (PowerState, PowerAction)) {
             debug!(?state, "webview2 power state");
         }
         (*s).web.power = state;
+        if matches!(action, PowerAction::Show { .. }) {
+            // Back in sight: a retry that is still waiting has nothing left
+            // to do, and the next stay out of sight gets its full allowance.
+            let _ = KillTimer(Some((*s).hwnd), TIMER_SUSPEND_RETRY);
+            (*s).web.suspend_retries_left = model::SUSPEND_RETRIES;
+        }
         let Some(c) = (*s).web.controller.clone() else {
             return; // the text view is the window; nothing to suspend
         };
         match action {
             PowerAction::Nothing => {}
+            PowerAction::RetrySuspend => {
+                SetTimer(
+                    Some((*s).hwnd),
+                    TIMER_SUSPEND_RETRY,
+                    model::SUSPEND_RETRY_MS,
+                    None,
+                );
+            }
+            PowerAction::Suspend => try_suspend(s),
             PowerAction::Hide | PowerAction::HideAndSuspend => {
                 run_script(s, SLEEP_SCRIPT);
                 let _ = c.SetIsVisible(false);
@@ -521,7 +558,12 @@ unsafe fn power(s: *mut UiState, next: (PowerState, PowerAction)) {
                     resume_page(s);
                 }
                 let _ = c.SetIsVisible(true);
-                let _ = c.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                // Only into a window that has the keyboard: a page woken
+                // because the game in front of it closed must not pull
+                // focus out of whatever the user went to instead.
+                if (*s).active {
+                    let _ = c.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                }
                 run_script(s, WAKE_SCRIPT);
             }
             PowerAction::Resume => resume_page(s),
@@ -531,6 +573,13 @@ unsafe fn power(s: *mut UiState, next: (PowerState, PowerAction)) {
 
 /// Ask the runtime to suspend the page. The answer arrives on this thread's
 /// message loop like every other WebView2 completion; nothing waits for it.
+///
+/// Like the environment loader (see `begin`), the call may also answer
+/// before it returns — an outright error does, and a handler invoked
+/// synchronously would. `power` has therefore already recorded
+/// `Suspending` (and the retry timer has already taken its count) by the
+/// time this runs, so an answer that arrives inside the call finds the same
+/// state as one that arrives a message later.
 unsafe fn try_suspend(s: *mut UiState) {
     // SAFETY: `s` is live; the handler captures only the window handle.
     unsafe {
@@ -565,10 +614,37 @@ unsafe fn on_suspended(hwnd: HWND, hr: windows::core::Result<()>, ok: bool) {
     }
 }
 
+/// The one place a suspension's outcome is decided — and said: `ctl.log`
+/// gets one `info` line per stay out of sight, either that the page was
+/// suspended or that the runtime would not, so "is 300 MiB of WebView2
+/// still resident behind the game" is answerable from the log.
 unsafe fn suspend_answered(s: *mut UiState, ok: bool) {
     // SAFETY: `s` is live.
     unsafe {
-        power(s, model::power_suspended((*s).web.power, ok));
+        let left = (*s).web.suspend_retries_left;
+        let waiting = (*s).web.power == PowerState::Suspending;
+        let next = model::power_suspended((*s).web.power, ok, left);
+        let attempts = u32::from(model::SUSPEND_RETRIES - left.min(model::SUSPEND_RETRIES)) + 1;
+        match (waiting, ok, next.1) {
+            // Answered after the window came back: undone or moot.
+            (false, _, _) => debug!(ok, "late TrySuspend answer"),
+            (true, true, _) => {
+                info!(
+                    attempts,
+                    "panel page suspended while the window is out of sight"
+                )
+            }
+            (true, false, PowerAction::RetrySuspend) => debug!(
+                attempts,
+                retry_ms = model::SUSPEND_RETRY_MS,
+                "TrySuspend refused; asking again"
+            ),
+            (true, false, _) => info!(
+                attempts,
+                "the WebView2 runtime would not suspend the hidden panel page; it has stopped polling and rendering but stays in memory until the window is shown"
+            ),
+        }
+        power(s, next);
     }
 }
 
@@ -617,6 +693,7 @@ pub(super) unsafe fn close(s: *mut UiState) {
         let hwnd = (*s).hwnd;
         let _ = KillTimer(Some(hwnd), TIMER_WATCHDOG);
         let _ = KillTimer(Some(hwnd), TIMER_NAV_RETRY);
+        let _ = KillTimer(Some(hwnd), TIMER_SUSPEND_RETRY);
         (*s).web.webview = None;
         (*s).web.suspend = None;
         (*s).web.power = PowerState::Visible;

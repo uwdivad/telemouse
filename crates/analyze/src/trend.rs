@@ -19,7 +19,8 @@ use telemouse_core::recordings;
 
 use crate::error::AnalyzeError;
 use crate::load::{file_signature, read_sidecar};
-use crate::report::{ANALYZER_VERSION, Report, SCHEMA};
+use crate::report::slim::{self, Headlines, Stamps};
+use crate::report::{ANALYZER_VERSION, Report, ReportSummary, SCHEMA, SessionSummary};
 use crate::series::Params;
 use crate::timefmt::{format_duration, format_utc_us};
 
@@ -79,59 +80,137 @@ pub fn cache_path(dir: &Path, session_id: &str) -> PathBuf {
 /// same-size replacement on a filesystem with coarse timestamps; it is kept as
 /// the cheap first test, and as the only test for a cache written before
 /// signatures were stamped.
+///
+/// The stamps are read and judged on their own first (they are the head of
+/// the document), so a cache that is going to be refused costs two kilobytes
+/// of parsing rather than the whole report.
 #[hotpath::measure]
 pub fn read_cache(
     cache: &Path,
     recording: &Path,
     params: Params,
 ) -> (Option<Report>, CacheOutcome) {
-    let cache_meta = match std::fs::metadata(cache) {
-        Ok(m) => m,
-        Err(_) => return (None, CacheOutcome::Missing),
+    let bytes = match read_current_cache(cache, recording, params) {
+        Ok(b) => b,
+        Err(why) => return (None, why),
     };
+    // Validated as UTF-8 once, up front: `from_slice` would check every one
+    // of the row tables' millions of keys separately, which made the full
+    // read a third slower than parsing a `str`.
+    let report = String::from_utf8(bytes)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Report>(&text).ok());
+    match report {
+        Some(report) => (Some(report), CacheOutcome::Hit),
+        None => (None, CacheOutcome::Unreadable),
+    }
+}
+
+/// [`read_cache`] for the two projections that read no row table: the same
+/// checks, the same outcome, but the tables stay on disk (see
+/// [`crate::report::slim`]).
+#[hotpath::measure]
+fn read_cache_headlines(
+    cache: &Path,
+    recording: &Path,
+    params: Params,
+) -> (Option<Headlines>, CacheOutcome) {
+    let bytes = match read_current_cache(cache, recording, params) {
+        Ok(b) => b,
+        Err(why) => return (None, why),
+    };
+    match Headlines::parse(&bytes) {
+        Some(headlines) => (Some(headlines), CacheOutcome::Hit),
+        None => (None, CacheOutcome::Unreadable),
+    }
+}
+
+/// The headline summary (`report --summary`) out of a cached report, if the
+/// cache is still valid for `recording` and `params` — [`read_cache`]'s
+/// rules, without reading the report's row tables. The sidecar-derived
+/// fields are re-read from the sidecar, as [`report_for`] does on a hit, so
+/// this is exactly what `report_for(..)` then [`Report::headline`] returns.
+pub fn read_cache_summary(
+    cache: &Path,
+    recording: &Path,
+    params: Params,
+) -> (Option<ReportSummary>, CacheOutcome) {
+    let (hit, why) = read_cache_headlines(cache, recording, params);
+    (
+        hit.map(|h| h.summary(read_sidecar(recording).as_ref())),
+        why,
+    )
+}
+
+/// The trend row out of a cached report, if the cache is still valid for
+/// `recording` and `params` — [`read_cache`]'s rules, without reading the
+/// report's row tables. The row has no `extra` columns: a `--metric` path
+/// can point anywhere in the report, so those go through [`read_cache`] and
+/// [`row`].
+pub fn read_cache_row(
+    cache: &Path,
+    recording: &Path,
+    params: Params,
+) -> (Option<TrendRow>, CacheOutcome) {
+    let (hit, why) = read_cache_headlines(cache, recording, params);
+    (hit.map(|h| h.trend_row()), why)
+}
+
+/// The cached document's bytes, once everything short of parsing its body
+/// says it is current: it exists, the recording is not newer than it, and its
+/// stamps (see [`judge`]) match this build, `params` and `recording`.
+fn read_current_cache(
+    cache: &Path,
+    recording: &Path,
+    params: Params,
+) -> Result<Vec<u8>, CacheOutcome> {
+    let cache_meta = std::fs::metadata(cache).map_err(|_| CacheOutcome::Missing)?;
     if let (Ok(rec), Ok(cached)) = (
         std::fs::metadata(recording).and_then(|m| m.modified()),
         cache_meta.modified(),
     ) && rec > cached
     {
-        return (None, CacheOutcome::Stale);
+        return Err(CacheOutcome::Stale);
     }
-    let text = match std::fs::read_to_string(cache) {
-        Ok(t) => t,
-        Err(_) => return (None, CacheOutcome::Unreadable),
-    };
-    let report = match serde_json::from_str::<Report>(&text) {
-        Ok(r) => r,
-        Err(_) => return (None, CacheOutcome::Unreadable),
-    };
+    let bytes = std::fs::read(cache).map_err(|_| CacheOutcome::Unreadable)?;
+    let stamps = slim::read_partial::<slim::StampSlots>(&bytes).ok_or(CacheOutcome::Unreadable)?;
+    match judge(&stamps, recording, params) {
+        CacheOutcome::Hit => Ok(bytes),
+        why => Err(why),
+    }
+}
+
+/// Whether a cached report with these stamps answers for `recording` under
+/// `params`: [`CacheOutcome::Hit`], or the reason it does not.
+fn judge(stamps: &Stamps, recording: &Path, params: Params) -> CacheOutcome {
     // Either provenance stamp moving on means the numbers may not mean the
     // same thing any more.
-    if report.analyzer_version != ANALYZER_VERSION || report.schema != SCHEMA {
-        return (None, CacheOutcome::VersionChanged);
+    if stamps.analyzer_version != ANALYZER_VERSION || stamps.schema != SCHEMA {
+        return CacheOutcome::VersionChanged;
     }
-    if report.params != params {
-        return (None, CacheOutcome::ParamsChanged);
+    if stamps.params != params {
+        return CacheOutcome::ParamsChanged;
     }
-    if !describes(&report, recording) {
-        return (None, CacheOutcome::Mismatch);
+    if !describes(&stamps.session, recording) {
+        return CacheOutcome::Mismatch;
     }
-    match (&report.recording_signature, file_signature(recording)) {
-        (Some(stamped), Ok(Some(now))) if *stamped != now => (None, CacheOutcome::Stale),
+    match (&stamps.recording_signature, file_signature(recording)) {
+        (Some(stamped), Ok(Some(now))) if *stamped != now => CacheOutcome::Stale,
         // Unreadable or actively-growing recording: fall back to the mtime
-        // test already done above rather than refusing to use a cache that is
+        // test already done rather than refusing to use a cache that is
         // probably fine.
-        _ => (Some(report), CacheOutcome::Hit),
+        _ => CacheOutcome::Hit,
     }
 }
 
 /// Whether a cached report is about `recording` at all — a cache directory
 /// shared between recording directories, or a renamed file, must not answer
 /// for the wrong session.
-fn describes(report: &Report, recording: &Path) -> bool {
-    let stem_ok = recording_id(recording).is_none_or(|id| id == report.session.session_id);
+fn describes(session: &SessionSummary, recording: &Path) -> bool {
+    let stem_ok = recording_id(recording).is_none_or(|id| id == session.session_id);
     // Compared by file name, not by the whole path: the same recording is
     // legitimately reached as `recordings/x.jsonl` and `C:\...\x.jsonl`.
-    let name_ok = Path::new(&report.session.path)
+    let name_ok = Path::new(&session.path)
         .file_name()
         .is_none_or(|name| Some(name) == recording.file_name());
     stem_ok && name_ok
@@ -147,9 +226,73 @@ fn recording_id(recording: &Path) -> Option<&str> {
 /// previous document or this one, never a half-written one, even if two
 /// analyzers race on the same session.
 #[hotpath::measure]
+///
+/// Not synced to disk first: the cache is disposable, and a document a power
+/// cut leaves torn is refused as unreadable and recomputed.
+#[hotpath::measure]
 fn write_cache(path: &Path, report: &Report) -> Result<(), AnalyzeError> {
-    crate::atomic::write_atomic(path, |w| report.write_json_to(w))
+    crate::atomic::write_atomic_unsynced(path, |w| report.write_json_to(w))
         .map_err(AnalyzeError::io("writing the report cache", path))
+}
+
+/// The session id `recording` is cached under and where, when `json_dir` is
+/// set. A recording whose file name is not `<session id>.jsonl` has no cache
+/// entry: the cache is keyed by that id.
+fn cache_target<'a>(recording: &'a Path, json_dir: Option<&Path>) -> Option<(&'a str, PathBuf)> {
+    let dir = json_dir?;
+    match recording_id(recording) {
+        Some(id) => Some((id, cache_path(dir, id))),
+        None => {
+            tracing::debug!(
+                path = %recording.display(),
+                "recording name is not a session id; not using the report cache"
+            );
+            None
+        }
+    }
+}
+
+/// Analyze `recording` afresh and publish the report to `cache`, after a
+/// cache read that came back `why`.
+fn recompute(
+    recording: &Path,
+    id: &str,
+    cache: &Path,
+    params: Params,
+    why: CacheOutcome,
+) -> Result<Report, AnalyzeError> {
+    tracing::info!(
+        session = %id,
+        cache = %cache.display(),
+        check = why.as_str(),
+        "recomputing report"
+    );
+    let before = file_signature(recording).ok().flatten();
+    let loaded = crate::load::load_session(recording)?;
+    let mut report = crate::report::build(loaded, params)?;
+    // A signature on both sides of the read: a recording capture was still
+    // appending to is analyzed and returned, but never published under an
+    // identity that does not describe what was read.
+    match (before, file_signature(recording).ok().flatten()) {
+        (Some(a), Some(b)) if a == b => {
+            report.recording_signature = Some(a);
+            write_cache(cache, &report)?;
+        }
+        _ => tracing::debug!(
+            session = %id,
+            "recording changed while it was being read; not caching the report"
+        ),
+    }
+    Ok(report)
+}
+
+fn log_reuse(id: &str, cache: &Path) {
+    tracing::info!(
+        session = %id,
+        cache = %cache.display(),
+        check = CacheOutcome::Hit.as_str(),
+        "reusing cached report"
+    );
 }
 
 /// Load `recording`, reusing `json_dir`'s cached report when it is current.
@@ -168,55 +311,69 @@ pub fn report_for(
     json_dir: Option<&Path>,
     params: Params,
 ) -> Result<(Report, CacheOutcome), AnalyzeError> {
-    let cache = json_dir.and_then(|dir| match recording_id(recording) {
-        Some(id) => Some((id, cache_path(dir, id))),
-        None => {
-            tracing::debug!(
-                path = %recording.display(),
-                "recording name is not a session id; not using the report cache"
-            );
-            None
-        }
-    });
-    let Some((id, path)) = cache else {
+    let Some((id, path)) = cache_target(recording, json_dir) else {
         let loaded = crate::load::load_session(recording)?;
         return Ok((crate::report::build(loaded, params)?, CacheOutcome::Missing));
     };
 
     let (hit, why) = read_cache(&path, recording, params);
     if let Some(mut r) = hit {
-        tracing::info!(
-            session = %id,
-            cache = %path.display(),
-            check = why.as_str(),
-            "reusing cached report"
-        );
+        log_reuse(id, &path);
         r.refresh_sidecar(read_sidecar(recording).as_ref());
         return Ok((r, why));
     }
-    tracing::info!(
-        session = %id,
-        cache = %path.display(),
-        check = why.as_str(),
-        "recomputing report"
-    );
-    let before = file_signature(recording).ok().flatten();
-    let loaded = crate::load::load_session(recording)?;
-    let mut report = crate::report::build(loaded, params)?;
-    // A signature on both sides of the read: a recording capture was still
-    // appending to is analyzed and returned, but never published under an
-    // identity that does not describe what was read.
-    match (before, file_signature(recording).ok().flatten()) {
-        (Some(a), Some(b)) if a == b => {
-            report.recording_signature = Some(a);
-            write_cache(&path, &report)?;
-        }
-        _ => tracing::debug!(
-            session = %id,
-            "recording changed while it was being read; not caching the report"
-        ),
+    Ok((recompute(recording, id, &path, params, why)?, why))
+}
+
+/// The headline summary of `recording` (`report --summary`): what
+/// [`report_for`] then [`Report::headline`] returns, with the same cache
+/// reuse and write-back — but a cache hit reads only the sections the summary
+/// is made of ([`read_cache_summary`]) instead of the whole report.
+#[hotpath::measure]
+pub fn summary_for(
+    recording: &Path,
+    json_dir: Option<&Path>,
+    params: Params,
+) -> Result<(ReportSummary, CacheOutcome), AnalyzeError> {
+    let Some((id, path)) = cache_target(recording, json_dir) else {
+        let (report, why) = report_for(recording, None, params)?;
+        return Ok((report.headline(), why));
+    };
+    let (hit, why) = read_cache_summary(&path, recording, params);
+    if let Some(summary) = hit {
+        log_reuse(id, &path);
+        return Ok((summary, why));
     }
-    Ok((report, why))
+    Ok((
+        recompute(recording, id, &path, params, why)?.headline(),
+        why,
+    ))
+}
+
+/// The trend row of `recording`, and nothing else of its report: what
+/// [`report_for`] then [`row`] returns. Without `--metric` columns a cache
+/// hit reads only the report's headline sections ([`read_cache_row`]).
+fn row_for(
+    recording: &Path,
+    json_dir: Option<&Path>,
+    params: Params,
+    metrics: &[String],
+) -> Result<TrendRow, AnalyzeError> {
+    if metrics.is_empty()
+        && let Some((id, path)) = cache_target(recording, json_dir)
+    {
+        let (hit, why) = read_cache_row(&path, recording, params);
+        if let Some(row) = hit {
+            log_reuse(id, &path);
+            return Ok(row);
+        }
+        let report = recompute(recording, id, &path, params, why)?;
+        return Ok(row(&report, false, metrics));
+    }
+    // The report is summarized and dropped here, on the worker, so four
+    // sessions in flight never means four full reports resident.
+    let (report, why) = report_for(recording, json_dir, params)?;
+    Ok(row(&report, why == CacheOutcome::Hit, metrics))
 }
 
 /// One session's line in the longitudinal table.
@@ -318,7 +475,9 @@ const TREND_MAX_WORKERS: usize = 4;
 /// The real constraint is memory, not cores: a session peaks at roughly 2.5×
 /// its file size in RAM, and recordings run past a gigabyte. One session is
 /// always admitted however large it is, so a 1.2 GB recording runs on its own
-/// and the small ones still pack four at a time.
+/// and the small ones still pack four at a time — an idle worker takes the
+/// first recording that fits rather than waiting behind one that does not
+/// (see [`next_admissible`]).
 const TREND_BYTES_IN_FLIGHT: u64 = 512 * 1024 * 1024;
 
 /// What one worker hands back for one recording: its row, or why it was
@@ -326,13 +485,120 @@ const TREND_BYTES_IN_FLIGHT: u64 = 512 * 1024 * 1024;
 /// says the same things in the same sequence however the work was scheduled.
 type SessionOutcome = Result<TrendRow, String>;
 
-/// The scheduler's shared state: whose turn it is, how many recording bytes
-/// are being worked on, and where the answers go.
-struct Schedule {
-    next: usize,
+/// The scheduler's shared state: which jobs have been handed out, how many
+/// bytes are being worked on, and where the answers go.
+struct Schedule<T> {
+    taken: Vec<bool>,
+    remaining: usize,
     in_flight: u64,
     active: usize,
-    out: Vec<Option<SessionOutcome>>,
+    out: Vec<Option<T>>,
+}
+
+/// The job an idle worker should start now: the first one not yet taken that
+/// fits what is left of `budget`. `None` means wait (or, with nothing left
+/// untaken, stop).
+///
+/// When nothing is running, the first untaken job is admitted whatever its
+/// size, so one larger than the whole budget still runs — alone, and only
+/// after every job that fits has been handed out.
+///
+/// Taking strictly the next job instead made every idle worker wait behind a
+/// large one while later small ones would have fitted
+/// (`docs/PERFORMANCE-2026-11-14.md`, A6).
+fn next_admissible(
+    sizes: &[u64],
+    taken: &[bool],
+    in_flight: u64,
+    active: usize,
+    budget: u64,
+) -> Option<usize> {
+    let mut untaken = (0..sizes.len()).filter(|&i| !taken[i]);
+    let first = untaken.next()?;
+    std::iter::once(first)
+        .chain(untaken)
+        .find(|&i| in_flight.saturating_add(sizes[i]) <= budget)
+        .or((active == 0).then_some(first))
+}
+
+/// Run `job(i)` for every `i` in `0..sizes.len()` on up to `workers` scoped
+/// threads, never with more than `budget` bytes of `sizes` in flight unless a
+/// single job exceeds it on its own. Results land in their own slot, so the
+/// output does not depend on which worker ran what, or when.
+fn run_within_budget<T: Send>(
+    sizes: &[u64],
+    workers: usize,
+    budget: u64,
+    job: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    let schedule = Mutex::new(Schedule {
+        taken: vec![false; sizes.len()],
+        remaining: sizes.len(),
+        in_flight: 0,
+        active: 0,
+        out: (0..sizes.len()).map(|_| None).collect(),
+    });
+    let admitted = Condvar::new();
+    let (sched, admitted, job) = (&schedule, &admitted, &job);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(move || {
+                loop {
+                    let index = {
+                        let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if s.remaining == 0 {
+                                return;
+                            }
+                            if let Some(index) =
+                                next_admissible(sizes, &s.taken, s.in_flight, s.active, budget)
+                            {
+                                s.taken[index] = true;
+                                s.remaining -= 1;
+                                s.in_flight += sizes[index];
+                                s.active += 1;
+                                break index;
+                            }
+                            // Something is running (or nothing would have
+                            // been refused), and its completion notifies.
+                            s = admitted.wait(s).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+
+                    // Released even when the job panics: the scope re-raises
+                    // the panic once every worker is done, and the others can
+                    // only get there if the bytes this one held are returned.
+                    let slot = Release {
+                        sched,
+                        admitted,
+                        size: sizes[index],
+                    };
+                    let outcome = job(index);
+                    sched.lock().unwrap_or_else(|e| e.into_inner()).out[index] = Some(outcome);
+                    drop(slot);
+                }
+            });
+        }
+    });
+    schedule.into_inner().unwrap_or_else(|e| e.into_inner()).out
+}
+
+/// Hands a finished job's bytes back to the budget and wakes the waiters.
+struct Release<'a, T> {
+    sched: &'a Mutex<Schedule<T>>,
+    admitted: &'a Condvar,
+    size: u64,
+}
+
+impl<T> Drop for Release<'_, T> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+            s.in_flight -= self.size;
+            s.active -= 1;
+        }
+        self.admitted.notify_all();
+    }
 }
 
 fn analyze_one(
@@ -341,14 +607,9 @@ fn analyze_one(
     params: Params,
     metrics: &[String],
 ) -> SessionOutcome {
-    match report_for(path, json_dir, params) {
-        // The report is summarized and dropped here, on the worker, so four
-        // sessions in flight never means four full reports resident.
-        Ok((report, why)) => Ok(row(&report, why == CacheOutcome::Hit, metrics)),
-        // The whole chain: the outer message alone is "failed to read x",
-        // without the reason it failed.
-        Err(e) => Err(crate::load::error_chain(&e)),
-    }
+    // The whole chain: the outer message alone is "failed to read x", without
+    // the reason it failed.
+    row_for(path, json_dir, params, metrics).map_err(|e| crate::load::error_chain(&e))
 }
 
 /// The recordings in `dir` by the recording-id rule, in path order. A
@@ -410,58 +671,9 @@ pub fn compute(
             .map(|p| Some(analyze_one(p, json_dir, params, metrics)))
             .collect()
     } else {
-        let schedule = Mutex::new(Schedule {
-            next: 0,
-            in_flight: 0,
-            active: 0,
-            out: (0..paths.len()).map(|_| None).collect(),
-        });
-        let admitted = Condvar::new();
-        let (paths, sizes) = (&paths, &sizes);
-        let (sched, admitted) = (&schedule, &admitted);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(move || {
-                    loop {
-                        // Take the next recording, waiting while admitting it
-                        // would put too many bytes in flight. A worker with
-                        // nothing else running is always admitted, so a
-                        // recording larger than the whole budget still gets
-                        // analyzed — alone.
-                        let Some((index, size)) = ({
-                            let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                if s.next >= paths.len() {
-                                    break None;
-                                }
-                                let index = s.next;
-                                let size = sizes[index];
-                                if s.active == 0 || s.in_flight + size <= TREND_BYTES_IN_FLIGHT {
-                                    s.next += 1;
-                                    s.in_flight += size;
-                                    s.active += 1;
-                                    break Some((index, size));
-                                }
-                                s = admitted.wait(s).unwrap_or_else(|e| e.into_inner());
-                            }
-                        }) else {
-                            return;
-                        };
-
-                        let outcome = analyze_one(&paths[index], json_dir, params, metrics);
-
-                        {
-                            let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
-                            s.out[index] = Some(outcome);
-                            s.in_flight -= size;
-                            s.active -= 1;
-                        }
-                        admitted.notify_all();
-                    }
-                });
-            }
-        });
-        schedule.into_inner().unwrap_or_else(|e| e.into_inner()).out
+        run_within_budget(&sizes, workers, TREND_BYTES_IN_FLIGHT, |index| {
+            analyze_one(&paths[index], json_dir, params, metrics)
+        })
     };
 
     let mut rows = Vec::with_capacity(paths.len());
@@ -907,6 +1119,237 @@ mod tests {
         };
         let text = serde_json::to_string(&odd).unwrap();
         assert_eq!(serde_json::from_str::<Params>(&text).unwrap(), odd);
+    }
+
+    /// A marked, clicked session with a sidecar: every section the summary
+    /// and the trend row project from has something in it.
+    fn marked_session(dir: &Path) -> PathBuf {
+        use telemouse_core::recordings::{ExitReason, SessionMeta};
+
+        let mut cfg = testutil::session_cfg();
+        cfg.session_id = "s-marked".into();
+        let markers = [("sens A", 400), ("sens B", 2_000)].map(|(label, ms)| {
+            let mut m = testutil::marker_at(ms, label);
+            m.session_id = cfg.session_id.clone();
+            m
+        });
+        testutil::write_session(dir, &cfg, Some("cs2.exe"), &flicky_events(8), &markers, 128);
+        let meta = SessionMeta {
+            session_id: "s-marked".into(),
+            exit: ExitReason::Running.as_str().into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.join("s-marked.meta.json"),
+            meta.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        dir.join("s-marked.jsonl")
+    }
+
+    /// The readers that leave the row tables on disk must give exactly what
+    /// the full parse gives: the summary and the trend row, field for field.
+    #[test]
+    fn the_slim_cache_readers_match_the_full_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let recording = marked_session(dir.path());
+        let params = Params::default();
+
+        let (built, why) = report_for(&recording, Some(&cache_dir), params).unwrap();
+        assert_eq!(why, CacheOutcome::Missing);
+        // The fixture has to exercise the tables the slim readers skip.
+        assert!(!built.flicks.flicks.is_empty() && !built.per_second.is_empty());
+        assert_eq!(built.markers.len(), 2);
+
+        let cache = cache_path(&cache_dir, "s-marked");
+        let (full, why) = report_for(&recording, Some(&cache_dir), params).unwrap();
+        assert_eq!(why, CacheOutcome::Hit);
+
+        let (summary, why) = read_cache_summary(&cache, &recording, params);
+        assert_eq!(why, CacheOutcome::Hit);
+        let summary = summary.unwrap();
+        assert_eq!(summary, full.headline());
+        assert!(summary.quality.unfinished && !summary.warnings.is_empty());
+        assert_eq!(summary.segments.len(), 3);
+        // Byte for byte what `report --summary` prints either way.
+        assert_eq!(
+            serde_json::to_string_pretty(&summary).unwrap(),
+            serde_json::to_string_pretty(&full.headline()).unwrap()
+        );
+        let (via_for, why) = summary_for(&recording, Some(&cache_dir), params).unwrap();
+        assert_eq!((via_for, why), (summary, CacheOutcome::Hit));
+
+        let (slim_row, why) = read_cache_row(&cache, &recording, params);
+        assert_eq!(why, CacheOutcome::Hit);
+        assert_eq!(slim_row.unwrap(), row(&full, true, &[]));
+        assert_eq!(
+            row_for(&recording, Some(&cache_dir), params, &[]).unwrap(),
+            row(&full, true, &[])
+        );
+
+        // A document with its keys in another order (here: sorted, as a
+        // `Value` round trip leaves them, so the tables no longer come last)
+        // reads the same.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+        std::fs::write(&cache, serde_json::to_string(&v).unwrap()).unwrap();
+        let (full, why) = report_for(&recording, Some(&cache_dir), params).unwrap();
+        assert_eq!(why, CacheOutcome::Hit);
+        let (reordered, why) = read_cache_summary(&cache, &recording, params);
+        assert_eq!(why, CacheOutcome::Hit);
+        assert_eq!(reordered.unwrap(), full.headline());
+        assert_eq!(
+            read_cache_row(&cache, &recording, params).0.unwrap(),
+            row(&full, true, &[])
+        );
+    }
+
+    /// The slim readers refuse a cache for the same reasons the full one
+    /// does, and a summary asked of a refused cache is recomputed and equal.
+    #[test]
+    fn the_slim_cache_readers_refuse_what_the_full_reader_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let recording = marked_session(dir.path());
+        let params = Params::default();
+        let (built, _) = report_for(&recording, Some(&cache_dir), params).unwrap();
+        let cache = cache_path(&cache_dir, "s-marked");
+        let outcomes = |params: Params| {
+            (
+                read_cache(&cache, &recording, params).1,
+                read_cache_summary(&cache, &recording, params).1,
+                read_cache_row(&cache, &recording, params).1,
+            )
+        };
+        let all = |why: CacheOutcome| (why, why, why);
+
+        let other = Params {
+            flick_speed: 500_000.0,
+            ..params
+        };
+        assert_eq!(outcomes(other), all(CacheOutcome::ParamsChanged));
+
+        let original = std::fs::read_to_string(&cache).unwrap();
+        let edited = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value = serde_json::from_str(&original).unwrap();
+            edit(&mut v);
+            std::fs::write(&cache, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        };
+        edited(&|v| v["analyzer_version"] = "0.0.0-ancient".into());
+        assert_eq!(outcomes(params), all(CacheOutcome::VersionChanged));
+        edited(&|v| v["session"]["session_id"] = "s-other".into());
+        assert_eq!(outcomes(params), all(CacheOutcome::Mismatch));
+        // A section the summary needs is gone: unreadable to every reader,
+        // even though the stamps are fine.
+        edited(&|v| {
+            v.as_object_mut().unwrap().remove("micro");
+        });
+        assert_eq!(outcomes(params), all(CacheOutcome::Unreadable));
+        // A stale version stamp is the reason given even when the rest of
+        // the document would not parse: it is judged before anything else.
+        edited(&|v| {
+            v.as_object_mut().unwrap().remove("micro");
+            v["schema"] = "telemouse-analyze/2".into();
+        });
+        assert_eq!(outcomes(params), all(CacheOutcome::VersionChanged));
+        std::fs::write(&cache, "{ not json").unwrap();
+        assert_eq!(outcomes(params), all(CacheOutcome::Unreadable));
+
+        // ...and asking for the summary anyway recomputes and republishes.
+        let (summary, why) = summary_for(&recording, Some(&cache_dir), params).unwrap();
+        assert_eq!(why, CacheOutcome::Unreadable);
+        assert_eq!(summary, built.headline());
+        assert_eq!(outcomes(params), all(CacheOutcome::Hit));
+    }
+
+    /// An idle worker takes the first recording that fits, not strictly the
+    /// next one.
+    #[test]
+    fn the_scheduler_skips_ahead_to_a_recording_that_fits() {
+        let sizes = [60, 50, 10, 200, 30];
+        let none = [false; 5];
+        // Nothing running: the first one, in order.
+        assert_eq!(next_admissible(&sizes, &none, 0, 0, 100), Some(0));
+        // 60 in flight: 50 does not fit, 10 does.
+        let t = [true, false, false, false, false];
+        assert_eq!(next_admissible(&sizes, &t, 60, 1, 100), Some(2));
+        // 70 in flight: 50 and 200 do not fit, 30 does.
+        let t = [true, false, true, false, false];
+        assert_eq!(next_admissible(&sizes, &t, 70, 2, 100), Some(4));
+        // 100 in flight and nothing fits: wait.
+        let t = [true, false, true, false, true];
+        assert_eq!(next_admissible(&sizes, &t, 100, 3, 100), None);
+        // Everything that fits is done; the oversized one is admitted only
+        // when nothing else is running.
+        let t = [true, true, true, false, true];
+        assert_eq!(next_admissible(&sizes, &t, 50, 1, 100), None);
+        assert_eq!(next_admissible(&sizes, &t, 0, 0, 100), Some(3));
+        // A smaller one is preferred to an oversized one ahead of it.
+        let t = [true, true, true, false, false];
+        assert_eq!(next_admissible(&sizes, &t, 0, 0, 100), Some(4));
+        // Nothing left.
+        assert_eq!(next_admissible(&sizes, &[true; 5], 0, 0, 100), None);
+        assert_eq!(next_admissible(&[], &[], 0, 0, 100), None);
+        // Sizes that would overflow the sum are simply too large.
+        assert_eq!(
+            next_admissible(&[u64::MAX, 1], &[false; 2], 5, 1, 100),
+            Some(1)
+        );
+    }
+
+    /// Every job runs exactly once and lands in its own slot, the budget is
+    /// never exceeded except by a job running alone, and jobs larger than
+    /// the whole budget are not starved.
+    #[test]
+    fn the_scheduler_runs_everything_within_the_budget() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        const BUDGET: u64 = 100;
+        let sizes: Vec<u64> = (0..60u64)
+            .map(|i| match i % 10 {
+                0 => 250, // larger than the whole budget
+                3 => 100, // exactly the budget
+                7 => 0,
+                k => 5 + k * 9,
+            })
+            .collect();
+        let (in_flight, active) = (AtomicU64::new(0), AtomicUsize::new(0));
+        let runs: Vec<AtomicUsize> = sizes.iter().map(|_| AtomicUsize::new(0)).collect();
+        let (over_budget, max_active) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+        let out = run_within_budget(&sizes, 4, BUDGET, |i| {
+            let bytes = in_flight.fetch_add(sizes[i], Ordering::SeqCst) + sizes[i];
+            let others = active.fetch_add(1, Ordering::SeqCst);
+            max_active.fetch_max(others + 1, Ordering::SeqCst);
+            if bytes > BUDGET && others > 0 {
+                over_budget.fetch_add(1, Ordering::SeqCst);
+            }
+            runs[i].fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(200 + 37 * (i as u64 % 5)));
+            // Still alone at the end, if it was admitted over the budget.
+            if in_flight.load(Ordering::SeqCst) > BUDGET && active.load(Ordering::SeqCst) > 1 {
+                over_budget.fetch_add(1, Ordering::SeqCst);
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            in_flight.fetch_sub(sizes[i], Ordering::SeqCst);
+            i * 3
+        });
+
+        assert_eq!(
+            out,
+            (0..sizes.len()).map(|i| Some(i * 3)).collect::<Vec<_>>()
+        );
+        assert!(runs.iter().all(|r| r.load(Ordering::SeqCst) == 1));
+        assert_eq!(over_budget.load(Ordering::SeqCst), 0);
+        assert!(max_active.load(Ordering::SeqCst) <= 4);
+
+        // One worker, and no jobs at all, are both fine.
+        assert_eq!(
+            run_within_budget(&[500, 1], 1, BUDGET, |i| i),
+            [Some(0), Some(1)]
+        );
+        assert!(run_within_budget(&[], 4, BUDGET, |i| i).is_empty());
     }
 
     #[test]

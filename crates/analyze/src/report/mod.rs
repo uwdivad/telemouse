@@ -11,6 +11,7 @@
 //! it is not comparable to anything.
 
 mod render;
+pub(crate) mod slim;
 mod summary;
 #[cfg(test)]
 mod tests;
@@ -33,7 +34,7 @@ use crate::micro::{self, MicroReport};
 use crate::per_minute::{self, MinuteRow};
 use crate::per_second::{self, SecondRow};
 use crate::quality::{self, QualityReport};
-use crate::series::{Params, ParamsError, Prepared, prepare};
+use crate::series::{Params, ParamsError, Prepared, prepare_with_parallelism};
 use crate::timefmt::format_utc_us;
 
 pub use summary::{
@@ -157,8 +158,14 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
 
 // Below this point, creating scoped OS threads costs as much as the work they
 // save. Large reports benefit from coarse parallel groups without imposing a
-// fixed startup penalty on short recordings and unit tests.
-const PARALLEL_MIN_EVENTS: usize = 250_000;
+// fixed startup penalty on tiny recordings and unit tests.
+//
+// It was 250 000, which left the typical 10–20 minute session serial.
+// Measured 2026-11-14 on nine recordings of 8 600–190 000 events (15 runs
+// each, serial against parallel): the parallel build was faster on every one,
+// 12.5 → 7.0 ms at 23 500 events and 80 → 39 ms at 183 000, so the threshold
+// sits at the small end of that range (`docs/PERFORMANCE-2026-11-14.md`, N4).
+const PARALLEL_MIN_EVENTS: usize = 25_000;
 const PARALLEL_MIN_CPUS: usize = 4;
 
 fn parallel_worthwhile(events: usize, cpus: usize) -> bool {
@@ -229,7 +236,7 @@ fn compute_metrics(p: &Prepared, parallel: bool) -> MetricResults {
             fork(
                 parallel,
                 || timed(|| quality::compute_with_warnings(p)),
-                || timed(|| kinematics::compute(p)),
+                || timed(|| kinematics::compute_with_parallelism(p, parallel)),
             )
         },
         || {
@@ -343,7 +350,7 @@ fn build_with_parallelism(
         phase: "load".to_string(),
         ms: load_ms,
     });
-    let (p, prepare_ms) = timed(|| prepare(session, params));
+    let (p, prepare_ms) = timed(|| prepare_with_parallelism(session, params, parallel));
     let p = p?;
     phase!(
         timings,

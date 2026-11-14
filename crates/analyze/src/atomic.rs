@@ -27,6 +27,26 @@ pub(crate) fn write_atomic(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> io::Result<()> {
+    publish(path, true, write)
+}
+
+/// [`write_atomic`] without the sync before the rename: still all-or-nothing
+/// to every reader while the machine stays up, but a power cut can leave the
+/// published name holding a torn document. For a cache whose reader refuses
+/// what does not parse and rebuilds it, where the sync was the larger part of
+/// writing tens of megabytes.
+pub(crate) fn write_atomic_unsynced(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
+    publish(path, false, write)
+}
+
+fn publish(
+    path: &Path,
+    sync: bool,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -44,7 +64,9 @@ pub(crate) fn write_atomic(
             let mut w = BufWriter::with_capacity(1 << 20, file);
             write(&mut w)?;
             w.flush()?;
-            w.get_ref().sync_all()?;
+            if sync {
+                w.get_ref().sync_all()?;
+            }
             drop(w);
             fs::rename(&temp, path)
         });

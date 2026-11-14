@@ -6,6 +6,60 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-14
+
+- **Performance audit, 2026-11-14.** A whole-workspace audit
+  (`docs/PERFORMANCE-2026-11-14.md`) was followed by a fix pass. Reports are
+  bit-identical to the previous analyzer; the wire format and the recording
+  files are unchanged.
+
+  - **Analyzer.** A 1.1 GB report builds in about 2.7 s instead of 3.9 s:
+    the six kinematics summaries and the per-run smoothing pass run on
+    worker threads, and the interval statistics are tallied rather than
+    sorted (−122 MB). Sessions from 25,000 events up (was 250,000) use the
+    parallel metric schedule, 15–35% off a typical 10–20 minute session.
+    `report --summary` and `trend` on a cache hit read only the headline
+    sections of `<id>.report.json` (a summary in ~48 ms instead of ~130 ms,
+    a warm 41-session trend in ~0.23 s instead of ~0.62 s), and a stale
+    cache is refused from its first 2 KB. A cold `trend` no longer idles
+    workers behind a recording too large for the byte budget (19.0 s →
+    14.8 s over 41 recordings), and the report cache write no longer
+    fsyncs. The cache file format is unchanged.
+  - **Pointer lock.** The detector needs three consecutive
+    frozen-while-active samples (was two), which removes the one-tick false
+    locks seen on the desktop. **Behaviour change:** an established lock now
+    survives pauses in mouse motion and ends only when the cursor moves, so
+    `pointer_locked` and `--locked-only` coverage rise in games (a pause of
+    250 ms used to drop the lock and flag the start of the next flick as
+    unlocked).
+  - **Capture.** A waitable timer that cannot be armed is dropped for the
+    session, so the drain cadence falls back to sleeping instead of waiting
+    ~68 ms per drain on a timer nobody armed. Kafka builds: the producer
+    linger is a fixed 250 ms instead of the batch window (about four produce
+    RPCs a second per topic rather than one per batch); the tail is flushed
+    at once on shutdown and when the in-flight set fills.
+  - **Dashboard.** The trail draw no longer scales with polling rate:
+    points under 0.75 device px from the last drawn one are skipped and
+    segments are stroked as polylines, with nothing allocated per frame. A
+    hidden dashboard tab closes its WebSocket after five seconds and
+    reconnects when shown again (session totals skip the hidden interval;
+    the `/obs` overlay never does this). The *event age* tile shows "idle"
+    after 3 s without an event instead of counting up. `?desync=0` creates
+    the canvases without `desynchronized: true`, for A/B-ing frame pacing
+    next to a game.
+  - **Control panel.** The window goes to its cheap state (page asleep and
+    suspended, slow publisher, no process scan) when minimised or left open
+    underneath a full-screen application, not only when hidden to the tray;
+    full-screen detection asks the shell and opens nothing on the game. A
+    WebView2 suspension the runtime refuses is retried up to three times
+    and `ctl.log` says whether it took. The Report button shows a
+    recording's stored summary at once when the recording, schema and
+    analyzer version are unchanged, and analyzer children run at
+    below-normal priority. The page lists the recordings folder only when
+    it can have changed, not on every poll.
+  - **MCP.** `session_summary` and `trend` run one analysis at a time and
+    read a current cache through the slim path.
+
 - **The Kafka sink is no longer in the default build.** `kafka` was the one
   default-on Cargo feature that a release user cannot use without standing
   up a broker, and it brought `rskafka`, zstd and tokio into the capture

@@ -268,6 +268,14 @@ const PROFILE = QUERY.get("profile") === "1";
    rate (60 by default), so anything above that is wasted there. */
 const FPS_DEFAULT = 120, FPS_OBS_DEFAULT = 60, FPS_BACKGROUND = 30;
 const fpsQ = parseFloat(QUERY.get("fps"));
+/* `?desync=0` asks for ordinary, compositor-synchronised canvases instead of
+   `desynchronized: true` (see Panel). A diagnostic switch for A/B-ing frame
+   pacing next to a game; anything else leaves the default alone. */
+const DESYNC = QUERY.get("desync") !== "0";
+/* How long a hidden dashboard tab keeps its live socket (`ui.pageVisibility`).
+   Long enough that flicking between tabs never reconnects, short enough that
+   a tab left behind a game stops costing anything almost at once. */
+const HIDDEN_CLOSE_MS = 5000;
 /* both is desk + aim (the original pair); pointer is Windows' cursor on
    its own; compare puts the raw hand path and the cursor side by side. */
 const VIEWS = ["both", "desk", "aim", "pointer", "compare"];
@@ -768,6 +776,119 @@ function buildRamp() {
 buildRamp();
 const ALEVELS = 7;
 
+/* A trail point closer than this to the last one drawn is not drawn: at
+   8kHz nearly every report moves the head by a fraction of a pixel, and a
+   path of 48,000 sub-pixel segments rasterises to the same picture as one
+   of a few hundred. In device pixels, so a high-DPI canvas keeps its detail. */
+const TRAIL_MIN_STEP_DEVICE_PX = 0.75;
+
+/** Working storage for `decimateTrail`, allocated once: `cap` must be at
+    least the capacity of any trail handed to it.
+
+    Points are in panel (CSS pixel) coordinates. Point `i` with
+    `bucket[i] >= 0` ends a segment that starts at point `i - 1` and is drawn
+    in that velocity × age bucket; `bucket[i] === -1` is a point nothing is
+    drawn *to* (the start of the trail, or the far side of a break).
+    `head[b]` / `next[i]` chain each bucket's segments in trail order, -1
+    terminated, so the renderer walks one bucket at a time without anything
+    having been copied or sorted. */
+function trailScratch(cap) {
+  return {
+    cap: cap, n: 0, segments: 0,
+    x: new Float64Array(cap), y: new Float64Array(cap),
+    bucket: new Int16Array(cap), next: new Int32Array(cap),
+    head: new Int32Array(VLEVELS * ALEVELS), tail: new Int32Array(VLEVELS * ALEVELS),
+  };
+}
+
+/** Turn a trail ring into what the renderer strokes: its points in panel
+    space, minus the ones under `minStep` pixels from the last point kept,
+    each kept segment filed under its velocity × age bucket. Pure: reads
+    `trail` and `view` (`w`, `h`, `cx`, `cy`, `scale` — a Panel), writes `out`
+    (a `trailScratch`), allocates nothing.
+
+    What survives decimation is chosen so the picture does not change:
+      - a segment takes the bucket of the point it ends at, as it always has;
+      - a point that is skipped is remembered, and drawn after all if the run
+        it belongs to ends there — so the newest point is always the end of
+        the line, and a hand trembling inside one pixel is still a dot;
+      - nothing is ever drawn to a point flagged `brk` or outside the decay
+        window, and the next segment starts from that point, not across it.
+    `minStep <= 0` keeps every point. */
+function decimateTrail(trail, view, now, decay, vref, minStep, out) {
+  const head = out.head, tail = out.tail;
+  head.fill(-1);
+  out.n = 0; out.segments = 0;
+  if (trail.n < 2) return out;
+  const X = out.x, Y = out.y, B = out.bucket, NX = out.next;
+  const TX = trail.x, TY = trail.y, TT = trail.t, TV = trail.v, TB = trail.brk;
+  const cap = trail.cap;
+  const inv = 1 / (vref || 1);
+  const min2 = minStep > 0 ? minStep * minStep : 0;
+  const ox = view.w / 2, oy = view.h / 2, cx = view.cx, cy = view.cy, sc = view.scale;
+
+  let idx = trail.head;
+  /* The last point kept: where the next segment starts. */
+  let ex = ox + (TX[idx] - cx) * sc, ey = oy + (TY[idx] - cy) * sc;
+  X[0] = ex; Y[0] = ey; B[0] = -1;
+  let n = 1, segments = 0;
+  /* The newest point skipped since then, and the bucket it would have had. */
+  let pending = false, pendX = 0, pendY = 0, pendB = 0;
+
+  for (let k = 1; k < trail.n; k++) {
+    idx = idx + 1 === cap ? 0 : idx + 1;
+    const x = ox + (TX[idx] - cx) * sc, y = oy + (TY[idx] - cy) * sc;
+    let b = -1;
+    if (!TB[idx]) {
+      const age = now - TT[idx];
+      if (age <= decay && age >= 0) {
+        const vi = clamp(Math.round(Math.sqrt(clamp(TV[idx] * inv, 0, 1)) * (VLEVELS - 1)), 0, VLEVELS - 1);
+        const ai = clamp(Math.round((1 - age / decay) * (ALEVELS - 1)), 0, ALEVELS - 1);
+        b = vi * ALEVELS + ai;
+      }
+    }
+    if (b < 0) {
+      /* Nothing is drawn to this point. If the run before it ended on a
+         skipped point, draw to that one first; then start over from here. */
+      if (pending) {
+        X[n] = pendX; Y[n] = pendY; B[n] = pendB; NX[n] = -1;
+        if (head[pendB] < 0) head[pendB] = n; else NX[tail[pendB]] = n;
+        tail[pendB] = n;
+        n++; segments++;
+        pending = false;
+      }
+      /* A start nothing was drawn from is replaced, not kept. */
+      if (B[n - 1] < 0) n--;
+      X[n] = x; Y[n] = y; B[n] = -1;
+      n++;
+      ex = x; ey = y;
+      continue;
+    }
+    const dx = x - ex, dy = y - ey;
+    if (dx * dx + dy * dy < min2) {
+      pending = true; pendX = x; pendY = y; pendB = b;
+      continue;
+    }
+    X[n] = x; Y[n] = y; B[n] = b; NX[n] = -1;
+    if (head[b] < 0) head[b] = n; else NX[tail[b]] = n;
+    tail[b] = n;
+    n++; segments++;
+    ex = x; ey = y;
+    pending = false;
+  }
+  if (pending) {
+    X[n] = pendX; Y[n] = pendY; B[n] = pendB; NX[n] = -1;
+    if (head[pendB] < 0) head[pendB] = n; else NX[tail[pendB]] = n;
+    tail[pendB] = n;
+    n++; segments++;
+  }
+  out.n = n; out.segments = segments;
+  return out;
+}
+
+/* One scratch for every panel: drawing is synchronous, a panel at a time. */
+const TRAIL_SCRATCH = trailScratch(TRAIL_CAP);
+
 /* =====================================================================
    Engine
    ===================================================================== */
@@ -1134,6 +1255,16 @@ const engine = {
     const idle = this.latencyReceivedAt === null || receivedAt - this.latencyReceivedAt >= NO_DATA_SECS;
     this.arrivalLatencyMs = idle ? ms : this.arrivalLatencyMs + (ms - this.arrivalLatencyMs) * 0.25;
     this.latencyReceivedAt = receivedAt;
+  },
+
+  /** The page stopped listening for a while on purpose (a hidden dashboard
+      tab closes its socket) and is about to resume. The `seq_no` jump that
+      follows is not loss, so the sequence starts over; and a button whose
+      release went by unheard must not keep its ring. Totals simply do not
+      include what was not received. */
+  noteFeedGap() {
+    this.lastSeq = null;
+    if (this.held) { this.held = 0; this.dirty = true; }
   },
 
   /** Discard the oldest `k` events and everything indexed by them. */
@@ -1562,7 +1693,8 @@ class Panel {
   constructor(canvasId, opts) {
     this.canvas = document.getElementById(canvasId);
     /* alpha:false lets the compositor skip a blend of the whole canvas every
-       frame; desynchronized lets it skip a frame of latency getting there.
+       frame; desynchronized lets it skip a frame of latency getting there
+       (`?desync=0` turns that one off, to rule it out when chasing a hitch).
        Both mean the canvas is opaque, so the background is painted, not
        cleared. The one exception is an OBS overlay with a see-through
        background, which needs the alpha channel and pays for it. */
@@ -1571,7 +1703,7 @@ class Panel {
        which follows the theme. */
     this.bg = OBS ? OBS.bg : null;
     this.hidden = false;
-    this.ctx = this.canvas.getContext("2d", { alpha: !this.opaque, desynchronized: true });
+    this.ctx = this.canvas.getContext("2d", { alpha: !this.opaque, desynchronized: DESYNC });
     /* Which of the engine's three integrations this panel draws: the hand
        in cm, the crosshair in degrees, or Windows' cursor in pixels. */
     this.space = opts.space;           // "desk" | "aim" | "ptr"
@@ -1589,8 +1721,6 @@ class Panel {
     this.flashEl = document.getElementById(opts.flashId);
     this.cx = 0; this.cy = 0; this.scale = 20;
     this.w = 0; this.h = 0; this.dpr = 1;
-    this.buckets = [];
-    for (let i = 0; i < VLEVELS * ALEVELS; i++) this.buckets.push([]);
     this.flashUntil = -1;
     this.resize();
     new ResizeObserver(() => this.resize()).observe(this.canvas.parentElement);
@@ -1749,50 +1879,36 @@ class Panel {
   }
 
   /** Batched polyline rendering: segments are quantised into velocity ×
-      age buckets so a 3-second 1kHz trail costs ~100 stroke calls, not
-      3000. Reads straight out of the ring's typed arrays. */
+      age buckets so a 3-second trail costs ~100 stroke calls whatever the
+      polling rate, and `decimateTrail` has already dropped the points no
+      pixel would show. Within a bucket, segments that follow one another
+      are one polyline; the round joins cover exactly what the round caps of
+      separate segments did, and one stroke() per bucket means the overlaps
+      never blend twice. */
   drawTrail(ctx, trail, eng, vref) {
     if (trail.n < 2) return;
-    const buckets = this.buckets;
-    for (let i = 0; i < buckets.length; i++) buckets[i].length = 0;
-
-    const now = eng.playT;
-    const decay = eng.decay;
-    const inv = 1 / (vref || 1);
-    const cap = trail.cap;
-    const TX = trail.x, TY = trail.y, TT = trail.t, TV = trail.v, TB = trail.brk;
-
-    let idx = trail.head;
-    let px = this.toX(TX[idx]), py = this.toY(TY[idx]);
-    for (let k = 1; k < trail.n; k++) {
-      idx = idx + 1 === cap ? 0 : idx + 1;
-      const x = this.toX(TX[idx]), y = this.toY(TY[idx]);
-      if (!TB[idx]) {
-        const age = now - TT[idx];
-        if (age <= decay && age >= 0) {
-          const vi = clamp(Math.round(Math.sqrt(clamp(TV[idx] * inv, 0, 1)) * (VLEVELS - 1)), 0, VLEVELS - 1);
-          const ai = clamp(Math.round((1 - age / decay) * (ALEVELS - 1)), 0, ALEVELS - 1);
-          const b = buckets[vi * ALEVELS + ai];
-          b.push(px, py, x, y);
-        }
-      }
-      px = x; py = y;
-    }
+    const path = decimateTrail(trail, this, eng.playT, eng.decay, vref,
+      TRAIL_MIN_STEP_DEVICE_PX / this.dpr, TRAIL_SCRATCH);
+    if (!path.segments) return;
+    const X = path.x, Y = path.y, NX = path.next, head = path.head;
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     for (let vi = 0; vi < VLEVELS; vi++) {
       for (let ai = 0; ai < ALEVELS; ai++) {
-        const b = buckets[vi * ALEVELS + ai];
-        if (!b.length) continue;
+        let i = head[vi * ALEVELS + ai];
+        if (i < 0) continue;
         const fade = (ai + 1) / ALEVELS;
         ctx.globalAlpha = 0.10 + 0.85 * fade * fade;
         ctx.strokeStyle = RAMP_CSS[vi];
         ctx.lineWidth = (1.1 + 1.5 * (vi / (VLEVELS - 1)) * fade) * S;
         ctx.beginPath();
-        for (let k = 0; k < b.length; k += 4) {
-          ctx.moveTo(b[k], b[k + 1]);
-          ctx.lineTo(b[k + 2], b[k + 3]);
+        /* Segment i runs from point i-1 to point i. A segment whose
+           predecessor is in this bucket too continues its polyline; any
+           other starts a subpath where the previous bucket's one ended. */
+        for (let prev = -2; i >= 0; prev = i, i = NX[i]) {
+          if (i !== prev + 1) ctx.moveTo(X[i - 1], Y[i - 1]);
+          ctx.lineTo(X[i], Y[i]);
         }
         ctx.stroke();
       }
@@ -2051,6 +2167,10 @@ const ui = {
   ws: null,
   wsRetry: 0,
   wsTimer: null,
+  /* Hidden-tab socket parking (see `pageVisibility`): the grace timer, and
+     whether the live socket is closed because nobody is looking. */
+  hideTimer: null,
+  parked: false,
   loadedSession: null,
   loadToken: 0,
   sessions: [],
@@ -2193,6 +2313,8 @@ const ui = {
 
   connect() {
     this.disconnect();
+    /* Whoever asks for a socket gets one; only `parkHidden` sets this. */
+    this.parked = false;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = proto + "//" + location.host + "/ws";
     this.setConn("warn", "connecting");
@@ -2240,6 +2362,50 @@ const ui = {
     this.setConn("err", "retry in " + Math.round(delay / 100) / 10 + "s");
     clearTimeout(this.wsTimer);
     this.wsTimer = setTimeout(() => this.connect(), delay);
+  },
+
+  /* ---------------- hidden tab ----------------
+     A dashboard tab nobody is looking at — the one left open behind a game —
+     used to keep its socket: every batch parsed and appended, 40 wake-ups a
+     second, for a picture rAF was not painting. So a tab hidden for
+     HIDDEN_CLOSE_MS lets the socket go, and takes it back the moment it is
+     looked at again.
+
+     Dashboard only. The overlay never comes here: an OBS browser source can
+     report itself hidden while it is on air, and `/obs` in a plain browser
+     is somebody previewing that same page. */
+
+  /** The page became visible or hidden (`visibilitychange`). */
+  pageVisibility(visible) {
+    if (OBS) return;
+    clearTimeout(this.hideTimer);
+    this.hideTimer = null;
+    if (!visible) {
+      this.hideTimer = setTimeout(() => this.parkHidden(), HIDDEN_CLOSE_MS);
+      return;
+    }
+    if (!this.parked) return;
+    this.parked = false;
+    if (this.mode !== "live") return;
+    /* The batches that went by while nobody was listening were not lost, and
+       a button released meanwhile must not stay drawn as held. */
+    engine.noteFeedGap();
+    this.wsRetry = 0;
+    this.connect();
+  },
+
+  /** Still hidden after the grace period: close the live socket, quietly.
+      Replay has no socket to close, and a load in progress is a fetch the
+      user asked for; neither is touched. `disconnect` also cancels a pending
+      retry, so a socket that was down when the tab was hidden stays down
+      until `pageVisibility(true)` instead of retrying into the dark. */
+  parkHidden() {
+    this.hideTimer = null;
+    if (OBS || this.parked || this.mode !== "live") return;
+    if (document.visibilityState !== "hidden") return;
+    this.disconnect();
+    this.parked = true;
+    this.setConn("", "paused while hidden");
   },
 
   /* ---------------- replay ---------------- */
@@ -2720,7 +2886,7 @@ let refreshEst = 60;
 const SE = {};
 for (const id of [
   "sSpeedCm", "sSpeedDeg", "sSpeedPx", "sDistM", "sDistDeg", "sCpm", "sClicks", "sEps",
-  "sLat", "sLatUnit", "statLat", "sAge", "statAge", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
+  "sLat", "sLatUnit", "statLat", "sAge", "sAgeUnit", "statAge", "sLag", "statLag", "sFps", "sFpsRef", "statFps",
   "sDrops", "statDrops", "sLost", "statLost", "sAbs", "statAbs",
   "sBad", "statBad", "statBridge", "sBridge", "sBridgeSub",
   "sLocked", "sCpi", "gameText", "sProf",
@@ -2753,10 +2919,14 @@ function paintStats(now) {
   for (const [id, key] of SHARED_READOUTS) setText(SE[id], hudValue(key, e, now));
   setText(SE.sClicks, hudValue("clicks", e, now) + " total");
 
-  /* Event age keeps increasing during normal inactivity. Delivery latency
-     only changes on arrival; old samples become idle. Neither is a replay metric. */
+  /* Event age counts up between events and delivery latency only changes on
+     arrival; after NO_DATA_SECS without one, both read "idle" and stop
+     changing. Neither is a replay metric. */
   const live = ui.mode === "live";
-  SE.statAge.classList.toggle("dim", !live);
+  const age = hudValue("eventage", e, now);
+  const aged = age !== "—" && age !== "idle";
+  setText(SE.sAgeUnit, aged ? "ms" : "");
+  SE.statAge.classList.toggle("dim", !live || !aged);
   const latency = hudValue("latency", e, now);
   const measured = latency !== "—" && latency !== "idle";
   setText(SE.sLat, latency);
@@ -2938,7 +3108,11 @@ function setVisible(channel, on) {
     return;
   }
   if (typeof document.visibilityState === "string") {
-    const sync = () => setVisible("page", document.visibilityState !== "hidden");
+    const sync = () => {
+      const visible = document.visibilityState !== "hidden";
+      setVisible("page", visible);
+      ui.pageVisibility(visible);
+    };
     document.addEventListener("visibilitychange", sync);
     sync();
   }
@@ -3008,7 +3182,12 @@ function hudValue(key, e, now = nowSec()) {
     case "latency": return latencyValue(e, now);
     case "eventage": {
       const us = ui.mode === "live" ? e.newestUtcUs() : null;
-      return us === null ? "—" : ((Date.now() * 1000 - us) / 1000).toFixed(1);
+      if (us === null) return "—";
+      /* Once nothing has arrived for NO_DATA_SECS the age is just a clock:
+         a number that changes every repaint, forever, to say "idle". Say
+         that instead, as the latency readout does, and stop repainting. */
+      if (e.latencyReceivedAt !== null && now - e.latencyReceivedAt >= NO_DATA_SECS) return "idle";
+      return ((Date.now() * 1000 - us) / 1000).toFixed(1);
     }
     case "status":
       if (staleView.kind === "live") return "live";
@@ -3022,7 +3201,9 @@ function paintHud() {
   for (const it of hud.items) {
     const v = hudValue(it.key, e);
     if (v !== it.last) { it.last = v; it.el.textContent = v; }
-    if (it.key === "latency" && it.unit) setText(it.unit, v === "idle" || v === "—" ? "" : "ms");
+    if ((it.key === "latency" || it.key === "eventage") && it.unit) {
+      setText(it.unit, v === "idle" || v === "—" ? "" : "ms");
+    }
   }
   /* The panel hints are only visible with labels on; paintStats normally
      keeps them current, and this is its stand-in. */
@@ -3384,5 +3565,7 @@ window.telemouse = {
    functions that would otherwise only be reachable as leaked VM globals. */
 window.telemouse._test = {
   paintStats: paintStats, hudValue: hudValue, setView: setView, isSafeId: isSafeId,
-  streamLines: streamLines, limits: { BUFFER_MS: BUFFER_MS, TRAIL_SECS: TRAIL_SECS, OBS_SCALE: OBS_SCALE },
+  streamLines: streamLines, Trail: Trail, trailScratch: trailScratch, decimateTrail: decimateTrail,
+  trailLevels: { v: VLEVELS, a: ALEVELS }, trailMinStep: TRAIL_MIN_STEP_DEVICE_PX,
+  hiddenCloseMs: HIDDEN_CLOSE_MS, desync: DESYNC, limits: { BUFFER_MS: BUFFER_MS, TRAIL_SECS: TRAIL_SECS, OBS_SCALE: OBS_SCALE },
 };

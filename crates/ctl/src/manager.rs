@@ -72,6 +72,9 @@ pub const VIZ: &str = "viz";
 /// The analyzer's per-recording report task, whose binary also makes the
 /// summaries the report card is drawn from.
 pub const REPORT: &str = "report";
+/// The analyzer's executable, without extension: what the `report` and
+/// `trend` tasks and the summary run launch ([`Component::background`]).
+pub const ANALYZER_BIN: &str = "telemouse-analyze";
 
 /// The id of the sample recording a release ships (`recordings/demo-session.jsonl`):
 /// the first-run guide offers it when it is there.
@@ -132,6 +135,19 @@ pub struct Component {
     /// a report computed once is reused by the next run over the same
     /// recording, and by the summary the result card is drawn from.
     pub report_cache: bool,
+}
+
+impl Component {
+    /// Started below normal priority: the analyzer's tasks, and nothing
+    /// else. A report over a long recording is seconds of every core, and
+    /// it is run from a panel that sits next to a game; below normal, the
+    /// scheduler gives those cores to the game (and to the capture agent)
+    /// first and the report simply takes a little longer. The services and
+    /// `doctor` — which times the clock and the devices — keep the priority
+    /// they were given.
+    pub fn background(&self) -> bool {
+        self.kind == Kind::Task && self.bin == ANALYZER_BIN
+    }
 }
 
 /// The folder inside the recordings directory where the analyzer's cached
@@ -238,7 +254,7 @@ pub const COMPONENTS: &[Component] = &[
         id: "trend",
         label: "Analyze: trend",
         summary: "telemouse-analyze trend — one row per recorded session",
-        bin: "telemouse-analyze",
+        bin: ANALYZER_BIN,
         base_args: &["trend"],
         kind: Kind::Task,
         flags: &[],
@@ -251,7 +267,7 @@ pub const COMPONENTS: &[Component] = &[
         id: REPORT,
         label: "Analyze: report",
         summary: "telemouse-analyze report <session> — metrics for one recording",
-        bin: "telemouse-analyze",
+        bin: ANALYZER_BIN,
         base_args: &["report"],
         kind: Kind::Task,
         flags: &[Flag {
@@ -628,6 +644,36 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// A recording's size and modification time: enough to tell whether it was
+/// written to while the analyzer was reading it.
+fn recording_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// Write `<id>.summary.json` and, when `recording_modified` is given, stamp
+/// the file with that time — the mark [`Manager::stored_summary`] looks for.
+/// `None` (the recording changed during the run, or has no timestamp) leaves
+/// the file with the time of writing, which matches no recording: the
+/// summary is on disk for whoever reads the folder, and is not served.
+fn keep_summary(
+    path: &Path,
+    json: &[u8],
+    recording_modified: Option<SystemTime>,
+) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, json)?;
+    if let Some(t) = recording_modified {
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(t)?;
+    }
+    Ok(())
+}
+
 /// The label as it will be written, or why it cannot be. One line, no
 /// control characters, not blank, not longer than [`MAX_MARKER_LABEL_CHARS`]:
 /// the pipe protocol is one marker per line, so a newline inside a label
@@ -985,8 +1031,9 @@ struct Detached {
 /// `LogSink::push` strips whatever slips past), killed if the panel drops
 /// it, and — on Windows — its own process group, so a Ctrl-Break addressed
 /// to it reaches exactly that child and a Ctrl-C at the panel's console
-/// reaches none of them.
-fn child_command(bin: &Path) -> Command {
+/// reaches none of them. `background` ([`Component::background`]) also
+/// starts it below normal priority; elsewhere it changes nothing.
+fn child_command(bin: &Path, background: bool) -> Command {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -994,8 +1041,21 @@ fn child_command(bin: &Path) -> Command {
         .env("NO_COLOR", "1")
         .kill_on_drop(true);
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    cmd.creation_flags(creation_flags(background));
+    #[cfg(not(windows))]
+    let _ = background;
     cmd
+}
+
+/// `CreateProcess` flags for a child: always its own process group, and the
+/// below-normal priority class for a background one.
+#[cfg(windows)]
+fn creation_flags(background: bool) -> u32 {
+    if background {
+        CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
+    } else {
+        CREATE_NEW_PROCESS_GROUP
+    }
 }
 
 pub(crate) fn describe_exit(e: &ExitInfo) -> String {
@@ -1185,20 +1245,35 @@ impl Manager {
         slots.get_mut(idx).is_some_and(|s| !s.reap(c))
     }
 
-    /// The stored summary of a recording, if one was made after the
-    /// recording last changed *and* in the shape this panel knows. Reads a
-    /// small file; runs nothing.
+    /// The stored summary of a recording, if it is still *about* that
+    /// recording, in the shape this panel knows, and from this version's
+    /// analyzer. Reads a small file; runs nothing. The page shows what this
+    /// returns without running the analyzer, so every way a summary can go
+    /// stale has to end in `None` here:
     ///
-    /// The mtime test alone is not enough: a recording never changes once its
-    /// run has ended, so a summary cached before the analyzer grew a field
-    /// would be served for the rest of that recording's life. The schema tag
-    /// is the only thing that can retire it, which is why an addition to
-    /// `ReportSummary` bumps it (`crates/analyze/src/report.rs`).
+    /// * **The recording changed.** [`Self::report_summary`] stamps the
+    ///   summary file with the recording's own modification time, and only
+    ///   when that did not move during the run. Fresh means the two are
+    ///   *equal*: a recording still being written, one that grew afterwards
+    ///   and one replaced by a file with another timestamp (an older backup
+    ///   included, which "summary is newer" would let through) all differ.
+    ///   A summary that could not be stamped never matches and is simply
+    ///   computed again.
+    /// * **The summary's shape changed.** A recording never changes once
+    ///   its run has ended, so the schema tag is the only thing that can
+    ///   retire a summary cached before the analyzer grew a field, which is
+    ///   why an addition to `ReportSummary` bumps it
+    ///   (`crates/analyze/src/report`).
+    /// * **The analyzer changed.** Its own report cache is dropped when
+    ///   `analyzer_version` moves; so is this. The workspace shares one
+    ///   version, so the panel's is the analyzer's — and a `bin_dir` that
+    ///   holds another build just never hits, which costs a run, not a
+    ///   wrong number.
     pub fn stored_summary(&self, id: &str) -> Result<Option<serde_json::Value>, SummaryError> {
         let recording = self.recording_by_id(id)?;
         let path = self.reports_dir().join(format!("{id}.summary.json"));
         let fresh = match (mtime_of(&path), mtime_of(&recording)) {
-            (Some(s), Some(r)) => s >= r,
+            (Some(s), Some(r)) => s == r,
             _ => false,
         };
         if !fresh {
@@ -1207,7 +1282,9 @@ impl Manager {
         let stored: Option<serde_json::Value> = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
-        Ok(stored.filter(|v| v["schema"] == SUMMARY_SCHEMA))
+        Ok(stored.filter(|v| {
+            v["schema"] == SUMMARY_SCHEMA && v["analyzer_version"] == env!("CARGO_PKG_VERSION")
+        }))
     }
 
     /// `<recordings>/<id>.jsonl` for an id that obeys the workspace rule.
@@ -1246,7 +1323,11 @@ impl Manager {
         // over the same cores the game is using.
         let _one = self.summary_lock.lock().await;
         let dir = self.reports_dir();
-        let mut cmd = child_command(&bin);
+        // What the recording looked like before the run: the summary is
+        // only vouched for (`keep_summary`) if it still looks like that after.
+        let before = recording_stamp(&recording);
+        // Below normal priority, like the analyzer's tasks.
+        let mut cmd = child_command(&bin, true);
         cmd.arg("report")
             .arg(&recording)
             .arg("--summary")
@@ -1273,9 +1354,8 @@ impl Manager {
             SummaryError::Failed(format!("the analyzer did not print a summary: {e}"))
         })?;
         let path = dir.join(format!("{id}.summary.json"));
-        if let Err(e) =
-            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &out.stdout))
-        {
+        let unchanged = before.filter(|b| recording_stamp(&recording) == Some(*b));
+        if let Err(e) = keep_summary(&path, &out.stdout, unchanged.map(|(_, modified)| modified)) {
             warn!(path = %path.display(), error = %e, "could not keep the summary; it will be computed again next time");
         }
         Ok(value)
@@ -1626,7 +1706,7 @@ impl Manager {
         #[cfg(feature = "observability")]
         slot.log.forget_seen();
 
-        let mut cmd = child_command(&bin);
+        let mut cmd = child_command(&bin, c.background());
         cmd.args(&args);
         if c.markers {
             cmd.stdin(Stdio::piped());
@@ -1864,6 +1944,9 @@ fn which(file: &str) -> bool {
 
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// winbase.h: the child starts in the below-normal priority class.
+#[cfg(windows)]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
 #[cfg(windows)]
 unsafe extern "system" {
@@ -2580,6 +2663,137 @@ mod tests {
         );
         assert!(manager(&dir.join("absent")).list_sessions().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The page shows a stored summary without running the analyzer, so a
+    /// summary must stop being served the moment it is no longer about the
+    /// recording as it is now, or no longer from this analyzer.
+    #[test]
+    fn a_stored_summary_is_only_served_for_the_recording_it_was_made_from() {
+        let dir = tmpdir("stored");
+        let m = manager(&dir);
+        let rec = dir.join("s-1.jsonl");
+        std::fs::write(&rec, "{}\n").unwrap();
+        let set_mtime = |p: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_mtime(&rec, 1_700_000_000);
+        let path = m.reports_dir().join("s-1.summary.json");
+        let good = format!(
+            r#"{{"schema":"{SUMMARY_SCHEMA}","analyzer_version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        let stamp = || recording_stamp(&rec).map(|(_, t)| t);
+
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "nothing yet");
+
+        // Kept and stamped: served.
+        keep_summary(&path, good.as_bytes(), stamp()).unwrap();
+        let v = m.stored_summary("s-1").unwrap().expect("a fresh summary");
+        assert_eq!(v["schema"], SUMMARY_SCHEMA);
+
+        // The recording grew: not served, though the file is still there.
+        set_mtime(&rec, 1_700_000_050);
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "recording moved on");
+        // An older file put back under the same name: "the summary is newer
+        // than the recording" would serve this one.
+        set_mtime(&rec, 1_600_000_000);
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "restored backup");
+
+        // Written without a stamp (the recording changed during the run):
+        // on disk, never served.
+        keep_summary(&path, good.as_bytes(), None).unwrap();
+        assert!(path.is_file());
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "unstamped");
+
+        // Another analyzer's numbers, and another shape, are not ours.
+        let old = good.replace(env!("CARGO_PKG_VERSION"), "0.0.0-ancient");
+        keep_summary(&path, old.as_bytes(), stamp()).unwrap();
+        assert_eq!(
+            m.stored_summary("s-1").unwrap(),
+            None,
+            "analyzer version moved"
+        );
+        let shape = good.replace(SUMMARY_SCHEMA, "telemouse-report-summary/1");
+        keep_summary(&path, shape.as_bytes(), stamp()).unwrap();
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "schema moved");
+        keep_summary(&path, b"{ not json", stamp()).unwrap();
+        assert_eq!(m.stored_summary("s-1").unwrap(), None, "unreadable");
+
+        // And back to good, to show the fixture itself was not the reason.
+        keep_summary(&path, good.as_bytes(), stamp()).unwrap();
+        assert!(m.stored_summary("s-1").unwrap().is_some());
+        assert!(matches!(
+            m.stored_summary("nope"),
+            Err(SummaryError::NoRecording)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the analyzer's tasks are started below normal priority: the
+    /// services and doctor are not, whatever else is added to the catalogue.
+    #[test]
+    fn only_the_analyzer_tasks_run_in_the_background() {
+        let background: Vec<&str> = COMPONENTS
+            .iter()
+            .filter(|c| c.background())
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(background, vec!["trend", REPORT]);
+        for c in COMPONENTS.iter().filter(|c| c.background()) {
+            assert_eq!(c.kind, Kind::Task, "{} is a service", c.id);
+        }
+        assert!(!SLEEPER.background() && !FAILER.background() && !REPORTER.background());
+    }
+
+    /// The flag reaches the child: a background command's process really is
+    /// in the below-normal class, an ordinary one really is not. Both are
+    /// this test's own `cmd.exe` children, read through the handles the
+    /// spawn returned.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_background_child_starts_below_normal_priority() {
+        unsafe extern "system" {
+            fn GetPriorityClass(process: *mut std::ffi::c_void) -> u32;
+        }
+        const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+
+        assert_eq!(creation_flags(false), CREATE_NEW_PROCESS_GROUP);
+        assert_eq!(
+            creation_flags(true),
+            CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
+        );
+        let class_of = |background: bool| {
+            let mut cmd = child_command(Path::new("cmd"), background);
+            cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+            let mut child = cmd.spawn().expect("cmd.exe starts");
+            let handle = child.raw_handle().expect("a running child has a handle");
+            // SAFETY: the handle is this test's own child process, alive
+            // until `start_kill` below.
+            let class = unsafe { GetPriorityClass(handle.cast()) };
+            let _ = child.start_kill();
+            class
+        };
+        assert_eq!(class_of(true), BELOW_NORMAL_PRIORITY_CLASS);
+        // A child inherits its parent's class only when that is idle or
+        // below normal; from a normal (or higher) parent it starts normal.
+        // So the comparison is only meaningful when this test run is not
+        // itself in one of the two low classes.
+        const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+        // SAFETY: -1 is the pseudo-handle for the current process.
+        let mine = unsafe { GetPriorityClass(usize::MAX as *mut std::ffi::c_void) };
+        if mine != IDLE_PRIORITY_CLASS && mine != BELOW_NORMAL_PRIORITY_CLASS {
+            assert_eq!(
+                class_of(false),
+                NORMAL_PRIORITY_CLASS,
+                "an ordinary child keeps the default class"
+            );
+        }
     }
 
     #[test]

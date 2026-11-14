@@ -77,7 +77,12 @@ any recording with scrubbing and speed control.
 The dashboard tab is the expensive part, not the capture agent: two full
 canvases repainting on the game's GPU. Add `?fps=60` to its URL while
 playing, or close it and open it afterwards for replay. The recording is
-complete either way.
+complete either way. A dashboard tab that has been hidden for five seconds
+(another tab in front, the browser minimised) disconnects from the live
+feed and reconnects when you look at it again; its session totals do not
+include what happened in between. If the game hitches with the dashboard
+visible, `?desync=0` turns off the canvases' low-latency drawing mode, to
+rule that out.
 
 ### Raw input vs the Windows pointer
 

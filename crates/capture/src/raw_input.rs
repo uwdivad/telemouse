@@ -987,7 +987,10 @@ mod win {
         );
         // One process-lifetime timer for the coalescing window; the whole
         // drain path stays allocation-free.
-        let coalesce_timer = if coalesce.is_zero() {
+        // `None` from here on means "no usable timer": never created, or
+        // dropped below the first time it could not be armed. Both the
+        // coalesce wait and the live cadence then run on `thread::sleep`.
+        let mut coalesce_timer = if coalesce.is_zero() {
             None
         } else {
             create_coalesce_timer()
@@ -1005,9 +1008,6 @@ mod win {
             .as_millis()
             .clamp(1, u32::MAX as u128 - 1) as u32;
         let mut timer_warn = Throttle::new(TIMER_WARN_INTERVAL);
-        // `SetWaitableTimer` failing is a one-off fact about this machine,
-        // not a per-drain event: say it once and fall back for good.
-        let mut arm_failure_logged = false;
         let mut raw_buf: Vec<RAWINPUT> = vec![RAWINPUT::default(); RAW_BUFFER_REPORTS];
         let mut msg = MSG::default();
         #[cfg(feature = "observability")]
@@ -1068,13 +1068,24 @@ mod win {
                                     wait_timer(timer, timer_wait_ms, &mut timer_warn, "coalesce");
                             }
                             Err(e) => {
-                                if !arm_failure_logged {
-                                    arm_failure_logged = true;
-                                    tracing::warn!(
-                                        error = %e,
-                                        "SetWaitableTimer failed; coalescing falls back to thread::sleep"
-                                    );
-                                }
+                                // A one-off fact about this machine, not a
+                                // per-drain event: say it once and give the
+                                // timer up for good. Keeping the handle
+                                // would leave the live branch above waiting
+                                // out `timer_wait_ms` on a timer nobody
+                                // armed — a drain every ~68ms instead of
+                                // every cadence period, and more reports
+                                // per drain than `raw_buf` holds at 8kHz.
+                                tracing::warn!(
+                                    error = %e,
+                                    "SetWaitableTimer failed; coalescing and the live cadence fall back to thread::sleep"
+                                );
+                                coalesce_timer = None;
+                                // SAFETY: our timer handle, closed once: it
+                                // was just taken out of `coalesce_timer`, so
+                                // nothing waits on, cancels or closes it
+                                // again.
+                                let _ = unsafe { CloseHandle(timer) };
                             }
                         }
                     }

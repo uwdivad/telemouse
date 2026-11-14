@@ -106,7 +106,8 @@ function element(id) {
     querySelector() { return null; },
     querySelectorAll() { return []; },
     getBoundingClientRect() { return { width: 800, height: 600, left: 0, top: 0 }; },
-    getContext() { return context2d(); },
+    /* What the page asked for is kept, for the tests that care (`?desync=0`). */
+    getContext(kind, options) { this.contextOptions = options; return context2d(); },
   };
   el.parentElement = { id: id + "-parent", getBoundingClientRect: el.getBoundingClientRect };
   return el;
@@ -199,6 +200,9 @@ class WebSocket {
  * `fetch(url)` answers the page's requests (return a Response from
  * `jsonResponse` / `textResponse`, or throw); by default every request gets
  * an empty JSON list.
+ * `visibility` ("visible" | "hidden") gives the document a Page Visibility
+ * API starting in that state; `setVisibility(state)` then changes it and
+ * fires `visibilitychange`.
  * Returns { telemouse, sandbox, elements, fire, fetched, flushTimers } —
  * `telemouse` is the page's devtools handle; `fire(type, detail)` dispatches
  * a window event to whatever the page registered for it; `fetched` lists the
@@ -206,12 +210,15 @@ class WebSocket {
  * frame ever runs by itself: tests that need the frame loop call
  * `telemouse.frame(ms)`.
  */
-export function loadApp({ search = "", config = {}, clock = null, globals = {}, fetch = null } = {}) {
+export function loadApp({
+  search = "", config = {}, clock = null, globals = {}, fetch = null, visibility = null,
+} = {}) {
   const timers = timerQueue();
   const fetched = [];
   const answer = fetch || (() => jsonResponse([]));
   const elements = new Map();
   const listeners = new Map();
+  const docListeners = new Map();
   const document = {
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, element(id));
@@ -219,11 +226,22 @@ export function loadApp({ search = "", config = {}, clock = null, globals = {}, 
     },
     createElement(tag) { return element("<" + tag + ">"); },
     createDocumentFragment() { return element("#fragment"); },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, []);
+      docListeners.get(type).push(fn);
+    },
     hasFocus() { return true; },
     hidden: false,
     body: element("body"),
     documentElement: element("html"),
+  };
+  /* Only a test that asks for it gets a Page Visibility API: without
+     `visibilityState` the page does not watch for a hidden tab at all. */
+  if (visibility !== null) document.visibilityState = visibility;
+  const setVisibility = (state) => {
+    document.visibilityState = state;
+    document.hidden = state === "hidden";
+    (docListeners.get("visibilitychange") || []).forEach((fn) => fn({ type: "visibilitychange" }));
   };
   const sandbox = {
     console,
@@ -264,7 +282,7 @@ export function loadApp({ search = "", config = {}, clock = null, globals = {}, 
   if (!sandbox.telemouse) throw new Error("app.js did not publish window.telemouse");
   const fire = (type, detail) => (listeners.get(type) || []).forEach((fn) => fn({ type, detail }));
   return {
-    telemouse: sandbox.telemouse, sandbox, elements, fire, fetched,
+    telemouse: sandbox.telemouse, sandbox, elements, fire, fetched, setVisibility,
     flushTimers: () => timers.flush(),
     pendingTimers: () => timers.size,
   };

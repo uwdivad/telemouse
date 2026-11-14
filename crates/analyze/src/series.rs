@@ -659,21 +659,28 @@ impl Grid {
     }
 }
 
-/// `1 + index of the last cell at or before i above `threshold``, else 0.
+/// [`last_move_into`] as a vector of its own.
+#[cfg(test)]
+fn last_move_table(speed: &[f64], threshold: f64) -> Vec<u32> {
+    let mut out = Vec::with_capacity(speed.len());
+    last_move_into(speed, threshold, &mut out);
+    out
+}
+
+/// Appends, for every cell `i` of `speed`, `1 + index of the last cell at or
+/// before i above `threshold``, else 0.
 ///
 /// A run is never longer than `Params::max_grid_cells`, which
 /// [`Params::validate`] holds below `u32::MAX`, so the index always fits; the
 /// saturating conversion is there so a hand-built grid cannot wrap.
-fn last_move_table(speed: &[f64], threshold: f64) -> Vec<u32> {
-    let mut out = vec![0u32; speed.len()];
+fn last_move_into(speed: &[f64], threshold: f64, out: &mut Vec<u32>) {
     let mut last = 0u32;
-    for (i, &s) in speed.iter().enumerate() {
+    out.extend(speed.iter().enumerate().map(|(i, &s)| {
         if s > threshold {
             last = u32::try_from(i).map_or(u32::MAX, |i| i.saturating_add(1));
         }
-        out[i] = last;
-    }
-    out
+        last
+    }));
 }
 
 /// A contiguous run of movement — grid cells whose smoothed speed exceeds the
@@ -1024,26 +1031,6 @@ fn cap_runs(spans: Vec<(usize, usize)>, cap: usize) -> (Vec<(usize, usize)>, boo
     (out, true)
 }
 
-/// Apply a Savitzky–Golay operator to one run so the result is bit-identical
-/// to applying it to the equivalent dense grid.
-///
-/// The run is temporarily framed by up to `half` cells of the silence that
-/// really surrounds it, which is exactly the context an interior window needs;
-/// where the frame would run past the ends of the session it is left off, so
-/// the operator's genuine edge handling applies there — as it does densely.
-pub(crate) fn sg_run(
-    sg: &SavGol,
-    x: &[f64],
-    start: usize,
-    n: usize,
-    half: usize,
-    dt: f64,
-) -> Vec<f64> {
-    let mut scratch = SgScratch::default();
-    let (out, from) = sg_run_into(sg, x, start, n, half, dt, &mut scratch);
-    out[from..from + x.len()].to_vec()
-}
-
 /// Reusable buffers for [`sg_run_into`]: the framed input and the framed
 /// output. One pair serves every run and lane of a sweep, so the sweep
 /// allocates at most twice (for the longest run) instead of three times per
@@ -1054,9 +1041,16 @@ pub(crate) struct SgScratch {
     out: Vec<f64>,
 }
 
-/// [`sg_run`] without the per-call allocations: returns the framed output
-/// buffer and the offset at which the run's `x.len()` results start, so the
-/// caller reads `out[from..from + x.len()]`. Bit-identical to `sg_run`.
+/// Apply a Savitzky–Golay operator to one run so the result is bit-identical
+/// to applying it to the equivalent dense grid.
+///
+/// The run is temporarily framed by up to `half` cells of the silence that
+/// really surrounds it, which is exactly the context an interior window needs;
+/// where the frame would run past the ends of the session it is left off, so
+/// the operator's genuine edge handling applies there — as it does densely.
+///
+/// Returns the framed output buffer and the offset at which the run's
+/// `x.len()` results start, so the caller reads `out[from..from + x.len()]`.
 #[hotpath::measure]
 pub(crate) fn sg_run_into<'s>(
     sg: &SavGol,
@@ -1088,8 +1082,146 @@ pub(crate) fn sg_run_into<'s>(
 ///
 /// Fails only on parameters [`Params::validate`] refuses; any recording the
 /// loader accepted prepares.
-#[hotpath::measure]
 pub fn prepare(session: LoadedSession, params: Params) -> Result<Prepared, ParamsError> {
+    prepare_with_parallelism(session, params, false)
+}
+
+/// Most threads the smoothing pass of [`prepare_with_parallelism`] spreads
+/// the runs over. The pass streams six lanes per run through memory, so it
+/// stops scaling with cores well before a large box runs out of them.
+const SMOOTH_MAX_WORKERS: usize = 8;
+/// Below this many stored cells per worker a thread costs more than it saves.
+const SMOOTH_MIN_CELLS_PER_WORKER: usize = 250_000;
+
+/// Scale one run's binned counts to velocities and derive its smoothed lanes,
+/// speeds and last-movement table. Everything here reads and writes this run
+/// alone, so runs can be finished in any order, on any thread.
+///
+/// The derived lanes are appended to, never replaced: [`finish_runs`] has
+/// already reserved them, and this must not allocate a lane of its own.
+fn finish_run(
+    r: &mut Run,
+    sg: &SavGol,
+    n: usize,
+    params: &Params,
+    inv_dt: f64,
+    scratch: &mut SgScratch,
+) {
+    for v in r.vx.iter_mut().chain(r.vy.iter_mut()) {
+        *v *= inv_dt;
+    }
+    let (half, dt) = (params.sg_half, params.grid_dt_s);
+    let len = r.len();
+    let (out, from) = sg_run_into(sg, &r.vx, r.start, n, half, dt, scratch);
+    r.vxs.extend_from_slice(&out[from..from + len]);
+    let (out, from) = sg_run_into(sg, &r.vy, r.start, n, half, dt, scratch);
+    r.vys.extend_from_slice(&out[from..from + len]);
+    r.speed_raw
+        .extend(r.vx.iter().zip(&r.vy).map(|(x, y)| stats::mag(*x, *y)));
+    r.speed
+        .extend(r.vxs.iter().zip(&r.vys).map(|(x, y)| stats::mag(*x, *y)));
+    last_move_into(&r.speed, params.still_speed, &mut r.last_move);
+}
+
+/// Where to cut `runs` into at most `parts` contiguous pieces of roughly
+/// equal stored cells: the exclusive end index of each piece. Split by cells
+/// rather than by run count, because one long run of play and a thousand
+/// two-cell blips are not the same amount of work.
+fn split_by_cells(runs: &[Run], parts: usize) -> Vec<usize> {
+    let total: usize = runs.iter().map(Run::len).sum();
+    let parts = parts.max(1);
+    let mut ends = Vec::with_capacity(parts);
+    let mut seen = 0usize;
+    for (i, r) in runs.iter().enumerate() {
+        seen += r.len();
+        // Piece `k` (1-based) ends at the first run that brings the running
+        // total to `k / parts` of all cells.
+        while ends.len() + 1 < parts && seen * parts >= total * (ends.len() + 1) {
+            ends.push(i + 1);
+        }
+    }
+    ends.push(runs.len());
+    ends.dedup();
+    ends
+}
+
+/// How many threads the smoothing pass should use for `runs`: one unless
+/// `parallel`, and never more than the grid is large enough to keep busy.
+fn smoothing_workers(runs: &[Run], parallel: bool) -> usize {
+    if !parallel {
+        return 1;
+    }
+    let cells: usize = runs.iter().map(Run::len).sum();
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(SMOOTH_MAX_WORKERS)
+        .min(cells / SMOOTH_MIN_CELLS_PER_WORKER)
+}
+
+/// Pass 3 of [`prepare`]: scale, smooth and derive every run, on `workers`
+/// scoped threads (or this one, for `workers <= 1`). Each worker owns a
+/// contiguous piece of the run list and one scratch pair.
+fn finish_runs(runs: &mut [Run], n: usize, params: &Params, workers: usize) {
+    let inv_dt = 1.0 / params.grid_dt_s;
+    let sg = SavGol::smoother(params.sg_half, params.sg_order);
+    // Every lane is allocated here, in run order, on this thread; the workers
+    // only fill them. Letting each worker allocate its own runs' lanes left
+    // the heap so interleaved that freeing the grid afterwards took 4.5 s
+    // instead of 0.3 s on a 22 000-run session (Windows heap, measured
+    // 2026-11-14) — several times what the parallel pass had saved.
+    for r in runs.iter_mut() {
+        let len = r.len();
+        for lane in [&mut r.vxs, &mut r.vys, &mut r.speed_raw, &mut r.speed] {
+            lane.reserve_exact(len);
+        }
+        r.last_move.reserve_exact(len);
+    }
+    let finish_piece = |piece: &mut [Run]| {
+        let mut scratch = SgScratch::default();
+        for r in piece {
+            finish_run(r, &sg, n, params, inv_dt, &mut scratch);
+        }
+    };
+    if workers <= 1 {
+        finish_piece(runs);
+    } else {
+        let ends = split_by_cells(runs, workers);
+        std::thread::scope(|scope| {
+            let mut rest = &mut *runs;
+            let mut taken = 0usize;
+            let finish_piece = &finish_piece;
+            for end in ends {
+                let (piece, tail) = rest.split_at_mut(end - taken);
+                rest = tail;
+                taken = end;
+                scope.spawn(move || finish_piece(piece));
+            }
+        });
+    }
+
+    // The one thing a run needs from its predecessors: where the hand last
+    // moved before it. A chain, so it is threaded through afterwards, in order.
+    let mut prev_last_move: Option<usize> = None;
+    for r in runs.iter_mut() {
+        r.prev_last_move = prev_last_move;
+        if let Some(&v) = r.last_move.last()
+            && v > 0
+        {
+            prev_last_move = Some(r.start + v as usize - 1);
+        }
+    }
+}
+
+/// [`prepare`], with the per-run smoothing pass spread over scoped workers
+/// when `parallel` (`docs/PERFORMANCE-2026-11-14.md`, A2). The prepared
+/// series is bit-identical either way: every run is finished by the same
+/// code from the same inputs, only on a different thread.
+#[hotpath::measure]
+pub(crate) fn prepare_with_parallelism(
+    session: LoadedSession,
+    params: Params,
+    parallel: bool,
+) -> Result<Prepared, ParamsError> {
     params.validate()?;
     // One tally of events-per-process for the whole pipeline: the dominant
     // game, its share, and the aim profile all fall out of it, and the quality
@@ -1210,34 +1342,8 @@ pub fn prepare(session: LoadedSession, params: Params) -> Result<Prepared, Param
     }
 
     // Pass 3: scale, smooth, derive.
-    let inv_dt = 1.0 / dt;
-    let sg = SavGol::smoother(params.sg_half, params.sg_order);
-    let mut prev_last_move: Option<usize> = None;
-    for r in &mut runs {
-        for v in r.vx.iter_mut().chain(r.vy.iter_mut()) {
-            *v *= inv_dt;
-        }
-        r.vxs = sg_run(&sg, &r.vx, r.start, n, params.sg_half, dt);
-        r.vys = sg_run(&sg, &r.vy, r.start, n, params.sg_half, dt);
-        r.speed_raw =
-            r.vx.iter()
-                .zip(&r.vy)
-                .map(|(x, y)| stats::mag(*x, *y))
-                .collect();
-        r.speed = r
-            .vxs
-            .iter()
-            .zip(&r.vys)
-            .map(|(x, y)| stats::mag(*x, *y))
-            .collect();
-        r.last_move = last_move_table(&r.speed, params.still_speed);
-        r.prev_last_move = prev_last_move;
-        if let Some(&v) = r.last_move.last()
-            && v > 0
-        {
-            prev_last_move = Some(r.start + v as usize - 1);
-        }
-    }
+    let workers = smoothing_workers(&runs, parallel);
+    finish_runs(&mut runs, n, &params, workers);
 
     let grid = Grid { dt, n, pad, runs };
     let segments = movement_segments(&grid, params.still_speed, params.min_segment_ms);
@@ -1334,6 +1440,92 @@ mod tests {
             },
             50.0,
         )
+    }
+
+    /// Binned-but-unfinished runs, as pass 2 of `prepare` leaves them: bursts
+    /// of very different lengths separated by silence, the first one starting
+    /// at the session's edge. Returns the runs and the session's cell count.
+    fn raw_runs(lens: &[usize]) -> (Vec<Run>, usize) {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 41) as f64 - 20.0
+        };
+        let mut start = 0usize;
+        let mut runs = Vec::new();
+        for (k, &len) in lens.iter().enumerate() {
+            runs.push(Run {
+                start,
+                // Every third run never moves, so the last-movement chain has
+                // to reach back past it.
+                vx: (0..len)
+                    .map(|_| if k % 3 == 2 { 0.0 } else { next() })
+                    .collect(),
+                vy: (0..len)
+                    .map(|_| if k % 3 == 2 { 0.0 } else { next() })
+                    .collect(),
+                vxs: Vec::new(),
+                vys: Vec::new(),
+                speed_raw: Vec::new(),
+                speed: Vec::new(),
+                clicks: vec![0; len],
+                last_move: Vec::new(),
+                prev_last_move: None,
+            });
+            start += len + 250;
+        }
+        (runs, start)
+    }
+
+    /// The smoothing pass must not be able to tell how many threads ran it:
+    /// every lane of every run, and the last-movement chain across runs, bit
+    /// for bit.
+    #[test]
+    fn finishing_the_runs_in_parallel_changes_nothing() {
+        let (raw, n) = raw_runs(&[400, 3, 1, 2_000, 17, 5, 5, 900, 1, 60, 3_000, 2]);
+        let params = Params::default();
+        let mut serial = raw.clone();
+        finish_runs(&mut serial, n, &params, 1);
+        assert!(serial.iter().any(|r| r.prev_last_move.is_some()));
+        assert!(serial.iter().all(|r| r.speed.len() == r.len()));
+        for workers in [2, 3, 5, 8, 64] {
+            let mut parallel = raw.clone();
+            finish_runs(&mut parallel, n, &params, workers);
+            assert_eq!(parallel, serial, "{workers} workers");
+            for (a, b) in parallel.iter().zip(&serial) {
+                for (x, y) in [(&a.vxs, &b.vxs), (&a.vys, &b.vys), (&a.speed, &b.speed)] {
+                    assert!(
+                        x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                        "{workers} workers, run at {}",
+                        a.start
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runs_are_split_by_cells_not_by_count() {
+        let (runs, _) = raw_runs(&[10, 10, 10, 10, 1_000, 10, 10, 1_000, 10]);
+        let ends = |parts| split_by_cells(&runs, parts);
+        assert_eq!(ends(1), [9]);
+        // Half the cells are reached inside the first long run.
+        assert_eq!(ends(2), [5, 9]);
+        // Pieces are contiguous, non-empty and cover every run, however many
+        // are asked for — one run can swallow several shares.
+        for parts in 1..=40 {
+            let ends = ends(parts);
+            assert!(ends.len() <= parts, "{parts}: {ends:?}");
+            assert!(ends.windows(2).all(|w| w[0] < w[1]), "{parts}: {ends:?}");
+            assert!(ends[0] > 0);
+            assert_eq!(ends.last(), Some(&runs.len()));
+        }
+        assert_eq!(split_by_cells(&[], 4), [0]);
+        // Not parallel, or too small to be worth a thread: one worker.
+        assert_eq!(smoothing_workers(&runs, false), 1);
+        assert!(smoothing_workers(&runs, true) <= 1);
     }
 
     /// The dense grid `prepare` would have built, computed the obvious way.

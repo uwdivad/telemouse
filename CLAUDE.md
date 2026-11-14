@@ -146,7 +146,9 @@ WebView2 cache in `%LOCALAPPDATA%\telemouse\WebView2`.
 instrumentation in capture and analyze: what each row measures, how to run
 it, rules for adding more), `docs/PERFORMANCE-2026-10-12.md` (first full
 hotpath pass: 20-min capture + analyzer over all recordings, ranked fixes
-A1–A6/C1–C2, none landed yet), `CHANGELOG.md` (the 2026-09-12 field audit
+A1–A6/C1–C2), `docs/PERFORMANCE-2026-11-14.md` (whole-workspace audit;
+its header lists what landed in v0.3.0 — A2, A6, C2 and the N/K/V/T items —
+and what is still open), `CHANGELOG.md` (the 2026-09-12 field audit
 fixes are under v0.1.2), `docs/AGENTIC-2026-09-13.md` (the agentic-workflow
 menu, build order and what has landed; steps 1-3 are done, the post-session
 triage note and the log-health loop are next),
