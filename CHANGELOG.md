@@ -6,7 +6,16 @@ publishes the section below that names that version.
 
 ## [Unreleased]
 
-## [0.3.0] — 2026-11-14
+## [0.3.1] — 2026-11-14
+
+The first published 0.3 release: the `v0.3.0` tag failed the release
+workflow's dependency audit and produced no zip.
+
+- **Dependency advisories cleared.** `rmcp` 3.4 → 3.10, `rustls` 0.23.46,
+  `rustls-webpki` 0.103.17, `webpki-roots` 1.0.12, `zstd` 0.13.5
+  (`zstd-safe` 7.4.1, `zstd-sys` 2.1.3): thirteen RustSec advisories filed
+  since v0.2.3. The TLS and zstd crates are only in a Kafka build; `rmcp`'s
+  were in HTTP transports the stdio-only MCP server does not use.
 
 - **Performance audit, 2026-11-14.** A whole-workspace audit
   (`docs/PERFORMANCE-2026-11-14.md`) was followed by a fix pass. Reports are

@@ -11,7 +11,7 @@ Same box as before (Ryzen 9 5950X, Windows 10 19045, Rust 1.98), `release`
 profile, default features as of the morning's tree (capture still had
 `kafka` compiled in), no hotpath.
 
-**Landed the same day, in v0.3.0** (see `CHANGELOG.md`): N1, A2, N3, N4,
+**Landed the same day, in v0.3.1** (see `CHANGELOG.md`): N1, A2, N3, N4,
 N5, A6 with skip-ahead, K1 (linger 250 ms, still unmeasured against a live
 broker), K5, C2, V1–V4, V6 (`?desync=0`), T1–T5. Still open: A1, A4, A5,
 N2, N6, N7, K2–K4, V5, the measurements (K2 quiet desktop, K3 real 8 kHz
